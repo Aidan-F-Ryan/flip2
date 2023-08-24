@@ -1,0 +1,102 @@
+#ifndef KERNELS_H
+#define KERNELS_H
+
+#include "typedefs.h"
+#include "grid.hpp"
+
+#define BLOCKSIZE 512
+
+__global__ void rootCell(float* px, float* py, float* pz, uint numParticles, Grid grid, uint* gridPosition){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(index < numParticles){
+        uint x = floorf((px[index] - grid.negX) / grid.cellSize);
+        uint y = floorf((py[index] - grid.negY) / grid.cellSize);
+        uint z = floorf((pz[index] - grid.negZ) / grid.cellSize);
+        gridPosition[index] = x + y*grid.sizeX + z*grid.sizeX*grid.sizeY;
+    }
+}
+
+__global__ void subCell(float* px, float* py, float* pz, uint numParticles, Grid grid, uint* gridPosition, char* subCellPosition, uint numRefinementLevels, uint xySize){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(index < numParticles){
+        uint moduloWRTxySize = gridPosition[index] % xySize;
+        uint z = gridPosition[index] / (xySize);
+        uint y = (moduloWRTxySize) / grid.sizeX;
+        uint x = (moduloWRTxySize) % grid.sizeX;
+        float gridCellPositionX = px[index] - grid.negX - x*grid.cellSize;
+        float gridCellPositionY = py[index] - grid.negY - y*grid.cellSize;
+        float gridCellPositionZ = pz[index] - grid.negZ - z*grid.cellSize;
+        float curCellHalfSize = grid.cellSize/2.0f;
+        for(uint i = 0; i < numRefinementLevels; ++i){
+            char position = 0;
+            position |= gridCellPositionX > curCellHalfSize ? 1 : 0;
+            position |= gridCellPositionY > curCellHalfSize ? 2 : 0;
+            position |= gridCellPositionZ > curCellHalfSize ? 4 : 0;
+            subCellPosition[index*numRefinementLevels+i] = position;
+            if(position & 1 != 0){
+                gridCellPositionX -= curCellHalfSize;
+            }
+            if(position & 2 != 0){
+                gridCellPositionY -= curCellHalfSize;
+            }
+            if(position & 4 != 0){
+                gridCellPositionZ -= curCellHalfSize;
+            }
+            curCellHalfSize /= 2.0f;
+        }
+    }
+}
+
+__global__ void radixBinParticlesByGridPositionBitIndex(uint numParticles, uint* gridPosition, uint* sortedGridPosition, uint* sortedParticleIndices, uint bitIndex, uint* front, uint* back){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(index < numParticles){
+        if((gridPosition[index] & 1<<bitIndex) == 0){
+            front[index] = 1;
+            back[index] = 0;
+        }
+        else{
+            front[index] = 0;
+            back[index] = 1;
+        }
+    }
+    
+}
+
+__global__ void parallelPrefix(uint numElements, uint* array){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    __shared__ uint shared[BLOCKSIZE];
+    if(index < numElements){
+        shared[threadIdx.x] = array[index];
+    }
+    for(uint i = 0; (threadIdx.x+1)<<(i+1)-1 < BLOCKSIZE; ++i){
+        __syncthreads();
+        shared[(threadIdx.x + 1)<<(i+1) - 1] += shared[(threadIdx.x + 1)<<i - 1];
+    }
+    __syncthreads();
+    for(uint i = 0; (threadIdx.x))
+}
+
+__global__ void moveGridSortedParticleData(uint numParticles, uint* gridPosition, uint* sortedParticleIndices, char* subCellPosition, uint numRefinementLevels){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(index < numParticles){
+
+    }
+}
+
+namespace kernels{
+    void cudaFindGridCell(float* px, float* py, float* pz, uint numParticles, Grid grid, uint* gridPosition, cudaStream_t stream){
+        rootCell<<<numParticles / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(px, py, pz, numParticles, grid, gridPosition);
+    }
+
+    void cudaFindSubCell(float* px, float* py, float* pz, uint numParticles, Grid grid, uint* gridPosition, char* subCellPosition, uint numRefinementLevels, cudaStream_t stream){
+        subCell<<<numParticles / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(px, py, pz, numParticles, grid, gridPosition, subCellPosition, numRefinementLevels, grid.sizeX*grid.sizeY);
+    }
+
+    void cudaSortParticles(){
+
+    }
+}
+
+
+
+#endif

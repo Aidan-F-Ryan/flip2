@@ -1,0 +1,26 @@
+#ifndef CUDAVEC_HU
+#define CUDAVEC_HU
+
+#include "typedefs.h"
+#include <vector>
+
+template <typename T>
+class CudaVec{
+public:
+    CudaVec();
+    CudaVec(const uint& size);
+    void resize(const uint& size);
+    T& operator[](const uint& i);
+    void upload();
+    void download();
+    void swapDevicePtr(T* devPtr);
+    T* devPtr();
+    void print();
+
+private:
+    void cuMalloc();
+    std::vector<T> vec;
+    T* d_vec;
+};
+
+#endif
