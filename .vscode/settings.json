@@ -1,0 +1,7 @@
+{
+    "files.associations": {
+        "*.hu": "cpp",
+        "random": "cpp",
+        "iostream": "cpp"
+    }
+}

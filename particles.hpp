@@ -5,7 +5,6 @@
 #include "cudaVec.hu"
 #include "grid.hpp"
 #include "kernels.hu"
-#include <random>
 
 #define REFINEMENTLEVELS 10
 
@@ -32,29 +31,19 @@ public:
         grid.setSize(x, y, z, cellSize);
     }
 
-    void randomizeParticlePositions(){
-        std::random_device rd;
-        std::default_random_engine e2(rd());
-        std::uniform_real_distribution<> distX(grid.negX, grid.negX + grid.sizeX*grid.cellSize);
-        std::uniform_real_distribution<> distY(grid.negY, grid.negY + grid.sizeY*grid.cellSize);
-        std::uniform_real_distribution<> distZ(grid.negZ, grid.negZ + grid.sizeZ*grid.cellSize);
-
-        for(uint i = 0; i < size; ++i){
-            px[i] = distX(e2);
-            py[i] = distY(e2);
-            pz[i] = distZ(e2);
-        }
-
-        px.upload();
-        py.upload();
-        pz.upload();
-    }
-
     void alignParticlesToGrid(){
         kernels::cudaFindGridCell(px.devPtr(), py.devPtr(), pz.devPtr(), size, grid, gridCell.devPtr(), stream);
         kernels::cudaFindSubCell(px.devPtr(), py.devPtr(), pz.devPtr(), size, grid, gridCell.devPtr(), subCell.devPtr(), REFINEMENTLEVELS, stream);
-        cudaStreamSynchronize(stream);
     }
+
+    void sortParticles(){
+        uint* tempGridCell = gridCell.devPtr();
+        char* tempSubCell = subCell.devPtr();
+        kernels::cudaSortParticles(size, tempGridCell, tempSubCell, REFINEMENTLEVELS, stream);
+        gridCell.swapDevicePtr(tempGridCell);
+        subCell.swapDevicePtr(tempSubCell);
+    }
+
 
     ~Particles(){
         cudaStreamDestroy(stream);
@@ -68,6 +57,8 @@ private:
     uint size;
     Grid grid;
     cudaStream_t stream;
+
+    friend class ParticleSystemTester;
 };
 
 #endif

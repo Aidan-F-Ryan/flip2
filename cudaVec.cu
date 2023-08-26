@@ -24,6 +24,11 @@ T& CudaVec<T>::operator[](const uint& i){
 }
 
 template <typename T>
+const T& CudaVec<T>::operator[](const uint& i) const{
+    return vec[i];
+}
+
+template <typename T>
 void CudaVec<T>::upload(){
     cudaMemcpy(d_vec, vec.data(), vec.size()*sizeof(T), cudaMemcpyHostToDevice);
 }
@@ -31,6 +36,16 @@ void CudaVec<T>::upload(){
 template <typename T>
 void CudaVec<T>::download(){
     cudaMemcpy(vec.data(), d_vec, vec.size()*sizeof(T), cudaMemcpyDeviceToHost);
+}
+
+template <typename T>
+void CudaVec<T>::upload(cudaStream_t stream){
+    cudaMemcpyAsync(d_vec, vec.data(), vec.size()*sizeof(T), cudaMemcpyHostToDevice, stream);
+}
+
+template <typename T>
+void CudaVec<T>::download(cudaStream_t stream){
+    cudaMemcpyAsync(vec.data(), d_vec, vec.size()*sizeof(T), cudaMemcpyDeviceToHost, stream);
 }
 
 template <typename T>
@@ -48,14 +63,14 @@ void CudaVec<T>::cuMalloc(){
 
 template<typename T>
 void CudaVec<T>::swapDevicePtr(T* devPtr){
-    if(d_vec != nullptr){
+    if(d_vec != nullptr && d_vec != devPtr){
         cudaFree(d_vec);
     }
     d_vec = devPtr;
 }
 
 template<typename T>
-void CudaVec<T>::print(){
+void CudaVec<T>::print() const{
     for(uint i = 0; i < vec.size(); ++i){
         std::cout<<+vec[i]<<", ";
     }
