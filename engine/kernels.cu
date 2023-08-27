@@ -65,7 +65,7 @@ void kernels::cudaRadixSortUint(uint numElements, uint* inArray, uint* outArray,
     }
 }
 
-void kernels::cudaSortParticles(uint numParticles, uint*& gridPosition, cudaStream_t stream){
+void kernels::cudaSortParticlesByGridNode(uint numParticles, uint*& gridPosition, cudaStream_t stream){
     uint* ogGridPosition = gridPosition;
 
     uint* sortedGridPosition;

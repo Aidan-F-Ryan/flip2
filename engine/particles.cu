@@ -30,7 +30,7 @@ void Particles::alignParticlesToGrid(){
 
 void Particles::sortParticles(){
     uint* tempGridCell = gridCell.devPtr();
-    kernels::cudaSortParticles(size, tempGridCell, stream);
+    kernels::cudaSortParticlesByGridNode(size, tempGridCell, stream);
     gridCell.swapDevicePtr(tempGridCell);
 }
 
