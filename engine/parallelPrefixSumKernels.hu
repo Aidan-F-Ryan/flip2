@@ -1,3 +1,6 @@
+#ifndef PARALLELPREFIXSUMKERNELS_HU
+#define PARALLELPREFIXSUMKERNELS_HU
+
 #include "typedefs.h"
 
 __global__ void parallelPrefix(uint numElements, uint* array, uint* blockSums){
@@ -67,15 +70,10 @@ __global__ void parallelPrefixApplyPreviousBlockSum(uint numElements, uint* arra
         }
         __syncthreads();
     }
-    // if(threadIdx.x == 0){
-    //     prevBlockSum = 0;
-    //     for(uint i = 0; i < blockDim.x; ++i){
-    //         prevBlockSum += localBlockSums[i];
-    //     }
-    // }
-    // __syncthreads();
+    
     if(index < numElements){
         array[index] += localBlockSums[0];
-        // array[index] += prevBlockSum;
     }
 }
+
+#endif

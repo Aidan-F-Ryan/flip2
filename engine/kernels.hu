@@ -4,8 +4,6 @@
 #include "typedefs.h"
 #include "grid.hpp"
 
-#define BLOCKSIZE 256
-// #define BLOCKSIZE 32
 
 namespace kernels{
     void cudaFindGridCell(float* px, float* py, float* pz, uint numParticles, Grid grid, uint* gridPosition, cudaStream_t stream);

@@ -1,3 +1,6 @@
+#ifndef RADIXSORTKERNELS_HU
+#define RADIXSORTKERNELS_HU
+
 #include "typedefs.h"
 
 __global__ void radixBinUintByBitIndex(uint numElements, uint* inArray, uint bitIndex, uint* front, uint* back){
@@ -54,3 +57,5 @@ __global__ void reorderGridIndices(uint numElements, uint* sortedIndices, uint* 
         outArray[index] = inArray[sortedIndices[index]];
     }
 }
+
+#endif
