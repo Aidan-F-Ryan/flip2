@@ -1,12 +1,12 @@
-cmake_minimum_required(VERSION 3.21)
-project(flip2 LANGUAGES CUDA CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_FLAGS "-Wall -Wextra")
 
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -G -g")
 
 set(cudaLibraries
+    particles
     cudaVec
+    kernels
 )
 
 foreach(lib ${cudaLibraries})
