@@ -49,6 +49,22 @@ void kernels::cudaParallelPrefixSum(uint numElements, T* array, T* blockSums, cu
     parallelPrefixApplyPreviousBlockSum<<<numElements/BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numElements, array, blockSums);
 }
 
+void kernels::cudaRadixSortUint(uint numElements, uint* inArray, uint* outArray, uint* sortedIndices, uint* front, uint* back, uint* blockSumsFront, uint* blockSumsBack, cudaStream_t frontStream, cudaStream_t backStream){
+    for(uint i = 0; i < sizeof(uint)*8; ++i){
+        radixBinUintByBitIndex<<<numElements/BLOCKSIZE + 1, BLOCKSIZE, 0, frontStream>>>(numElements, inArray, i, front, back);
+        cudaStreamSynchronize(frontStream);
+        kernels::cudaParallelPrefixSum<uint>(numElements, front, blockSumsFront, frontStream);
+        kernels::cudaParallelPrefixSum<uint>(numElements, back, blockSumsBack, backStream);
+        cudaStreamSynchronize(backStream);
+        coalesceFrontBack<<<numElements/BLOCKSIZE + 1, BLOCKSIZE, 0, frontStream>>>(numElements, sortedIndices, front, back);
+        reorderGridIndices<<<numElements/BLOCKSIZE + 1, BLOCKSIZE, 0, frontStream>>>(numElements, sortedIndices, inArray, outArray);
+        cudaStreamSynchronize(frontStream);
+        uint* tempGP = inArray;
+        inArray = outArray;
+        outArray = tempGP;
+    }
+}
+
 void kernels::cudaSortParticles(uint numParticles, uint*& gridPosition, cudaStream_t stream){
     uint* ogGridPosition = gridPosition;
 
@@ -68,19 +84,9 @@ void kernels::cudaSortParticles(uint numParticles, uint*& gridPosition, cudaStre
 
     cudaStream_t backStream;
     cudaStreamCreate(&backStream);
-    for(uint i = 0; i < sizeof(uint)*8; ++i){
-        radixBinParticlesByGridPositionBitIndex<<<numParticles/BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numParticles, gridPosition, i, front, back);
-        cudaStreamSynchronize(stream);
-        kernels::cudaParallelPrefixSum<uint>(numParticles, front, blockSumsFront, stream);
-        kernels::cudaParallelPrefixSum<uint>(numParticles, back, blockSumsBack, backStream);
-        cudaStreamSynchronize(backStream);
-        coalesceFrontBack<<<numParticles/BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numParticles, sortedParticleIndices, front, back);
-        reorderGridIndices<<<numParticles/BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numParticles, sortedParticleIndices, gridPosition, sortedGridPosition);
-        cudaStreamSynchronize(stream);
-        uint* tempGP = gridPosition;
-        gridPosition = sortedGridPosition;
-        sortedGridPosition = tempGP;
-    }
+    
+    cudaRadixSortUint(numParticles, gridPosition, sortedGridPosition, sortedParticleIndices, front, back, blockSumsFront, blockSumsBack, stream, backStream);
+    
     if(ogGridPosition != sortedGridPosition){
         cudaFree(sortedGridPosition);
     }

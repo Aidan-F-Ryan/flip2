@@ -1,9 +1,9 @@
 #include "typedefs.h"
 
-__global__ void radixBinParticlesByGridPositionBitIndex(uint numParticles, uint* gridPosition, uint bitIndex, uint* front, uint* back){
+__global__ void radixBinUintByBitIndex(uint numElements, uint* inArray, uint bitIndex, uint* front, uint* back){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
-    if(index < numParticles){
-        if((gridPosition[index] & (1<<bitIndex)) == 0){
+    if(index < numElements){
+        if((inArray[index] & (1<<bitIndex)) == 0){
             front[index] = 1;
             back[index] = 0;
         }
@@ -16,13 +16,13 @@ __global__ void radixBinParticlesByGridPositionBitIndex(uint numParticles, uint*
 }
 
 
-__global__ void coalesceFrontBack(uint numParticles, uint* sortedParticleIndices, uint* front, uint* back){
+__global__ void coalesceFrontBack(uint numElements, uint* outArray, uint* front, uint* back){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
     __shared__ uint maxFrontIndex;
     __shared__ uint thisBlockFront[BLOCKSIZE+1];
     __shared__ uint thisBlockBack[BLOCKSIZE+1];
-    if(threadIdx.x == 0 && index < numParticles){
-        maxFrontIndex = front[numParticles-1];
+    if(threadIdx.x == 0 && index < numElements){
+        maxFrontIndex = front[numElements-1];
         if((int)index - 1 >= 0){
             thisBlockFront[0] = front[index - 1];
             thisBlockBack[0] = back[index - 1];
@@ -33,24 +33,24 @@ __global__ void coalesceFrontBack(uint numParticles, uint* sortedParticleIndices
         }
     }
     __syncthreads();
-    if(index < numParticles){
+    if(index < numElements){
         thisBlockFront[threadIdx.x + 1] = front[index];
         thisBlockBack[threadIdx.x + 1] = back[index];
     }
     __syncthreads();
-    if(index < numParticles){
+    if(index < numElements){
         if(thisBlockFront[threadIdx.x] != thisBlockFront[threadIdx.x+1]){
-            sortedParticleIndices[thisBlockFront[threadIdx.x]] = index;
+            outArray[thisBlockFront[threadIdx.x]] = index;
         }
         if(thisBlockBack[threadIdx.x] != thisBlockBack[threadIdx.x+1]){
-            sortedParticleIndices[thisBlockBack[threadIdx.x] + maxFrontIndex] = index;
+            outArray[thisBlockBack[threadIdx.x] + maxFrontIndex] = index;
         }
     }
 }
 
-__global__ void reorderGridIndices(uint numParticles, uint* sortedParticleIndices, uint* gridPosition, uint* sortedGridPosition){
+__global__ void reorderGridIndices(uint numElements, uint* sortedIndices, uint* inArray, uint* outArray){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
-    if(index < numParticles){
-        sortedGridPosition[index] = gridPosition[sortedParticleIndices[index]];
+    if(index < numElements){
+        outArray[index] = inArray[sortedIndices[index]];
     }
 }
