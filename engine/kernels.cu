@@ -2,8 +2,6 @@
 #include "parallelPrefixSumKernels.hu"
 #include "radixSortKernels.hu"
 
-#include <stdio.h>
-
 __global__ void rootCell(float* px, float* py, float* pz, uint numParticles, Grid grid, uint* gridPosition){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
     if(index < numParticles){
