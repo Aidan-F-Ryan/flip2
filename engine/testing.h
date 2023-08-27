@@ -72,6 +72,7 @@ public:
         // particles.gridCell.upload();
         storeGridCellMap();
         particles.sortParticles();
+        particles.alignParticlesToSubCells();
         validateGridCellOrdering();
     }
 

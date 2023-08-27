@@ -13,7 +13,9 @@ Particles::Particles(uint size)
     vz.resize(size);
 
     gridCell.resize(size);
-    subCell.resize(size*REFINEMENTLEVELS);    //starting with 10 levels of refinement
+    subCellX.resize(size);
+    subCellY.resize(size);
+    subCellZ.resize(size);
     cudaStreamCreate(&stream);
 }
 
@@ -24,17 +26,17 @@ void Particles::setDomain(float nx, float ny, float nz, uint x, uint y, uint z, 
 
 void Particles::alignParticlesToGrid(){
     kernels::cudaFindGridCell(px.devPtr(), py.devPtr(), pz.devPtr(), size, grid, gridCell.devPtr(), stream);
-    kernels::cudaFindSubCell(px.devPtr(), py.devPtr(), pz.devPtr(), size, grid, gridCell.devPtr(), subCell.devPtr(), REFINEMENTLEVELS, stream);
 }
 
 void Particles::sortParticles(){
     uint* tempGridCell = gridCell.devPtr();
-    char* tempSubCell = subCell.devPtr();
-    kernels::cudaSortParticles(size, tempGridCell, tempSubCell, REFINEMENTLEVELS, stream);
+    kernels::cudaSortParticles(size, tempGridCell, stream);
     gridCell.swapDevicePtr(tempGridCell);
-    subCell.swapDevicePtr(tempSubCell);
 }
 
+void Particles::alignParticlesToSubCells(){
+    kernels::cudaFindSubCell(px.devPtr(), py.devPtr(), pz.devPtr(), size, grid, gridCell.devPtr(), subCellX.devPtr(), subCellY.devPtr(), subCellZ.devPtr(), 2, stream);
+}
 
 Particles::~Particles(){
     cudaStreamDestroy(stream);

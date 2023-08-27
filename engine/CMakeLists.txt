@@ -1,7 +1,8 @@
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_FLAGS "-Wall -Wextra")
 
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -G -g")
+# set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -G -g")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3")
 
 set(cudaLibraries
     particles

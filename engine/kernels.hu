@@ -10,9 +10,12 @@
 namespace kernels{
     void cudaFindGridCell(float* px, float* py, float* pz, uint numParticles, Grid grid, uint* gridPosition, cudaStream_t stream);
 
-    void cudaFindSubCell(float* px, float* py, float* pz, uint numParticles, Grid grid, uint* gridPosition, char* subCellPosition, uint numRefinementLevels, cudaStream_t stream);
+    void cudaFindSubCell(float* px, float* py, float* pz, uint numParticles, Grid grid, uint* gridPosition, uint* subCellPositionX, uint* subCellPositionY, uint* subCellPositionZ, uint refinementLevel, cudaStream_t stream);
 
-    void cudaSortParticles(uint numParticles, uint*& gridPosition, char*& subCellPosition, uint numRefinementLevels, cudaStream_t stream);
+    template <typename T>
+    void cudaParallelPrefixSum(uint numElements, T* array, cudaStream_t stream);
+
+    void cudaSortParticles(uint numParticles, uint*& gridPosition, cudaStream_t stream);
 
 }
 

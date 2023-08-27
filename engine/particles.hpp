@@ -14,6 +14,7 @@ public:
     void setDomain(float nx, float ny, float nz, uint x, uint y, uint z, float cellSize);
 
     void alignParticlesToGrid();
+    void alignParticlesToSubCells();
 
     void sortParticles();
 
@@ -22,7 +23,7 @@ private:
     CudaVec<float> px, py, pz;
     CudaVec<float> vx, vy, vz;
     CudaVec<uint> gridCell;
-    CudaVec<char> subCell;
+    CudaVec<uint> subCellX, subCellY, subCellZ;
     uint size;
     Grid grid;
     cudaStream_t stream;
