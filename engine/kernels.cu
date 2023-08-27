@@ -1,5 +1,6 @@
 #include "kernels.hu"
 #include "parallelPrefixSumKernels.hu"
+#include "radixSortKernels.hu"
 
 #include <stdio.h>
 
@@ -33,60 +34,6 @@ __global__ void subCell(float* px, float* py, float* pz, uint numParticles, Grid
     }
 }
 
-__global__ void radixBinParticlesByGridPositionBitIndex(uint numParticles, uint* gridPosition, uint bitIndex, uint* front, uint* back){
-    uint index = threadIdx.x + blockIdx.x*blockDim.x;
-    if(index < numParticles){
-        if((gridPosition[index] & (1<<bitIndex)) == 0){
-            front[index] = 1;
-            back[index] = 0;
-        }
-        else{
-            front[index] = 0;
-            back[index] = 1;
-        }
-    }
-    
-}
-
-
-__global__ void coalesceFrontBack(uint numParticles, uint* sortedParticleIndices, uint* front, uint* back){
-    uint index = threadIdx.x + blockIdx.x*blockDim.x;
-    __shared__ uint maxFrontIndex;
-    __shared__ uint thisBlockFront[BLOCKSIZE+1];
-    __shared__ uint thisBlockBack[BLOCKSIZE+1];
-    if(threadIdx.x == 0 && index < numParticles){
-        maxFrontIndex = front[numParticles-1];
-        if((int)index - 1 >= 0){
-            thisBlockFront[0] = front[index - 1];
-            thisBlockBack[0] = back[index - 1];
-        }
-        else{
-            thisBlockFront[0] = 0;
-            thisBlockBack[0] = 0;
-        }
-    }
-    __syncthreads();
-    if(index < numParticles){
-        thisBlockFront[threadIdx.x + 1] = front[index];
-        thisBlockBack[threadIdx.x + 1] = back[index];
-    }
-    __syncthreads();
-    if(index < numParticles){
-        if(thisBlockFront[threadIdx.x] != thisBlockFront[threadIdx.x+1]){
-            sortedParticleIndices[thisBlockFront[threadIdx.x]] = index;
-        }
-        if(thisBlockBack[threadIdx.x] != thisBlockBack[threadIdx.x+1]){
-            sortedParticleIndices[thisBlockBack[threadIdx.x] + maxFrontIndex] = index;
-        }
-    }
-}
-
-__global__ void reorderGridIndices(uint numParticles, uint* sortedParticleIndices, uint* gridPosition, uint* sortedGridPosition){
-    uint index = threadIdx.x + blockIdx.x*blockDim.x;
-    if(index < numParticles){
-        sortedGridPosition[index] = gridPosition[sortedParticleIndices[index]];
-    }
-}
 
 void kernels::cudaFindGridCell(float* px, float* py, float* pz, uint numParticles, Grid grid, uint* gridPosition, cudaStream_t stream){
     rootCell<<<numParticles / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(px, py, pz, numParticles, grid, gridPosition);
