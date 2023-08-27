@@ -1,3 +1,5 @@
 build/
 debug/
 .cache/
+html/
+latex/
