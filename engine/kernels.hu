@@ -7,6 +7,20 @@
 #define BLOCKSIZE 256
 // #define BLOCKSIZE 32
 
+__global__ void rootCell(float* px, float* py, float* pz, uint numParticles, Grid grid, uint* gridPosition);
+
+__global__ void subCell(float* px, float* py, float* pz, uint numParticles, Grid grid, uint* gridPosition, char* subCellPosition, uint numRefinementLevels, uint xySize);
+
+__global__ void radixBinParticlesByGridPositionBitIndex(uint numParticles, uint* gridPosition, uint bitIndex, uint* front, uint* back);
+
+__global__ void parallelPrefix(uint numElements, uint* array, uint* blockSums);
+
+__global__ void parallelPrefixApplyPreviousBlockSum(uint numElements, uint* array, uint* blockSums);
+
+__global__ void coalesceFrontBack(uint numParticles, uint* sortedParticleIndices, uint* front, uint* back);
+
+__global__ void reorderGridIndices(uint numParticles, uint* sortedParticleIndices, uint* gridPosition, uint* sortedGridPosition, char* subCellPosition, char* sortedSubCellPosition, uint numRefinementLevels);
+
 namespace kernels{
     void cudaFindGridCell(float* px, float* py, float* pz, uint numParticles, Grid grid, uint* gridPosition, cudaStream_t stream);
 
