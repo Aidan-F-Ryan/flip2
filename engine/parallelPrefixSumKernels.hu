@@ -59,22 +59,8 @@ __global__ void parallelPrefix(uint numElements, uint* array, uint* blockSums){ 
 
 __global__ void parallelPrefixApplyPreviousBlockSum(uint numElements, uint* array, uint* blockSums){ //designed for WORKSIZE threads per block, 2x BLOCKSIZE
     uint index = threadIdx.x + (blockIdx.x)*blockDim.x;
-    __shared__ uint localBlockSums[WORKSIZE];
-    localBlockSums[threadIdx.x] = 0;
-    for(uint i = threadIdx.x; i < blockIdx.x; i += blockDim.x){ //add blockSums up to current block to localBlockSums for reduction later
-        localBlockSums[threadIdx.x] += blockSums[i];
-    }
-    
-    __syncthreads();
-    for(uint i = blockDim.x>>1; i > 0; i >>= 1){    //REDUCE
-        if(threadIdx.x < i){
-            localBlockSums[threadIdx.x] += localBlockSums[threadIdx.x + i];
-        }
-        __syncthreads();
-    }
-    
-    if(index < numElements){    //STORE
-        array[index] += localBlockSums[0];
+    if(blockIdx.x > 0 && index < numElements){    //STORE
+        array[index] += blockSums[blockIdx.x - 1];
     }
 }
 

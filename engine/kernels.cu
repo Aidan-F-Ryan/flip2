@@ -1,6 +1,7 @@
 #include "kernels.hu"
 #include "parallelPrefixSumKernels.hu"
 #include "radixSortKernels.hu"
+#include "typedefs.h"
 
 
 /**
@@ -112,7 +113,13 @@ void kernels::cudaFindSubCell(float* px, float* py, float* pz, uint numParticles
 template <typename T>
 void kernels::cudaParallelPrefixSum(uint numElements, T* array, T* blockSums, cudaStream_t stream){
     parallelPrefix<<<numElements/WORKSIZE + 1, BLOCKSIZE, 0, stream>>>(numElements, array, blockSums);
+    if(numElements / WORKSIZE > 0){
+        T* tempBlockSums;
+        cudaMalloc((void**)&tempBlockSums, sizeof(T) * ((numElements/WORKSIZE + 1) / WORKSIZE + 1));
+        cudaParallelPrefixSum((numElements/WORKSIZE + 1), blockSums,  tempBlockSums, stream);
+    }
     parallelPrefixApplyPreviousBlockSum<<<numElements/WORKSIZE + 1, WORKSIZE, 0, stream>>>(numElements, array, blockSums);
+    cudaFree(blockSums);
 }
 
 /**
@@ -130,8 +137,13 @@ void kernels::cudaParallelPrefixSum(uint numElements, T* array, T* blockSums, cu
  * @param backStream 
  */
 
-void kernels::cudaRadixSortUint(uint numElements, uint* inArray, uint* outArray, uint* sortedIndices, uint* front, uint* back, uint* blockSumsFront, uint* blockSumsBack, cudaStream_t frontStream, cudaStream_t backStream){
+void kernels::cudaRadixSortUint(uint numElements, uint* inArray, uint* outArray, uint* sortedIndices, uint* front, uint* back, cudaStream_t frontStream, cudaStream_t backStream){
     for(uint i = 0; i < sizeof(uint)*8; ++i){
+        uint* blockSumsFront;
+        uint* blockSumsBack;
+        cudaMalloc((void**)&blockSumsFront, sizeof(uint)*numElements/BLOCKSIZE + 1);
+        cudaMalloc((void**)&blockSumsBack, sizeof(uint)*numElements/BLOCKSIZE + 1);
+
         radixBinUintByBitIndex<<<numElements/BLOCKSIZE + 1, BLOCKSIZE, 0, frontStream>>>(numElements, inArray, i, front, back);
         cudaStreamSynchronize(frontStream);
         kernels::cudaParallelPrefixSum<uint>(numElements, front, blockSumsFront, frontStream);
@@ -174,7 +186,7 @@ void kernels::cudaSortParticlesByGridNode(uint numParticles, uint*& gridPosition
     cudaStream_t backStream;
     cudaStreamCreate(&backStream);
     
-    cudaRadixSortUint(numParticles, gridPosition, sortedGridPosition, sortedParticleIndices, front, back, blockSumsFront, blockSumsBack, stream, backStream);
+    cudaRadixSortUint(numParticles, gridPosition, sortedGridPosition, sortedParticleIndices, front, back, stream, backStream);
     
     if(ogGridPosition != sortedGridPosition){
         cudaFree(sortedGridPosition);
@@ -183,6 +195,6 @@ void kernels::cudaSortParticlesByGridNode(uint numParticles, uint*& gridPosition
     cudaFree(sortedParticleIndices);
     cudaFree(front);
     cudaFree(back);
-    cudaFree(blockSumsFront);
-    cudaFree(blockSumsBack);
+    // cudaFree(blockSumsFront);
+    // cudaFree(blockSumsBack);
 }
