@@ -1,7 +1,8 @@
 {
     "files.associations": {
-        "*.hu": "cpp",
+        "*.hu": "cuda-cpp",
         "random": "cpp",
         "iostream": "cpp"
-    }
+    },
+    "cmake.configureOnOpen": false
 }

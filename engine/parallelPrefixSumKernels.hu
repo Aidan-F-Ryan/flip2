@@ -3,9 +3,9 @@
 
 #include "typedefs.h"
 
-__global__ void parallelPrefix(uint numElements, uint* array, uint* blockSums){
-    uint index = threadIdx.x + blockIdx.x*blockDim.x;
-    __shared__ uint shared[BLOCKSIZE];
+__global__ void parallelPrefix(uint numElements, uint* array, uint* blockSums){ // BLOCKSIZE threads operating on WORKSIZE (2x BLOCKSIZE) elements
+    uint index = threadIdx.x + blockIdx.x*WORKSIZE;
+    __shared__ uint shared[WORKSIZE];
     __shared__ uint blockSum;
     if(index < numElements){
         shared[threadIdx.x] = array[index];
@@ -13,65 +13,67 @@ __global__ void parallelPrefix(uint numElements, uint* array, uint* blockSums){
     else{
         shared[threadIdx.x] = 0;
     }
-    for(uint i = 0; 1<<(i+1)-1 < BLOCKSIZE; ++i){
+    if(index + blockDim.x < numElements){
+        shared[threadIdx.x + blockDim.x] = array[index + blockDim.x];
+    }
+    else{
+        shared[threadIdx.x + blockDim.x] = 0;
+    }
+    for(uint i = 0; 1<<(i+1)-1 < WORKSIZE; ++i){
         __syncthreads();
-        if(((threadIdx.x + 1)<<(i+1)) - 1 < BLOCKSIZE){
+        if(((threadIdx.x + 1)<<(i+1)) - 1 < WORKSIZE){
             shared[((threadIdx.x + 1)<<(i+1)) - 1] += shared[((threadIdx.x + 1)<<(i+1)) - 1 - (1<<i)];
         }
     }
     __syncthreads();
 
     if(threadIdx.x == 0){
-        blockSum = shared[BLOCKSIZE - 1];
+        blockSum = shared[WORKSIZE - 1];
         blockSums[blockIdx.x] = blockSum;
-        shared[BLOCKSIZE-1] = 0;
+        shared[WORKSIZE-1] = 0;
     }
     __syncthreads();
     
-    for(int i = sizeof(uint)*8 - __clz(BLOCKSIZE>>1) - 1; i >= 0; --i){
+    for(int i = sizeof(uint)*8 - __clz(WORKSIZE>>1) - 1; i >= 0; --i){
         __syncthreads();
-        if(((threadIdx.x + 1)<<(i+1)) - 1 < BLOCKSIZE){
+        if(((threadIdx.x + 1)<<(i+1)) - 1 < WORKSIZE){
             uint temp = shared[((threadIdx.x + 1)<<(i+1)) - 1];
             shared[((threadIdx.x + 1)<<(i+1)) - 1] += shared[((threadIdx.x + 1)<<(i+1)) - 1 - (1<<i)];
             shared[((threadIdx.x + 1)<<(i+1)) - 1 - (1<<i)] = temp;
         }
     }
     __syncthreads();
-    if(index < numElements){
-        if(threadIdx.x < blockDim.x-1){
-            if(threadIdx.x == numElements-1){
-                array[index] = blockSums[blockIdx.x];
-            }
-            else{
-                array[index] = shared[threadIdx.x+1];
-            }
+    if(index < numElements){    //copy first of the two values handled by each thread
+        array[index] = shared[threadIdx.x + 1];
+    }
+    if(index + blockDim.x < numElements){
+        if(threadIdx.x == blockDim.x-1){
+            array[index + blockDim.x] = blockSum;
         }
-        else if(threadIdx.x == blockDim.x-1){
-            array[index] = blockSum;
+        else {
+            array[index + blockDim.x] = shared[threadIdx.x + blockDim.x + 1];
         }
 
     }
 }
 
-__global__ void parallelPrefixApplyPreviousBlockSum(uint numElements, uint* array, uint* blockSums){
-    uint index = threadIdx.x + blockIdx.x*blockDim.x;
-    __shared__ uint localBlockSums[BLOCKSIZE];
-    // __shared__ uint prevBlockSum;
+__global__ void parallelPrefixApplyPreviousBlockSum(uint numElements, uint* array, uint* blockSums){ //designed for WORKSIZE threads per block, 2x BLOCKSIZE
+    uint index = threadIdx.x + (blockIdx.x)*blockDim.x;
+    __shared__ uint localBlockSums[WORKSIZE];
     localBlockSums[threadIdx.x] = 0;
-    for(uint i = threadIdx.x; i < blockIdx.x; i += blockDim.x){
+    for(uint i = threadIdx.x; i < blockIdx.x; i += blockDim.x){ //add blockSums up to current block to localBlockSums for reduction later
         localBlockSums[threadIdx.x] += blockSums[i];
     }
     
     __syncthreads();
-    for(uint i = 1; i < blockDim.x; i *= 2){
-        uint j = threadIdx.x * 2 * i;
-        if(j < blockDim.x){
-            localBlockSums[j] += localBlockSums[j + i];
+    for(uint i = blockDim.x>>1; i > 0; i >>= 1){    //REDUCE
+        if(threadIdx.x < i){
+            localBlockSums[threadIdx.x] += localBlockSums[threadIdx.x + i];
         }
         __syncthreads();
     }
     
-    if(index < numElements){
+    if(index < numElements){    //STORE
         array[index] += localBlockSums[0];
     }
 }

@@ -64,16 +64,18 @@ public:
         particles.pz.upload(particles.stream);
     }
     
-    void run(){
+    void runVerify(){
         particles.alignParticlesToGrid();
-        // particles.gridCell.download();
-        // particles.gridCell[4] = 12;
-        // particles.gridCell[2] = 55;
-        // particles.gridCell.upload();
         storeGridCellMap();
         particles.sortParticles();
         particles.alignParticlesToSubCells();
         validateGridCellOrdering();
+    }
+
+    void run(){
+        particles.alignParticlesToGrid();
+        particles.sortParticles();
+        particles.alignParticlesToSubCells();
     }
 
 private:

@@ -111,8 +111,8 @@ void kernels::cudaFindSubCell(float* px, float* py, float* pz, uint numParticles
 
 template <typename T>
 void kernels::cudaParallelPrefixSum(uint numElements, T* array, T* blockSums, cudaStream_t stream){
-    parallelPrefix<<<numElements/BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numElements, array, blockSums);
-    parallelPrefixApplyPreviousBlockSum<<<numElements/BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numElements, array, blockSums);
+    parallelPrefix<<<numElements/WORKSIZE + 1, BLOCKSIZE, 0, stream>>>(numElements, array, blockSums);
+    parallelPrefixApplyPreviousBlockSum<<<numElements/WORKSIZE + 1, WORKSIZE, 0, stream>>>(numElements, array, blockSums);
 }
 
 /**
