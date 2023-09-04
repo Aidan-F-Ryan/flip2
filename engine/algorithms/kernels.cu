@@ -1,7 +1,7 @@
 #include "kernels.hu"
-#include "parallelPrefixSumKernels.hu"
-#include "radixSortKernels.hu"
-#include "typedefs.h"
+#include "../algorithms/parallelPrefixSumKernels.hu"
+#include "../algorithms/radixSortKernels.hu"
+#include "../typedefs.h"
 
 
 /**
@@ -137,7 +137,12 @@ void kernels::cudaParallelPrefixSum(uint numElements, T* array, T* blockSums, cu
  * @param backStream 
  */
 
-void kernels::cudaRadixSortUint(uint numElements, uint* inArray, uint* outArray, uint* sortedIndices, uint* front, uint* back, cudaStream_t frontStream, cudaStream_t backStream){
+void kernels::cudaRadixSortUint(uint numElements, uint* inArray, uint* outArray, uint* sortedIndices, uint* front, uint* back, cudaStream_t frontStream, cudaStream_t backStream, uint*& reorderedIndicesRelativeToOriginal){
+    uint* tReordered;
+
+    cudaMalloc((void**)&reorderedIndicesRelativeToOriginal, sizeof(uint) * numElements); //reordered indices relative to original position, for shuffling positions
+    cudaMalloc((void**)&tReordered, sizeof(uint) * numElements); //reordered indices relative to original position, for shuffling positions
+
     for(uint i = 0; i < sizeof(uint)*8; ++i){
         uint* blockSumsFront;
         uint* blockSumsBack;
@@ -152,10 +157,22 @@ void kernels::cudaRadixSortUint(uint numElements, uint* inArray, uint* outArray,
         coalesceFrontBack<<<numElements/BLOCKSIZE + 1, BLOCKSIZE, 0, frontStream>>>(numElements, sortedIndices, front, back);
         reorderGridIndices<<<numElements/BLOCKSIZE + 1, BLOCKSIZE, 0, frontStream>>>(numElements, sortedIndices, inArray, outArray);
         cudaStreamSynchronize(frontStream);
+        
+        if(i == 0){
+            cudaMemcpyAsync(reorderedIndicesRelativeToOriginal, sortedIndices, sizeof(uint)*numElements, cudaMemcpyDeviceToDevice, frontStream);
+        }
+        else{
+            reorderGridIndices<<<numElements/BLOCKSIZE + 1, BLOCKSIZE, 0, frontStream>>>(numElements, sortedIndices, reorderedIndicesRelativeToOriginal, tReordered);
+            uint* temp = tReordered;
+            tReordered = reorderedIndicesRelativeToOriginal;
+            reorderedIndicesRelativeToOriginal = temp;
+        }
+
         uint* tempGP = inArray;
         inArray = outArray;
         outArray = tempGP;
     }
+    cudaFree(tReordered);
 }
 
 /**
@@ -166,35 +183,34 @@ void kernels::cudaRadixSortUint(uint numElements, uint* inArray, uint* outArray,
  * @param stream 
  */
 
-void kernels::cudaSortParticlesByGridNode(uint numParticles, uint*& gridPosition, cudaStream_t stream){
+void kernels::cudaSortParticlesByGridNode(uint numParticles, uint*& gridPosition, uint*& reorderedIndicesRelativeToOriginal, cudaStream_t stream){
     uint* ogGridPosition = gridPosition;
+    uint* ogReordered = reorderedIndicesRelativeToOriginal;
 
     uint* sortedGridPosition;
     uint* sortedParticleIndices;
     uint* front;
     uint* back;
-    uint* blockSumsFront;
-    uint* blockSumsBack;
 
     cudaMalloc((void**)&sortedGridPosition, sizeof(uint)*numParticles);
     cudaMalloc((void**)&sortedParticleIndices, sizeof(uint)*numParticles);
     cudaMalloc((void**)&front, sizeof(uint)*numParticles);
     cudaMalloc((void**)&back, sizeof(uint)*numParticles);
-    cudaMalloc((void**)&blockSumsFront, sizeof(uint)*numParticles/BLOCKSIZE + 1);
-    cudaMalloc((void**)&blockSumsBack, sizeof(uint)*numParticles/BLOCKSIZE + 1);
 
     cudaStream_t backStream;
     cudaStreamCreate(&backStream);
     
-    cudaRadixSortUint(numParticles, gridPosition, sortedGridPosition, sortedParticleIndices, front, back, stream, backStream);
-    
+    cudaRadixSortUint(numParticles, gridPosition, sortedGridPosition, sortedParticleIndices, front, back, stream, backStream, reorderedIndicesRelativeToOriginal);
+
     if(ogGridPosition != sortedGridPosition){
         cudaFree(sortedGridPosition);
     }
 
+    // if(ogReordered != reorderedIndicesRelativeToOriginal){
+        // cudaFree(reorderedIndicesRelativeToOriginal);
+    // }
+
     cudaFree(sortedParticleIndices);
     cudaFree(front);
     cudaFree(back);
-    // cudaFree(blockSumsFront);
-    // cudaFree(blockSumsBack);
 }

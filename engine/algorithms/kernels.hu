@@ -1,8 +1,8 @@
 #ifndef KERNELS_H
 #define KERNELS_H
 
-#include "typedefs.h"
-#include "grid.hpp"
+#include "../typedefs.h"
+#include "../grid.hpp"
 
 
 namespace kernels{
@@ -13,9 +13,9 @@ namespace kernels{
     template <typename T>
     void cudaParallelPrefixSum(uint numElements, T* array, T* blockSums, cudaStream_t stream);
 
-    void cudaRadixSortUint(uint numElements, uint* inArray, uint* outArray, uint* sortedIndices, uint* front, uint* back, cudaStream_t frontStream, cudaStream_t backStream);
+    void cudaRadixSortUint(uint numElements, uint* inArray, uint* outArray, uint* sortedIndices, uint* front, uint* back, cudaStream_t frontStream, cudaStream_t backStream, uint*& reorderedIndicesRelativeToOriginal);
 
-    void cudaSortParticlesByGridNode(uint numParticles, uint*& gridPosition, cudaStream_t stream);
+    void cudaSortParticlesByGridNode(uint numParticles, uint*& gridPosition, uint*& reorderedIndicesRelativeToOriginal, cudaStream_t stream);
 
 }
 

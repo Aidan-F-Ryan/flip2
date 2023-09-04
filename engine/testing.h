@@ -1,7 +1,7 @@
 #ifndef TESTING_H
 #define TESTING_H
 
-#include "particles.hpp"
+#include "particles.hu"
 #include <map>
 #include <random>
 #include <iostream>
@@ -66,16 +66,16 @@ public:
     
     void runVerify(){
         particles.alignParticlesToGrid();
+        particles.alignParticlesToSubCells();
         storeGridCellMap();
         particles.sortParticles();
-        particles.alignParticlesToSubCells();
         validateGridCellOrdering();
     }
 
     void run(){
         particles.alignParticlesToGrid();
-        particles.sortParticles();
         particles.alignParticlesToSubCells();
+        particles.sortParticles();
     }
 
 private:

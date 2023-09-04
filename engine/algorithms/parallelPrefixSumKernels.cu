@@ -1,7 +1,4 @@
-#ifndef PARALLELPREFIXSUMKERNELS_HU
-#define PARALLELPREFIXSUMKERNELS_HU
-
-#include "typedefs.h"
+#include "parallelPrefixSumKernels.hu"
 
 __global__ void parallelPrefix(uint numElements, uint* array, uint* blockSums){ // BLOCKSIZE threads operating on WORKSIZE (2x BLOCKSIZE) elements
     uint index = threadIdx.x + blockIdx.x*WORKSIZE;
@@ -63,5 +60,3 @@ __global__ void parallelPrefixApplyPreviousBlockSum(uint numElements, uint* arra
         array[index] += blockSums[blockIdx.x - 1];
     }
 }
-
-#endif

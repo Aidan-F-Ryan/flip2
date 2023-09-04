@@ -3,7 +3,7 @@
 
 #include "typedefs.h"
 #include "cudaVec.hu"
-#include "kernels.hu"
+#include "algorithms/kernels.hu"
 
 #define REFINEMENTLEVELS 10
 
@@ -24,6 +24,7 @@ private:
     CudaVec<float> vx, vy, vz;
     CudaVec<uint> gridCell;
     CudaVec<uint> subCellX, subCellY, subCellZ;
+    CudaVec<uint> reorderedGridIndices;
     uint size;
     Grid grid;
     cudaStream_t stream;

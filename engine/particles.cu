@@ -1,5 +1,6 @@
-#include "particles.hpp"
+#include "particles.hu"
 #include "grid.hpp"
+#include "algorithms/radixSortKernels.hu"
 
 Particles::Particles(uint size)
 : size(size)
@@ -16,6 +17,8 @@ Particles::Particles(uint size)
     subCellX.resize(size);
     subCellY.resize(size);
     subCellZ.resize(size);
+
+    reorderedGridIndices.resize(size);
     cudaStreamCreate(&stream);
 }
 
@@ -29,9 +32,25 @@ void Particles::alignParticlesToGrid(){
 }
 
 void Particles::sortParticles(){
+    float *d_px, *d_py, *d_pz;
+    cudaMalloc((void**)&d_px, sizeof(float)*size);    
+    cudaMalloc((void**)&d_py, sizeof(float)*size);    
+    cudaMalloc((void**)&d_pz, sizeof(float)*size);    
+
+
     uint* tempGridCell = gridCell.devPtr();
-    kernels::cudaSortParticlesByGridNode(size, tempGridCell, stream);
+    uint* tempSortedIndices = reorderedGridIndices.devPtr();
+    kernels::cudaSortParticlesByGridNode(size, tempGridCell, tempSortedIndices, stream);
     gridCell.swapDevicePtr(tempGridCell);
+    reorderedGridIndices.swapDevicePtr(tempSortedIndices);
+
+    reorderGridIndices<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, reorderedGridIndices.devPtr(), px.devPtr(), d_px);
+    reorderGridIndices<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, reorderedGridIndices.devPtr(), py.devPtr(), d_py);
+    reorderGridIndices<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, reorderedGridIndices.devPtr(), pz.devPtr(), d_pz);
+    cudaStreamSynchronize(stream);
+    px.swapDevicePtr(d_px);
+    py.swapDevicePtr(d_py);
+    pz.swapDevicePtr(d_pz);
 }
 
 void Particles::alignParticlesToSubCells(){

@@ -1,7 +1,4 @@
-#ifndef RADIXSORTKERNELS_HU
-#define RADIXSORTKERNELS_HU
-
-#include "typedefs.h"
+#include "radixSortKernels.hu"
 
 __global__ void radixBinUintByBitIndex(uint numElements, uint* inArray, uint bitIndex, uint* front, uint* back){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
@@ -51,11 +48,14 @@ __global__ void coalesceFrontBack(uint numElements, uint* outArray, uint* front,
     }
 }
 
-__global__ void reorderGridIndices(uint numElements, uint* sortedIndices, uint* inArray, uint* outArray){
+
+template <typename T>
+__global__ void reorderGridIndices(uint numElements, uint* sortedIndices, T* inArray, T* outArray){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
     if(index < numElements){
         outArray[index] = inArray[sortedIndices[index]];
     }
 }
 
-#endif
+template __global__ void reorderGridIndices(uint numElements, uint *sortedIndices, uint* inArray, uint* outArray);
+template __global__ void reorderGridIndices(uint numElements, uint *sortedIndices, float* inArray, float* outArray);
