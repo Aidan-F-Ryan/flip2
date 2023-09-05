@@ -66,16 +66,16 @@ public:
     
     void runVerify(){
         particles.alignParticlesToGrid();
-        particles.alignParticlesToSubCells();
         storeGridCellMap();
         particles.sortParticles();
         validateGridCellOrdering();
+        particles.alignParticlesToSubCells();
     }
 
     void run(){
         particles.alignParticlesToGrid();
-        particles.alignParticlesToSubCells();
         particles.sortParticles();
+        particles.alignParticlesToSubCells();
     }
 
 private:

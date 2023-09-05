@@ -1,6 +1,7 @@
 #include "kernels.hu"
-#include "../algorithms/parallelPrefixSumKernels.hu"
-#include "../algorithms/radixSortKernels.hu"
+#include "parallelPrefixSumKernels.hu"
+#include "radixSortKernels.hu"
+#include "reductionKernels.hu"
 #include "../typedefs.h"
 
 
@@ -26,6 +27,11 @@ __global__ void rootCell(float* px, float* py, float* pz, uint numParticles, Gri
     }
 }
 
+template <typename T>
+__device__ T square(T in){
+    return in*in;
+}
+
 /**
  * @brief Find subcell containing each particle inside its containing grid node
  * 
@@ -43,23 +49,128 @@ __global__ void rootCell(float* px, float* py, float* pz, uint numParticles, Gri
  * @return __global__ 
  */
 
-__global__ void subCell(float* px, float* py, float* pz, uint numParticles, Grid grid, uint* gridPosition, uint* subCellPositionX, uint* subCellPositionY, uint* subCellPositionZ, uint refinementLevel, uint xySize){
+__global__ void subCellCreateNumSubCellsTouchedEachDimension(float* px, float* py, float* pz, uint numParticles, Grid grid, uint* gridPosition, uint* subCellsTouchedX, uint* subCellsTouchedY, uint* subCellsTouchedZ, uint refinementLevel, float radius, uint xySize){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
     if(index < numParticles){
         uint moduloWRTxySize = gridPosition[index] % xySize;
-        uint z = gridPosition[index] / (xySize);
-        uint y = (moduloWRTxySize) / grid.sizeX;
-        uint x = (moduloWRTxySize) % grid.sizeX;
+        uint gridIDz = gridPosition[index] / (xySize);
+        uint gridIDy = (moduloWRTxySize) / grid.sizeX;
+        uint gridIDx = (moduloWRTxySize) % grid.sizeX;
         
-        float gridCellPositionX = (px[index] - grid.negX - x*grid.cellSize);
-        float gridCellPositionY = (py[index] - grid.negY - y*grid.cellSize);
-        float gridCellPositionZ = (pz[index] - grid.negZ - z*grid.cellSize);
-        float curSubCellSize = grid.cellSize/(2.0f*(1<<refinementLevel));
+        float pxInGridCell = (px[index] - grid.negX - gridIDx*grid.cellSize);
+        float pyInGridCell = (py[index] - grid.negY - gridIDy*grid.cellSize);
+        float pzInGridCell = (pz[index] - grid.negZ - gridIDz*grid.cellSize);
+        float subCellWidth = grid.cellSize/(2.0f*(1<<refinementLevel));
 
-        subCellPositionX[index] = floorf(gridCellPositionX/curSubCellSize);
-        subCellPositionY[index] = floorf(gridCellPositionY/curSubCellSize);
-        subCellPositionZ[index] = floorf(gridCellPositionZ/curSubCellSize);
+        uint xTouched = 0;
+        uint yTouched = 0;
+        uint zTouched = 0;
+
+        uint subCellPositionX = floorf(pxInGridCell/subCellWidth);
+        uint subCellPositionY = floorf(pyInGridCell/subCellWidth);
+        uint subCellPositionZ = floorf(pzInGridCell/subCellWidth);
         
+        uint apronCells = floorf(radius);
+
+        subCellPositionX += apronCells;
+        subCellPositionY += apronCells;
+        subCellPositionZ += apronCells;
+
+        float halfSubCellWidth = subCellWidth / 2.0f;
+        float radiusSCW_squared = square(radius*subCellWidth);
+
+        for(uint x = subCellPositionX - apronCells; x < subCellPositionX + apronCells; ++x){
+            for(uint y = subCellPositionY - apronCells; y < subCellPositionY + apronCells; ++y){
+                for(uint z = subCellPositionZ - apronCells; z < subCellPositionZ + apronCells; ++z){
+                    float subCellBaseX = x * subCellWidth;
+                    float subCellBaseY = y * subCellWidth;
+                    float subCellBaseZ = z * subCellWidth;
+
+                    if(square(pxInGridCell - subCellBaseX)
+                     + square(pyInGridCell - subCellBaseY + halfSubCellWidth)
+                     + square(pzInGridCell - subCellBaseZ + halfSubCellWidth) < radiusSCW_squared){
+                        ++xTouched;
+                    }
+                    if(square(pxInGridCell - subCellBaseX + halfSubCellWidth)
+                     + square(pyInGridCell - subCellBaseY)
+                     + square(pzInGridCell - subCellBaseZ + halfSubCellWidth) < radiusSCW_squared){
+                        ++yTouched;
+                    }
+                    if(square(pxInGridCell - subCellBaseX + halfSubCellWidth)
+                     + square(pyInGridCell - subCellBaseY + halfSubCellWidth)
+                     + square(pzInGridCell - subCellBaseZ) < radiusSCW_squared){
+                        ++zTouched;
+                    }
+                }
+            }
+        }
+
+        subCellsTouchedX[index] = xTouched;
+        subCellsTouchedY[index] = yTouched;
+        subCellsTouchedZ[index] = zTouched;
+    }
+}
+
+__global__ void subCellCreateLists(float* px, float* py, float* pz, uint numParticles, Grid grid, uint* gridPosition,
+        uint* numSubCellsTouchedX, uint* numSubCellsTouchedY, uint* numSubCellsTouchedZ, uint* subCellsX, uint* subCellsY,
+        uint* subCellsZ, uint refinementLevel, float radius, uint xySize){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(index < numParticles){
+        uint moduloWRTxySize = gridPosition[index] % xySize;
+        uint gridIDz = gridPosition[index] / (xySize);
+        uint gridIDy = (moduloWRTxySize) / grid.sizeX;
+        uint gridIDx = (moduloWRTxySize) % grid.sizeX;
+        
+        float pxInGridCell = (px[index] - grid.negX - gridIDx*grid.cellSize);
+        float pyInGridCell = (py[index] - grid.negY - gridIDy*grid.cellSize);
+        float pzInGridCell = (pz[index] - grid.negZ - gridIDz*grid.cellSize);
+        float subCellWidth = grid.cellSize/(2.0f*(1<<refinementLevel));
+
+        uint subCellPositionX = floorf(pxInGridCell/subCellWidth);
+        uint subCellPositionY = floorf(pyInGridCell/subCellWidth);
+        uint subCellPositionZ = floorf(pzInGridCell/subCellWidth);
+        
+        uint apronCells = floorf(radius);
+
+        subCellPositionX += apronCells;
+        subCellPositionY += apronCells;
+        subCellPositionZ += apronCells;
+
+        float halfSubCellWidth = subCellWidth / 2.0f;
+        float radiusSCW_squared = square(radius*subCellWidth);
+
+        uint xWritten = 0;
+        uint yWritten = 0;
+        uint zWritten = 0;
+
+        uint numVoxelsInNodeDimension = 2*apronCells + (2<<refinementLevel);
+
+        for(uint x = subCellPositionX - apronCells; x < subCellPositionX + apronCells; ++x){
+            for(uint y = subCellPositionY - apronCells; y < subCellPositionY + apronCells; ++y){
+                for(uint z = subCellPositionZ - apronCells; z < subCellPositionZ + apronCells; ++z){
+                    float subCellBaseX = x * subCellWidth;
+                    float subCellBaseY = y * subCellWidth;
+                    float subCellBaseZ = z * subCellWidth;
+
+                    if(square(pxInGridCell - subCellBaseX)
+                     + square(pyInGridCell - subCellBaseY + halfSubCellWidth)
+                     + square(pzInGridCell - subCellBaseZ + halfSubCellWidth) < radiusSCW_squared){
+                        subCellsX[numSubCellsTouchedX[index] + xWritten++] = x + y*numVoxelsInNodeDimension + z*numVoxelsInNodeDimension*numVoxelsInNodeDimension;
+
+                    }
+                    if(square(pxInGridCell - subCellBaseX + halfSubCellWidth)
+                     + square(pyInGridCell - subCellBaseY)
+                     + square(pzInGridCell - subCellBaseZ + halfSubCellWidth) < radiusSCW_squared){
+                        subCellsY[numSubCellsTouchedY[index] + yWritten++] = y + x*numVoxelsInNodeDimension + z * numVoxelsInNodeDimension * numVoxelsInNodeDimension;
+                    }
+                    if(square(pxInGridCell - subCellBaseX + halfSubCellWidth)
+                     + square(pyInGridCell - subCellBaseY + halfSubCellWidth)
+                     + square(pzInGridCell - subCellBaseZ) < radiusSCW_squared){
+                        subCellsZ[numSubCellsTouchedZ[index] + zWritten++] = z + x*numVoxelsInNodeDimension + y * numVoxelsInNodeDimension * numVoxelsInNodeDimension;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -80,24 +191,47 @@ void kernels::cudaFindGridCell(float* px, float* py, float* pz, uint numParticle
     rootCell<<<numParticles / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(px, py, pz, numParticles, grid, gridPosition);
 }
 
-/**
- * @brief Wrapper for subCell
- * 
- * @param px 
- * @param py 
- * @param pz 
- * @param numParticles 
- * @param grid 
- * @param gridPosition 
- * @param subCellPositionX 
- * @param subCellPositionY 
- * @param subCellPositionZ 
- * @param numRefinementLevels 
- * @param stream 
- */
+void kernels::cudaFindSubCell(float* px, float* py, float* pz,
+    uint numParticles, Grid grid, uint* gridPosition,
+    uint* subCellsTouchedX, uint* subCellsTouchedY,
+    uint* subCellsTouchedZ, CudaVec<uint>& subCellPositionX, 
+    CudaVec<uint>& subCellPositionY, CudaVec<uint>& subCellPositionZ, 
+    uint numRefinementLevels, float radius, cudaStream_t stream)
+{
+    cudaStream_t prefixSumStream;
+    cudaStreamCreate(&prefixSumStream);
 
-void kernels::cudaFindSubCell(float* px, float* py, float* pz, uint numParticles, Grid grid, uint* gridPosition, uint* subCellPositionX, uint* subCellPositionY, uint* subCellPositionZ, uint numRefinementLevels, cudaStream_t stream){
-    subCell<<<numParticles / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(px, py, pz, numParticles, grid, gridPosition, subCellPositionX, subCellPositionY, subCellPositionZ, numRefinementLevels, grid.sizeX*grid.sizeY);
+    uint* blockSumsSubCells = nullptr;
+
+    cudaMallocAsync((void**)&blockSumsSubCells, sizeof(uint)*(numParticles / WORKSIZE + 1), prefixSumStream);
+
+    subCellCreateNumSubCellsTouchedEachDimension<<<numParticles / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>
+        (px, py, pz, numParticles, grid, gridPosition, subCellsTouchedX, subCellsTouchedY, subCellsTouchedZ,
+        numRefinementLevels, radius, grid.sizeX*grid.sizeY);
+    
+
+    cudaParallelPrefixSum(numParticles, subCellsTouchedX, blockSumsSubCells, prefixSumStream);
+    cudaParallelPrefixSum(numParticles, subCellsTouchedY, blockSumsSubCells, prefixSumStream);
+    cudaParallelPrefixSum(numParticles, subCellsTouchedZ, blockSumsSubCells, prefixSumStream);
+
+    cudaFreeAsync(blockSumsSubCells, prefixSumStream);
+    uint subCellListSizeX[1];
+    uint subCellListSizeY[1];
+    uint subCellListSizeZ[1];
+    cudaMemcpyAsync(subCellListSizeX, subCellsTouchedX + numParticles - 1, sizeof(uint), cudaMemcpyDeviceToHost, prefixSumStream);
+    cudaMemcpyAsync(subCellListSizeY, subCellsTouchedY + numParticles - 1, sizeof(uint), cudaMemcpyDeviceToHost, prefixSumStream);
+    cudaMemcpyAsync(subCellListSizeZ, subCellsTouchedZ + numParticles - 1, sizeof(uint), cudaMemcpyDeviceToHost, prefixSumStream);
+    cudaStreamSynchronize(prefixSumStream);
+
+    subCellPositionX.resizeAsync(*subCellListSizeX, stream);
+    subCellPositionY.resizeAsync(*subCellListSizeY, stream);
+    subCellPositionZ.resizeAsync(*subCellListSizeZ, stream);
+
+    subCellCreateLists<<<numParticles / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(px, py, pz, numParticles, grid, gridPosition,
+        subCellsTouchedX, subCellsTouchedY, subCellsTouchedZ, subCellPositionX.devPtr(), subCellPositionY.devPtr(), subCellPositionZ.devPtr(),
+        numRefinementLevels, radius, grid.sizeX*grid.sizeY);
+
+    cudaStreamDestroy(prefixSumStream);
 }
 
 /**
@@ -115,11 +249,11 @@ void kernels::cudaParallelPrefixSum(uint numElements, T* array, T* blockSums, cu
     parallelPrefix<<<numElements/WORKSIZE + 1, BLOCKSIZE, 0, stream>>>(numElements, array, blockSums);
     if(numElements / WORKSIZE > 0){
         T* tempBlockSums;
-        cudaMalloc((void**)&tempBlockSums, sizeof(T) * ((numElements/WORKSIZE + 1) / WORKSIZE + 1));
+        cudaMallocAsync((void**)&tempBlockSums, sizeof(T) * ((numElements/WORKSIZE + 1) / WORKSIZE + 1), stream);
         cudaParallelPrefixSum((numElements/WORKSIZE + 1), blockSums,  tempBlockSums, stream);
+        cudaFreeAsync(tempBlockSums, stream);
     }
     parallelPrefixApplyPreviousBlockSum<<<numElements/WORKSIZE + 1, WORKSIZE, 0, stream>>>(numElements, array, blockSums);
-    cudaFree(blockSums);
 }
 
 /**
@@ -140,19 +274,24 @@ void kernels::cudaParallelPrefixSum(uint numElements, T* array, T* blockSums, cu
 void kernels::cudaRadixSortUint(uint numElements, uint* inArray, uint* outArray, uint* sortedIndices, uint* front, uint* back, cudaStream_t frontStream, cudaStream_t backStream, uint*& reorderedIndicesRelativeToOriginal){
     uint* tReordered;
 
-    cudaMalloc((void**)&reorderedIndicesRelativeToOriginal, sizeof(uint) * numElements); //reordered indices relative to original position, for shuffling positions
-    cudaMalloc((void**)&tReordered, sizeof(uint) * numElements); //reordered indices relative to original position, for shuffling positions
+    cudaMallocAsync((void**)&reorderedIndicesRelativeToOriginal, sizeof(uint) * numElements, backStream); //reordered indices relative to original position, for shuffling positions
+    cudaMallocAsync((void**)&tReordered, sizeof(uint) * numElements, backStream); //reordered indices relative to original position, for shuffling positions
 
     for(uint i = 0; i < sizeof(uint)*8; ++i){
+        radixBinUintByBitIndex<<<numElements/BLOCKSIZE + 1, BLOCKSIZE, 0, frontStream>>>(numElements, inArray, i, front, back);
+        
         uint* blockSumsFront;
         uint* blockSumsBack;
-        cudaMalloc((void**)&blockSumsFront, sizeof(uint)*numElements/BLOCKSIZE + 1);
-        cudaMalloc((void**)&blockSumsBack, sizeof(uint)*numElements/BLOCKSIZE + 1);
+        cudaMallocAsync((void**)&blockSumsFront, sizeof(uint)*numElements/WORKSIZE + 1, frontStream);
+        cudaMallocAsync((void**)&blockSumsBack, sizeof(uint)*numElements/WORKSIZE + 1, backStream);
 
-        radixBinUintByBitIndex<<<numElements/BLOCKSIZE + 1, BLOCKSIZE, 0, frontStream>>>(numElements, inArray, i, front, back);
         cudaStreamSynchronize(frontStream);
         kernels::cudaParallelPrefixSum<uint>(numElements, front, blockSumsFront, frontStream);
         kernels::cudaParallelPrefixSum<uint>(numElements, back, blockSumsBack, backStream);
+
+        cudaFreeAsync(blockSumsFront, frontStream);
+        cudaFreeAsync(blockSumsBack, backStream);
+
         cudaStreamSynchronize(backStream);
         coalesceFrontBack<<<numElements/BLOCKSIZE + 1, BLOCKSIZE, 0, frontStream>>>(numElements, sortedIndices, front, back);
         reorderGridIndices<<<numElements/BLOCKSIZE + 1, BLOCKSIZE, 0, frontStream>>>(numElements, sortedIndices, inArray, outArray);
@@ -172,7 +311,7 @@ void kernels::cudaRadixSortUint(uint numElements, uint* inArray, uint* outArray,
         inArray = outArray;
         outArray = tempGP;
     }
-    cudaFree(tReordered);
+    cudaFreeAsync(tReordered, backStream);
 }
 
 /**
@@ -192,10 +331,10 @@ void kernels::cudaSortParticlesByGridNode(uint numParticles, uint*& gridPosition
     uint* front;
     uint* back;
 
-    cudaMalloc((void**)&sortedGridPosition, sizeof(uint)*numParticles);
-    cudaMalloc((void**)&sortedParticleIndices, sizeof(uint)*numParticles);
-    cudaMalloc((void**)&front, sizeof(uint)*numParticles);
-    cudaMalloc((void**)&back, sizeof(uint)*numParticles);
+    cudaMallocAsync((void**)&sortedGridPosition, sizeof(uint)*numParticles, stream);
+    cudaMallocAsync((void**)&sortedParticleIndices, sizeof(uint)*numParticles, stream);
+    cudaMallocAsync((void**)&front, sizeof(uint)*numParticles, stream);
+    cudaMallocAsync((void**)&back, sizeof(uint)*numParticles, stream);
 
     cudaStream_t backStream;
     cudaStreamCreate(&backStream);
@@ -203,14 +342,14 @@ void kernels::cudaSortParticlesByGridNode(uint numParticles, uint*& gridPosition
     cudaRadixSortUint(numParticles, gridPosition, sortedGridPosition, sortedParticleIndices, front, back, stream, backStream, reorderedIndicesRelativeToOriginal);
 
     if(ogGridPosition != sortedGridPosition){
-        cudaFree(sortedGridPosition);
+        cudaFreeAsync(sortedGridPosition, stream);
     }
 
     // if(ogReordered != reorderedIndicesRelativeToOriginal){
         // cudaFree(reorderedIndicesRelativeToOriginal);
     // }
 
-    cudaFree(sortedParticleIndices);
-    cudaFree(front);
-    cudaFree(back);
+    cudaFreeAsync(sortedParticleIndices, stream);
+    cudaFreeAsync(front, stream);
+    cudaFreeAsync(back, stream);
 }

@@ -3,12 +3,15 @@
 
 #include "../typedefs.h"
 #include "../grid.hpp"
+#include "../cudaVec.hu"
 
 
 namespace kernels{
     void cudaFindGridCell(float* px, float* py, float* pz, uint numParticles, Grid grid, uint* gridPosition, cudaStream_t stream);
 
-    void cudaFindSubCell(float* px, float* py, float* pz, uint numParticles, Grid grid, uint* gridPosition, uint* subCellPositionX, uint* subCellPositionY, uint* subCellPositionZ, uint refinementLevel, cudaStream_t stream);
+    void cudaFindSubCell(float* px, float* py, float* pz, uint numParticles, Grid grid, uint* gridPosition, uint* subCellsTouchedX,
+     uint* subCellsTouchedY, uint* subCellsTouchedZ, CudaVec<uint>& subCellPositionX, CudaVec<uint>& subCellPositionY,
+     CudaVec<uint>& subCellPositionZ, uint numRefinementLevels, float radius, cudaStream_t stream);
 
     template <typename T>
     void cudaParallelPrefixSum(uint numElements, T* array, T* blockSums, cudaStream_t stream);

@@ -10,6 +10,7 @@ public:
     CudaVec();
     CudaVec(const uint& size);
     void resize(const uint& size);
+    void resizeAsync(const uint& size, const cudaStream_t& stream);
     T& operator[](const uint& i);
     const T& operator[](const uint& i) const;
     void upload();
@@ -25,8 +26,10 @@ public:
 
 private:
     void cuMalloc();
+    void cuMallocAsync(const cudaStream_t& stream);
     std::vector<T> vec;
     T* d_vec;
+    uint numElements;
 };
 
 #endif

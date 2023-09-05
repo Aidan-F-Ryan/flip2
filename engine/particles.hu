@@ -23,9 +23,11 @@ private:
     CudaVec<float> px, py, pz;
     CudaVec<float> vx, vy, vz;
     CudaVec<uint> gridCell;
-    CudaVec<uint> subCellX, subCellY, subCellZ;
+    CudaVec<uint> subCellsTouchedX, subCellsTouchedY, subCellsTouchedZ;
+    CudaVec<uint> subCellsX, subCellsY, subCellsZ;
     CudaVec<uint> reorderedGridIndices;
     uint size;
+    float radius;
     Grid grid;
     cudaStream_t stream;
 

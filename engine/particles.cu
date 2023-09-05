@@ -4,6 +4,7 @@
 
 Particles::Particles(uint size)
 : size(size)
+, radius(1.5)
 {
     px.resize(size);
     py.resize(size);
@@ -14,9 +15,9 @@ Particles::Particles(uint size)
     vz.resize(size);
 
     gridCell.resize(size);
-    subCellX.resize(size);
-    subCellY.resize(size);
-    subCellZ.resize(size);
+    subCellsTouchedX.resize(size);
+    subCellsTouchedY.resize(size);
+    subCellsTouchedZ.resize(size);
 
     reorderedGridIndices.resize(size);
     cudaStreamCreate(&stream);
@@ -54,7 +55,9 @@ void Particles::sortParticles(){
 }
 
 void Particles::alignParticlesToSubCells(){
-    kernels::cudaFindSubCell(px.devPtr(), py.devPtr(), pz.devPtr(), size, grid, gridCell.devPtr(), subCellX.devPtr(), subCellY.devPtr(), subCellZ.devPtr(), 2, stream);
+    kernels::cudaFindSubCell(px.devPtr(), py.devPtr(), pz.devPtr(), size, grid, 
+        gridCell.devPtr(), subCellsTouchedX.devPtr(), subCellsTouchedY.devPtr(),
+        subCellsTouchedZ.devPtr(), subCellsX, subCellsY, subCellsZ, 2, radius, stream);
 }
 
 Particles::~Particles(){

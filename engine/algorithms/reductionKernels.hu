@@ -1,0 +1,8 @@
+#ifndef REDUCTIONKERNELS_HU
+#define REDUCTIONKERNELS_HU
+
+#include "../typedefs.h"
+
+__global__ void parallelReduction(uint numElements, uint* array, uint* outArray);
+
+#endif

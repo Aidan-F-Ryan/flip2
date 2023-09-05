@@ -14,8 +14,15 @@ CudaVec<T>::CudaVec(const uint& size){
 
 template <typename T>
 void CudaVec<T>::resize(const uint& size){
+    numElements = size;
     vec.resize(size);
     cuMalloc();
+}
+
+template <typename T>
+void CudaVec<T>::resizeAsync(const uint& size, const cudaStream_t& stream){
+    numElements = size;
+    cuMallocAsync(stream);
 }
 
 template <typename T>
@@ -45,6 +52,9 @@ void CudaVec<T>::upload(cudaStream_t stream){
 
 template <typename T>
 void CudaVec<T>::download(cudaStream_t stream){
+    if(vec.size() != numElements){
+        vec.resize(numElements);
+    }
     cudaMemcpyAsync(vec.data(), d_vec, vec.size()*sizeof(T), cudaMemcpyDeviceToHost, stream);
 }
 
@@ -59,6 +69,14 @@ void CudaVec<T>::cuMalloc(){
         cudaFree(d_vec);
     }
     cudaMalloc((void**)&d_vec, sizeof(T)*vec.size());
+}
+
+template<typename T>
+void CudaVec<T>::cuMallocAsync(const cudaStream_t& stream){
+    if(d_vec != nullptr){
+        cudaFreeAsync(d_vec, stream);
+    }
+    cudaMallocAsync((void**)&d_vec, sizeof(T)*numElements, stream);
 }
 
 template<typename T>
