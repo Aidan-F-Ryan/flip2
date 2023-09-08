@@ -23,6 +23,7 @@ public:
     inline uint size() const{
         return vec.size();
     }
+    ~CudaVec();
 
 private:
     void cuMalloc();

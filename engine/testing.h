@@ -49,9 +49,10 @@ public:
     void randomizeParticlePositions(){
         std::random_device rd;
         std::default_random_engine e2(rd());
-        std::uniform_real_distribution<> distX(particles.grid.negX, particles.grid.negX + particles.grid.sizeX*particles.grid.cellSize);
-        std::uniform_real_distribution<> distY(particles.grid.negY, particles.grid.negY + particles.grid.sizeY*particles.grid.cellSize);
-        std::uniform_real_distribution<> distZ(particles.grid.negZ, particles.grid.negZ + particles.grid.sizeZ*particles.grid.cellSize);
+        float oneThirdYDimension = particles.grid.sizeY*particles.grid.cellSize / 3.0f;
+        std::uniform_real_distribution<> distX(particles.grid.negX + oneThirdYDimension, particles.grid.negX + particles.grid.sizeX*particles.grid.cellSize - oneThirdYDimension);
+        std::uniform_real_distribution<> distY(particles.grid.negY + oneThirdYDimension, particles.grid.negY + particles.grid.sizeY*particles.grid.cellSize - oneThirdYDimension);
+        std::uniform_real_distribution<> distZ(particles.grid.negZ + oneThirdYDimension, particles.grid.negZ + particles.grid.sizeZ*particles.grid.cellSize - oneThirdYDimension);
 
         for(uint i = 0; i < particles.size; ++i){
             particles.px[i] = distX(e2);
@@ -70,12 +71,14 @@ public:
         particles.sortParticles();
         validateGridCellOrdering();
         particles.alignParticlesToSubCells();
+        particles.generateVoxels();
     }
 
     void run(){
         particles.alignParticlesToGrid();
         particles.sortParticles();
         particles.alignParticlesToSubCells();
+        particles.generateVoxels();
     }
 
 private:

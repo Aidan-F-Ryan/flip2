@@ -95,6 +95,13 @@ void CudaVec<T>::print() const{
     std::cout<<std::endl;
 }
 
+template<typename T>
+CudaVec<T>::~CudaVec(){
+    if(d_vec != nullptr){
+        cudaFree(d_vec);
+    }
+}
+
 template class CudaVec<float>;
 template class CudaVec<uint>;
 template class CudaVec<char>;

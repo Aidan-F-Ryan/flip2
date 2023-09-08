@@ -1,3 +1,10 @@
+import ctypes
+import os
+
+particleLibPath = os.path.join(os.getcwd(), "../build/engine/libparticles.so")
+particleLib = ctypes.CDLL(particleLibPath)
+
+
 bl_info = {
     "name": "FLUID SOLVER",
     "blender": (2, 80, 0),

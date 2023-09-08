@@ -18,14 +18,27 @@ public:
 
     void sortParticles();
 
+    void generateVoxels();
+
+    void particleVelToVoxels();
+
     ~Particles();
 private:
     CudaVec<float> px, py, pz;
     CudaVec<float> vx, vy, vz;
     CudaVec<uint> gridCell;
-    CudaVec<uint> subCellsTouchedX, subCellsTouchedY, subCellsTouchedZ;
-    CudaVec<uint> subCellsX, subCellsY, subCellsZ;
+    CudaVec<uint> subCellsTouchedX, subCellsTouchedY, subCellsTouchedZ; //number of subcells touched by each particle
+    CudaVec<uint> subCellsX, subCellsY, subCellsZ; //subcell index list, multiple subcells per particle allowed, indexed by subCellsTouched
     CudaVec<uint> reorderedGridIndices;
+
+    CudaVec<uint> uniqueGridNodeIndices;
+    CudaVec<uint> gridNodeIndicesToFirstParticleIndex;
+
+    CudaVec<float> voxelsUx, voxelsUy, voxelsUz;
+
+    uint refinementLevel;
+    uint numVoxelsPerNode;
+    uint numVoxels1D;
     uint size;
     float radius;
     Grid grid;

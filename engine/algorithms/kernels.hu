@@ -20,6 +20,13 @@ namespace kernels{
 
     void cudaSortParticlesByGridNode(uint numParticles, uint*& gridPosition, uint*& reorderedIndicesRelativeToOriginal, cudaStream_t stream);
 
+    uint cudaMarkUniqueGridCellsAndCount(uint numParticles, uint* gridPosition, uint* uniqueGridNodes, cudaStream_t stream);
+
+    void cudaMapNodeIndicesToParticles(uint numParticles, uint* uniqueGridNodes, uint* gridNodeIndicesToFirstParticleIndex, cudaStream_t stream);
+
+    void cudaSumParticlesPerNodeAndWriteNumUsedVoxels(uint numGridNodes, uint numParticles, uint* gridNodeIndicesToFirstParticleIndex, uint* subCellsTouchedPerParticle, uint* subCellsDim, uint* numNonZeroVoxels,
+        uint* numParticlesInVoxelLists, uint numVoxelsPerNode, cudaStream_t stream);
+
 }
 
 
