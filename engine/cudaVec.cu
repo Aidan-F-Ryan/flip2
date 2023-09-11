@@ -1,4 +1,5 @@
 #include "cudaVec.hu"
+#include "typedefs.h"
 #include <iostream>
 
 template <typename T>
@@ -37,17 +38,17 @@ const T& CudaVec<T>::operator[](const uint& i) const{
 
 template <typename T>
 void CudaVec<T>::upload(){
-    cudaMemcpy(d_vec, vec.data(), vec.size()*sizeof(T), cudaMemcpyHostToDevice);
+    gpuErrchk( cudaMemcpy(d_vec, vec.data(), vec.size()*sizeof(T), cudaMemcpyHostToDevice) );
 }
 
 template <typename T>
 void CudaVec<T>::download(){
-    cudaMemcpy(vec.data(), d_vec, vec.size()*sizeof(T), cudaMemcpyDeviceToHost);
+    gpuErrchk( cudaMemcpy(vec.data(), d_vec, vec.size()*sizeof(T), cudaMemcpyDeviceToHost) );
 }
 
 template <typename T>
 void CudaVec<T>::upload(cudaStream_t stream){
-    cudaMemcpyAsync(d_vec, vec.data(), vec.size()*sizeof(T), cudaMemcpyHostToDevice, stream);
+    gpuErrchk( cudaMemcpyAsync(d_vec, vec.data(), vec.size()*sizeof(T), cudaMemcpyHostToDevice, stream) );
 }
 
 template <typename T>
@@ -55,7 +56,7 @@ void CudaVec<T>::download(cudaStream_t stream){
     if(vec.size() != numElements){
         vec.resize(numElements);
     }
-    cudaMemcpyAsync(vec.data(), d_vec, vec.size()*sizeof(T), cudaMemcpyDeviceToHost, stream);
+    gpuErrchk( cudaMemcpyAsync(vec.data(), d_vec, vec.size()*sizeof(T), cudaMemcpyDeviceToHost, stream) );
 }
 
 template <typename T>
@@ -66,23 +67,23 @@ T* CudaVec<T>::devPtr(){
 template<typename T>
 void CudaVec<T>::cuMalloc(){
     if(d_vec != nullptr){
-        cudaFree(d_vec);
+        gpuErrchk( cudaFree(d_vec) );
     }
-    cudaMalloc((void**)&d_vec, sizeof(T)*vec.size());
+    gpuErrchk( cudaMalloc((void**)&d_vec, sizeof(T)*vec.size()) );
 }
 
 template<typename T>
 void CudaVec<T>::cuMallocAsync(const cudaStream_t& stream){
     if(d_vec != nullptr){
-        cudaFreeAsync(d_vec, stream);
+        gpuErrchk( cudaFreeAsync(d_vec, stream) );
     }
-    cudaMallocAsync((void**)&d_vec, sizeof(T)*numElements, stream);
+    gpuErrchk( cudaMallocAsync((void**)&d_vec, sizeof(T)*numElements, stream) );
 }
 
 template<typename T>
 void CudaVec<T>::swapDevicePtr(T* devPtr){
     if(d_vec != nullptr && d_vec != devPtr){
-        cudaFree(d_vec);
+        gpuErrchk( cudaFree(d_vec) );
     }
     d_vec = devPtr;
 }
@@ -98,7 +99,7 @@ void CudaVec<T>::print() const{
 template<typename T>
 CudaVec<T>::~CudaVec(){
     if(d_vec != nullptr){
-        cudaFree(d_vec);
+        gpuErrchk( cudaFree(d_vec) );
     }
 }
 

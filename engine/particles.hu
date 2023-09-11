@@ -34,7 +34,32 @@ private:
     CudaVec<uint> uniqueGridNodeIndices;
     CudaVec<uint> gridNodeIndicesToFirstParticleIndex;
 
+    CudaVec<uint> nodeIndexToFirstUsedVoxelX;
+    CudaVec<uint> nodeIndexToFirstUsedVoxelY;
+    CudaVec<uint> nodeIndexToFirstUsedVoxelZ;
+
+    CudaVec<uint> particleListsX;
+    CudaVec<uint> particleListsY;
+    CudaVec<uint> particleListsZ;
+
+    CudaVec<uint> voxelIDsX;
+    CudaVec<uint> voxelIDsY;
+    CudaVec<uint> voxelIDsZ;
+
+    CudaVec<uint> voxelParticleListStartX;
+    CudaVec<uint> voxelParticleListStartY;
+    CudaVec<uint> voxelParticleListStartZ;
+    
+
     CudaVec<float> voxelsUx, voxelsUy, voxelsUz;
+
+    uint numUsedGridNodes;
+    uint numUsedVoxelsX;
+    uint numUsedVoxelsY;
+    uint numUsedVoxelsZ;
+    uint totalNumParticlesInPerVoxelListsX;
+    uint totalNumParticlesInPerVoxelListsY;
+    uint totalNumParticlesInPerVoxelListsZ;
 
     uint refinementLevel;
     uint numVoxelsPerNode;

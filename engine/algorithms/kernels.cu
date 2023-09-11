@@ -169,18 +169,18 @@ __global__ void subCellCreateLists(float* px, float* py, float* pz, uint numPart
                     if(square(pxInGridCell - subCellBaseX)
                      + square(pyInGridCell - subCellBaseY + halfSubCellWidth)
                      + square(pzInGridCell - subCellBaseZ + halfSubCellWidth) < radiusSCW_squared){
-                        subCellsX[subCellsTouchedStartX + xWritten++] = x + y*numVoxelsInNodeDimension + z*numVoxelsInNodeDimension*numVoxelsInNodeDimension;
+                        subCellsX[subCellsTouchedStartX + xWritten++] = x + y*numVoxelsInNodeDimension + z*numVoxelsInNodeDimension*numVoxelsInNodeDimension; //x is x, y is y, z is z
 
                     }
                     if(square(pxInGridCell - subCellBaseX + halfSubCellWidth)
                      + square(pyInGridCell - subCellBaseY)
                      + square(pzInGridCell - subCellBaseZ + halfSubCellWidth) < radiusSCW_squared){
-                        subCellsY[subCellsTouchedStartY + yWritten++] = y + x*numVoxelsInNodeDimension + z * numVoxelsInNodeDimension * numVoxelsInNodeDimension;
+                        subCellsY[subCellsTouchedStartY + yWritten++] = y + x*numVoxelsInNodeDimension + z * numVoxelsInNodeDimension * numVoxelsInNodeDimension; //y is x, x is y, z is z
                     }
                     if(square(pxInGridCell - subCellBaseX + halfSubCellWidth)
                      + square(pyInGridCell - subCellBaseY + halfSubCellWidth)
                      + square(pzInGridCell - subCellBaseZ) < radiusSCW_squared){
-                        subCellsZ[subCellsTouchedStartZ + zWritten++] = z + x*numVoxelsInNodeDimension + y * numVoxelsInNodeDimension * numVoxelsInNodeDimension;
+                        subCellsZ[subCellsTouchedStartZ + zWritten++] = z + x*numVoxelsInNodeDimension + y * numVoxelsInNodeDimension * numVoxelsInNodeDimension; //z is x, x is y, y is z
                     }
                 }
             }
@@ -261,13 +261,15 @@ void kernels::cudaFindSubCell(float* px, float* py, float* pz,
 template <typename T>
 void kernels::cudaParallelPrefixSum(uint numElements, T* array, T* blockSums, cudaStream_t stream){
     parallelPrefix<<<numElements/WORKSIZE + 1, BLOCKSIZE, 0, stream>>>(numElements, array, blockSums);
+    gpuErrchk(cudaPeekAtLastError());
     if(numElements / WORKSIZE > 0){
         T* tempBlockSums;
-        cudaMallocAsync((void**)&tempBlockSums, sizeof(T) * ((numElements/WORKSIZE + 1) / WORKSIZE + 1), stream);
+        gpuErrchk( cudaMallocAsync((void**)&tempBlockSums, sizeof(T) * ((numElements/WORKSIZE + 1) / WORKSIZE + 1), stream) );
         cudaParallelPrefixSum((numElements/WORKSIZE + 1), blockSums,  tempBlockSums, stream);
-        cudaFreeAsync(tempBlockSums, stream);
+        gpuErrchk( cudaFreeAsync(tempBlockSums, stream) );
     }
     parallelPrefixApplyPreviousBlockSum<<<numElements/WORKSIZE + 1, WORKSIZE, 0, stream>>>(numElements, array, blockSums);
+    gpuErrchk(cudaPeekAtLastError());
 }
 
 /**
@@ -421,7 +423,8 @@ __global__ void sumParticlesPerNode(uint numGridNodes, uint numParticles, uint* 
     uint index = threadIdx.x + blockDim.x*blockIdx.x;
 
     extern __shared__ uint voxelCount[];
-    __shared__ uint sums[BLOCKSIZE];
+    __shared__ uint sums[WORKSIZE];
+    __shared__ uint nonZeroVoxels[WORKSIZE];
     __shared__ uint maxParticleNum;
 
     if(threadIdx.x == 0){
@@ -443,6 +446,32 @@ __global__ void sumParticlesPerNode(uint numGridNodes, uint numParticles, uint* 
             atomicAdd(voxelCount + subCellsDim[j], 1);
         }
     }
+
+    sums[threadIdx.x] = 0;
+    sums[threadIdx.x + blockDim.x] = 0;
+    nonZeroVoxels[threadIdx.x] = 0;
+    nonZeroVoxels[threadIdx.x + blockDim.x] = 0;
+    __syncthreads();
+
+    for(uint i = threadIdx.x; i < numVoxelsPerNode; i += blockDim.x){
+        sums[i % WORKSIZE] += voxelCount[i];
+        if(voxelCount[i] != 0){
+            ++nonZeroVoxels[i % WORKSIZE];
+        }
+    }
+
+    for(uint i = blockDim.x; i > 0; i>>=1){
+        __syncthreads();
+        if(threadIdx.x < i){
+            sums[threadIdx.x] += sums[threadIdx.x + i];
+            nonZeroVoxels[threadIdx.x] += nonZeroVoxels[threadIdx.x + i];
+        }
+    }
+
+    if(threadIdx.x == 0){
+        numParticlesInVoxelLists[blockIdx.x] = sums[0];
+        numNonZeroVoxels[blockIdx.x] = nonZeroVoxels[0];
+    }
 }
 
 void kernels::cudaSumParticlesPerNodeAndWriteNumUsedVoxels(uint numGridNodes, uint numParticles, uint* gridNodeIndicesToFirstParticleIndex, uint* subCellsTouchedPerParticle, uint* subCellsDim, uint* numNonZeroVoxels,
@@ -450,6 +479,194 @@ void kernels::cudaSumParticlesPerNodeAndWriteNumUsedVoxels(uint numGridNodes, ui
     sumParticlesPerNode<<<numGridNodes, BLOCKSIZE, sizeof(uint) * numVoxelsPerNode, stream>>>(
         numGridNodes, numParticles, gridNodeIndicesToFirstParticleIndex, subCellsTouchedPerParticle, subCellsDim, numNonZeroVoxels,
         numParticlesInVoxelLists, numVoxelsPerNode);
+
     gpuErrchk(cudaPeekAtLastError());
-        
+    cudaStream_t particleListStream;
+    cudaStreamCreate(&particleListStream);
+
+    uint* numParticlesInVoxelListsBlockSums;
+    uint* nonZeroVoxelBlockSums;
+
+    gpuErrchk( cudaMallocAsync((void**)&nonZeroVoxelBlockSums, sizeof(uint)*(numGridNodes / WORKSIZE + 1), stream) );
+    gpuErrchk( cudaMallocAsync((void**)&numParticlesInVoxelListsBlockSums, sizeof(uint)*(numGridNodes / WORKSIZE + 1), particleListStream) );
+    cudaStreamSynchronize(stream);
+    cudaParallelPrefixSum(numGridNodes, numNonZeroVoxels, nonZeroVoxelBlockSums, stream);
+    cudaParallelPrefixSum(numGridNodes, numParticlesInVoxelLists, numParticlesInVoxelListsBlockSums, particleListStream);
+    
+    gpuErrchk( cudaFreeAsync(nonZeroVoxelBlockSums, stream) );
+    gpuErrchk( cudaFreeAsync(numParticlesInVoxelListsBlockSums, particleListStream) );
+    gpuErrchk( cudaStreamSynchronize(particleListStream) );
+    gpuErrchk( cudaStreamDestroy(particleListStream) );
+}
+
+
+__global__ void createParticleListStartIndices(uint totalNumberVoxelsDimension, uint numGridNodes, uint numParticles, uint numVoxelsPerNode, uint* voxelIDs,
+    uint* perVoxelParticleListStartIndices, uint* numUsedVoxelsPerNode, uint* subCellsTouchedPerParticle, uint* subCellsDim,
+    uint* firstParticleInNodeIndex, uint* particleLists, uint* firstParticleListIndexPerNode)   //need to revisit how particle list creation is done
+{
+
+    //firstParticleInNodeIndex used to index node->subCellsTouchedPerParticle
+    //subCellsTouchedPerParticle used to index particle->subCellsDim
+    uint index = threadIdx.x + blockDim.x*blockIdx.x;
+
+    extern __shared__ uint voxelUsedIndex[]; //sized to 2*numVoxelsPerNode
+    __shared__ uint maxParticleNum;
+    uint* voxelCount = voxelUsedIndex + numVoxelsPerNode;
+
+    if(threadIdx.x == 0){
+        if(blockIdx.x < numGridNodes - 1){
+            maxParticleNum = firstParticleInNodeIndex[blockIdx.x + 1];
+        }
+        else{
+            maxParticleNum = numParticles;
+        }
     }
+    for(uint i = threadIdx.x; i < numVoxelsPerNode; i += blockDim.x){
+        voxelUsedIndex[i] = 0;
+        voxelCount[i] = 0;
+    }
+
+    __syncthreads();
+
+    for(uint i = firstParticleInNodeIndex[blockIdx.x] + threadIdx.x; i < maxParticleNum; i += blockDim.x){
+        for(uint j = subCellsTouchedPerParticle[i]; j < subCellsTouchedPerParticle[i+1]; ++j){
+            atomicMax(voxelUsedIndex + subCellsDim[j], 1);  //marking used voxels
+            atomicAdd(voxelCount + subCellsDim[j], 1);
+        }
+    }
+
+    __syncthreads();
+    //now have number of particles per voxel, need blockWise prefix sum on voxelCount to get offset of each used voxel's particle list
+    for(uint i = 1; i < numVoxelsPerNode; i<<=1){
+        for(uint j = threadIdx.x; j < numVoxelsPerNode; j += blockDim.x){
+            if(j >= i){
+                voxelUsedIndex[j] += voxelUsedIndex[j-i];
+                voxelCount[j] += voxelCount[j-i];
+            }
+        }
+        __syncthreads();
+    }
+
+    for(uint i = threadIdx.x; i < numVoxelsPerNode; i += blockDim.x){
+        uint prevVal = 0;
+        uint prevCount = 0;
+        if(i != 0){
+            prevVal = voxelUsedIndex[i-1];
+            prevCount = voxelCount[i-1];
+        }
+        if(voxelUsedIndex[i] != prevVal){
+            voxelIDs[numUsedVoxelsPerNode[blockIdx.x] + prevVal] = i;   //store in-node voxel ID to voxelIDs array
+            perVoxelParticleListStartIndices[numUsedVoxelsPerNode[blockIdx.x] + prevVal] = prevCount;
+
+            //need to reframe from per-particle thread to per-voxel thread, each thread iterates over all particles in node to generate per-voxel list of particles
+            uint numParticlesWrittenToCurrentVoxel = 0;
+            for(uint particleIndex = firstParticleInNodeIndex[blockIdx.x]; particleIndex < maxParticleNum; ++particleIndex){    //whole loop needs to be its own kernel, iterate only over used nodes and write accordingly
+                for(uint subCellTouchedPerParticleIndex = subCellsTouchedPerParticle[particleIndex];                            //current version wastes threads and unnecessarily prolongs runtime of each thread
+                        subCellTouchedPerParticleIndex < subCellsTouchedPerParticle[particleIndex+1];
+                        ++subCellTouchedPerParticleIndex)
+                {
+                    if(subCellsDim[subCellTouchedPerParticleIndex] == i){   //need to convert this to shared mem array 
+                        particleLists[firstParticleListIndexPerNode[blockIdx.x] + prevCount + numParticlesWrittenToCurrentVoxel++] = particleIndex;
+                    }
+                }
+            }
+        }
+    }
+}
+    
+void kernels::cudaParticleListCreate(uint totalNumberVoxelsDimension, uint numGridNodes, uint numParticles, uint numVoxelsPerNode,
+    uint* voxelIDs, uint* perVoxelParticleListStartIndices, uint* numUsedVoxelsPerNode, uint* firstParticleListIndexPerNode,
+    uint* subCellsTouchedPerParticle, uint* subCellsDim, uint* firstParticleInNodeIndex, uint* particleLists,
+    cudaStream_t stream)
+{
+    createParticleListStartIndices<<<numGridNodes, BLOCKSIZE, 2*numVoxelsPerNode*sizeof(uint), stream>>>(
+        totalNumberVoxelsDimension, numGridNodes, numParticles, numVoxelsPerNode, voxelIDs, perVoxelParticleListStartIndices,
+        numUsedVoxelsPerNode, subCellsTouchedPerParticle, subCellsDim, firstParticleInNodeIndex, particleLists, firstParticleListIndexPerNode);
+    gpuErrchk(cudaPeekAtLastError());
+    gpuErrchk( cudaStreamSynchronize(stream) );
+}
+
+__device__ float weightFromDistance(float in, float radius){
+    if(in > radius){
+        return 0.0f;
+    }
+    else{
+        return 1.0f - in/radius;
+    }
+}
+
+__global__ void voxelUGather(uint numVoxelsPerNode, uint numUsedVoxelsInGrid, uint numParticlesInParticleLists, uint* gridPosition, float* particleVs,
+    float* px, float* py, float* pz, uint* nodeIndexToFirstVoxelIndex, uint* voxelIDs, uint* perVoxelParticleListStartIndices, uint* particleLists,
+    float* voxelUs, Grid grid, uint xySize, uint refinementLevel, float radius, uint numVoxels1D)
+{
+    extern __shared__ float thisNodeU[];
+    __shared__ uint maxVoxelIndex;
+    __shared__ uint maxParticleListIndex;
+    __shared__ float voxelParticleSums[BLOCKSIZE];
+    for(uint i = threadIdx.x; i < numVoxelsPerNode; i += blockDim.x){
+        thisNodeU[i] = 0.0f;
+    }
+    if(threadIdx.x == 0){
+        if(blockIdx.x < numUsedVoxelsInGrid - 1){
+            maxVoxelIndex = nodeIndexToFirstVoxelIndex[blockIdx.x + 1];
+            maxParticleListIndex = perVoxelParticleListStartIndices[blockIdx.x + 1];
+        }
+        else{
+            maxVoxelIndex = numUsedVoxelsInGrid;
+            maxParticleListIndex = numParticlesInParticleLists;
+        }
+    }
+    __syncthreads();
+    float subCellWidth = grid.cellSize/(2.0f*(1<<refinementLevel));
+
+    for(uint voxelIndex = nodeIndexToFirstVoxelIndex[blockIdx.x]; voxelIndex < maxVoxelIndex; ++voxelIndex){
+        voxelParticleSums[threadIdx.x] = 0.0f;
+        uint voxelIDx = voxelIDs[voxelIndex] % numVoxels1D;
+        uint voxelIDy = voxelIDs[voxelIndex] / numVoxels1D;
+        uint voxelIDz = voxelIDs[voxelIndex] / numVoxels1D*numVoxels1D;
+
+        float voxelPx = voxelIDx * subCellWidth;
+        float voxelPy = voxelIDy * subCellWidth + 0.5*subCellWidth;
+        float voxelPz = voxelIDz * subCellWidth + 0.5*subCellWidth;
+        
+        for(uint particleListIndex = perVoxelParticleListStartIndices[voxelIndex] + threadIdx.x; particleListIndex < maxParticleListIndex; particleListIndex += blockDim.x){
+            uint particleIndex = particleLists[particleListIndex];
+
+            uint moduloWRTxySize = gridPosition[particleIndex] % xySize;
+            uint gridIDz = gridPosition[particleIndex] / (xySize);
+            uint gridIDy = (moduloWRTxySize) / grid.sizeX;
+            uint gridIDx = (moduloWRTxySize) % grid.sizeX;
+            
+            float pxInGridCell = (px[particleIndex] - grid.negX - gridIDx*grid.cellSize + subCellWidth);
+            float pyInGridCell = (py[particleIndex] - grid.negY - gridIDy*grid.cellSize + subCellWidth);
+            float pzInGridCell = (pz[particleIndex] - grid.negZ - gridIDz*grid.cellSize + subCellWidth);
+
+            float dpx = pxInGridCell - voxelPx;
+            float dpy = pyInGridCell - voxelPy;
+            float dpz = pzInGridCell - voxelPz;
+
+            float particleToNodeDistance = sqrtf(fmaf(dpx, dpx, fmaf(dpy, dpy, (dpz*dpz))));
+
+
+            voxelParticleSums[threadIdx.x] += weightFromDistance(particleToNodeDistance, radius) * particleVs[particleIndex];
+        }
+        for(uint i = blockDim.x>>1; i > 0; i>>=1){
+            __syncthreads();
+            if(threadIdx.x < i){
+                voxelParticleSums[threadIdx.x] += voxelParticleSums[threadIdx.x + i];
+            }
+        }
+        if(threadIdx.x == 0){
+            voxelUs[voxelIndex] = voxelParticleSums[0];
+        }
+    }
+}
+
+void kernels::cudaVoxelUGather(uint numUsedVoxelsGrid, uint numGridNodes, uint numParticles, uint numVoxelsPerNode, uint numParticlesInParticleLists,
+    uint* gridPosition, float* particleVs, float* px, float* py, float* pz, uint* nodeIndexToFirstVoxelIndex, uint* voxelIDs,
+    uint* perVoxelParticleListStartIndices, uint* particleLists, float* voxelUs, Grid grid, uint xySize, uint refinementLevel, float radius, uint numVoxels1D, cudaStream_t stream)
+{
+    voxelUGather<<<numGridNodes, BLOCKSIZE, sizeof(float) * numVoxelsPerNode, stream>>>(numVoxelsPerNode, numUsedVoxelsGrid, numParticlesInParticleLists,
+        gridPosition, particleVs, px, py, pz, nodeIndexToFirstVoxelIndex, voxelIDs, perVoxelParticleListStartIndices, particleLists, voxelUs, grid, xySize,
+        refinementLevel, radius, numVoxels1D);
+}

@@ -9,7 +9,7 @@
 Particles::Particles(uint size)
 : size(size)
 , radius(1.5)
-, refinementLevel(0)
+, refinementLevel(1)
 {
     cudaStreamCreate(&stream);
     px.resize(size);
@@ -72,39 +72,84 @@ void Particles::alignParticlesToSubCells(){
 }
 
 void Particles::generateVoxels(){
-    uint numGridNodes = kernels::cudaMarkUniqueGridCellsAndCount(size, gridCell.devPtr(), uniqueGridNodeIndices.devPtr(), stream);
+    numUsedGridNodes = kernels::cudaMarkUniqueGridCellsAndCount(size, gridCell.devPtr(), uniqueGridNodeIndices.devPtr(), stream);
     
-    gridNodeIndicesToFirstParticleIndex.resizeAsync(numGridNodes, stream);
+    gridNodeIndicesToFirstParticleIndex.resizeAsync(numUsedGridNodes, stream);
 
     kernels::cudaMapNodeIndicesToParticles(size, uniqueGridNodeIndices.devPtr(), gridNodeIndicesToFirstParticleIndex.devPtr(), stream);
-    
-    uint* numUsedVoxelsPerNodeX;
-    uint* numUsedVoxelsPerNodeY;
-    uint* numUsedVoxelsPerNodeZ;
+    nodeIndexToFirstUsedVoxelX.resizeAsync(numUsedGridNodes, stream);
+    nodeIndexToFirstUsedVoxelY.resizeAsync(numUsedGridNodes, stream);
+    nodeIndexToFirstUsedVoxelZ.resizeAsync(numUsedGridNodes, stream);
     uint* numParticlesInVoxelListsX;
     uint* numParticlesInVoxelListsY;
     uint* numParticlesInVoxelListsZ;
-    gpuErrchk( cudaMallocAsync((void**)&numUsedVoxelsPerNodeX, sizeof(uint)*numGridNodes, stream) );
-    gpuErrchk( cudaMallocAsync((void**)&numParticlesInVoxelListsX, sizeof(uint)*numGridNodes, stream) );
-    gpuErrchk( cudaMallocAsync((void**)&numUsedVoxelsPerNodeY, sizeof(uint)*numGridNodes, stream) );
-    gpuErrchk( cudaMallocAsync((void**)&numParticlesInVoxelListsY, sizeof(uint)*numGridNodes, stream) );
-    gpuErrchk( cudaMallocAsync((void**)&numUsedVoxelsPerNodeZ, sizeof(uint)*numGridNodes, stream) );
-    gpuErrchk( cudaMallocAsync((void**)&numParticlesInVoxelListsZ, sizeof(uint)*numGridNodes, stream) );
+    gpuErrchk( cudaMallocAsync((void**)&numParticlesInVoxelListsX, sizeof(uint)*numUsedGridNodes, stream) );
+    gpuErrchk( cudaMallocAsync((void**)&numParticlesInVoxelListsY, sizeof(uint)*numUsedGridNodes, stream) );
+    gpuErrchk( cudaMallocAsync((void**)&numParticlesInVoxelListsZ, sizeof(uint)*numUsedGridNodes, stream) );
 
-    kernels::cudaSumParticlesPerNodeAndWriteNumUsedVoxels(numGridNodes, size, gridNodeIndicesToFirstParticleIndex.devPtr(), subCellsTouchedX.devPtr(), subCellsX.devPtr(), numUsedVoxelsPerNodeX, numParticlesInVoxelListsX, numVoxelsPerNode, stream);
-    kernels::cudaSumParticlesPerNodeAndWriteNumUsedVoxels(numGridNodes, size, gridNodeIndicesToFirstParticleIndex.devPtr(), subCellsTouchedY.devPtr(), subCellsY.devPtr(), numUsedVoxelsPerNodeY, numParticlesInVoxelListsY, numVoxelsPerNode, stream);
-    kernels::cudaSumParticlesPerNodeAndWriteNumUsedVoxels(numGridNodes, size, gridNodeIndicesToFirstParticleIndex.devPtr(), subCellsTouchedZ.devPtr(), subCellsZ.devPtr(), numUsedVoxelsPerNodeZ, numParticlesInVoxelListsZ, numVoxelsPerNode, stream);
+    //get sizes for number of voxels used and number of particles including duplicates in particle lists for used voxels in each node
+    kernels::cudaSumParticlesPerNodeAndWriteNumUsedVoxels(numUsedGridNodes, size, gridNodeIndicesToFirstParticleIndex.devPtr(),
+        subCellsTouchedX.devPtr(), subCellsX.devPtr(), nodeIndexToFirstUsedVoxelX.devPtr(), numParticlesInVoxelListsX, numVoxelsPerNode, stream);
+    kernels::cudaSumParticlesPerNodeAndWriteNumUsedVoxels(numUsedGridNodes, size, gridNodeIndicesToFirstParticleIndex.devPtr(),
+        subCellsTouchedY.devPtr(), subCellsY.devPtr(), nodeIndexToFirstUsedVoxelY.devPtr(), numParticlesInVoxelListsY, numVoxelsPerNode, stream);
+    kernels::cudaSumParticlesPerNodeAndWriteNumUsedVoxels(numUsedGridNodes, size, gridNodeIndicesToFirstParticleIndex.devPtr(),
+        subCellsTouchedZ.devPtr(), subCellsZ.devPtr(), nodeIndexToFirstUsedVoxelZ.devPtr(), numParticlesInVoxelListsZ, numVoxelsPerNode, stream);
 
-    gpuErrchk( cudaFreeAsync(numUsedVoxelsPerNodeX, stream) );
+    gpuErrchk( cudaMemcpyAsync(&numUsedVoxelsX, nodeIndexToFirstUsedVoxelX.devPtr() + numUsedGridNodes -1, sizeof(uint), cudaMemcpyDeviceToHost,
+        stream) );
+    gpuErrchk( cudaMemcpyAsync(&totalNumParticlesInPerVoxelListsX, numParticlesInVoxelListsX + numUsedGridNodes -1, sizeof(uint),
+        cudaMemcpyDeviceToHost, stream) );
+
+    voxelIDsX.resizeAsync(numUsedVoxelsX, stream); //size voxel id array to total number of voxels used
+    voxelParticleListStartX.resizeAsync(numUsedVoxelsX, stream);   //particle list start index for each voxel using total number of voxels
+    particleListsX.resizeAsync(totalNumParticlesInPerVoxelListsX, stream);  //size overall particle list array, position for each node start known from numParticlesInVoxelLists
+    
+    gpuErrchk( cudaMemcpyAsync(&numUsedVoxelsY, nodeIndexToFirstUsedVoxelY.devPtr() + numUsedGridNodes -1, sizeof(uint), cudaMemcpyDeviceToHost,
+        stream) );
+    gpuErrchk( cudaMemcpyAsync(&totalNumParticlesInPerVoxelListsY, numParticlesInVoxelListsY + numUsedGridNodes -1, sizeof(uint),
+        cudaMemcpyDeviceToHost, stream) );
+
+    voxelIDsY.resizeAsync(numUsedVoxelsY, stream); //size voxel id array to total number of voxels used
+    voxelParticleListStartY.resizeAsync(numUsedVoxelsY, stream);   //particle list start index for each voxel using total number of voxels
+    particleListsY.resizeAsync(totalNumParticlesInPerVoxelListsY, stream);  //size overall particle list array, position for each node start known from numParticlesInVoxelLists
+
+    gpuErrchk( cudaMemcpyAsync(&numUsedVoxelsZ, nodeIndexToFirstUsedVoxelZ.devPtr() + numUsedGridNodes -1, sizeof(uint), cudaMemcpyDeviceToHost,
+        stream) );
+    gpuErrchk( cudaMemcpyAsync(&totalNumParticlesInPerVoxelListsZ, numParticlesInVoxelListsZ + numUsedGridNodes -1, sizeof(uint),
+        cudaMemcpyDeviceToHost, stream) );
+
+    voxelIDsZ.resizeAsync(numUsedVoxelsZ, stream); //size voxel id array to total number of voxels used
+    voxelParticleListStartZ.resizeAsync(numUsedVoxelsZ, stream);   //particle list start index for each voxel using total number of voxels
+    particleListsZ.resizeAsync(totalNumParticlesInPerVoxelListsZ, stream);  //size overall particle list array, position for each node start known from numParticlesInVoxelLists
+
+    //  create particle lists.
+    //  voxelParticleListsStart = parallel prefix sum over number of particles in each voxel list. Each node starts at numUsedVoxelsPerNode[nodeNum]
+    //  particleList = particles in each voxel, starting at voxelParticleListsStart[voxelNum] -> note this is sparse
+    //  voxelIDs = voxel position within node, sparse
+    kernels::cudaParticleListCreate(numUsedVoxelsX, numUsedGridNodes, size, numVoxelsPerNode, voxelIDsX.devPtr(),
+        voxelParticleListStartX.devPtr(), nodeIndexToFirstUsedVoxelX.devPtr(), numParticlesInVoxelListsX, subCellsTouchedX.devPtr(), subCellsX.devPtr(),
+        gridNodeIndicesToFirstParticleIndex.devPtr(), particleListsX.devPtr(), stream);
+
+    kernels::cudaParticleListCreate(numUsedVoxelsY, numUsedGridNodes, size, numVoxelsPerNode, voxelIDsY.devPtr(),
+        voxelParticleListStartY.devPtr(), nodeIndexToFirstUsedVoxelY.devPtr(), numParticlesInVoxelListsY, subCellsTouchedY.devPtr(), subCellsY.devPtr(),
+        gridNodeIndicesToFirstParticleIndex.devPtr(), particleListsY.devPtr(), stream);
+    
+    kernels::cudaParticleListCreate(numUsedVoxelsZ, numUsedGridNodes, size, numVoxelsPerNode, voxelIDsZ.devPtr(),
+        voxelParticleListStartZ.devPtr(), nodeIndexToFirstUsedVoxelZ.devPtr(), numParticlesInVoxelListsZ, subCellsTouchedZ.devPtr(), subCellsZ.devPtr(),
+        gridNodeIndicesToFirstParticleIndex.devPtr(), particleListsZ.devPtr(), stream);
+
+    voxelsUx.resizeAsync(numUsedVoxelsX, stream);
+    voxelsUy.resizeAsync(numUsedVoxelsY, stream);
+    voxelsUz.resizeAsync(numUsedVoxelsZ, stream);
+
     gpuErrchk( cudaFreeAsync(numParticlesInVoxelListsX, stream) );
-    gpuErrchk( cudaFreeAsync(numUsedVoxelsPerNodeY, stream) );
     gpuErrchk( cudaFreeAsync(numParticlesInVoxelListsY, stream) );
-    gpuErrchk( cudaFreeAsync(numUsedVoxelsPerNodeZ, stream) );
     gpuErrchk( cudaFreeAsync(numParticlesInVoxelListsZ, stream) );
 }
 
 void Particles::particleVelToVoxels(){
-    
+    kernels::cudaVoxelUGather(numUsedVoxelsX, numUsedGridNodes, size, numVoxelsPerNode, vx.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(),
+        nodeIndexToFirstUsedVoxelX.devPtr(), voxelIDsX.devPtr(), voxelParticleListStartX.devPtr(), particleListsX.devPtr(), voxelsUx.devPtr(), stream);
 }
 
 Particles::~Particles(){
