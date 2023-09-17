@@ -72,6 +72,13 @@ public:
         validateGridCellOrdering();
         particles.alignParticlesToSubCells();
         particles.generateVoxels();
+        particles.particleVelToVoxels();
+        particles.voxelsUx.download();
+        particles.voxelIDsX.download();
+
+        for(uint i = 0; i < particles.voxelIDsX.size(); ++i){
+            std::cout<<particles.voxelIDsX[i]<<": "<<particles.voxelsUx[i]<<std::endl;
+        }
     }
 
     void run(){

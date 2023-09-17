@@ -43,11 +43,18 @@ void CudaVec<T>::upload(){
 
 template <typename T>
 void CudaVec<T>::download(){
+    if(numElements != vec.size()){
+        vec.resize(numElements);
+    }
     gpuErrchk( cudaMemcpy(vec.data(), d_vec, vec.size()*sizeof(T), cudaMemcpyDeviceToHost) );
 }
 
 template <typename T>
 void CudaVec<T>::upload(cudaStream_t stream){
+    if(numElements != vec.size()){
+        std::cerr<<"ERROR: ATTEMPT TO UPLOAD CPU VECTOR TO ASYNC ALLOCATED GPU VECTOR\nCPU VEC SIZE: "<<vec.size()<<"\nGPU_VEC SIZE: "<<numElements<<"\n";
+        exit(1);
+    }
     gpuErrchk( cudaMemcpyAsync(d_vec, vec.data(), vec.size()*sizeof(T), cudaMemcpyHostToDevice, stream) );
 }
 

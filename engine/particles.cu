@@ -8,7 +8,7 @@
 
 Particles::Particles(uint size)
 : size(size)
-, radius(1.5)
+, radius(2)
 , refinementLevel(1)
 {
     cudaStreamCreate(&stream);
@@ -148,8 +148,13 @@ void Particles::generateVoxels(){
 }
 
 void Particles::particleVelToVoxels(){
-    kernels::cudaVoxelUGather(numUsedVoxelsX, numUsedGridNodes, size, numVoxelsPerNode, vx.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(),
-        nodeIndexToFirstUsedVoxelX.devPtr(), voxelIDsX.devPtr(), voxelParticleListStartX.devPtr(), particleListsX.devPtr(), voxelsUx.devPtr(), stream);
+    // kernels::cudaVoxelUGather(numUsedVoxelsX, numUsedGridNodes, size, numVoxelsPerNode, vx.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(),
+        // nodeIndexToFirstUsedVoxelX.devPtr(), voxelIDsX.devPtr(), voxelParticleListStartX.devPtr(), particleListsX.devPtr(), voxelsUx.devPtr(), stream);
+
+    kernels::cudaVoxelUGather(numUsedVoxelsX, numUsedGridNodes, size, numVoxelsPerNode, totalNumParticlesInPerVoxelListsX, gridCell.devPtr(), vx.devPtr(), px.devPtr(),
+        py.devPtr(), pz.devPtr(), nodeIndexToFirstUsedVoxelX.devPtr(), voxelIDsX.devPtr(), voxelParticleListStartX.devPtr(), particleListsX.devPtr(), voxelsUx.devPtr(),
+        grid, grid.sizeX*grid.sizeY, refinementLevel, radius, numVoxels1D, stream);
+    cudaStreamSynchronize(stream);
 }
 
 Particles::~Particles(){
