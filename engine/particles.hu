@@ -22,13 +22,22 @@ public:
 
     void particleVelToVoxels();
 
+    void setupCudaDevices();
+
     ~Particles();
 private:
     CudaVec<float> px, py, pz;
     CudaVec<float> vx, vy, vz;
     CudaVec<uint> gridCell;
-    CudaVec<uint> subCellsTouchedX, subCellsTouchedY, subCellsTouchedZ; //number of subcells touched by each particle
-    CudaVec<uint> subCellsX, subCellsY, subCellsZ; //subcell index list, multiple subcells per particle allowed, indexed by subCellsTouched
+    
+    CudaVec<uint> subCellsTouchedX;
+    CudaVec<uint> subCellsTouchedY;
+    CudaVec<uint> subCellsTouchedZ; //number of subcells touched by each particle
+    
+    CudaVec<uint> subCellsX;
+    CudaVec<uint> subCellsY;
+    CudaVec<uint> subCellsZ; //subcell index list, multiple subcells per particle allowed, indexed by subCellsTouched
+    
     CudaVec<uint> reorderedGridIndices;
 
     CudaVec<uint> uniqueGridNodeIndices;
@@ -49,9 +58,10 @@ private:
     CudaVec<uint> voxelParticleListStartX;
     CudaVec<uint> voxelParticleListStartY;
     CudaVec<uint> voxelParticleListStartZ;
-    
 
-    CudaVec<float> voxelsUx, voxelsUy, voxelsUz;
+    CudaVec<float> voxelsUx;
+    CudaVec<float> voxelsUy;
+    CudaVec<float> voxelsUz;
 
     uint numUsedGridNodes;
     uint numUsedVoxelsX;
@@ -68,6 +78,8 @@ private:
     float radius;
     Grid grid;
     cudaStream_t stream;
+    std::vector<cudaDeviceProp> deviceProp;
+    std::vector<uint> selectedDevices;
 
     friend class ParticleSystemTester;
 };

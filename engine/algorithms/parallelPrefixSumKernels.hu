@@ -7,4 +7,37 @@ __global__ void parallelPrefix(uint numElements, uint* array, uint* blockSums); 
 
 __global__ void parallelPrefixApplyPreviousBlockSum(uint numElements, uint* array, uint* blockSums); //designed for WORKSIZE threads per block, 2x BLOCKSIZE
 
+template <typename T>
+__device__ void blockWiseExclusivePrefixSum(T* shared, uint workspaceSize, uint& sharedBlockSum){
+    for(uint i = 0; (1<<(i+1))-1 < workspaceSize; ++i){
+        __syncthreads();
+        for(uint tid = threadIdx.x; tid < workspaceSize; tid += blockDim.x){
+            if(((tid + 1)<<(i+1)) - 1 < workspaceSize){
+                shared[((tid + 1)<<(i+1)) - 1] += shared[((tid + 1)<<(i+1)) - 1 - (1<<i)];
+            }
+        }
+    }
+    __syncthreads();
+
+    if(threadIdx.x == 0){
+        sharedBlockSum = shared[workspaceSize - 1];
+        shared[workspaceSize-1] = 0;
+    }
+    __syncthreads();
+    
+    for(int i = sizeof(uint)*8 - __clz(workspaceSize>>1) - 1; i >= 0; --i){
+        __syncthreads();
+        for(uint tid = threadIdx.x; tid < workspaceSize; tid += blockDim.x){
+            if(((tid + 1)<<(i+1)) - 1 < workspaceSize){
+                uint temp = shared[((tid + 1)<<(i+1)) - 1];
+                shared[((tid + 1)<<(i+1)) - 1] += shared[((tid + 1)<<(i+1)) - 1 - (1<<i)];
+                shared[((tid + 1)<<(i+1)) - 1 - (1<<i)] = temp;
+            }
+        }
+    }
+    __syncthreads();
+
+}
+
+
 #endif

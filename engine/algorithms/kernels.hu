@@ -37,7 +37,7 @@ namespace kernels{
     void cudaVoxelUGather(uint numUsedVoxelsGrid, uint numGridNodes, uint numParticles, uint numVoxelsPerNode, uint numParticlesInParticleLists,
         uint* gridPosition, float* particleVs, float* px, float* py, float* pz, uint* nodeIndexToFirstVoxelIndex, uint* voxelIDs,
         uint* perVoxelParticleListStartIndices, uint* particleList, float* voxelUs,Grid grid, uint xySize, uint refinementLevel,
-        float radius, uint numVoxels1D, cudaStream_t stream);
+        float radius, uint numVoxels1D, VelocityGatherDimension solveDimension, cudaStream_t stream);
 }
 
 

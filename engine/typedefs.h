@@ -17,7 +17,9 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
    }
 }
 
-
+enum VelocityGatherDimension{
+   X, Y, Z
+};
 
 typedef unsigned int uint;
 

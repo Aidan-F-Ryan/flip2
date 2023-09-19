@@ -11,6 +11,8 @@ Particles::Particles(uint size)
 , radius(2)
 , refinementLevel(1)
 {
+    setupCudaDevices();
+
     cudaStreamCreate(&stream);
     px.resize(size);
     py.resize(size);
@@ -148,15 +150,31 @@ void Particles::generateVoxels(){
 }
 
 void Particles::particleVelToVoxels(){
-    // kernels::cudaVoxelUGather(numUsedVoxelsX, numUsedGridNodes, size, numVoxelsPerNode, vx.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(),
-        // nodeIndexToFirstUsedVoxelX.devPtr(), voxelIDsX.devPtr(), voxelParticleListStartX.devPtr(), particleListsX.devPtr(), voxelsUx.devPtr(), stream);
-
     kernels::cudaVoxelUGather(numUsedVoxelsX, numUsedGridNodes, size, numVoxelsPerNode, totalNumParticlesInPerVoxelListsX, gridCell.devPtr(), vx.devPtr(), px.devPtr(),
         py.devPtr(), pz.devPtr(), nodeIndexToFirstUsedVoxelX.devPtr(), voxelIDsX.devPtr(), voxelParticleListStartX.devPtr(), particleListsX.devPtr(), voxelsUx.devPtr(),
-        grid, grid.sizeX*grid.sizeY, refinementLevel, radius, numVoxels1D, stream);
-    cudaStreamSynchronize(stream);
+        grid, grid.sizeX*grid.sizeY, refinementLevel, radius, numVoxels1D, VelocityGatherDimension::X, stream);
+    kernels::cudaVoxelUGather(numUsedVoxelsY, numUsedGridNodes, size, numVoxelsPerNode, totalNumParticlesInPerVoxelListsY, gridCell.devPtr(), vy.devPtr(), px.devPtr(),
+        py.devPtr(), pz.devPtr(), nodeIndexToFirstUsedVoxelY.devPtr(), voxelIDsY.devPtr(), voxelParticleListStartY.devPtr(), particleListsY.devPtr(), voxelsUy.devPtr(),
+        grid, grid.sizeX*grid.sizeY, refinementLevel, radius, numVoxels1D, VelocityGatherDimension::Y, stream);
+    kernels::cudaVoxelUGather(numUsedVoxelsZ, numUsedGridNodes, size, numVoxelsPerNode, totalNumParticlesInPerVoxelListsZ, gridCell.devPtr(), vz.devPtr(), px.devPtr(),
+        py.devPtr(), pz.devPtr(), nodeIndexToFirstUsedVoxelZ.devPtr(), voxelIDsZ.devPtr(), voxelParticleListStartZ.devPtr(), particleListsZ.devPtr(), voxelsUz.devPtr(),
+        grid, grid.sizeX*grid.sizeY, refinementLevel, radius, numVoxels1D, VelocityGatherDimension::Z, stream);
+    gpuErrchk( cudaStreamSynchronize(stream) );
+}
+
+void Particles::setupCudaDevices(){
+    int numDevices;
+    gpuErrchk(cudaGetDeviceCount(&numDevices));
+    deviceProp.resize(numDevices);
+    for(uint i = 0; i < numDevices; ++i){
+        gpuErrchk( cudaGetDeviceProperties(deviceProp.data() + i, i) );
+    }
+
+    for(uint i = 0; i < deviceProp.size(); ++i){
+        std::cout<<"Device "<<i<<": "<<deviceProp[i].name<<" with "<<deviceProp[i].totalGlobalMem / (1<<20)<<"MB available"<<std::endl;
+    }
 }
 
 Particles::~Particles(){
-    cudaStreamDestroy(stream);
+    gpuErrchk( cudaStreamDestroy(stream) );
 }

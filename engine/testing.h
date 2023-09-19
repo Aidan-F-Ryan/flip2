@@ -54,15 +54,23 @@ public:
         std::uniform_real_distribution<> distY(particles.grid.negY + oneThirdYDimension, particles.grid.negY + particles.grid.sizeY*particles.grid.cellSize - oneThirdYDimension);
         std::uniform_real_distribution<> distZ(particles.grid.negZ + oneThirdYDimension, particles.grid.negZ + particles.grid.sizeZ*particles.grid.cellSize - oneThirdYDimension);
 
+        std::uniform_real_distribution<> vDist(-1.0f, 1.0f);
+
         for(uint i = 0; i < particles.size; ++i){
             particles.px[i] = distX(e2);
             particles.py[i] = distY(e2);
             particles.pz[i] = distZ(e2);
+            particles.vx[i] = vDist(e2);
+            particles.vy[i] = vDist(e2);
+            particles.vz[i] = vDist(e2);
         }
         
         particles.px.upload(particles.stream);
         particles.py.upload(particles.stream);
         particles.pz.upload(particles.stream);
+        particles.vx.upload(particles.stream);
+        particles.vy.upload(particles.stream);
+        particles.vz.upload(particles.stream);
     }
     
     void runVerify(){
@@ -75,9 +83,15 @@ public:
         particles.particleVelToVoxels();
         particles.voxelsUx.download();
         particles.voxelIDsX.download();
+        particles.voxelsUy.download();
+        particles.voxelIDsY.download();
+        particles.voxelsUz.download();
+        particles.voxelIDsZ.download();
 
         for(uint i = 0; i < particles.voxelIDsX.size(); ++i){
             std::cout<<particles.voxelIDsX[i]<<": "<<particles.voxelsUx[i]<<std::endl;
+            std::cout<<particles.voxelIDsY[i]<<": "<<particles.voxelsUy[i]<<std::endl;
+            std::cout<<particles.voxelIDsZ[i]<<": "<<particles.voxelsUy[i]<<std::endl;
         }
     }
 
@@ -86,6 +100,7 @@ public:
         particles.sortParticles();
         particles.alignParticlesToSubCells();
         particles.generateVoxels();
+        particles.particleVelToVoxels();
     }
 
 private:

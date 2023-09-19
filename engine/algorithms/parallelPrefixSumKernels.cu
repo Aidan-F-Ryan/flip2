@@ -16,30 +16,8 @@ __global__ void parallelPrefix(uint numElements, uint* array, uint* blockSums){ 
     else{
         shared[threadIdx.x + blockDim.x] = 0;
     }
-    for(uint i = 0; 1<<(i+1)-1 < WORKSIZE; ++i){
-        __syncthreads();
-        if(((threadIdx.x + 1)<<(i+1)) - 1 < WORKSIZE){
-            shared[((threadIdx.x + 1)<<(i+1)) - 1] += shared[((threadIdx.x + 1)<<(i+1)) - 1 - (1<<i)];
-        }
-    }
-    __syncthreads();
-
-    if(threadIdx.x == 0){
-        blockSum = shared[WORKSIZE - 1];
-        blockSums[blockIdx.x] = blockSum;
-        shared[WORKSIZE-1] = 0;
-    }
-    __syncthreads();
-    
-    for(int i = sizeof(uint)*8 - __clz(WORKSIZE>>1) - 1; i >= 0; --i){
-        __syncthreads();
-        if(((threadIdx.x + 1)<<(i+1)) - 1 < WORKSIZE){
-            uint temp = shared[((threadIdx.x + 1)<<(i+1)) - 1];
-            shared[((threadIdx.x + 1)<<(i+1)) - 1] += shared[((threadIdx.x + 1)<<(i+1)) - 1 - (1<<i)];
-            shared[((threadIdx.x + 1)<<(i+1)) - 1 - (1<<i)] = temp;
-        }
-    }
-    __syncthreads();
+    blockWiseExclusivePrefixSum(shared, WORKSIZE, blockSum);
+    blockSums[blockIdx.x] = blockSum;
     if(index < numElements){    //copy first of the two values handled by each thread
         array[index] = shared[threadIdx.x + 1];
     }

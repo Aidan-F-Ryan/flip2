@@ -54,8 +54,8 @@ __global__ void subCellCreateNumSubCellsTouchedEachDimension(float* px, float* p
     if(index < numParticles){
         uint moduloWRTxySize = gridPosition[index] % xySize;
         uint gridIDz = gridPosition[index] / (xySize);
-        uint gridIDy = (moduloWRTxySize % xySize) / grid.sizeX;
-        uint gridIDx = (moduloWRTxySize) % grid.sizeX;
+        uint gridIDy = moduloWRTxySize / grid.sizeX;
+        uint gridIDx = moduloWRTxySize % grid.sizeX;
         
         uint apronCells = floorf(radius);
         float subCellWidth = grid.cellSize/(2.0f*(1<<refinementLevel));
@@ -73,7 +73,7 @@ __global__ void subCellCreateNumSubCellsTouchedEachDimension(float* px, float* p
         
 
         float halfSubCellWidth = subCellWidth / 2.0f;
-        float radiusSCW_squared = square(radius*subCellWidth);
+        float radiusSCW = radius*subCellWidth;
 
         for(uint x = subCellPositionX - apronCells; x < subCellPositionX + apronCells; ++x){
             for(uint y = subCellPositionY - apronCells; y < subCellPositionY + apronCells; ++y){
@@ -82,19 +82,21 @@ __global__ void subCellCreateNumSubCellsTouchedEachDimension(float* px, float* p
                     float subCellBaseY = y * subCellWidth;
                     float subCellBaseZ = z * subCellWidth;
 
-                    if(square(pxInGridCell - subCellBaseX)
-                     + square(pyInGridCell - subCellBaseY + halfSubCellWidth)
-                     + square(pzInGridCell - subCellBaseZ + halfSubCellWidth) < radiusSCW_squared){
+                    float dpx = pxInGridCell - subCellBaseX;
+                    float dpy = pyInGridCell - subCellBaseY;
+                    float dpz = pzInGridCell - subCellBaseZ;
+
+                    float xCheck = sqrtf(square(dpx) + square(dpy + halfSubCellWidth) + square(dpz + halfSubCellWidth));
+                    float yCheck = sqrtf(square(dpx + halfSubCellWidth) + square(dpy) + square(dpz + halfSubCellWidth));
+                    float zCheck = sqrtf(square(dpx + halfSubCellWidth) + square(dpy + halfSubCellWidth) + square(dpz));
+
+                    if(xCheck < radiusSCW){
                         ++xTouched;
                     }
-                    if(square(pxInGridCell - subCellBaseX + halfSubCellWidth)
-                     + square(pyInGridCell - subCellBaseY)
-                     + square(pzInGridCell - subCellBaseZ + halfSubCellWidth) < radiusSCW_squared){
+                    if(yCheck < radiusSCW){
                         ++yTouched;
                     }
-                    if(square(pxInGridCell - subCellBaseX + halfSubCellWidth)
-                     + square(pyInGridCell - subCellBaseY + halfSubCellWidth)
-                     + square(pzInGridCell - subCellBaseZ) < radiusSCW_squared){
+                    if(zCheck < radiusSCW){
                         ++zTouched;
                     }
                 }
@@ -114,8 +116,8 @@ __global__ void subCellCreateLists(float* px, float* py, float* pz, uint numPart
     if(index < numParticles){
         uint moduloWRTxySize = gridPosition[index] % xySize;
         uint gridIDz = gridPosition[index] / (xySize);
-        uint gridIDy = (moduloWRTxySize % xySize) / grid.sizeX;
-        uint gridIDx = (moduloWRTxySize) % grid.sizeX;
+        uint gridIDy = moduloWRTxySize / grid.sizeX;
+        uint gridIDx = moduloWRTxySize % grid.sizeX;
         
         uint apronCells = floorf(radius);
         float subCellWidth = grid.cellSize/(2.0f*(1<<refinementLevel));
@@ -129,7 +131,7 @@ __global__ void subCellCreateLists(float* px, float* py, float* pz, uint numPart
         
 
         float halfSubCellWidth = subCellWidth / 2.0f;
-        float radiusSCW_squared = square(radius*subCellWidth);
+        float radiusSCW = radius*subCellWidth;
 
         uint xWritten = 0;
         uint yWritten = 0;
@@ -157,22 +159,23 @@ __global__ void subCellCreateLists(float* px, float* py, float* pz, uint numPart
                     float subCellBaseX = x * subCellWidth;
                     float subCellBaseY = y * subCellWidth;
                     float subCellBaseZ = z * subCellWidth;
+                    
+                    float dpx = pxInGridCell - subCellBaseX;
+                    float dpy = pyInGridCell - subCellBaseY;
+                    float dpz = pzInGridCell - subCellBaseZ;
 
-                    if(square(pxInGridCell - subCellBaseX)
-                     + square(pyInGridCell - subCellBaseY + halfSubCellWidth)
-                     + square(pzInGridCell - subCellBaseZ + halfSubCellWidth) < radiusSCW_squared){
+                    float xCheck = sqrtf(square(dpx) + square(dpy + halfSubCellWidth) + square(dpz + halfSubCellWidth));
+                    float yCheck = sqrtf(square(dpx + halfSubCellWidth) + square(dpy) + square(dpz + halfSubCellWidth));
+                    float zCheck = sqrtf(square(dpx + halfSubCellWidth) + square(dpy + halfSubCellWidth) + square(dpz));
+
+                    if(xCheck < radiusSCW){
                         subCellsX[subCellsTouchedStartX + xWritten++] = x + y*numVoxelsInNodeDimension + z*numVoxelsInNodeDimension*numVoxelsInNodeDimension; //x is x, y is y, z is z
-
                     }
-                    if(square(pxInGridCell - subCellBaseX + halfSubCellWidth)
-                     + square(pyInGridCell - subCellBaseY)
-                     + square(pzInGridCell - subCellBaseZ + halfSubCellWidth) < radiusSCW_squared){
-                        subCellsY[subCellsTouchedStartY + yWritten++] = y + x*numVoxelsInNodeDimension + z * numVoxelsInNodeDimension * numVoxelsInNodeDimension; //y is x, x is y, z is z
+                    if(yCheck < radiusSCW){
+                        subCellsY[subCellsTouchedStartY + yWritten++] = x + y*numVoxelsInNodeDimension + z * numVoxelsInNodeDimension * numVoxelsInNodeDimension; //y is x, x is y, z is z
                     }
-                    if(square(pxInGridCell - subCellBaseX + halfSubCellWidth)
-                     + square(pyInGridCell - subCellBaseY + halfSubCellWidth)
-                     + square(pzInGridCell - subCellBaseZ) < radiusSCW_squared){
-                        subCellsZ[subCellsTouchedStartZ + zWritten++] = z + x*numVoxelsInNodeDimension + y * numVoxelsInNodeDimension * numVoxelsInNodeDimension; //z is x, x is y, y is z
+                    if(zCheck < radiusSCW){
+                        subCellsZ[subCellsTouchedStartZ + zWritten++] = x + y*numVoxelsInNodeDimension + z * numVoxelsInNodeDimension * numVoxelsInNodeDimension; //z is x, x is y, y is z
                     }
                 }
             }
@@ -436,7 +439,14 @@ __global__ void sumParticlesPerNode(uint numGridNodes, uint numParticles, uint* 
     __syncthreads();
 
     for(uint i = gridNodeIndicesToFirstParticleIndex[blockIdx.x] + threadIdx.x; i < maxParticleNum; i += blockDim.x){
-        for(uint j = subCellsTouchedPerParticle[i]; j < subCellsTouchedPerParticle[i+1]; ++j){
+        uint firstSubCellsTouched;
+        if(i == 0){
+            firstSubCellsTouched = 0;
+        }
+        else{
+            firstSubCellsTouched = subCellsTouchedPerParticle[i-1];
+        }
+        for(uint j = firstSubCellsTouched; j < subCellsTouchedPerParticle[i]; ++j){
             atomicAdd(voxelCount + subCellsDim[j], 1);
         }
     }
@@ -509,6 +519,9 @@ __global__ void createParticleListStartIndices(uint totalNumberVoxelsDimension, 
     __shared__ uint numUsedVoxelsThisNode;
 
     __shared__ uint firstParticleListIndex;
+    __shared__ uint voxelUsedMax;
+    __shared__ uint voxelCountMax;
+
     if(threadIdx.x == 0){
         if(blockIdx.x < numGridNodes - 1){
             maxParticleNum = firstParticleInNodeIndex[blockIdx.x + 1];
@@ -533,7 +546,14 @@ __global__ void createParticleListStartIndices(uint totalNumberVoxelsDimension, 
     __syncthreads();
 
     for(uint i = firstParticleInNodeIndex[blockIdx.x] + threadIdx.x; i < maxParticleNum; i += blockDim.x){
-        for(uint j = subCellsTouchedPerParticle[i]; j < subCellsTouchedPerParticle[i+1]; ++j){
+        uint firstSubCellsTouched;
+        if(i == 0){
+            firstSubCellsTouched = 0;
+        }
+        else{
+            firstSubCellsTouched = subCellsTouchedPerParticle[i-1];
+        }
+        for(uint j = firstSubCellsTouched; j < subCellsTouchedPerParticle[i]; ++j){
             atomicMax(voxelUsedIndex + subCellsDim[j], 1);  //marking used voxels
             atomicAdd(voxelCount + subCellsDim[j], 1);
         }
@@ -541,36 +561,36 @@ __global__ void createParticleListStartIndices(uint totalNumberVoxelsDimension, 
 
     __syncthreads();
     //now have number of particles per voxel, need blockWise prefix sum on voxelCount to get offset of each used voxel's particle list
-    for(uint i = 1; i < numVoxelsPerNode; i<<=1){
-        for(uint j = threadIdx.x; j < numVoxelsPerNode; j += blockDim.x){
-            if(j >= i){
-                voxelUsedIndex[j] += voxelUsedIndex[j-i];
-                voxelCount[j] += voxelCount[j-i];
-            }
-        }
-        __syncthreads();
-    }
+    blockWiseExclusivePrefixSum(voxelUsedIndex, numVoxelsPerNode, voxelUsedMax);
+    blockWiseExclusivePrefixSum(voxelCount, numVoxelsPerNode, voxelCountMax);
 
     for(uint i = threadIdx.x; i < numVoxelsPerNode; i += blockDim.x){
-        uint prevVal = 0;
-        uint prevCount = 0;
-        if(i != 0){
-            prevVal = voxelUsedIndex[i-1];
-            prevCount = voxelCount[i-1];
+        uint nextVal = voxelUsedMax;
+        uint nextCount = voxelCountMax;
+        if(i != numVoxelsPerNode-1){
+            nextVal = voxelUsedIndex[i+1];
+            nextCount = voxelCount[i+1];
         }
-        if(voxelUsedIndex[i] != prevVal){
-            voxelIDs[numUsedVoxelsThisNode + prevVal] = i;   //store in-node voxel ID to voxelIDs array
-            perVoxelParticleListStartIndices[numUsedVoxelsThisNode + prevVal] = prevCount + firstParticleListIndex;
+        if(voxelUsedIndex[i] != nextVal){
+            voxelIDs[numUsedVoxelsThisNode + voxelUsedIndex[i]] = i;   //store in-node voxel ID to voxelIDs array
+            perVoxelParticleListStartIndices[numUsedVoxelsThisNode + voxelUsedIndex[i]] = voxelCount[i] + firstParticleListIndex;
 
             //need to reframe from per-particle thread to per-voxel thread, each thread iterates over all particles in node to generate per-voxel list of particles
             uint numParticlesWrittenToCurrentVoxel = 0;
             for(uint particleIndex = firstParticleInNodeIndex[blockIdx.x]; particleIndex < maxParticleNum; ++particleIndex){    //whole loop needs to be its own kernel, iterate only over used nodes and write accordingly
-                for(uint subCellTouchedPerParticleIndex = subCellsTouchedPerParticle[particleIndex];                            //current version wastes threads and unnecessarily prolongs runtime of each thread
-                        subCellTouchedPerParticleIndex < subCellsTouchedPerParticle[particleIndex+1];
+                int firstSubCellsTouched;
+                if(particleIndex == 0){
+                    firstSubCellsTouched = 0;
+                }
+                else{
+                    firstSubCellsTouched = subCellsTouchedPerParticle[particleIndex-1];
+                }
+                for(uint subCellTouchedPerParticleIndex = firstSubCellsTouched;                            //current version wastes threads and unnecessarily prolongs runtime of each thread
+                        subCellTouchedPerParticleIndex < subCellsTouchedPerParticle[particleIndex];
                         ++subCellTouchedPerParticleIndex)
                 {
                     if(subCellsDim[subCellTouchedPerParticleIndex] == i){   //need to convert this to shared mem array 
-                        particleLists[firstParticleListIndex + prevCount + numParticlesWrittenToCurrentVoxel++] = particleIndex;
+                        particleLists[firstParticleListIndex + voxelCount[i] + numParticlesWrittenToCurrentVoxel++] = particleIndex;
                     }
                 }
             }
@@ -601,24 +621,24 @@ __device__ float weightFromDistance(float in, float radius){
 
 __global__ void voxelUGather(uint numVoxelsPerNode, uint numUsedVoxelsInGrid, uint numParticlesInParticleLists, uint* gridPosition, float* particleVs,
     float* px, float* py, float* pz, uint* nodeIndexToFirstVoxelIndex, uint* voxelIDs, uint* perVoxelParticleListStartIndices, uint* particleLists,
-    float* voxelUs, Grid grid, uint xySize, uint refinementLevel, float radius, uint numVoxels1D)
+    float* voxelUs, Grid grid, uint xySize, uint refinementLevel, float radius, VelocityGatherDimension solveDimension, uint numVoxels1D)
 {
     extern __shared__ float thisNodeU[];
     __shared__ uint maxVoxelIndex;
-    __shared__ uint maxParticleListIndex;
     __shared__ uint voxelStartIndex;
-    __shared__ float voxelParticleSums[BLOCKSIZE];
+    __shared__ uint thisNodeParticleListStopIndex;
+    __shared__ uint thisNodeParticleListStartIndex;
 
     for(uint i = threadIdx.x; i < numVoxelsPerNode; i += blockDim.x){
         thisNodeU[i] = 0.0f;
     }
     if(threadIdx.x == 0){
         maxVoxelIndex = nodeIndexToFirstVoxelIndex[blockIdx.x];
-        if(blockIdx.x < numUsedVoxelsInGrid - 1){
-            maxParticleListIndex = perVoxelParticleListStartIndices[blockIdx.x + 1];
+        if(maxVoxelIndex < numUsedVoxelsInGrid - 1){
+            thisNodeParticleListStopIndex = perVoxelParticleListStartIndices[maxVoxelIndex];
         }
         else{
-            maxParticleListIndex = numParticlesInParticleLists;
+            thisNodeParticleListStopIndex = numParticlesInParticleLists;
         }
         if(blockIdx.x == 0){
             voxelStartIndex = 0;
@@ -626,60 +646,82 @@ __global__ void voxelUGather(uint numVoxelsPerNode, uint numUsedVoxelsInGrid, ui
         else{
             voxelStartIndex = nodeIndexToFirstVoxelIndex[blockIdx.x - 1];
         }
+        thisNodeParticleListStartIndex = perVoxelParticleListStartIndices[voxelStartIndex];
     }
     __syncthreads();
     float subCellWidth = grid.cellSize/(2.0f*(1<<refinementLevel));
     uint apronCells = floorf(radius);
     uint numVoxels2D = numVoxels1D*numVoxels1D;
-
-    for(uint voxelIndex = voxelStartIndex; voxelIndex < maxVoxelIndex; ++voxelIndex){
-        voxelParticleSums[threadIdx.x] = 0.0f;
-        uint voxelIDx = voxelIDs[voxelIndex] % numVoxels1D;
-        uint voxelIDy = (voxelIDs[voxelIndex] % numVoxels2D) / numVoxels1D;
-        uint voxelIDz = voxelIDs[voxelIndex] / numVoxels2D;
-
-        float voxelPx = voxelIDx * subCellWidth;
-        float voxelPy = voxelIDy * subCellWidth + 0.5*subCellWidth;
-        float voxelPz = voxelIDz * subCellWidth + 0.5*subCellWidth;
-        
-        for(uint particleListIndex = perVoxelParticleListStartIndices[voxelIndex] + threadIdx.x; particleListIndex < maxParticleListIndex; particleListIndex += blockDim.x){
-            uint particleIndex = particleLists[particleListIndex];
-
-            uint moduloWRTxySize = gridPosition[particleIndex] % xySize;
-            uint gridIDz = gridPosition[particleIndex] / (xySize);
-            uint gridIDy = (moduloWRTxySize) / grid.sizeX;
-            uint gridIDx = (moduloWRTxySize) % grid.sizeX;
-            
-            float pxInGridCell = (px[particleIndex] - grid.negX - gridIDx*grid.cellSize + apronCells*subCellWidth);
-            float pyInGridCell = (py[particleIndex] - grid.negY - gridIDy*grid.cellSize + apronCells*subCellWidth);
-            float pzInGridCell = (pz[particleIndex] - grid.negZ - gridIDz*grid.cellSize + apronCells*subCellWidth);
-
-            float dpx = pxInGridCell - voxelPx;
-            float dpy = pyInGridCell - voxelPy;
-            float dpz = pzInGridCell - voxelPz;
-
-            float particleToNodeDistance = sqrtf(fmaf(dpx, dpx, fmaf(dpy, dpy, (dpz*dpz)))) / subCellWidth;
-
-
-            voxelParticleSums[threadIdx.x] += weightFromDistance(particleToNodeDistance, radius) * particleVs[particleIndex];
-        }
-        for(uint i = blockDim.x>>1; i > 0; i>>=1){
-            __syncthreads();
-            if(threadIdx.x < i){
-                voxelParticleSums[threadIdx.x] += voxelParticleSums[threadIdx.x + i];
+    for(uint curParticleInNode = thisNodeParticleListStartIndex + threadIdx.x; curParticleInNode < thisNodeParticleListStopIndex; curParticleInNode += blockDim.x){
+        uint curThreadParticleVoxelID;
+        // uint curThreadParticleVoxelListIndex;
+        uint particleIndex = particleLists[curParticleInNode];
+        for(uint curVoxelIndex = voxelStartIndex; curVoxelIndex < maxVoxelIndex; ++curVoxelIndex){
+            uint voxelParticleListStart = perVoxelParticleListStartIndices[curVoxelIndex];
+            uint voxelParticleListStop;
+            if(curVoxelIndex < numUsedVoxelsInGrid - 1){
+                voxelParticleListStop = perVoxelParticleListStartIndices[curVoxelIndex+1];
+            }
+            else{
+                voxelParticleListStop = numParticlesInParticleLists;
+            }
+            if(curParticleInNode >= voxelParticleListStart && curParticleInNode < voxelParticleListStop){
+                curThreadParticleVoxelID = voxelIDs[curVoxelIndex];
             }
         }
-        if(threadIdx.x == 0){
-            voxelUs[voxelIndex] = voxelParticleSums[0];
+        uint voxelIDx = curThreadParticleVoxelID % numVoxels1D;
+        uint voxelIDy = (curThreadParticleVoxelID % numVoxels2D) / numVoxels1D;
+        uint voxelIDz = curThreadParticleVoxelID / numVoxels2D;
+
+        float voxelPx = voxelIDx * subCellWidth;
+        float voxelPy = voxelIDy * subCellWidth;
+        float voxelPz = voxelIDz * subCellWidth;
+        
+        if(solveDimension == VelocityGatherDimension::X){
+            voxelPy += 0.5*subCellWidth;
+            voxelPz += 0.5*subCellWidth;
         }
+        else if(solveDimension == VelocityGatherDimension::X){
+            voxelPx += 0.5*subCellWidth;
+            voxelPz += 0.5*subCellWidth;
+        }
+        else{
+            voxelPx += 0.5*subCellWidth;
+            voxelPy += 0.5*subCellWidth;
+        }
+
+        uint moduloWRTxySize = gridPosition[particleIndex] % xySize;
+        uint gridIDz = gridPosition[particleIndex] / (xySize);
+        uint gridIDy = (moduloWRTxySize) / grid.sizeX;
+        uint gridIDx = (moduloWRTxySize) % grid.sizeX;
+        
+        float pxInGridCell = (px[particleIndex] - grid.negX - gridIDx*grid.cellSize + apronCells*subCellWidth);
+        float pyInGridCell = (py[particleIndex] - grid.negY - gridIDy*grid.cellSize + apronCells*subCellWidth);
+        float pzInGridCell = (pz[particleIndex] - grid.negZ - gridIDz*grid.cellSize + apronCells*subCellWidth);
+
+        float dpx = pxInGridCell - voxelPx;
+        float dpy = pyInGridCell - voxelPy;
+        float dpz = pzInGridCell - voxelPz;
+        float dpx_2 = dpx*dpx;
+        float dpy_2 = dpy*dpy;
+        float dpz_2 = dpz*dpz;
+
+        float particleToNodeDistance = sqrtf(dpx_2 + dpy_2 + dpz_2) / subCellWidth;
+
+        atomicAdd(thisNodeU + curThreadParticleVoxelID, weightFromDistance(particleToNodeDistance, radius) * particleVs[particleIndex]);
+    }
+    __syncthreads();
+    for(uint usedVoxelIndex = voxelStartIndex + threadIdx.x; usedVoxelIndex < maxVoxelIndex; usedVoxelIndex += blockDim.x){
+        voxelUs[usedVoxelIndex] = thisNodeU[voxelIDs[usedVoxelIndex]];
     }
 }
 
 void kernels::cudaVoxelUGather(uint numUsedVoxelsGrid, uint numGridNodes, uint numParticles, uint numVoxelsPerNode, uint numParticlesInParticleLists,
     uint* gridPosition, float* particleVs, float* px, float* py, float* pz, uint* nodeIndexToFirstVoxelIndex, uint* voxelIDs,
-    uint* perVoxelParticleListStartIndices, uint* particleLists, float* voxelUs, Grid grid, uint xySize, uint refinementLevel, float radius, uint numVoxels1D, cudaStream_t stream)
+    uint* perVoxelParticleListStartIndices, uint* particleLists, float* voxelUs, Grid grid, uint xySize, uint refinementLevel, float radius,
+    uint numVoxels1D, VelocityGatherDimension solveDimension, cudaStream_t stream)
 {
     voxelUGather<<<numGridNodes, BLOCKSIZE, sizeof(float) * numVoxelsPerNode, stream>>>(numVoxelsPerNode, numUsedVoxelsGrid, numParticlesInParticleLists,
         gridPosition, particleVs, px, py, pz, nodeIndexToFirstVoxelIndex, voxelIDs, perVoxelParticleListStartIndices, particleLists, voxelUs, grid, xySize,
-        refinementLevel, radius, numVoxels1D);
+        refinementLevel, radius, solveDimension, numVoxels1D);
 }
