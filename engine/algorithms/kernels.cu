@@ -210,21 +210,17 @@ void kernels::cudaFindSubCell(float* px, float* py, float* pz,
     cudaStream_t prefixSumStream;
     cudaStreamCreate(&prefixSumStream);
 
-    uint* blockSumsSubCells = nullptr;
-
-    cudaMallocAsync((void**)&blockSumsSubCells, sizeof(uint)*(numParticles / WORKSIZE + 1), prefixSumStream);
-
     subCellCreateNumSubCellsTouchedEachDimension<<<numParticles / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>
         (px, py, pz, numParticles, grid, gridPosition, subCellsTouchedX, subCellsTouchedY, subCellsTouchedZ,
         numRefinementLevels, radius, grid.sizeX*grid.sizeY);
     cudaStreamSynchronize(stream);
     
 
-    cudaParallelPrefixSum(numParticles, subCellsTouchedX, blockSumsSubCells, prefixSumStream);
-    cudaParallelPrefixSum(numParticles, subCellsTouchedY, blockSumsSubCells, prefixSumStream);
-    cudaParallelPrefixSum(numParticles, subCellsTouchedZ, blockSumsSubCells, prefixSumStream);
+    cudaParallelPrefixSum(numParticles, subCellsTouchedX, prefixSumStream);
+    cudaParallelPrefixSum(numParticles, subCellsTouchedY, prefixSumStream);
+    cudaParallelPrefixSum(numParticles, subCellsTouchedZ, prefixSumStream);
     cudaStreamSynchronize(prefixSumStream);
-    cudaFreeAsync(blockSumsSubCells, prefixSumStream);
+    
     uint subCellListSizeX[1];
     uint subCellListSizeY[1];
     uint subCellListSizeZ[1];
@@ -256,17 +252,26 @@ void kernels::cudaFindSubCell(float* px, float* py, float* pz,
  */
 
 template <typename T>
-void kernels::cudaParallelPrefixSum(uint numElements, T* array, T* blockSums, cudaStream_t stream){
+void kernels::cudaParallelPrefixSum_internal(uint numElements, T* array, T* blockSums, cudaStream_t stream){
     parallelPrefix<<<numElements/WORKSIZE + 1, BLOCKSIZE, 0, stream>>>(numElements, array, blockSums);
     gpuErrchk(cudaPeekAtLastError());
     if(numElements / WORKSIZE > 0){
-        T* tempBlockSums;
-        gpuErrchk( cudaMallocAsync((void**)&tempBlockSums, sizeof(T) * ((numElements/WORKSIZE + 1) / WORKSIZE + 1), stream) );
-        cudaParallelPrefixSum((numElements/WORKSIZE + 1), blockSums,  tempBlockSums, stream);
-        gpuErrchk( cudaFreeAsync(tempBlockSums, stream) );
+        cudaParallelPrefixSum_internal((numElements/WORKSIZE + 1), blockSums, blockSums + numElements / WORKSIZE + 1, stream);
     }
     parallelPrefixApplyPreviousBlockSum<<<numElements/WORKSIZE + 1, WORKSIZE, 0, stream>>>(numElements, array, blockSums);
     gpuErrchk(cudaPeekAtLastError());
+}
+
+template <typename T>
+void kernels::cudaParallelPrefixSum(uint numElements, T* array, cudaStream_t stream){
+    uint totalBlockSumsSize = 0;
+    T* blockSums;
+    for(uint i = numElements / WORKSIZE; i > 0; i = i / WORKSIZE ){
+        totalBlockSumsSize += i + 1;
+    }
+    gpuErrchk(cudaMallocAsync((void**)&blockSums, sizeof(T) * totalBlockSumsSize, stream));
+    kernels::cudaParallelPrefixSum_internal(numElements, array, blockSums, stream);
+    gpuErrchk(cudaFreeAsync(blockSums, stream));
 }
 
 /**
@@ -293,17 +298,9 @@ void kernels::cudaRadixSortUint(uint numElements, uint* inArray, uint* outArray,
     for(uint i = 0; i < sizeof(uint)*8; ++i){
         radixBinUintByBitIndex<<<numElements/BLOCKSIZE + 1, BLOCKSIZE, 0, frontStream>>>(numElements, inArray, i, front, back);
         
-        uint* blockSumsFront;
-        uint* blockSumsBack;
-        cudaMallocAsync((void**)&blockSumsFront, sizeof(uint)*numElements/WORKSIZE + 1, frontStream);
-        cudaMallocAsync((void**)&blockSumsBack, sizeof(uint)*numElements/WORKSIZE + 1, backStream);
-
         cudaStreamSynchronize(frontStream);
-        kernels::cudaParallelPrefixSum<uint>(numElements, front, blockSumsFront, frontStream);
-        kernels::cudaParallelPrefixSum<uint>(numElements, back, blockSumsBack, backStream);
-
-        cudaFreeAsync(blockSumsFront, frontStream);
-        cudaFreeAsync(blockSumsBack, backStream);
+        kernels::cudaParallelPrefixSum<uint>(numElements, front, frontStream);
+        kernels::cudaParallelPrefixSum<uint>(numElements, back, backStream);
 
         cudaStreamSynchronize(backStream);
         coalesceFrontBack<<<numElements/BLOCKSIZE + 1, BLOCKSIZE, 0, frontStream>>>(numElements, sortedIndices, front, back);
@@ -381,20 +378,24 @@ __global__ void markUniqueGridCells(uint numElements, uint* gridCells, uint* uni
         }
     }
 }
+template <typename T>
+__global__ void zeroArray(uint size, T* array){
+    uint index = threadIdx.x + blockDim.x*blockIdx.x;
+    if(index < size){
+        array[index] = 0;
+    }
+}
+
 
 uint kernels::cudaMarkUniqueGridCellsAndCount(uint numParticles, uint* gridCells, uint* uniqueGridNodes, cudaStream_t stream){
     markUniqueGridCells<<<numParticles / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numParticles, gridCells, uniqueGridNodes);
     
-    uint* uniqueBlockSums;
-    uint numGridNodes[1];
+    uint numGridNodes;
     
-    cudaMallocAsync((void**)&uniqueBlockSums, sizeof(uint) * (numParticles / WORKSIZE + 1), stream);
-    cudaParallelPrefixSum(numParticles,uniqueGridNodes, uniqueBlockSums, stream);
-    cudaMemcpyAsync(numGridNodes, uniqueGridNodes + numParticles - 1, sizeof(uint), cudaMemcpyDeviceToHost, stream);
+    cudaParallelPrefixSum(numParticles,uniqueGridNodes, stream);
+    cudaMemcpyAsync(&numGridNodes, uniqueGridNodes + numParticles - 1, sizeof(uint), cudaMemcpyDeviceToHost, stream);
 
-    cudaFreeAsync(uniqueBlockSums, stream);
-
-    return numGridNodes[0];
+    return numGridNodes;
 }
 
 __global__ void mapNodeIndicesToParticles(uint numParticles, uint* uniqueGridNodes, uint* gridNodeIndicesToFirstParticleIndex){
@@ -415,10 +416,31 @@ void kernels::cudaMapNodeIndicesToParticles(uint numParticles, uint* uniqueGridN
     mapNodeIndicesToParticles<<<numParticles / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numParticles, uniqueGridNodes, gridNodeIndicesToFirstParticleIndex);
 }
 
+__global__ void getYDimPositionFirstInRow(uint numUniqueGridNodes, uint* gridNodeIndicesToFirstParticleIndex, uint* gridNodeIDs, uint* yDimFirstNodeIndex, Grid grid){
+    uint index = threadIdx.x + blockDim.x*blockIdx.x;
+    if(index < numUniqueGridNodes){
+        uint prevGridNodeUniqueIndex;
+        if(index != 0){
+            prevGridNodeUniqueIndex = gridNodeIDs[gridNodeIndicesToFirstParticleIndex[index - 1]];
+        }
+        else{
+            prevGridNodeUniqueIndex = 0;
+        }
+        uint gridNodeUniqueIndex = gridNodeIDs[gridNodeIndicesToFirstParticleIndex[index]];
+        uint prevYRow = prevGridNodeUniqueIndex / grid.sizeX;
+        uint yRow = gridNodeUniqueIndex / grid.sizeX;
+        if(prevYRow != yRow){
+            yDimFirstNodeIndex[yRow] = gridNodeUniqueIndex;
+        }
+    }
+}
+
+void kernels::cudaGetFirstNodeInYRows(uint numUniqueGridNodes, uint* gridNodeIndicesToFirstParticleIndex, uint* gridNodeIDs, uint* yDimFirstNodeIndex, Grid grid, cudaStream_t stream){
+    getYDimPositionFirstInRow<<<numUniqueGridNodes / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numUniqueGridNodes, gridNodeIndicesToFirstParticleIndex, gridNodeIDs, yDimFirstNodeIndex, grid);
+}
+
 __global__ void sumParticlesPerNode(uint numGridNodes, uint numParticles, uint* gridNodeIndicesToFirstParticleIndex, uint* subCellsTouchedPerParticle,
         uint* subCellsDim, uint* numNonZeroVoxels, uint* numParticlesInVoxelLists, uint numVoxelsPerNode){
-    uint index = threadIdx.x + blockDim.x*blockIdx.x;
-
     extern __shared__ uint voxelCount[];
     __shared__ uint sums[WORKSIZE];
     __shared__ uint nonZeroVoxels[WORKSIZE];
@@ -488,17 +510,10 @@ void kernels::cudaSumParticlesPerNodeAndWriteNumUsedVoxels(uint numGridNodes, ui
     cudaStream_t particleListStream;
     cudaStreamCreate(&particleListStream);
 
-    uint* numParticlesInVoxelListsBlockSums;
-    uint* nonZeroVoxelBlockSums;
-
-    gpuErrchk( cudaMallocAsync((void**)&nonZeroVoxelBlockSums, sizeof(uint)*(numGridNodes / WORKSIZE + 1), stream) );
-    gpuErrchk( cudaMallocAsync((void**)&numParticlesInVoxelListsBlockSums, sizeof(uint)*(numGridNodes / WORKSIZE + 1), particleListStream) );
     cudaStreamSynchronize(stream);
-    cudaParallelPrefixSum(numGridNodes, numNonZeroVoxels, nonZeroVoxelBlockSums, stream);
-    cudaParallelPrefixSum(numGridNodes, numParticlesInVoxelLists, numParticlesInVoxelListsBlockSums, particleListStream);
+    cudaParallelPrefixSum(numGridNodes, numNonZeroVoxels, stream);
+    cudaParallelPrefixSum(numGridNodes, numParticlesInVoxelLists, particleListStream);
     
-    gpuErrchk( cudaFreeAsync(nonZeroVoxelBlockSums, stream) );
-    gpuErrchk( cudaFreeAsync(numParticlesInVoxelListsBlockSums, particleListStream) );
     gpuErrchk( cudaStreamSynchronize(particleListStream) );
     gpuErrchk( cudaStreamDestroy(particleListStream) );
 }
@@ -511,8 +526,6 @@ __global__ void createParticleListStartIndices(uint totalNumberVoxelsDimension, 
 
     //firstParticleInNodeIndex used to index node->subCellsTouchedPerParticle
     //subCellsTouchedPerParticle used to index particle->subCellsDim
-    uint index = threadIdx.x + blockDim.x*blockIdx.x;
-
     extern __shared__ uint voxelUsedIndex[]; //sized to 2*numVoxelsPerNode
     __shared__ uint maxParticleNum;
     uint* voxelCount = voxelUsedIndex + numVoxelsPerNode;

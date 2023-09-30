@@ -14,7 +14,10 @@ namespace kernels{
         CudaVec<uint>& subCellPositionZ, uint numRefinementLevels, float radius, cudaStream_t stream);
 
     template <typename T>
-    void cudaParallelPrefixSum(uint numElements, T* array, T* blockSums, cudaStream_t stream);
+    void cudaParallelPrefixSum_internal(uint numElements, T* array, T* blockSums, cudaStream_t stream);
+    
+    template <typename T>
+    void cudaParallelPrefixSum(uint numElements, T* array, cudaStream_t stream);
 
     void cudaRadixSortUint(uint numElements, uint* inArray, uint* outArray, uint* sortedIndices, uint* front, uint* back,
         cudaStream_t frontStream, cudaStream_t backStream, uint*& reorderedIndicesRelativeToOriginal);
@@ -24,6 +27,8 @@ namespace kernels{
     uint cudaMarkUniqueGridCellsAndCount(uint numParticles, uint* gridPosition, uint* uniqueGridNodes, cudaStream_t stream);
 
     void cudaMapNodeIndicesToParticles(uint numParticles, uint* uniqueGridNodes, uint* gridNodeIndicesToFirstParticleIndex, cudaStream_t stream);
+    
+    void cudaGetFirstNodeInYRows(uint numUniqueGridNodes, uint* gridNodeIndicesToFirstParticleIndex, uint* gridNodeIDs, uint* yDimFirstNodeIndex, Grid grid, cudaStream_t stream);
 
     void cudaSumParticlesPerNodeAndWriteNumUsedVoxels(uint numGridNodes, uint numParticles, uint* gridNodeIndicesToFirstParticleIndex,
         uint* subCellsTouchedPerParticle, uint* subCellsDim, uint* numNonZeroVoxels, uint* numParticlesInVoxelLists, uint numVoxelsPerNode,

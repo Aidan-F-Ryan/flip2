@@ -19,11 +19,15 @@ public:
     void download(cudaStream_t stream);
     void swapDevicePtr(T* devPtr);
     T* devPtr();
+    void clear();
+    void clearAsync(cudaStream_t stream);
     void print() const;
     inline uint size() const{
         return vec.size();
     }
     ~CudaVec();
+
+    static uint GPU_MEMORY_ALLOCATED;
 
 private:
     void cuMalloc();

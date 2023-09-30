@@ -38,6 +38,7 @@ Particles::Particles(uint size)
 void Particles::setDomain(float nx, float ny, float nz, uint x, uint y, uint z, float cellSize){
     grid.setNegativeCorner(nx, ny, nz);
     grid.setSize(x, y, z, cellSize);
+    yDimNumUsedGridNodes.resizeAsync(y*z, stream);
 }
 
 void Particles::alignParticlesToGrid(){
@@ -77,11 +78,17 @@ void Particles::generateVoxels(){
     numUsedGridNodes = kernels::cudaMarkUniqueGridCellsAndCount(size, gridCell.devPtr(), uniqueGridNodeIndices.devPtr(), stream);
     
     gridNodeIndicesToFirstParticleIndex.resizeAsync(numUsedGridNodes, stream);
+    CudaVec<uint> yDimIndices;
+    yDimIndices.resizeAsync(numUsedGridNodes, stream);
 
     kernels::cudaMapNodeIndicesToParticles(size, uniqueGridNodeIndices.devPtr(), gridNodeIndicesToFirstParticleIndex.devPtr(), stream);
+
     nodeIndexToFirstUsedVoxelX.resizeAsync(numUsedGridNodes, stream);
     nodeIndexToFirstUsedVoxelY.resizeAsync(numUsedGridNodes, stream);
     nodeIndexToFirstUsedVoxelZ.resizeAsync(numUsedGridNodes, stream);
+
+    kernels::cudaGetFirstNodeInYRows(numUsedGridNodes, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), yDimIndices.devPtr(), grid, stream);
+    
     uint* numParticlesInVoxelListsX;
     uint* numParticlesInVoxelListsY;
     uint* numParticlesInVoxelListsZ;
@@ -143,10 +150,20 @@ void Particles::generateVoxels(){
     voxelsUx.resizeAsync(numUsedVoxelsX, stream);
     voxelsUy.resizeAsync(numUsedVoxelsY, stream);
     voxelsUz.resizeAsync(numUsedVoxelsZ, stream);
+    std::cout<<"Using "<<(CudaVec<uint>::GPU_MEMORY_ALLOCATED + CudaVec<float>::GPU_MEMORY_ALLOCATED + CudaVec<char>::GPU_MEMORY_ALLOCATED) / (1<<20)<<" MB on GPU\n";
 
     gpuErrchk( cudaFreeAsync(numParticlesInVoxelListsX, stream) );
     gpuErrchk( cudaFreeAsync(numParticlesInVoxelListsY, stream) );
     gpuErrchk( cudaFreeAsync(numParticlesInVoxelListsZ, stream) );
+
+    subCellsTouchedX.clearAsync(stream);
+    subCellsTouchedY.clearAsync(stream);
+    subCellsTouchedZ.clearAsync(stream);
+    subCellsX.clearAsync(stream);
+    subCellsY.clearAsync(stream);
+    subCellsZ.clearAsync(stream);
+
+    std::cout<<"Using "<<(CudaVec<uint>::GPU_MEMORY_ALLOCATED + CudaVec<float>::GPU_MEMORY_ALLOCATED + CudaVec<char>::GPU_MEMORY_ALLOCATED) / (1<<20)<<" MB on GPU\n";
 }
 
 void Particles::particleVelToVoxels(){
@@ -171,7 +188,7 @@ void Particles::setupCudaDevices(){
     }
 
     for(uint i = 0; i < deviceProp.size(); ++i){
-        std::cout<<"Device "<<i<<": "<<deviceProp[i].name<<" with "<<deviceProp[i].totalGlobalMem / (1<<20)<<"MB available"<<std::endl;
+        std::cout<<"Device "<<i<<": "<<deviceProp[i].name<<" with "<<deviceProp[i].totalGlobalMem / (1<<20)<<"MB VRAM available"<<std::endl;
     }
 }
 

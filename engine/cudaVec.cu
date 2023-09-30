@@ -4,7 +4,7 @@
 
 template <typename T>
 CudaVec<T>::CudaVec()
-: d_vec(0){
+: d_vec(nullptr){
 
 }
 
@@ -77,6 +77,7 @@ void CudaVec<T>::cuMalloc(){
         gpuErrchk( cudaFree(d_vec) );
     }
     gpuErrchk( cudaMalloc((void**)&d_vec, sizeof(T)*vec.size()) );
+    GPU_MEMORY_ALLOCATED += sizeof(T) * vec.size();
 }
 
 template<typename T>
@@ -85,14 +86,38 @@ void CudaVec<T>::cuMallocAsync(const cudaStream_t& stream){
         gpuErrchk( cudaFreeAsync(d_vec, stream) );
     }
     gpuErrchk( cudaMallocAsync((void**)&d_vec, sizeof(T)*numElements, stream) );
+    GPU_MEMORY_ALLOCATED += sizeof(T) * numElements;
 }
 
 template<typename T>
 void CudaVec<T>::swapDevicePtr(T* devPtr){
     if(d_vec != nullptr && d_vec != devPtr){
         gpuErrchk( cudaFree(d_vec) );
+        GPU_MEMORY_ALLOCATED -= sizeof(T) * numElements;
     }
     d_vec = devPtr;
+}
+
+template <typename T>
+void CudaVec<T>::clear(){
+    if(d_vec != nullptr){
+        cudaFree(d_vec);
+        d_vec = nullptr;
+    }
+    GPU_MEMORY_ALLOCATED -= sizeof(T) * numElements;
+    vec.clear();
+    numElements = 0;
+}
+
+template <typename T>
+void CudaVec<T>::clearAsync(cudaStream_t stream){
+    if(d_vec != nullptr){
+        cudaFreeAsync(d_vec, stream);
+        d_vec = nullptr;
+    }
+    GPU_MEMORY_ALLOCATED -= sizeof(T) * numElements;
+    vec.clear();
+    numElements = 0;
 }
 
 template<typename T>
@@ -113,3 +138,6 @@ CudaVec<T>::~CudaVec(){
 template class CudaVec<float>;
 template class CudaVec<uint>;
 template class CudaVec<char>;
+
+template <typename T>
+uint CudaVec<T>::GPU_MEMORY_ALLOCATED = 0;
