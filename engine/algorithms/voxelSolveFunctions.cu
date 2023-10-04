@@ -118,13 +118,78 @@ void cudaVoxelUGather(uint numUsedVoxelsGrid, uint numGridNodes, uint numParticl
         refinementLevel, radius, solveDimension, numVoxels1D);
 }
 
-__device__ void getApronCellDataForThisBlock(uint numVoxelsPerNode, float* localVoxelsThisNode, uint* nodeIndexToFirstVoxelIndex, uint* voxelIDs,
-    float* voxelData)
-{
+__device__ bool isIndexApronCell(uint voxelIndex, const uint& numVoxels1D, const uint& refinementLevel, const float& radius){
+    uint numApronCellsAtBorder = floorf(radius);
+    uint rightBoundApronCells = (1<<refinementLevel) + numApronCellsAtBorder;
+    uint xWiseIndex = voxelIndex % (numVoxels1D);
+    uint yWiseIndex = (voxelIndex / numVoxels1D) % numVoxels1D;
+    uint zWiseIndex = voxelIndex / (numVoxels1D*numVoxels1D);
+    return xWiseIndex < numApronCellsAtBorder
+        || xWiseIndex > rightBoundApronCells
+        || yWiseIndex < numApronCellsAtBorder
+        || yWiseIndex > rightBoundApronCells
+        || zWiseIndex < numApronCellsAtBorder
+        || zWiseIndex > rightBoundApronCells;
 }
 
-__global__ void calculateDivU(uint numUsedVoxelsGrid, uint* nodeIndexToFirstVoxelIndex, uint* voxelIDs, float* voxelUs,
+__device__ void addVoxelDataForUsedNode(uint thisThreadNodeIndexToHandle, float* sharedBlockVoxelStorage, uint* nodeIndexToFirstVoxelIndex, uint* voxelIDs, float* voxelData){
+    uint startVoxelID;
+    if(thisThreadNodeIndexToHandle == 0){
+        startVoxelID = 0;
+    }
+    else{
+        startVoxelID = nodeIndexToFirstVoxelIndex[thisThreadNodeIndexToHandle-1];
+    }
+    for(uint currentUsedVoxelIndex = startVoxelID + threadIdx.x; currentUsedVoxelIndex < nodeIndexToFirstVoxelIndex[thisThreadNodeIndexToHandle]; currentUsedVoxelIndex += blockDim.x){
+        sharedBlockVoxelStorage[voxelIDs[currentUsedVoxelIndex]] += voxelData[voxelIDs[currentUsedVoxelIndex]];
+    }
+
+}
+
+__device__ void loadVoxelDataForThisBlock(uint numVoxelsPerNode, uint numUniqueGridNodes, float* sharedBlockStorage, uint* nodeIndexToFirstVoxelIndex, uint* voxelIDs,
+    float* voxelData, float radius, uint refinementLevel, Grid grid, uint* yDimToFirstNodeIndex, uint* gridNodeIndicesToFirstParticleIndex, uint* gridNodeIDs)
+{
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(index < numUniqueGridNodes){
+        for(uint i = threadIdx.x; i < numVoxelsPerNode; i += blockDim.x){
+            sharedBlockStorage[i] = 0.0f;
+        }
+        __syncthreads();
+        addVoxelDataForUsedNode(index, sharedBlockStorage, nodeIndexToFirstVoxelIndex, voxelIDs, voxelData);
+        uint curGridNodeID = gridNodeIDs[gridNodeIndicesToFirstParticleIndex[blockIdx.x]];
+        uint curY = (curGridNodeID / grid.sizeX) % grid.sizeY;
+        uint curZ = curGridNodeID / (grid.sizeX*grid.sizeY);
+
+        uint yNeighborLeft = curY - 1;
+        uint yNeighborRight = curY + 1;
+        uint zNeighborLeft = curZ - 1;
+        uint zNeighborRight = curZ + 1;
+
+        __syncthreads();
+        uint neighborUniqueID;
+        if((neighborUniqueID = yDimToFirstNodeIndex[yNeighborLeft + curZ*grid.sizeY]) < numUniqueGridNodes){
+            addVoxelDataForUsedNode(neighborUniqueID, sharedBlockStorage, nodeIndexToFirstVoxelIndex, voxelIDs, voxelData);
+        }
+        __syncthreads();
+        if((neighborUniqueID = yDimToFirstNodeIndex[yNeighborRight + curZ*grid.sizeY]) < numUniqueGridNodes){
+            addVoxelDataForUsedNode(neighborUniqueID, sharedBlockStorage, nodeIndexToFirstVoxelIndex, voxelIDs, voxelData);
+        }
+        __syncthreads();
+        if((neighborUniqueID = yDimToFirstNodeIndex[zNeighborRight*grid.sizeY + curY]) < numUniqueGridNodes){
+            addVoxelDataForUsedNode(neighborUniqueID, sharedBlockStorage, nodeIndexToFirstVoxelIndex, voxelIDs, voxelData);
+        }
+        __syncthreads();
+        if((neighborUniqueID = yDimToFirstNodeIndex[zNeighborLeft*grid.sizeY + curY]) < numUniqueGridNodes){
+            addVoxelDataForUsedNode(neighborUniqueID, sharedBlockStorage, nodeIndexToFirstVoxelIndex, voxelIDs, voxelData);
+        }
+        __syncthreads();
+    }
+}
+
+__global__ void calculateDivU(uint numVoxelsPerNode, uint numUsedVoxelsGrid, uint* nodeIndexToFirstVoxelIndex, uint* voxelIDs, float* voxelUs,
     Grid grid, uint* yDimFirstNodeIndex)
 {
+    extern __shared__ float sharedVoxels[];
+
 
 }
