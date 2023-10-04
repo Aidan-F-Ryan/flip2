@@ -1,4 +1,4 @@
-//Copyright Aberrant Behavior LLC 2023
+//Copyright 2023 Aberrant Behavior LLC
 
 #ifndef PARALLELPREFIXSUMKERNELS_HU
 #define PARALLELPREFIXSUMKERNELS_HU
@@ -41,5 +41,10 @@ __device__ void blockWiseExclusivePrefixSum(T* shared, uint workspaceSize, uint&
 
 }
 
+template <typename T>
+void cudaParallelPrefixSum_internal(uint numElements, T* array, T* blockSums, cudaStream_t stream);
+
+template <typename T>
+void cudaParallelPrefixSum(uint numElements, T* array, cudaStream_t stream);
 
 #endif

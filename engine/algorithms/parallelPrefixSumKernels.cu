@@ -1,4 +1,4 @@
-//Copyright Aberrant Behavior LLC 2023
+//Copyright 2023 Aberrant Behavior LLC
 
 #include "parallelPrefixSumKernels.hu"
 
@@ -40,3 +40,38 @@ __global__ void parallelPrefixApplyPreviousBlockSum(uint numElements, uint* arra
         array[index] += blockSums[blockIdx.x - 1];
     }
 }
+
+/**
+ * @brief Wrapper for executing CUDA parallel prefix sum
+ * 
+ * @tparam T 
+ * @param numElements 
+ * @param array 
+ * @param blockSums 
+ * @param stream 
+ */
+
+template <typename T>
+void cudaParallelPrefixSum_internal(uint numElements, T* array, T* blockSums, cudaStream_t stream){
+    parallelPrefix<<<numElements/WORKSIZE + 1, BLOCKSIZE, 0, stream>>>(numElements, array, blockSums);
+    gpuErrchk(cudaPeekAtLastError());
+    if(numElements / WORKSIZE > 0){
+        cudaParallelPrefixSum_internal((numElements/WORKSIZE + 1), blockSums, blockSums + numElements / WORKSIZE + 1, stream);
+    }
+    parallelPrefixApplyPreviousBlockSum<<<numElements/WORKSIZE + 1, WORKSIZE, 0, stream>>>(numElements, array, blockSums);
+    gpuErrchk(cudaPeekAtLastError());
+}
+
+template <typename T>
+void cudaParallelPrefixSum(uint numElements, T* array, cudaStream_t stream){
+    uint totalBlockSumsSize = 0;
+    T* blockSums;
+    for(uint i = numElements / WORKSIZE; i > 0; i = i / WORKSIZE ){
+        totalBlockSumsSize += i + 1;
+    }
+    gpuErrchk(cudaMallocAsync((void**)&blockSums, sizeof(T) * totalBlockSumsSize, stream));
+    cudaParallelPrefixSum_internal(numElements, array, blockSums, stream);
+    gpuErrchk(cudaFreeAsync(blockSums, stream));
+}
+
+template void cudaParallelPrefixSum(uint numElements, uint* array, cudaStream_t stream);

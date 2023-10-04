@@ -1,0 +1,14 @@
+//Copyright 2023 Aberrant Behavior LLC
+
+#ifndef VOXELSOLVEFUNCTIONS_HU
+#define VOXELSOLVEFUNCTIONS_HU
+
+    #include "../grid.hpp"
+    #include "../typedefs.h"
+
+    void cudaVoxelUGather(uint numUsedVoxelsGrid, uint numGridNodes, uint numParticles, uint numVoxelsPerNode, uint numParticlesInParticleLists,
+        uint* gridPosition, float* particleVs, float* px, float* py, float* pz, uint* nodeIndexToFirstVoxelIndex, uint* voxelIDs,
+        uint* perVoxelParticleListStartIndices, uint* particleList, float* voxelUs, Grid grid, uint xySize, uint refinementLevel,
+        float radius, uint numVoxels1D, VelocityGatherDimension solveDimension, cudaStream_t stream);
+
+#endif

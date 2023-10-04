@@ -1,11 +1,11 @@
-//Copyright Aberrant Behavior LLC 2023
+//Copyright 2023 Aberrant Behavior LLC
 
 #ifndef PARTICLES_H
 #define PARTICLES_H
 
 #include "typedefs.h"
 #include "cudaVec.hu"
-#include "algorithms/kernels.hu"
+#include "grid.hpp"
 
 #define REFINEMENTLEVELS 10
 

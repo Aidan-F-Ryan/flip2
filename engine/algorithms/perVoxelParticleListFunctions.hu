@@ -1,0 +1,18 @@
+//Copyright 2023 Aberrant Behavior LLC
+
+#ifndef PERVOXELPARTICLELISTFUNCTIONS_HU
+#define PERVOXELPARTICLELISTFUNCTIONS_HU
+
+    #include "../typedefs.h"
+    #include "../grid.hpp"
+
+    void cudaSumParticlesPerNodeAndWriteNumUsedVoxels(uint numGridNodes, uint numParticles, uint* gridNodeIndicesToFirstParticleIndex,
+        uint* subCellsTouchedPerParticle, uint* subCellsDim, uint* numNonZeroVoxels, uint* numParticlesInVoxelLists, uint numVoxelsPerNode,
+        cudaStream_t stream);
+    
+    void cudaParticleListCreate(uint totalNumberVoxelsDimension, uint numGridNodes, uint numParticles, uint numVoxelsPerNode,
+        uint* voxelIDs, uint* perVoxelParticleListStartIndices, uint* numUsedVoxelsPerNode, uint* firstParticleListIndexPerNode,
+        uint* subCellsTouchedPerParticle, uint* subCellsDim, uint* firstParticleInNodeIndex, uint* particleLists,
+        cudaStream_t stream);
+
+#endif

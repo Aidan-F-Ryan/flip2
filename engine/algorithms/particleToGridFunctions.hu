@@ -1,0 +1,24 @@
+//Copyright 2023 Aberrant Behavior LLC
+
+#ifndef PARTICLETOGRIDFUNCTIONS_HU
+#define PARTICLETOGRIDFUNCTIONS_HU
+
+    #include "../typedefs.h"
+    #include "../grid.hpp"
+    #include "../cudaVec.hu"
+
+    void cudaFindGridCell(float* px, float* py, float* pz, uint numParticles, Grid grid, uint* gridPosition, cudaStream_t stream);
+
+    void cudaFindSubCell(float* px, float* py, float* pz, uint numParticles, Grid grid, uint* gridPosition, uint* subCellsTouchedX,
+        uint* subCellsTouchedY, uint* subCellsTouchedZ, CudaVec<uint>& subCellPositionX, CudaVec<uint>& subCellPositionY,
+        CudaVec<uint>& subCellPositionZ, uint numRefinementLevels, float radius, cudaStream_t stream);
+
+    void cudaSortParticlesByGridNode(uint numParticles, uint*& gridPosition, uint*& reorderedIndicesRelativeToOriginal, cudaStream_t stream);
+
+    uint cudaMarkUniqueGridCellsAndCount(uint numParticles, uint* gridPosition, uint* uniqueGridNodes, cudaStream_t stream);
+
+    void cudaMapNodeIndicesToParticles(uint numParticles, uint* uniqueGridNodes, uint* gridNodeIndicesToFirstParticleIndex, cudaStream_t stream);
+    
+    void cudaGetFirstNodeInYRows(uint numUniqueGridNodes, uint* gridNodeIndicesToFirstParticleIndex, uint* gridNodeIDs, uint* yDimFirstNodeIndex, const Grid& grid, cudaStream_t stream);
+
+#endif

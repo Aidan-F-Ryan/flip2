@@ -1,4 +1,4 @@
-//Copyright Aberrant Behavior LLC 2023
+//Copyright 2023 Aberrant Behavior LLC
 
 #include "testing.h"
 

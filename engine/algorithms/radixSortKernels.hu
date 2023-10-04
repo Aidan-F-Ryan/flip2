@@ -1,4 +1,4 @@
-//Copyright Aberrant Behavior LLC 2023
+//Copyright 2023 Aberrant Behavior LLC
 
 #ifndef RADIXSORTKERNELS_HU
 #define RADIXSORTKERNELS_HU
@@ -12,5 +12,8 @@ __global__ void coalesceFrontBack(uint numElements, uint* outArray, uint* front,
 
 template <typename T>
 __global__ void reorderGridIndices(uint numElements, uint* sortedIndices, T* inArray, T* outArray);
+
+void cudaRadixSortUint(uint numElements, uint* inArray, uint* outArray, uint* sortedIndices, uint* front, uint* back,
+    cudaStream_t frontStream, cudaStream_t backStream, uint*& reorderedIndicesRelativeToOriginal);
 
 #endif

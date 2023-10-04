@@ -1,6 +1,7 @@
-//Copyright Aberrant Behavior LLC 2023
+//Copyright 2023 Aberrant Behavior LLC
 
 #include "radixSortKernels.hu"
+#include "parallelPrefixSumKernels.hu"
 
 __global__ void radixBinUintByBitIndex(uint numElements, uint* inArray, uint bitIndex, uint* front, uint* back){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
@@ -61,3 +62,53 @@ __global__ void reorderGridIndices(uint numElements, uint* sortedIndices, T* inA
 
 template __global__ void reorderGridIndices(uint numElements, uint *sortedIndices, uint* inArray, uint* outArray);
 template __global__ void reorderGridIndices(uint numElements, uint *sortedIndices, float* inArray, float* outArray);
+
+/**
+ * @brief Wrapper for performing CUDA radix inclusive sort on uint array
+ * 
+ * @param numElements 
+ * @param inArray 
+ * @param outArray 
+ * @param sortedIndices 
+ * @param front 
+ * @param back 
+ * @param blockSumsFront 
+ * @param blockSumsBack 
+ * @param frontStream 
+ * @param backStream 
+ */
+
+void cudaRadixSortUint(uint numElements, uint* inArray, uint* outArray, uint* sortedIndices, uint* front, uint* back, cudaStream_t frontStream, cudaStream_t backStream, uint*& reorderedIndicesRelativeToOriginal){
+    uint* tReordered;
+
+    cudaMallocAsync((void**)&reorderedIndicesRelativeToOriginal, sizeof(uint) * numElements, backStream); //reordered indices relative to original position, for shuffling positions
+    cudaMallocAsync((void**)&tReordered, sizeof(uint) * numElements, backStream); //reordered indices relative to original position, for shuffling positions
+
+    for(uint i = 0; i < sizeof(uint)*8; ++i){
+        radixBinUintByBitIndex<<<numElements/BLOCKSIZE + 1, BLOCKSIZE, 0, frontStream>>>(numElements, inArray, i, front, back);
+        
+        cudaStreamSynchronize(frontStream);
+        cudaParallelPrefixSum<uint>(numElements, front, frontStream);
+        cudaParallelPrefixSum<uint>(numElements, back, backStream);
+
+        cudaStreamSynchronize(backStream);
+        coalesceFrontBack<<<numElements/BLOCKSIZE + 1, BLOCKSIZE, 0, frontStream>>>(numElements, sortedIndices, front, back);
+        reorderGridIndices<<<numElements/BLOCKSIZE + 1, BLOCKSIZE, 0, frontStream>>>(numElements, sortedIndices, inArray, outArray);
+        cudaStreamSynchronize(frontStream);
+        
+        if(i == 0){
+            cudaMemcpyAsync(reorderedIndicesRelativeToOriginal, sortedIndices, sizeof(uint)*numElements, cudaMemcpyDeviceToDevice, frontStream);
+        }
+        else{
+            reorderGridIndices<<<numElements/BLOCKSIZE + 1, BLOCKSIZE, 0, frontStream>>>(numElements, sortedIndices, reorderedIndicesRelativeToOriginal, tReordered);
+            uint* temp = tReordered;
+            tReordered = reorderedIndicesRelativeToOriginal;
+            reorderedIndicesRelativeToOriginal = temp;
+        }
+
+        uint* tempGP = inArray;
+        inArray = outArray;
+        outArray = tempGP;
+    }
+    cudaFreeAsync(tReordered, backStream);
+}

@@ -1,4 +1,4 @@
-#Copyright Aberrant Behavior LLC 2023
+#Copyright 2023 Aberrant Behavior LLC
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_FLAGS "-Wall -Wextra")
@@ -23,7 +23,7 @@ add_library(particles SHARED
     particles.cu
 )
 
-target_link_libraries(particles ${cudaLibraries} kernels parallelPrefixSumKernels radixSortKernels reductionKernels)
+target_link_libraries(particles ${cudaLibraries}  parallelPrefixSumKernels radixSortKernels reductionKernels particleToGridFunctions perVoxelParticleListFunctions voxelSolveFunctions)
 set_target_properties(particles PROPERTIES CUDA_ARCHITECTURES "61;86;")
 
 add_executable(main main.cu)
