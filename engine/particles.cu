@@ -1,3 +1,5 @@
+//Copyright Aberrant Behavior LLC 2023
+
 #include "algorithms/kernels.hu"
 #include "particles.hu"
 #include "grid.hpp"
@@ -79,7 +81,7 @@ void Particles::generateVoxels(){
     
     gridNodeIndicesToFirstParticleIndex.resizeAsync(numUsedGridNodes, stream);
     CudaVec<uint> yDimIndices;
-    yDimIndices.resizeAsync(numUsedGridNodes, stream);
+    yDimIndices.resizeAsync(grid.sizeY*grid.sizeZ, stream);
 
     kernels::cudaMapNodeIndicesToParticles(size, uniqueGridNodeIndices.devPtr(), gridNodeIndicesToFirstParticleIndex.devPtr(), stream);
 

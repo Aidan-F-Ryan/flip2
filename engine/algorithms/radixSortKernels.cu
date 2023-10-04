@@ -1,3 +1,5 @@
+//Copyright Aberrant Behavior LLC 2023
+
 #include "radixSortKernels.hu"
 
 __global__ void radixBinUintByBitIndex(uint numElements, uint* inArray, uint bitIndex, uint* front, uint* back){

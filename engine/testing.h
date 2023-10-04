@@ -1,3 +1,5 @@
+//Copyright Aberrant Behavior LLC 2023
+
 #ifndef TESTING_H
 #define TESTING_H
 

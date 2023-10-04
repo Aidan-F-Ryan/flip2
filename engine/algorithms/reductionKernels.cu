@@ -1,3 +1,5 @@
+//Copyright Aberrant Behavior LLC 2023
+
 #include "reductionKernels.hu"
 
 __global__ void parallelReduction(uint numElements, uint* array, uint* outArray)

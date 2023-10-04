@@ -1,3 +1,5 @@
+//Copyright Aberrant Behavior LLC 2023
+
 #include "parallelPrefixSumKernels.hu"
 
 __global__ void parallelPrefix(uint numElements, uint* array, uint* blockSums){ // BLOCKSIZE threads operating on WORKSIZE (2x BLOCKSIZE) elements

@@ -1,3 +1,5 @@
+//Copyright Aberrant Behavior LLC 2023
+
 #include "cudaVec.hu"
 #include "typedefs.h"
 #include <iostream>

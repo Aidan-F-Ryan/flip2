@@ -1,3 +1,5 @@
+//Copyright Aberrant Behavior LLC 2023
+
 #include "kernels.hu"
 #include "parallelPrefixSumKernels.hu"
 #include "radixSortKernels.hu"
@@ -416,6 +418,14 @@ void kernels::cudaMapNodeIndicesToParticles(uint numParticles, uint* uniqueGridN
     mapNodeIndicesToParticles<<<numParticles / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numParticles, uniqueGridNodes, gridNodeIndicesToFirstParticleIndex);
 }
 
+__global__ void zeroYDimArray(Grid grid, uint numUniqueGridNodes, uint* yDimFirstNodeIndex){
+    uint index = threadIdx.x + blockDim.x*blockIdx.x;
+    if(index < grid.sizeX*grid.sizeY){
+        yDimFirstNodeIndex[index] = numUniqueGridNodes;
+    }
+}
+
+//find first node index of each used y-dimension row in memory, allows for y dimension-scan)
 __global__ void getYDimPositionFirstInRow(uint numUniqueGridNodes, uint* gridNodeIndicesToFirstParticleIndex, uint* gridNodeIDs, uint* yDimFirstNodeIndex, Grid grid){
     uint index = threadIdx.x + blockDim.x*blockIdx.x;
     if(index < numUniqueGridNodes){
@@ -424,7 +434,7 @@ __global__ void getYDimPositionFirstInRow(uint numUniqueGridNodes, uint* gridNod
             prevGridNodeUniqueIndex = gridNodeIDs[gridNodeIndicesToFirstParticleIndex[index - 1]];
         }
         else{
-            prevGridNodeUniqueIndex = 0;
+            prevGridNodeUniqueIndex = numUniqueGridNodes;
         }
         uint gridNodeUniqueIndex = gridNodeIDs[gridNodeIndicesToFirstParticleIndex[index]];
         uint prevYRow = prevGridNodeUniqueIndex / grid.sizeX;
@@ -435,7 +445,9 @@ __global__ void getYDimPositionFirstInRow(uint numUniqueGridNodes, uint* gridNod
     }
 }
 
-void kernels::cudaGetFirstNodeInYRows(uint numUniqueGridNodes, uint* gridNodeIndicesToFirstParticleIndex, uint* gridNodeIDs, uint* yDimFirstNodeIndex, Grid grid, cudaStream_t stream){
+void kernels::cudaGetFirstNodeInYRows(uint numUniqueGridNodes, uint* gridNodeIndicesToFirstParticleIndex, uint* gridNodeIDs, uint* yDimFirstNodeIndex, const Grid& grid, cudaStream_t stream){
+    zeroYDimArray<<<grid.sizeX*grid.sizeY / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(grid, numUniqueGridNodes, yDimFirstNodeIndex);
+    cudaStreamSynchronize(stream);
     getYDimPositionFirstInRow<<<numUniqueGridNodes / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numUniqueGridNodes, gridNodeIndicesToFirstParticleIndex, gridNodeIDs, yDimFirstNodeIndex, grid);
 }
 
@@ -694,7 +706,7 @@ __global__ void voxelUGather(uint numVoxelsPerNode, uint numUsedVoxelsInGrid, ui
             voxelPy += 0.5*subCellWidth;
             voxelPz += 0.5*subCellWidth;
         }
-        else if(solveDimension == VelocityGatherDimension::X){
+        else if(solveDimension == VelocityGatherDimension::Y){
             voxelPx += 0.5*subCellWidth;
             voxelPz += 0.5*subCellWidth;
         }
@@ -737,4 +749,15 @@ void kernels::cudaVoxelUGather(uint numUsedVoxelsGrid, uint numGridNodes, uint n
     voxelUGather<<<numGridNodes, BLOCKSIZE, sizeof(float) * numVoxelsPerNode, stream>>>(numVoxelsPerNode, numUsedVoxelsGrid, numParticlesInParticleLists,
         gridPosition, particleVs, px, py, pz, nodeIndexToFirstVoxelIndex, voxelIDs, perVoxelParticleListStartIndices, particleLists, voxelUs, grid, xySize,
         refinementLevel, radius, solveDimension, numVoxels1D);
+}
+
+__device__ void getApronCellDataForThisBlock(uint numVoxelsPerNode, float* localVoxelsThisNode, uint* nodeIndexToFirstVoxelIndex, uint* voxelIDs,
+    float* voxelData)
+{
+}
+
+__global__ void calculateDivU(uint numUsedVoxelsGrid, uint* nodeIndexToFirstVoxelIndex, uint* voxelIDs, float* voxelUs,
+    Grid grid, uint* yDimFirstNodeIndex)
+{
+
 }

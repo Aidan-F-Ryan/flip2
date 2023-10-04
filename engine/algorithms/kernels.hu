@@ -1,3 +1,5 @@
+//Copyright Aberrant Behavior LLC 2023
+
 #ifndef KERNELS_H
 #define KERNELS_H
 
@@ -28,7 +30,7 @@ namespace kernels{
 
     void cudaMapNodeIndicesToParticles(uint numParticles, uint* uniqueGridNodes, uint* gridNodeIndicesToFirstParticleIndex, cudaStream_t stream);
     
-    void cudaGetFirstNodeInYRows(uint numUniqueGridNodes, uint* gridNodeIndicesToFirstParticleIndex, uint* gridNodeIDs, uint* yDimFirstNodeIndex, Grid grid, cudaStream_t stream);
+    void cudaGetFirstNodeInYRows(uint numUniqueGridNodes, uint* gridNodeIndicesToFirstParticleIndex, uint* gridNodeIDs, uint* yDimFirstNodeIndex, const Grid& grid, cudaStream_t stream);
 
     void cudaSumParticlesPerNodeAndWriteNumUsedVoxels(uint numGridNodes, uint numParticles, uint* gridNodeIndicesToFirstParticleIndex,
         uint* subCellsTouchedPerParticle, uint* subCellsDim, uint* numNonZeroVoxels, uint* numParticlesInVoxelLists, uint numVoxelsPerNode,

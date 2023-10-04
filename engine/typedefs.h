@@ -1,3 +1,5 @@
+//Copyright Aberrant Behavior LLC 2023
+
 #ifndef TYPEDEFS_H
 #define TYPEDEFS_H
 
