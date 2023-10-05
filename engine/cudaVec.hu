@@ -21,11 +21,12 @@ public:
     void download(cudaStream_t stream);
     void swapDevicePtr(T* devPtr);
     T* devPtr();
+    const T* devPtr() const;
     void clear();
     void clearAsync(cudaStream_t stream);
     void print() const;
     inline uint size() const{
-        return vec.size();
+        return numElements;
     }
     ~CudaVec();
 

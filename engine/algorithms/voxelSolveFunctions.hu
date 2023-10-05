@@ -5,6 +5,7 @@
 
     #include "../grid.hpp"
     #include "../typedefs.h"
+    #include "../cudaVec.hu"
 
     void cudaVoxelUGather(uint numUsedVoxelsGrid, uint numGridNodes, uint numParticles, uint numVoxelsPerNode, uint numParticlesInParticleLists,
         uint* gridPosition, float* particleVs, float* px, float* py, float* pz, uint* nodeIndexToFirstVoxelIndex, uint* voxelIDs,

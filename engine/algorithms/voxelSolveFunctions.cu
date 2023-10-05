@@ -132,7 +132,9 @@ __device__ bool isIndexApronCell(uint voxelIndex, const uint& numVoxels1D, const
         || zWiseIndex > rightBoundApronCells;
 }
 
-__device__ void addVoxelDataForUsedNode(uint thisThreadNodeIndexToHandle, float* sharedBlockVoxelStorage, uint* nodeIndexToFirstVoxelIndex, uint* voxelIDs, float* voxelData){
+__device__ void addVoxelDataForUsedNode(const uint thisThreadNodeIndexToHandle, float* sharedBlockVoxelStorage, const uint* nodeIndexToFirstVoxelIndex,
+        const uint* voxelIDs, const float* voxelData)
+{
     uint startVoxelID;
     if(thisThreadNodeIndexToHandle == 0){
         startVoxelID = 0;
@@ -146,50 +148,73 @@ __device__ void addVoxelDataForUsedNode(uint thisThreadNodeIndexToHandle, float*
 
 }
 
-__device__ void loadVoxelDataForThisBlock(uint numVoxelsPerNode, uint numUniqueGridNodes, float* sharedBlockStorage, uint* nodeIndexToFirstVoxelIndex, uint* voxelIDs,
-    float* voxelData, float radius, uint refinementLevel, Grid grid, uint* yDimToFirstNodeIndex, uint* gridNodeIndicesToFirstParticleIndex, uint* gridNodeIDs)
+__device__ void loadVoxelDataForThisBlock(const uint numVoxelsPerNode, const uint numUniqueGridNodes, float* sharedBlockStorage,
+    const uint* nodeIndexToFirstVoxelIndex, const uint* voxelIDs, const float* voxelData, const float radius, const uint refinementLevel,
+    const Grid& grid, const uint* yDimToFirstNodeIndex, const uint* gridNodeIndicesToFirstParticleIndex, const uint* gridNodeIDs)
 {
+    for(uint i = threadIdx.x; i < numVoxelsPerNode; i += blockDim.x){
+        sharedBlockStorage[i] = 0.0f;
+    }
+    __syncthreads();
+    addVoxelDataForUsedNode(threadIdx.x + blockIdx.x*blockDim.x, sharedBlockStorage,
+        nodeIndexToFirstVoxelIndex, voxelIDs, voxelData);
+    
+    uint curGridNodeID = gridNodeIDs[gridNodeIndicesToFirstParticleIndex[blockIdx.x]];
+    uint curY = (curGridNodeID / grid.sizeX) % grid.sizeY;
+    uint curZ = curGridNodeID / (grid.sizeX*grid.sizeY);
+
+    uint yNeighborLeft = curY - 1;
+    uint yNeighborRight = curY + 1;
+    uint zNeighborLeft = curZ - 1;
+    uint zNeighborRight = curZ + 1;
+
+    __syncthreads();
+    uint neighborUniqueID;
+    if((neighborUniqueID = yDimToFirstNodeIndex[yNeighborLeft + curZ*grid.sizeY]) < numUniqueGridNodes){
+        addVoxelDataForUsedNode(neighborUniqueID, sharedBlockStorage,
+            nodeIndexToFirstVoxelIndex, voxelIDs, voxelData);
+    }
+    __syncthreads();
+    if((neighborUniqueID = yDimToFirstNodeIndex[yNeighborRight + curZ*grid.sizeY]) < numUniqueGridNodes){
+        addVoxelDataForUsedNode(neighborUniqueID, sharedBlockStorage,
+            nodeIndexToFirstVoxelIndex, voxelIDs, voxelData);
+    }
+    __syncthreads();
+    if((neighborUniqueID = yDimToFirstNodeIndex[zNeighborRight*grid.sizeY + curY]) < numUniqueGridNodes){
+        addVoxelDataForUsedNode(neighborUniqueID, sharedBlockStorage,
+            nodeIndexToFirstVoxelIndex, voxelIDs, voxelData);
+    }
+    __syncthreads();
+    if((neighborUniqueID = yDimToFirstNodeIndex[zNeighborLeft*grid.sizeY + curY]) < numUniqueGridNodes){
+        addVoxelDataForUsedNode(neighborUniqueID, sharedBlockStorage,
+            nodeIndexToFirstVoxelIndex, voxelIDs, voxelData);
+    }
+    __syncthreads();
+}
+
+__global__ void calculateDivU(uint numVoxelsPerNode, uint numVoxels1D, uint numUsedVoxelsInGrid, const uint* nodeIndexToFirstVoxelIndex, const uint* voxelIDs,
+                                const float* voxelUs, float radius, uint refinementLevel, Grid grid, const uint* yDimFirstNodeIndex,
+                                const uint* gridNodeIndicesToFirstParticleIndex, const uint* gridNodes, float* divU)
+{
+    extern __shared__ float sharedVoxels[];
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
-    if(index < numUniqueGridNodes){
-        for(uint i = threadIdx.x; i < numVoxelsPerNode; i += blockDim.x){
-            sharedBlockStorage[i] = 0.0f;
-        }
-        __syncthreads();
-        addVoxelDataForUsedNode(index, sharedBlockStorage, nodeIndexToFirstVoxelIndex, voxelIDs, voxelData);
-        uint curGridNodeID = gridNodeIDs[gridNodeIndicesToFirstParticleIndex[blockIdx.x]];
-        uint curY = (curGridNodeID / grid.sizeX) % grid.sizeY;
-        uint curZ = curGridNodeID / (grid.sizeX*grid.sizeY);
-
-        uint yNeighborLeft = curY - 1;
-        uint yNeighborRight = curY + 1;
-        uint zNeighborLeft = curZ - 1;
-        uint zNeighborRight = curZ + 1;
-
-        __syncthreads();
-        uint neighborUniqueID;
-        if((neighborUniqueID = yDimToFirstNodeIndex[yNeighborLeft + curZ*grid.sizeY]) < numUniqueGridNodes){
-            addVoxelDataForUsedNode(neighborUniqueID, sharedBlockStorage, nodeIndexToFirstVoxelIndex, voxelIDs, voxelData);
-        }
-        __syncthreads();
-        if((neighborUniqueID = yDimToFirstNodeIndex[yNeighborRight + curZ*grid.sizeY]) < numUniqueGridNodes){
-            addVoxelDataForUsedNode(neighborUniqueID, sharedBlockStorage, nodeIndexToFirstVoxelIndex, voxelIDs, voxelData);
-        }
-        __syncthreads();
-        if((neighborUniqueID = yDimToFirstNodeIndex[zNeighborRight*grid.sizeY + curY]) < numUniqueGridNodes){
-            addVoxelDataForUsedNode(neighborUniqueID, sharedBlockStorage, nodeIndexToFirstVoxelIndex, voxelIDs, voxelData);
-        }
-        __syncthreads();
-        if((neighborUniqueID = yDimToFirstNodeIndex[zNeighborLeft*grid.sizeY + curY]) < numUniqueGridNodes){
-            addVoxelDataForUsedNode(neighborUniqueID, sharedBlockStorage, nodeIndexToFirstVoxelIndex, voxelIDs, voxelData);
-        }
-        __syncthreads();
+    if(index < numUsedVoxelsInGrid){
+        loadVoxelDataForThisBlock(numVoxelsPerNode, numUsedVoxelsInGrid, sharedVoxels,
+                nodeIndexToFirstVoxelIndex, voxelIDs, voxelUs, radius, refinementLevel,
+                grid, yDimFirstNodeIndex, gridNodeIndicesToFirstParticleIndex,
+                gridNodes);
     }
 }
 
-__global__ void calculateDivU(uint numVoxelsPerNode, uint numUsedVoxelsGrid, uint* nodeIndexToFirstVoxelIndex, uint* voxelIDs, float* voxelUs,
-    Grid grid, uint* yDimFirstNodeIndex)
+void cudaPressureSolve(const CudaVec<uint>& nodeIndexToFirstVoxelIndex, const CudaVec<uint>& voxelIDs, const CudaVec<float>& voxelUs,
+                        float radius, uint refinementLevel, const Grid& grid, const CudaVec<uint>& yDimFirstNodeIndex,
+                        const CudaVec<uint>& gridNodeIndicesToFirstParticleIndex, const CudaVec<uint>& gridNodes, uint numVoxelsPerNode,
+                        uint numVoxels1D,
+                        CudaVec<float> divU, CudaVec<float> Ax, CudaVec<float> Ay, CudaVec<float> Az, CudaVec<float> Adiag, cudaStream_t stream)
 {
-    extern __shared__ float sharedVoxels[];
-
-
+    calculateDivU<<<nodeIndexToFirstVoxelIndex.size(), BLOCKSIZE, sizeof(float)*numVoxelsPerNode, stream>>>
+        (numVoxelsPerNode, numVoxels1D, nodeIndexToFirstVoxelIndex.size(), nodeIndexToFirstVoxelIndex.devPtr(),
+        voxelIDs.devPtr(), voxelUs.devPtr(), radius, refinementLevel, grid, yDimFirstNodeIndex.devPtr(),
+        gridNodeIndicesToFirstParticleIndex.devPtr(), gridNodes.devPtr(), divU.devPtr());
+    gpuErrchk(cudaPeekAtLastError());
 }

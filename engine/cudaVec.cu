@@ -73,6 +73,11 @@ T* CudaVec<T>::devPtr(){
     return d_vec;
 }
 
+template <typename T>
+const T* CudaVec<T>::devPtr() const{
+    return d_vec;
+}
+
 template<typename T>
 void CudaVec<T>::cuMalloc(){
     if(d_vec != nullptr){
