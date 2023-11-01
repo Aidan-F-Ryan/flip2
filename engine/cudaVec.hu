@@ -7,6 +7,14 @@
 #include <vector>
 
 template <typename T>
+__global__ void zeroArray(uint size, T* array){
+    uint index = threadIdx.x + blockDim.x*blockIdx.x;
+    if(index < size){
+        array[index] = 0;
+    }
+}
+
+template <typename T>
 class CudaVec{
 public:
     CudaVec();
@@ -25,6 +33,8 @@ public:
     void clear();
     void clearAsync(cudaStream_t stream);
     void print() const;
+    void zeroDevice();
+    void zeroDeviceAsync(cudaStream_t stream);
     inline uint size() const{
         return numElements;
     }

@@ -136,6 +136,16 @@ void CudaVec<T>::print() const{
 }
 
 template<typename T>
+void CudaVec<T>::zeroDevice(){
+    zeroArray<<<numElements / BLOCKSIZE + 1, BLOCKSIZE>>>(numElements, d_vec);
+}
+
+template<typename T>
+void CudaVec<T>::zeroDeviceAsync(cudaStream_t stream){
+    zeroArray<<<numElements / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numElements, d_vec);
+}
+
+template<typename T>
 CudaVec<T>::~CudaVec(){
     if(d_vec != nullptr){
         gpuErrchk( cudaFree(d_vec) );

@@ -47,4 +47,5 @@ void cudaParallelPrefixSum_internal(uint numElements, T* array, T* blockSums, cu
 template <typename T>
 void cudaParallelPrefixSum(uint numElements, T* array, cudaStream_t stream);
 
+
 #endif

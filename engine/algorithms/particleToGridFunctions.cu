@@ -294,13 +294,6 @@ __global__ void markUniqueGridCells(uint numElements, uint* gridCells, uint* uni
         }
     }
 }
-template <typename T>
-__global__ void zeroArray(uint size, T* array){
-    uint index = threadIdx.x + blockDim.x*blockIdx.x;
-    if(index < size){
-        array[index] = 0;
-    }
-}
 
 uint cudaMarkUniqueGridCellsAndCount(uint numParticles, uint* gridCells, uint* uniqueGridNodes, cudaStream_t stream){
     markUniqueGridCells<<<numParticles / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numParticles, gridCells, uniqueGridNodes);

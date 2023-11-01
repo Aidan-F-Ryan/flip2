@@ -16,7 +16,7 @@ public:
     void setDomain(float nx, float ny, float nz, uint x, uint y, uint z, float cellSize);
 
     void alignParticlesToGrid();
-    void alignParticlesToSubCells();
+    // void alignParticlesToSubCells();
 
     void sortParticles();
 
@@ -26,6 +26,10 @@ public:
 
     void setupCudaDevices();
 
+    void pressureSolve();
+
+    // void universalIndexCreation();
+
     ~Particles();
 private:
     CudaVec<float> px, py, pz;
@@ -34,34 +38,42 @@ private:
 
     CudaVec<uint> yDimNumUsedGridNodes;
     
-    CudaVec<uint> subCellsTouchedX;
-    CudaVec<uint> subCellsTouchedY;
-    CudaVec<uint> subCellsTouchedZ; //number of subcells touched by each particle
+    // CudaVec<uint> subCellsTouchedX;
+    // CudaVec<uint> subCellsTouchedY;
+    // CudaVec<uint> subCellsTouchedZ; //number of subcells touched by each particle
     
-    CudaVec<uint> subCellsX;
-    CudaVec<uint> subCellsY;
-    CudaVec<uint> subCellsZ; //subcell index list, multiple subcells per particle allowed, indexed by subCellsTouched
+    // CudaVec<uint> subCellsX;
+    // CudaVec<uint> subCellsY;
+    // CudaVec<uint> subCellsZ; //subcell index list, multiple subcells per particle allowed, indexed by subCellsTouched
     
     CudaVec<uint> reorderedGridIndices;
 
     CudaVec<uint> uniqueGridNodeIndices;
     CudaVec<uint> gridNodeIndicesToFirstParticleIndex;
 
-    CudaVec<uint> nodeIndexToFirstUsedVoxelX;
-    CudaVec<uint> nodeIndexToFirstUsedVoxelY;
-    CudaVec<uint> nodeIndexToFirstUsedVoxelZ;
+    CudaVec<uint> nodeIndexUsedVoxels;
+    // CudaVec<uint> nodeIndexToFirstUsedVoxelX;
+    // CudaVec<uint> nodeIndexToFirstUsedVoxelY;
+    // CudaVec<uint> nodeIndexToFirstUsedVoxelZ;
 
-    CudaVec<uint> particleListsX;
-    CudaVec<uint> particleListsY;
-    CudaVec<uint> particleListsZ;
+    // CudaVec<uint> particleListsX;
+    // CudaVec<uint> particleListsY;
+    // CudaVec<uint> particleListsZ;
 
-    CudaVec<uint> voxelIDsX;
-    CudaVec<uint> voxelIDsY;
-    CudaVec<uint> voxelIDsZ;
+    // CudaVec<uint> voxelIDsX;
+    // CudaVec<uint> voxelIDsY;
+    // CudaVec<uint> voxelIDsZ;
+    CudaVec<uint> voxelIDsUsed;
 
-    CudaVec<uint> voxelParticleListStartX;
-    CudaVec<uint> voxelParticleListStartY;
-    CudaVec<uint> voxelParticleListStartZ;
+    // CudaVec<uint> voxelParticleListStartX;
+    // CudaVec<uint> voxelParticleListStartY;
+    // CudaVec<uint> voxelParticleListStartZ;
+
+    CudaVec<float> Adiag;
+    CudaVec<float> Ax;
+    CudaVec<float> Ay;
+    CudaVec<float> Az;
+    CudaVec<float> divU;
 
     CudaVec<float> voxelsUx;
     CudaVec<float> voxelsUy;

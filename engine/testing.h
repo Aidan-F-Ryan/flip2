@@ -80,29 +80,28 @@ public:
         storeGridCellMap();
         particles.sortParticles();
         validateGridCellOrdering();
-        particles.alignParticlesToSubCells();
+        // particles.alignParticlesToSubCells();
         particles.generateVoxels();
         particles.particleVelToVoxels();
-        particles.voxelsUx.download();
-        particles.voxelIDsX.download();
-        particles.voxelsUy.download();
-        particles.voxelIDsY.download();
-        particles.voxelsUz.download();
-        particles.voxelIDsZ.download();
 
-        for(uint i = 0; i < particles.voxelIDsX.size(); ++i){
-            std::cout<<particles.voxelIDsX[i]<<": "<<particles.voxelsUx[i]<<std::endl;
-            std::cout<<particles.voxelIDsY[i]<<": "<<particles.voxelsUy[i]<<std::endl;
-            std::cout<<particles.voxelIDsZ[i]<<": "<<particles.voxelsUy[i]<<std::endl;
+        particles.voxelsUx.download();
+        particles.voxelsUy.download();
+        particles.voxelsUz.download();
+        particles.voxelIDsUsed.download();
+
+        for(uint i = 0; i < particles.voxelIDsUsed.size(); ++i){
+            std::cout<<particles.voxelIDsUsed[i]<<": <"<<particles.voxelsUx[i]<<", "<<particles.voxelsUy[i]<<", "<<particles.voxelsUz[i]<<">\n";
         }
+        particles.pressureSolve();
     }
 
     void run(){
         particles.alignParticlesToGrid();
         particles.sortParticles();
-        particles.alignParticlesToSubCells();
+        // particles.alignParticlesToSubCells();
         particles.generateVoxels();
         particles.particleVelToVoxels();
+        particles.pressureSolve();
     }
 
 private:

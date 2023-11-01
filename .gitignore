@@ -3,3 +3,5 @@ debug/
 .cache/
 html/
 latex/
+engine/Makefile
+engine/devManagerTestDriver.cu

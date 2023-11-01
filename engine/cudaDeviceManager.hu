@@ -1,0 +1,108 @@
+#ifndef CUDADEVICEMANAGER_HU
+#define CUDADEVICEMANAGER_HU
+
+#include "typedefs.h"
+#include <set>
+#include <iostream>
+
+struct CudaArray{
+    char* start;
+    unsigned long long size;
+};
+
+struct CudaArrayCmp{
+    bool operator()(const CudaArray& lhs, const CudaArray& rhs) const{
+        return lhs.start < rhs.start;
+    }
+    bool operator()(const char*& lhs, const CudaArray& rhs) const{
+        return lhs < rhs.start;
+    }
+    bool operator()(const CudaArray& lhs, const char*& rhs) const{
+        return lhs.start < rhs;
+    }
+};
+
+class CudaDeviceManager{
+public:
+    CudaDeviceManager(uint devID = 0)
+    : memoryPool(nullptr)
+    , deviceID(devID)
+    {
+        if(cudaSuccess != cudaSetDevice(deviceID)){
+            std::cerr<<"Device "<<deviceID<<" not available";
+            exit(1);
+        }
+    }
+
+    bool setPoolSize(unsigned long long size){
+        if(cudaSuccess != cudaMalloc((void**)&memoryPool, size)){
+            return true;
+        }
+        curPointer = memoryPool;
+        memoryPoolSize = size;
+        availableSize = size;
+        return false;
+    }
+
+    template <typename T>
+    bool cuMalloc(T*& ptr, unsigned long long size){
+        unsigned long long byteSize = sizeof(T) * size;
+        if(byteSize < availableSize){
+            allocations.insert({curPointer, byteSize});
+            ptr = (T*)curPointer;
+            curPointer += byteSize;
+            availableSize -= byteSize;
+            // std::cout<<"allocating "<<byteSize<<" bytes at "<<(void*)ptr<<"\n";
+            return false;
+        }
+        else{
+            CudaArray prevAllocation{memoryPool,0};
+            for(auto& allocation : allocations){
+                if((long long)allocation.start - (long long)(prevAllocation.start + prevAllocation.size) > byteSize){
+                    allocations.insert({prevAllocation.start + prevAllocation.size, byteSize});
+                    ptr = (T*)(prevAllocation.start + prevAllocation.size);
+                    // std::cout<<"allocating "<<byteSize<<" bytes at "<<(void*)ptr<<"\n";
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    template<typename T>
+    bool cuFree(T* ptr){
+        auto found = allocations.find({(char*)ptr, 0});
+        if(found != allocations.end()){
+            // std::cout<<"erasing "<<found->size<<" bytes from "<<(void*)found->start<<"\n";
+            allocations.erase(found);
+            if(!allocations.size()){
+                availableSize = memoryPoolSize;
+                curPointer = memoryPool;
+            }
+            else{
+                auto last = allocations.rbegin();
+                availableSize = (long long)(memoryPool + memoryPoolSize) - (long long)(last->start + last->size);
+                curPointer = memoryPool + (memoryPoolSize - availableSize);
+            }
+            return false;
+        }
+        return true;
+    }
+
+    ~CudaDeviceManager(){
+        if(memoryPool != nullptr){
+            cudaFree(memoryPool);
+        }
+    }
+
+private:
+    char* memoryPool;
+    unsigned long long memoryPoolSize;
+    unsigned long long availableSize;
+    char* curPointer;
+    uint deviceID;
+
+    std::set<CudaArray, CudaArrayCmp> allocations;
+};
+
+#endif
