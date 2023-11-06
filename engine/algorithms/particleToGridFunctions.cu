@@ -265,7 +265,7 @@ void cudaSortParticlesByGridNode(uint numParticles, uint*& gridPosition, uint*& 
 
     cudaStream_t backStream;
     cudaStreamCreate(&backStream);
-    cudaStreamSynchronize(stream);
+    // cudaStreamSynchronize(stream);
 
     cudaRadixSortUint(numParticles, gridPosition, sortedGridPosition, sortedParticleIndices, front, back, stream, backStream, reorderedIndicesRelativeToOriginal);
 

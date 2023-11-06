@@ -105,6 +105,15 @@ void CudaVec<T>::swapDevicePtr(T* devPtr){
     d_vec = devPtr;
 }
 
+template<typename T>
+void CudaVec<T>::swapDevicePtrAsync(T* devPtr, cudaStream_t stream){
+    if(d_vec != nullptr && d_vec != devPtr){
+        gpuErrchk( cudaFreeAsync(d_vec, stream) );
+        GPU_MEMORY_ALLOCATED -= sizeof(T) * numElements;
+    }
+    d_vec = devPtr;
+}
+
 template <typename T>
 void CudaVec<T>::clear(){
     if(d_vec != nullptr){
@@ -155,6 +164,7 @@ CudaVec<T>::~CudaVec(){
 template class CudaVec<float>;
 template class CudaVec<uint>;
 template class CudaVec<char>;
+// template class CudaVec<bool>;
 
 template <typename T>
 uint CudaVec<T>::GPU_MEMORY_ALLOCATED = 0;

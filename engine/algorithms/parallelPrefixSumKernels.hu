@@ -5,35 +5,41 @@
 
 #include "../typedefs.h"
 
+#define LOG2_NUM_SM_BANKS 5
+
+#define SM_ADDRESS(n) ((n) + ((n)>>LOG2_NUM_SM_BANKS))
+
 __global__ void parallelPrefix(uint numElements, uint* array, uint* blockSums); // BLOCKSIZE threads operating on WORKSIZE (2x BLOCKSIZE) elements
 
 __global__ void parallelPrefixApplyPreviousBlockSum(uint numElements, uint* array, uint* blockSums); //designed for WORKSIZE threads per block, 2x BLOCKSIZE
 
 template <typename T>
 __device__ void blockWiseExclusivePrefixSum(T* shared, uint workspaceSize, uint& sharedBlockSum){
-    for(uint i = 0; (1<<(i+1))-1 < workspaceSize; ++i){
+    for(int i = 0; (1<<(i+1))-1 < workspaceSize; ++i){
         __syncthreads();    //thrashing shared memory, need to interleave accesses (warp stall here)
-        for(uint tid = threadIdx.x; tid < workspaceSize; tid += blockDim.x){
-            if(((tid + 1)<<(i+1)) - 1 < workspaceSize){
-                shared[((tid + 1)<<(i+1)) - 1] += shared[((tid + 1)<<(i+1)) - 1 - (1<<i)];
+        for(int tid = threadIdx.x; tid < workspaceSize; tid += blockDim.x){
+            uint sharedIndex = ((tid + 1)<<(i+1)) - 1;
+            if(sharedIndex < workspaceSize){
+                shared[SM_ADDRESS(sharedIndex)] += shared[SM_ADDRESS(sharedIndex - (1<<i))];
             }
         }
     }
     __syncthreads();
 
     if(threadIdx.x == 0){
-        sharedBlockSum = shared[workspaceSize - 1];
-        shared[workspaceSize-1] = 0;
+        sharedBlockSum = shared[SM_ADDRESS(workspaceSize - 1)];
+        shared[SM_ADDRESS(workspaceSize-1)] = 0;
     }
     __syncthreads();
     
     for(int i = sizeof(uint)*8 - __clz(workspaceSize>>1) - 1; i >= 0; --i){
         __syncthreads();
-        for(uint tid = threadIdx.x; tid < workspaceSize; tid += blockDim.x){
-            if(((tid + 1)<<(i+1)) - 1 < workspaceSize){
-                uint temp = shared[((tid + 1)<<(i+1)) - 1];
-                shared[((tid + 1)<<(i+1)) - 1] += shared[((tid + 1)<<(i+1)) - 1 - (1<<i)];
-                shared[((tid + 1)<<(i+1)) - 1 - (1<<i)] = temp;
+        for(int tid = threadIdx.x; tid < workspaceSize; tid += blockDim.x){
+            uint sharedIndex = ((tid + 1)<<(i+1)) - 1;
+            if(sharedIndex < workspaceSize){
+                T temp = shared[SM_ADDRESS(sharedIndex)];
+                shared[SM_ADDRESS(sharedIndex)] += shared[SM_ADDRESS(sharedIndex - (1<<i))];
+                shared[SM_ADDRESS(sharedIndex - (1<<i))] = temp;
             }
         }
     }

@@ -28,6 +28,7 @@ public:
     void download();
     void download(cudaStream_t stream);
     void swapDevicePtr(T* devPtr);
+    void swapDevicePtrAsync(T* devPtr, cudaStream_t stream);
     T* devPtr();
     const T* devPtr() const;
     void clear();

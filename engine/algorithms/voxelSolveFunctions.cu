@@ -26,7 +26,7 @@ __device__ void addVoxelDataForUsedNode(const uint thisThreadNodeIndexToHandle, 
     else{
         startVoxelID = nodeIndexToFirstVoxelIndex[thisThreadNodeIndexToHandle-1];
     }
-    for(uint currentUsedVoxelIndex = startVoxelID + threadIdx.x;
+    for(int currentUsedVoxelIndex = startVoxelID + threadIdx.x;
             currentUsedVoxelIndex < nodeIndexToFirstVoxelIndex[thisThreadNodeIndexToHandle];
             currentUsedVoxelIndex += blockDim.x){
         sharedBlockVoxelStorage[voxelIDs[currentUsedVoxelIndex]] += voxelData[currentUsedVoxelIndex];
@@ -45,7 +45,7 @@ __device__ void getNeighboringApronCellData(const uint thisThreadNodeIndexToHand
     else{
         startVoxelID = nodeIndexToFirstVoxelIndex[thisThreadNodeIndexToHandle-1];
     }
-    for(uint currentUsedVoxelIndex = startVoxelID + threadIdx.x;
+    for(int currentUsedVoxelIndex = startVoxelID + threadIdx.x;
             currentUsedVoxelIndex < nodeIndexToFirstVoxelIndex[thisThreadNodeIndexToHandle];
             currentUsedVoxelIndex += blockDim.x){
         uint usedVoxelIndex = voxelIDs[currentUsedVoxelIndex];
@@ -99,7 +99,7 @@ __device__ void loadVoxelDataForThisBlock(const uint numVoxelsPerNode, const uin
     const uint* nodeIndexToFirstVoxelIndex, const uint* voxelIDs, const float* voxelData, const uint numApronCells,
     const Grid& grid, const uint* yDimToFirstNodeIndex, const uint* gridNodeIndicesToFirstParticleIndex, const uint* gridNodeIDs)
 {
-    for(uint i = threadIdx.x; i < numVoxelsPerNode; i += blockDim.x){
+    for(int i = threadIdx.x; i < numVoxelsPerNode; i += blockDim.x){
         sharedBlockStorage[i] = 0.0f;
     }
     __syncthreads();
@@ -174,7 +174,7 @@ __global__ void calculateDivU(uint numVoxelsPerNode, uint numVoxels1D, uint numU
     }
     __syncthreads();
     
-    for(uint internalBlockID = threadIdx.x; internalBlockID < numVoxelsPerNode; internalBlockID += blockDim.x){
+    for(int internalBlockID = threadIdx.x; internalBlockID < numVoxelsPerNode; internalBlockID += blockDim.x){
         sharedDivU[internalBlockID] = 0.0f;
         if(dimension == VelocityGatherDimension::X){
             uint blockIDx = internalBlockID % numVoxels1D;
@@ -209,7 +209,7 @@ __global__ void calculateDivU(uint numVoxelsPerNode, uint numVoxels1D, uint numU
         }
     }
     __syncthreads();
-    for(uint voxelIndex = voxelIndexStart + threadIdx.x; voxelIndex < nodeIndexToFirstVoxelIndex[blockIdx.x]; voxelIndex += blockDim.x){
+    for(int voxelIndex = voxelIndexStart + threadIdx.x; voxelIndex < nodeIndexToFirstVoxelIndex[blockIdx.x]; voxelIndex += blockDim.x){
         divU[voxelIndex] += sharedDivU[voxelIDs[voxelIndex]];
     }
 
@@ -219,8 +219,8 @@ void cudaCalcDivU(const CudaVec<uint>& nodeIndexToFirstVoxelIndex, const CudaVec
                         const CudaVec<float>& voxelsUx, const CudaVec<float>& voxelsUy, const CudaVec<float>& voxelsUz,
                         float radius, uint refinementLevel, const Grid& grid, const CudaVec<uint>& yDimFirstNodeIndex,
                         const CudaVec<uint>& gridNodeIndicesToFirstParticleIndex, const CudaVec<uint>& gridNodes, uint numVoxelsPerNode,
-                        uint numVoxels1D, CudaVec<float>& divU, CudaVec<float>& Ax, CudaVec<float>& Ay, CudaVec<float>& Az,
-                        CudaVec<float>& Adiag, cudaStream_t stream)
+                        uint numVoxels1D, CudaVec<float>& divU,
+                        cudaStream_t stream)
 {
     divU.zeroDeviceAsync(stream);
     calculateDivU<<<nodeIndexToFirstVoxelIndex.size(), BLOCKSIZE, 2*sizeof(float)*numVoxelsPerNode, stream>>>
@@ -241,12 +241,20 @@ void cudaCalcDivU(const CudaVec<uint>& nodeIndexToFirstVoxelIndex, const CudaVec
     cudaStreamSynchronize((stream));
 }
 
-__global__ void GSiteration(uint numVoxelsPerNode, uint numVoxels1D, float radius, uint* nodeIndexUsedVoxels, uint* voxelIDs, bool* solids, float* divU, float* p, float* pOld){
-    uint linThreadIdx = threadIdx.x + threadIdx.y*numVoxels1D + threadIdx.z*numVoxels1D*numVoxels1D;
-    uint linBlockDim = blockDim.x * blockDim.y * blockDim.z;
-    extern __shared__ bool sharedSolids[];
+__global__ void GSiteration(uint numVoxelsPerNode, uint numVoxels1D, float radius, uint* nodeIndexUsedVoxels, uint* voxelIDs, char* solids, float* divU, float* p, float* pOld, float* residuals, float density, float dt, Grid grid){
+    extern __shared__ float sharedDivU[];
+    __shared__ float* sharedP;
+    __shared__ uint* processedVoxels;
+    __shared__ char* sharedSolids;
     __shared__ uint voxelIndexStart;
+    __shared__ float scale;
     if(threadIdx.x == 0){
+        sharedP = sharedDivU + numVoxelsPerNode;
+        processedVoxels = (uint*)(sharedP + numVoxelsPerNode);
+        sharedSolids = (char*)(processedVoxels + numVoxelsPerNode);
+
+        float voxelSize = grid.cellSize / (numVoxels1D - 2*floorf(radius));
+        scale = dt / (density*voxelSize*voxelSize);
         if(blockIdx.x == 0){
             voxelIndexStart = 0;
         }
@@ -255,11 +263,48 @@ __global__ void GSiteration(uint numVoxelsPerNode, uint numVoxels1D, float radiu
         }
     }
     
-    for(uint i = linThreadIdx; i < numVoxelsPerNode; i += linBlockDim){
+    for(int i = threadIdx.x; i < numVoxelsPerNode; i += blockDim.x){
+        sharedDivU[i] = 0.0f;
+        sharedP[i] = 0.0f;
         sharedSolids[i] = false;
+        processedVoxels[i] = numVoxelsPerNode;
     }
     __syncthreads();
-    
+    for(int i = threadIdx.x; i < nodeIndexUsedVoxels[blockIdx.x]; i += blockDim.x){
+        processedVoxels[i] = voxelIDs[voxelIndexStart + i];
+        sharedDivU[processedVoxels[i]] = divU[voxelIndexStart + i];
+        sharedP[processedVoxels[i]] = p[voxelIndexStart + i];
+        sharedSolids[processedVoxels[i]] = solids[voxelIndexStart + i];
+    }
+    __syncthreads();
+
+    for(int i = threadIdx.x; processedVoxels[i] != numVoxelsPerNode; i += blockDim.x){
+        if(!solids[processedVoxels[i]]){
+            uint voxelIDx = processedVoxels[i] % numVoxels1D;
+            uint voxelIDy = (processedVoxels[i] % (numVoxels1D*numVoxels1D)) / numVoxels1D;
+            uint voxelIDz = processedVoxels[i] / (numVoxels1D*numVoxels1D);
+            uint apronPad = floorf(radius);
+            if(voxelIDx >= apronPad && voxelIDx < numVoxels1D - apronPad){
+                if(voxelIDy >= apronPad && voxelIDy < numVoxels1D - apronPad){
+                    if(voxelIDz >= apronPad && voxelIDz < numVoxels1D - apronPad){
+                        float Adiag = 0.0f;
+                        float Apx = 0.0f;
+                        float Apy = 0.0f;
+                        float Apz = 0.0f;
+                        float Anx = 0.0f;
+                        float Any = 0.0f;
+                        float Anz = 0.0f;
+
+                        
+                    }
+                }
+
+            }
+        }
+    }
+
 }
 
-void cudaGSiteration()
+void cudaGSiteration(){
+
+}

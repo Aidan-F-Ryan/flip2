@@ -6,14 +6,17 @@
 __global__ void radixBinUintByBitIndex(uint numElements, uint* inArray, uint bitIndex, uint* front, uint* back){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
     if(index < numElements){
-        if((inArray[index] & (1<<bitIndex)) == 0){
-            front[index] = 1;
-            back[index] = 0;
-        }
-        else{
-            front[index] = 0;
-            back[index] = 1;
-        }
+        // if((inArray[index] & (1<<bitIndex)) == 0){
+        //     front[index] = 1;
+        //     back[index] = 0;
+        // }
+        // else{
+        //     front[index] = 0;
+        //     back[index] = 1;
+        // }
+        uint element = (inArray[index] >> bitIndex);
+        front[index] = (element ^ 1u) & 1u;
+        back[index] = element & 1u;
     }
     
 }
