@@ -7,12 +7,7 @@
     #include "../typedefs.h"
     #include "../cudaVec.hu"
 
-    void cudaVoxelUGather(uint numUsedVoxelsGrid, uint numGridNodes, uint numParticles, uint numVoxelsPerNode, uint numParticlesInParticleLists,
-        uint* gridPosition, float* particleVs, float* px, float* py, float* pz, uint* nodeIndexToFirstVoxelIndex, uint* voxelIDs,
-        uint* perVoxelParticleListStartIndices, uint* particleList, float* voxelUs, Grid grid, uint xySize, uint refinementLevel,
-        float radius, uint numVoxels1D, VelocityGatherDimension solveDimension, cudaStream_t stream);
-
-    void cudaCalcDivU(const CudaVec<uint>& nodeIndexToFirstVoxelIndex, const CudaVec<uint>& voxelIDs, const CudaVec<float>& voxelsUx, const CudaVec<float>& voxelsUy, const CudaVec<float>& voxelsUz,
+    void cudaCalcDivU(const CudaVec<uint>& nodeIndexToFirstVoxelIndex, const CudaVec<uint>& voxelIDs,   const CudaVec<float>& voxelsUx, const CudaVec<float>& voxelsUy, const CudaVec<float>& voxelsUz,
         float radius, uint refinementLevel, const Grid& grid, const CudaVec<uint>& yDimFirstNodeIndex,
         const CudaVec<uint>& gridNodeIndicesToFirstParticleIndex, const CudaVec<uint>& gridNodes, uint numVoxelsPerNode,
         uint numVoxels1D, CudaVec<float>& divU, CudaVec<float>& Ax, CudaVec<float>& Ay, CudaVec<float>& Az,

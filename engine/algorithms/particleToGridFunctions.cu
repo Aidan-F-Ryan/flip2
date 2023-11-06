@@ -197,6 +197,7 @@ __global__ void subCellCreateLists(float* px, float* py, float* pz, uint numPart
 
 void cudaFindGridCell(float* px, float* py, float* pz, uint numParticles, Grid grid, uint* gridPosition, cudaStream_t stream){
     rootCell<<<numParticles / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(px, py, pz, numParticles, grid, gridPosition);
+    cudaStreamSynchronize(stream);
 }
 
 void cudaFindSubCell(float* px, float* py, float* pz,
@@ -264,7 +265,8 @@ void cudaSortParticlesByGridNode(uint numParticles, uint*& gridPosition, uint*& 
 
     cudaStream_t backStream;
     cudaStreamCreate(&backStream);
-    
+    cudaStreamSynchronize(stream);
+
     cudaRadixSortUint(numParticles, gridPosition, sortedGridPosition, sortedParticleIndices, front, back, stream, backStream, reorderedIndicesRelativeToOriginal);
 
     if(ogGridPosition != sortedGridPosition){

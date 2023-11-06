@@ -26,7 +26,7 @@ __global__ void coalesceFrontBack(uint numElements, uint* outArray, uint* front,
     __shared__ uint thisBlockBack[BLOCKSIZE+1];
     if(threadIdx.x == 0 && index < numElements){
         maxFrontIndex = front[numElements-1];
-        if((int)index - 1 >= 0){
+        if(index > 0){
             thisBlockFront[0] = front[index - 1];
             thisBlockBack[0] = back[index - 1];
         }
@@ -45,7 +45,8 @@ __global__ void coalesceFrontBack(uint numElements, uint* outArray, uint* front,
         if(thisBlockFront[threadIdx.x] != thisBlockFront[threadIdx.x+1]){
             outArray[thisBlockFront[threadIdx.x]] = index;
         }
-        if(thisBlockBack[threadIdx.x] != thisBlockBack[threadIdx.x+1]){
+        // if(thisBlockBack[threadIdx.x] != thisBlockBack[threadIdx.x+1]){
+        else{
             outArray[thisBlockBack[threadIdx.x] + maxFrontIndex] = index;
         }
     }
@@ -89,11 +90,14 @@ void cudaRadixSortUint(uint numElements, uint* inArray, uint* outArray, uint* so
         
         cudaStreamSynchronize(frontStream);
         cudaParallelPrefixSum<uint>(numElements, front, frontStream);
+        cudaStreamSynchronize(frontStream);
         cudaParallelPrefixSum<uint>(numElements, back, backStream);
 
         cudaStreamSynchronize(backStream);
+        
         coalesceFrontBack<<<numElements/BLOCKSIZE + 1, BLOCKSIZE, 0, frontStream>>>(numElements, sortedIndices, front, back);
         reorderGridIndices<<<numElements/BLOCKSIZE + 1, BLOCKSIZE, 0, frontStream>>>(numElements, sortedIndices, inArray, outArray);
+
         cudaStreamSynchronize(frontStream);
         
         if(i == 0){
@@ -101,6 +105,7 @@ void cudaRadixSortUint(uint numElements, uint* inArray, uint* outArray, uint* so
         }
         else{
             reorderGridIndices<<<numElements/BLOCKSIZE + 1, BLOCKSIZE, 0, frontStream>>>(numElements, sortedIndices, reorderedIndicesRelativeToOriginal, tReordered);
+            
             uint* temp = tReordered;
             tReordered = reorderedIndicesRelativeToOriginal;
             reorderedIndicesRelativeToOriginal = temp;
@@ -109,6 +114,7 @@ void cudaRadixSortUint(uint numElements, uint* inArray, uint* outArray, uint* so
         uint* tempGP = inArray;
         inArray = outArray;
         outArray = tempGP;
+        cudaStreamSynchronize(frontStream);
     }
     cudaFreeAsync(tReordered, backStream);
 }

@@ -1,3 +1,4 @@
+//Copyright 2023 Aberrant Behavior LLC
 #ifndef CUDADEVICEMANAGER_HU
 #define CUDADEVICEMANAGER_HU
 

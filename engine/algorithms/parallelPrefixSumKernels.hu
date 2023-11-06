@@ -12,7 +12,7 @@ __global__ void parallelPrefixApplyPreviousBlockSum(uint numElements, uint* arra
 template <typename T>
 __device__ void blockWiseExclusivePrefixSum(T* shared, uint workspaceSize, uint& sharedBlockSum){
     for(uint i = 0; (1<<(i+1))-1 < workspaceSize; ++i){
-        __syncthreads();
+        __syncthreads();    //thrashing shared memory, need to interleave accesses (warp stall here)
         for(uint tid = threadIdx.x; tid < workspaceSize; tid += blockDim.x){
             if(((tid + 1)<<(i+1)) - 1 < workspaceSize){
                 shared[((tid + 1)<<(i+1)) - 1] += shared[((tid + 1)<<(i+1)) - 1 - (1<<i)];

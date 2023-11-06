@@ -7,6 +7,7 @@
 #include <map>
 #include <random>
 #include <iostream>
+#include <bitset>
 
 class ParticleSystemTester{
 public:
@@ -28,11 +29,11 @@ public:
     }
 
     void validateGridCellOrdering(){
-        particles.gridCell.download(particles.stream);
-        cudaStreamSynchronize(particles.stream);
+        particles.gridCell.download();
         uint prev = 0;
         std::map<uint, uint> tempGridMap;
         for(uint i = 0; i < particles.gridCell.size(); ++i){
+            // std::cout<<i<<": "<<std::bitset<sizeof(uint)*8>(particles.gridCell[i])<<std::endl;
             if(prev > particles.gridCell[i]){
                 std::cerr<<"gridCell not sorted "<<i<<" "<<particles.gridCell[i]<<"\n";
                 exit(1);
@@ -89,10 +90,14 @@ public:
         particles.voxelsUz.download();
         particles.voxelIDsUsed.download();
 
-        for(uint i = 0; i < particles.voxelIDsUsed.size(); ++i){
-            std::cout<<particles.voxelIDsUsed[i]<<": <"<<particles.voxelsUx[i]<<", "<<particles.voxelsUy[i]<<", "<<particles.voxelsUz[i]<<">\n";
-        }
+        // for(uint i = 0; i < particles.voxelIDsUsed.size(); ++i){
+        //     std::cout<<particles.voxelIDsUsed[i]<<": <"<<particles.voxelsUx[i]<<", "<<particles.voxelsUy[i]<<", "<<particles.voxelsUz[i]<<">\n";
+        // }
         particles.pressureSolve();
+        particles.divU.download();
+        for(uint i = 0; i < particles.voxelIDsUsed.size(); ++i){
+            std::cout<<particles.voxelIDsUsed[i]<<": "<<particles.divU[i]<<"\n";
+        }
     }
 
     void run(){
