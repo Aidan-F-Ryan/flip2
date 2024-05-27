@@ -491,6 +491,7 @@ __global__ void gridVelUpdate(uint numUsedGridNodes, uint* nodeIndexUsedVoxels, 
         else{
             voxelIndexStart = nodeIndexUsedVoxels[blockIdx.x - 1];
         }
+    }
     
     for(int i = threadIdx.x; i < numVoxelsPerNode; i += blockDim.x){
         sharedP[i] = 0.0f;
