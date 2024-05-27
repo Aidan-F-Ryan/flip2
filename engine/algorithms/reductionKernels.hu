@@ -7,4 +7,17 @@
 
 __global__ void parallelReduction(uint numElements, uint* array, uint* outArray);
 
+template <typename T>
+__device__ void blockwiseMaximum(T* sharedArray, uint sharedSize){
+    for(int i = sharedSize>>1; i > 0; i>>=1){
+        __syncthreads();
+        for(int tid = threadIdx.x; tid < i; tid += blockDim.x){
+            sharedArray[tid] = sharedArray[tid] > sharedArray[tid + i] ? sharedArray[tid] : sharedArray[tid + i];
+        }
+    }
+}
+
+template <typename T>
+void cudaParallelMaximum(uint numElements, T* array, cudaStream_t stream);
+
 #endif

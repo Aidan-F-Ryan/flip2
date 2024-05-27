@@ -36,6 +36,7 @@ Particles::Particles(uint size)
 
     numVoxels1D = 2*(uint)(std::floor(radius)) + (2<<refinementLevel);
     numVoxelsPerNode = numVoxels1D*numVoxels1D*numVoxels1D;
+    frameDt = 1.0f/24.0f;
 }
 
 void Particles::setDomain(float nx, float ny, float nz, uint x, uint y, uint z, float cellSize){
@@ -333,6 +334,9 @@ void Particles::generateVoxels(){
     voxelsUz.resizeAsync(numUsedVoxels, stream);
     solids.resizeAsync(numUsedVoxels, stream);
     divU.resizeAsync(numUsedVoxels, stream);
+    p.resizeAsync(numUsedVoxels, stream);
+    residuals.resizeAsync(numUsedVoxels, stream);
+    p.zeroDeviceAsync(stream);
     cudaStreamSynchronize(stream);
 
     generateVoxelIDs<<<numUsedGridNodes, 32, (SM_ADDRESS(numVoxelsPerNode) + numVoxelsPerNode)*sizeof(uint) + numVoxelsPerNode, stream>>>(numUsedGridNodes, size, numVoxelsPerNode, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(), nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(), solids.devPtr(), radius, grid, refinementLevel);
@@ -462,7 +466,7 @@ __global__ void gatherParticleVelsToVoxels(uint numUsedGridNodes, uint numPartic
     }
     __syncthreads();
     for(int i = startVoxelIndex + threadIdx.x; i < numVoxelsEachNode[blockIdx.x]; i += blockDim.x){
-        voxelUs[i] = sharedVoxelU[voxelIDs[i]] / sharedWeightSums[voxelIDs[i]];
+        voxelUs[i] = sharedVoxelU[voxelIDs[i]] / (sharedWeightSums[voxelIDs[i]] + 0.0000001);
     }
 }
 
@@ -475,12 +479,66 @@ void Particles::particleVelToVoxels(){
     cudaStreamSynchronize(stream);
 }
 
+__global__ void gridVelUpdate(uint numUsedGridNodes, uint* nodeIndexUsedVoxels, uint numVoxelsPerNode, uint numVoxels1D, uint* voxelIDsUsed, float* p, float* voxelUs, VelocityGatherDimension dimension, float dt, float density){
+    extern __shared__ float sharedP[];
+    __shared__ float* sharedU;
+    __shared__ uint voxelIndexStart;
+    if(threadIdx.x == 0){
+        sharedU = sharedP + numVoxelsPerNode;
+        if(blockIdx.x == 0){
+            voxelIndexStart = 0;
+        }
+        else{
+            voxelIndexStart = nodeIndexUsedVoxels[blockIdx.x - 1];
+        }
+    
+    for(int i = threadIdx.x; i < numVoxelsPerNode; i += blockDim.x){
+        sharedP[i] = 0.0f;
+    }
+    __syncthreads();
+
+    for(int voxelID = voxelIndexStart + threadIdx.x; voxelID < nodeIndexUsedVoxels[blockIdx.x]; voxelID += blockDim.x){
+        sharedP[voxelIDsUsed[voxelID]] = p[voxelID];
+        sharedU[voxelIDsUsed[voxelID]] = voxelUs[voxelID];
+    }
+    __syncthreads();
+    for(int i = threadIdx.x; i < numVoxelsPerNode; i += blockDim.x){
+        
+    }
+
+}
+
 void Particles::pressureSolve(){
     cudaCalcDivU(nodeIndexUsedVoxels, voxelIDsUsed, voxelsUx, voxelsUy, voxelsUz,
             radius, refinementLevel, grid, yDimNumUsedGridNodes, gridNodeIndicesToFirstParticleIndex,
             gridCell, numVoxelsPerNode, numVoxels1D, divU, stream);
     gpuErrchk(cudaPeekAtLastError());
+    float density = 0.014;
+    float threshold = 0.0001f;
+    uint maxIterations = 1024;
+    float previousTerminatingResidual = 100;
+    float terminatingResidual;
+    dt = frameDt / 10.0f;
+    //@TODO: need to use courant number for dt from max voxel u and voxel dimensions
     cudaStreamSynchronize(stream);
+    while(previousTerminatingResidual - (terminatingResidual = cudaGSiteration(numVoxelsPerNode, numVoxels1D, nodeIndexUsedVoxels, voxelIDsUsed, solids, divU, p, residuals, radius, density, dt, grid, threshold, maxIterations, stream)) > 0){    //while residual getting smaller
+        dt /= 2.0f;
+        p.zeroDeviceAsync(stream);
+        previousTerminatingResidual = terminatingResidual;
+        // residuals.zeroDeviceAsync(stream);
+        cudaStreamSynchronize(stream);
+    }
+    std::cout<<"Terminating Residual: "<<terminatingResidual<<"\nThreshold: "<<threshold<<"\n";
+    cudaStreamSynchronize(stream);
+}
+
+void Particles::updateVoxelVelocities(){
+
+}
+
+
+void Particles::advectParticles(){
+    
 }
 
 

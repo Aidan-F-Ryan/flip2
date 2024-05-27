@@ -3,8 +3,16 @@
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_FLAGS "-Wall -Wextra")
 
-# set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -G -g -fPIC")
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 -lineinfo -fPIC")
+find_package(OpenMP)
+
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -G -g -fPIC")
+# set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 -lineinfo -fPIC")
+
+if(OPENMP_FOUND)
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=\"-fopenmp\"")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${OpenMP_C_FLAGS}")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
+endif()
 
 set(cudaLibraries
     # particles
@@ -27,5 +35,5 @@ target_link_libraries(particles ${cudaLibraries}  parallelPrefixSumKernels radix
 set_target_properties(particles PROPERTIES CUDA_ARCHITECTURES "61;86;")
 
 add_executable(main main.cu)
-target_link_libraries(main particles)
+target_link_libraries(main particles gomp)
 set_target_properties(main PROPERTIES CUDA_ARCHITECTURES "61;86;")

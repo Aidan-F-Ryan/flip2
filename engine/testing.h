@@ -8,6 +8,7 @@
 #include <random>
 #include <iostream>
 #include <bitset>
+#include <omp.h>
 
 class ParticleSystemTester{
 public:
@@ -58,7 +59,7 @@ public:
         std::uniform_real_distribution<> distZ(particles.grid.negZ + oneThirdYDimension, particles.grid.negZ + particles.grid.sizeZ*particles.grid.cellSize - oneThirdYDimension);
 
         std::uniform_real_distribution<> vDist(-1.0f, 1.0f);
-
+#pragma omp for
         for(uint i = 0; i < particles.size; ++i){
             particles.px[i] = distX(e2);
             particles.py[i] = distY(e2);
@@ -67,7 +68,6 @@ public:
             particles.vy[i] = vDist(e2);
             particles.vz[i] = vDist(e2);
         }
-        
         particles.px.upload(particles.stream);
         particles.py.upload(particles.stream);
         particles.pz.upload(particles.stream);
@@ -95,9 +95,10 @@ public:
         // }
         particles.pressureSolve();
         particles.divU.download();
-        for(uint i = 0; i < particles.voxelIDsUsed.size(); ++i){
-            std::cout<<particles.voxelIDsUsed[i]<<": "<<particles.divU[i]<<"\n";
-        }
+
+        // for(uint i = 0; i < particles.voxelIDsUsed.size(); ++i){
+        //     std::cout<<particles.voxelIDsUsed[i]<<": "<<particles.divU[i]<<"\n";
+        // }
     }
 
     void run(){

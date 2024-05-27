@@ -5,3 +5,4 @@ html/
 latex/
 engine/Makefile
 engine/devManagerTestDriver.cu
+engine/deviceManagerTest

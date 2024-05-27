@@ -12,5 +12,8 @@
         const CudaVec<uint>& gridNodeIndicesToFirstParticleIndex, const CudaVec<uint>& gridNodes, uint numVoxelsPerNode,
         uint numVoxels1D, CudaVec<float>& divU, cudaStream_t stream);
     
+    float cudaGSiteration(const uint& numVoxelsPerNode, const uint& numVoxels1D, const CudaVec<uint>& nodeIndexUsedVoxels, const CudaVec<uint>& voxelIDs, const CudaVec<char>& solids, const CudaVec<float>& divU, CudaVec<float>& p, CudaVec<float>& residuals, const float& radius, const float& density, const float& dt, const Grid& grid, const float& threshold, const uint& maxIterations, cudaStream_t stream);
 
+    __device__ void getNeighboringApronCellData(const uint thisThreadNodeIndexToHandle, const uint numVoxels1D, float* sharedBlockVoxelStorage, const uint* nodeIndexToFirstVoxelIndex,
+        const uint* voxelIDs, const float* voxelData, const int xOffset, const int yOffset, const int zOffset);
 #endif

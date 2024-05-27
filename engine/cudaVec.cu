@@ -3,6 +3,7 @@
 #include "cudaVec.hu"
 #include "typedefs.h"
 #include <iostream>
+#include "cudaDeviceManager.hu"
 
 template <typename T>
 CudaVec<T>::CudaVec()
