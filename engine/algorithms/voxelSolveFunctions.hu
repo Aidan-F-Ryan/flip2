@@ -16,4 +16,6 @@
 
     __device__ void getNeighboringApronCellData(const uint thisThreadNodeIndexToHandle, const uint numVoxels1D, float* sharedBlockVoxelStorage, const uint* nodeIndexToFirstVoxelIndex,
         const uint* voxelIDs, const float* voxelData, const int xOffset, const int yOffset, const int zOffset);
+    
+    void cudaVelocityUpdate(uint numVoxelsPerNode, uint numVoxels1D, float dt, float radius, float density,  const CudaVec<uint>& nodeIndexUsedVoxels,  const CudaVec<uint>& voxelIDs,  const CudaVec<uint>& solids,  const CudaVec<float>& p,  const CudaVec<float>& voxelsUx, const CudaVec<float>& voxelsUy, const CudaVec<float>& voxelsUz, Grid grid, cudaStream_t stream);
 #endif
