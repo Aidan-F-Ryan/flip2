@@ -496,3 +496,10 @@ __global__ void pressureToAcceleration(uint numVoxelsPerNode, uint numVoxels1D, 
         voxelUs[voxelIndexStart + i] = sharedU[processedVoxels[i]];
     }
 }
+
+void cudaVelocityUpdate(uint numVoxelsPerNode, uint numVoxels1D, float dt, float radius, float density,  CudaVec<uint>& nodeIndexUsedVoxels,  CudaVec<uint>& voxelIDs,  CudaVec<uint>& solids,  CudaVec<float>& p,  CudaVec<float>& voxelsUx, CudaVec<float>& voxelsUy, CudaVec<float>& voxelsUz, Grid grid, cudaStream_t stream){
+    pressureToAcceleration<<<nodeIndexUsedVoxels.size(), 32, 4*4*numVoxelsPerNode, stream>>>(numVoxelsPerNode, numVoxels1D, dt, radius, density, nodeIndexUsedVoxels.devPtr(), voxelIDs.devPtr(), solids.devPtr(), p.devPtr(), voxelsUx.devPtr(), grid, VelocityGatherDimension::X);
+    pressureToAcceleration<<<nodeIndexUsedVoxels.size(), 32, 4*4*numVoxelsPerNode, stream>>>(numVoxelsPerNode, numVoxels1D, dt, radius, density, nodeIndexUsedVoxels.devPtr(), voxelIDs.devPtr(), solids.devPtr(), p.devPtr(), voxelsUy.devPtr(), grid, VelocityGatherDimension::Y);
+    pressureToAcceleration<<<nodeIndexUsedVoxels.size(), 32, 4*4*numVoxelsPerNode, stream>>>(numVoxelsPerNode, numVoxels1D, dt, radius, density, nodeIndexUsedVoxels.devPtr(), voxelIDs.devPtr(), solids.devPtr(), p.devPtr(), voxelsUz.devPtr(), grid, VelocityGatherDimension::Z);
+    cudaStreamSynchronize(stream);
+}
