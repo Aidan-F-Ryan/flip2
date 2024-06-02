@@ -479,42 +479,12 @@ void Particles::particleVelToVoxels(){
     cudaStreamSynchronize(stream);
 }
 
-__global__ void gridVelUpdate(uint numUsedGridNodes, uint* nodeIndexUsedVoxels, uint numVoxelsPerNode, uint numVoxels1D, uint* voxelIDsUsed, float* p, float* voxelUs, VelocityGatherDimension dimension, float dt, float density){
-    extern __shared__ float sharedP[];
-    __shared__ float* sharedU;
-    __shared__ uint voxelIndexStart;
-    if(threadIdx.x == 0){
-        sharedU = sharedP + numVoxelsPerNode;
-        if(blockIdx.x == 0){
-            voxelIndexStart = 0;
-        }
-        else{
-            voxelIndexStart = nodeIndexUsedVoxels[blockIdx.x - 1];
-        }
-    }
-    
-    for(int i = threadIdx.x; i < numVoxelsPerNode; i += blockDim.x){
-        sharedP[i] = 0.0f;
-    }
-    __syncthreads();
-
-    for(int voxelID = voxelIndexStart + threadIdx.x; voxelID < nodeIndexUsedVoxels[blockIdx.x]; voxelID += blockDim.x){
-        sharedP[voxelIDsUsed[voxelID]] = p[voxelID];
-        sharedU[voxelIDsUsed[voxelID]] = voxelUs[voxelID];
-    }
-    __syncthreads();
-    for(int i = threadIdx.x; i < numVoxelsPerNode; i += blockDim.x){
-        
-    }
-
-}
-
 void Particles::pressureSolve(){
     cudaCalcDivU(nodeIndexUsedVoxels, voxelIDsUsed, voxelsUx, voxelsUy, voxelsUz,
             radius, refinementLevel, grid, yDimNumUsedGridNodes, gridNodeIndicesToFirstParticleIndex,
             gridCell, numVoxelsPerNode, numVoxels1D, divU, stream);
     gpuErrchk(cudaPeekAtLastError());
-    float density = 0.014;
+    float density = 0.014f;
     float threshold = 0.0001f;
     uint maxIterations = 1024;
     float previousTerminatingResidual = 100;
@@ -534,7 +504,8 @@ void Particles::pressureSolve(){
 }
 
 void Particles::updateVoxelVelocities(){
-
+    cudaVelocityUpdate(numVoxelsPerNode, numVoxels1D, dt, radius, 0.014f, nodeIndexUsedVoxels, voxelIDsUsed, solids, p, voxelsUx, voxelsUy, voxelsUz, grid, stream);
+    gpuErrchk(cudaPeekAtLastError());
 }
 
 
