@@ -159,6 +159,7 @@ __device__ void loadVoxelDataForThisBlock(const uint numVoxelsPerNode, const uin
     __syncthreads();
 }
 
+//velocities are along negative faces of each
 __global__ void calculateDivU(uint numVoxelsPerNode, uint numVoxels1D, uint numUsedVoxelsInGrid, const uint* nodeIndexToFirstVoxelIndex,
                                 const uint* voxelIDs, const float* voxelUs, float radius, uint refinementLevel, Grid grid,
                                 const uint* yDimFirstNodeIndex, const uint* gridNodeIndicesToFirstParticleIndex, const uint* gridNodes,
@@ -416,4 +417,82 @@ float cudaGSiteration(const uint& numVoxelsPerNode, const uint& numVoxels1D, con
         }
     }
     return maxResidual;
+}
+
+//velocities are along negative faces of voxels
+__global__ void pressureToAcceleration(uint numVoxelsPerNode, uint numVoxels1D, float dt, float radius, float density, uint* nodeIndexUsedVoxels, uint* voxelIDs, uint* solids, float* p, float* voxelUs, Grid grid, VelocityGatherDimension dim){
+    extern __shared__ float sharedP[];
+    __shared__ float* sharedU;
+    __shared__ uint* processedVoxels;
+    __shared__ char* sharedSolids;
+    __shared__ uint voxelIndexStart;
+    __shared__ float scale;
+    if(threadIdx.x == 0){
+        sharedU = sharedP + numVoxelsPerNode;
+        processedVoxels = (uint*)(sharedU + numVoxelsPerNode);
+        sharedSolids = (char*)(processedVoxels + numVoxelsPerNode);
+
+        float voxelSize = grid.cellSize / (numVoxels1D - 2*floorf(radius));
+        scale = dt / (density*voxelSize*voxelSize);
+        if(blockIdx.x == 0){
+            voxelIndexStart = 0;
+        }
+        else{
+            voxelIndexStart = nodeIndexUsedVoxels[blockIdx.x - 1]; 
+        }
+    }
+    __syncthreads();
+    
+    for(int i = threadIdx.x; i < numVoxelsPerNode; i += blockDim.x){
+        sharedU[i] = 0.0f;
+        sharedP[i] = 0.0f;
+        sharedSolids[i] = false;
+        processedVoxels[i] = numVoxelsPerNode;
+    }
+    __syncthreads();
+    for(int i = threadIdx.x; voxelIndexStart + i < nodeIndexUsedVoxels[blockIdx.x]; i += blockDim.x){
+        processedVoxels[i] = voxelIDs[voxelIndexStart + i];
+        sharedU[processedVoxels[i]] = voxelUs[voxelIndexStart + i];
+        sharedP[processedVoxels[i]] = p[voxelIndexStart + i];
+        sharedSolids[processedVoxels[i]] = solids[voxelIndexStart + i];
+    }
+    __syncthreads();
+
+    for(int i = threadIdx.x; processedVoxels[i] != numVoxelsPerNode; i += blockDim.x){
+        if(!solids[processedVoxels[i]]){
+            uint voxelIDx = processedVoxels[i] % numVoxels1D;
+            uint voxelIDy = (processedVoxels[i] % (numVoxels1D*numVoxels1D)) / numVoxels1D;
+            uint voxelIDz = processedVoxels[i] / (numVoxels1D*numVoxels1D);
+            uint apronPad = floorf(radius);
+            if(voxelIDx >= apronPad && voxelIDx < numVoxels1D - apronPad){
+                if(voxelIDy >= apronPad && voxelIDy < numVoxels1D - apronPad){
+                    if(voxelIDz >= apronPad && voxelIDz < numVoxels1D - apronPad){
+                        uint voxelID = processedVoxels[i];
+                        float dpx = 0.0f;
+                        if(dim == VelocityGatherDimension::X){
+                            if(!sharedSolids[voxelID-1]){
+                                dpx = sharedP[voxelID] - sharedP[voxelID - 1];
+                            }
+                        }
+                        else if(dim == VelocityGatherDimension::Y){
+                            if(!sharedSolids[voxelID - numVoxels1D]){
+                                dpx = sharedP[voxelID] - sharedP[voxelID - numVoxels1D];
+                            }
+                        }
+                        else{
+                            if(!sharedSolids[voxelID - numVoxels1D*numVoxels1D]){
+                                dpx = sharedP[voxelID] - sharedP[voxelID - numVoxels1D*numVoxels1D];
+                            }
+                        }
+                        sharedU[voxelID] = sharedU[voxelID] - dpx * scale;
+                    }
+                }
+
+            }
+        }
+    }
+    __syncthreads();
+    for(int i = threadIdx.x; processedVoxels[i] != numVoxelsPerNode; i += blockDim.x){
+        voxelUs[voxelIndexStart + i] = sharedU[processedVoxels[i]];
+    }
 }
