@@ -2,6 +2,7 @@
 
 #include "cudaVec.hu"
 #include "typedefs.h"
+#include <cstdlib>
 #include <iostream>
 #include "cudaDeviceManager.hu"
 
@@ -18,6 +19,9 @@ CudaVec<T>::CudaVec(const uint& size){
 
 template <typename T>
 void CudaVec<T>::resize(const uint& size){
+    if(d_vec != nullptr){
+        GPU_MEMORY_ALLOCATED -= sizeof(T) * vec.size();
+    }
     numElements = size;
     vec.resize(size);
     cuMalloc();
@@ -25,6 +29,9 @@ void CudaVec<T>::resize(const uint& size){
 
 template <typename T>
 void CudaVec<T>::resizeAsync(const uint& size, const cudaStream_t& stream){
+    if(d_vec != nullptr){
+        GPU_MEMORY_ALLOCATED -= sizeof(T) * vec.size();
+    }
     numElements = size;
     cuMallocAsync(stream);
 }
@@ -118,10 +125,10 @@ void CudaVec<T>::swapDevicePtrAsync(T* devPtr, cudaStream_t stream){
 template <typename T>
 void CudaVec<T>::clear(){
     if(d_vec != nullptr){
+        GPU_MEMORY_ALLOCATED -= sizeof(T) * numElements;
         cudaFree(d_vec);
         d_vec = nullptr;
     }
-    GPU_MEMORY_ALLOCATED -= sizeof(T) * numElements;
     vec.clear();
     numElements = 0;
 }
@@ -129,10 +136,10 @@ void CudaVec<T>::clear(){
 template <typename T>
 void CudaVec<T>::clearAsync(cudaStream_t stream){
     if(d_vec != nullptr){
+        GPU_MEMORY_ALLOCATED -= sizeof(T) * numElements;
         cudaFreeAsync(d_vec, stream);
         d_vec = nullptr;
     }
-    GPU_MEMORY_ALLOCATED -= sizeof(T) * numElements;
     vec.clear();
     numElements = 0;
 }
@@ -155,9 +162,80 @@ void CudaVec<T>::zeroDeviceAsync(cudaStream_t stream){
     zeroArray<<<numElements / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numElements, d_vec);
 }
 
+__device__ char abs(const char& in){
+    return in;
+}
+
+__device__ uint abs(const uint& in){
+    return in;
+}
+
+template<typename T>
+__global__ void getMaxFromArray(bool absolute, uint numElements, T* array, T* out){
+    __shared__ T shared[WORKSIZE];
+    uint index = threadIdx.x + blockIdx.x*WORKSIZE;
+    if(index < numElements){
+        shared[threadIdx.x] = array[index];
+    }
+    else{
+        shared[threadIdx.x] = 0;
+    }
+    if(index + blockDim.x < numElements){
+        shared[threadIdx.x + blockDim.x] = array[index + blockDim.x];
+    }
+    else{
+        shared[threadIdx.x + blockDim.x] = 0;
+    }
+
+    for(int i = blockDim.x; i >= 1; i >>= 1){
+        __syncthreads();
+        if(!absolute)
+            shared[threadIdx.x] = shared[threadIdx.x] > shared[threadIdx.x + blockDim.x] ? shared[threadIdx.x] : shared[threadIdx.x + blockDim.x];
+        else
+            shared[threadIdx.x] = abs(shared[threadIdx.x]) > abs(shared[threadIdx.x + blockDim.x]) ? shared[threadIdx.x] : shared[threadIdx.x + blockDim.x];
+    }
+
+    __syncthreads();
+
+    if(threadIdx.x == 0){
+        out[blockIdx.x] = shared[threadIdx.x];
+    }
+}
+
+template <typename T>
+T CudaVec<T>::getMax(cudaStream_t stream, bool abs){
+    T* outArray;
+    T* outArray2;
+    T out;
+    cudaMallocAsync((void**)&outArray, sizeof(T) * (numElements / WORKSIZE + 1), stream);
+    gpuErrchk(cudaPeekAtLastError());
+    getMaxFromArray<<<numElements / WORKSIZE + 1, BLOCKSIZE, 0, stream>>>(abs, numElements, d_vec, outArray);
+    gpuErrchk(cudaPeekAtLastError());
+    cudaMallocAsync((void**)&outArray2, sizeof(T) * ((numElements / WORKSIZE + 1) / WORKSIZE + 1), stream);
+    gpuErrchk(cudaPeekAtLastError());
+    cudaStreamSynchronize(stream);
+    for(int i = numElements / WORKSIZE + 1; i > 1; i = i / WORKSIZE + 1){
+        getMaxFromArray<<<i / WORKSIZE + 1, BLOCKSIZE, 0, stream>>>(abs, i, outArray, outArray2);
+        gpuErrchk(cudaPeekAtLastError());
+        cudaStreamSynchronize(stream);
+        T* temp = outArray;
+        outArray = outArray2;
+        outArray2 = temp;
+    }
+    cudaMemcpyAsync(&out, outArray, sizeof(T), cudaMemcpyDeviceToHost, stream);
+    gpuErrchk(cudaPeekAtLastError());
+    cudaStreamSynchronize(stream);
+    cudaFreeAsync(outArray, stream);
+    cudaFreeAsync(outArray2, stream);
+    cudaStreamSynchronize(stream);
+    gpuErrchk(cudaPeekAtLastError());
+    return out;
+}
+
 template<typename T>
 CudaVec<T>::~CudaVec(){
     if(d_vec != nullptr){
+        GPU_MEMORY_ALLOCATED -= sizeof(T) * vec.size();
         gpuErrchk( cudaFree(d_vec) );
     }
 }

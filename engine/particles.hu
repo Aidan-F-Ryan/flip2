@@ -6,8 +6,7 @@
 #include "typedefs.h"
 #include "cudaVec.hu"
 #include "grid.hpp"
-
-#define REFINEMENTLEVELS 10
+#include <string>
 
 class Particles{
 public:
@@ -30,6 +29,12 @@ public:
     void updateVoxelVelocities();
 
     void advectParticles();
+
+    void solveFrame(float fps);
+
+    void writePositionsToFile(const std::string& fileName);
+
+    float getCourantDt();
 
     ~Particles();
 private:
@@ -73,6 +78,8 @@ private:
 
     float frameDt; //overall timestep used for writing particle positions
     float dt; //timestep used in pressure solve
+    float elapsedTime;
+    float elapsedTimeThisFrame;
 
     cudaStream_t stream;
     std::vector<cudaDeviceProp> deviceProp;

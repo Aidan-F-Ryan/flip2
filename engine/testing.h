@@ -9,6 +9,7 @@
 #include <iostream>
 #include <bitset>
 #include <omp.h>
+#include <string>
 
 class ParticleSystemTester{
 public:
@@ -22,6 +23,7 @@ public:
     }
 
     void storeGridCellMap(){
+        gridMap.clear();
         particles.gridCell.download(particles.stream);
         cudaStreamSynchronize(particles.stream);
         for(uint i = 0; i < particles.gridCell.size(); ++i){
@@ -75,7 +77,7 @@ public:
         particles.vy.upload(particles.stream);
         particles.vz.upload(particles.stream);
     }
-    
+
     void runVerify(){
         particles.alignParticlesToGrid();
         storeGridCellMap();
@@ -94,11 +96,15 @@ public:
         //     std::cout<<particles.voxelIDsUsed[i]<<": <"<<particles.voxelsUx[i]<<", "<<particles.voxelsUy[i]<<", "<<particles.voxelsUz[i]<<">\n";
         // }
         particles.pressureSolve();
-        particles.divU.download();
+        particles.updateVoxelVelocities();
+        particles.advectParticles();
+        particles.px.download();
+        particles.py.download();
+        particles.pz.download();
 
-        // for(uint i = 0; i < particles.voxelIDsUsed.size(); ++i){
-        //     std::cout<<particles.voxelIDsUsed[i]<<": "<<particles.divU[i]<<"\n";
-        // }
+        for(uint i = 0; i < 10; ++i){
+            std::cout<<particles.px[i]<<", "<<particles.py[i]<<", "<<particles.pz[i]<<"\n";
+        }
     }
 
     void run(){
@@ -108,6 +114,16 @@ public:
         particles.generateVoxels();
         particles.particleVelToVoxels();
         particles.pressureSolve();
+        particles.updateVoxelVelocities();
+        particles.advectParticles();
+    }
+
+    void solveFrame(float fps){
+        particles.solveFrame(fps);
+    }
+
+    void writePositionsToFile(const std::string& fileName){
+        particles.writePositionsToFile(fileName);
     }
 
 private:

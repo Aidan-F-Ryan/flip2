@@ -470,7 +470,15 @@ __global__ void gatherParticleVelsToVoxels(uint numUsedGridNodes, uint numPartic
     }
 }
 
+#include "algorithms/reductionKernels.hu"
+#include <cmath>
 
+float Particles::getCourantDt(){
+    float maxVel = max(abs(vx.getMax(stream, true)), max(abs(vy.getMax(stream, true)), abs(vz.getMax(stream, true))));
+    float voxelSize = (grid.cellSize / (numVoxels1D - 2*std::floor(radius)));
+    std::cout<<"maxVel: "<<maxVel<<"voxelSize: "<<voxelSize<<"\n";
+    return voxelSize / maxVel;
+}
 
 void Particles::particleVelToVoxels(){
     gatherParticleVelsToVoxels<<<numUsedGridNodes, 32, 2*sizeof(float)*numVoxelsPerNode + numVoxelsPerNode, stream>>>(numUsedGridNodes, size, numVoxelsPerNode, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(), voxelsUx.devPtr(), solids.devPtr(), radius, grid, refinementLevel, VelocityGatherDimension::X);
@@ -480,26 +488,49 @@ void Particles::particleVelToVoxels(){
 }
 
 void Particles::pressureSolve(){
+    applyGravity(solids, voxelsUz, dt, stream);
     cudaCalcDivU(nodeIndexUsedVoxels, voxelIDsUsed, voxelsUx, voxelsUy, voxelsUz,
             radius, refinementLevel, grid, yDimNumUsedGridNodes, gridNodeIndicesToFirstParticleIndex,
             gridCell, numVoxelsPerNode, numVoxels1D, divU, stream);
     gpuErrchk(cudaPeekAtLastError());
     float density = 0.014f;
-    float threshold = 0.0001f;
+    float threshold = 1.0f;
     uint maxIterations = 1024;
     float previousTerminatingResidual = 100;
     float terminatingResidual;
-    dt = frameDt / 10.0f;
     //@TODO: need to use courant number for dt from max voxel u and voxel dimensions
+    dt = getCourantDt();
+    std::cout<<"initial dt: "<<dt<<std::endl;
     cudaStreamSynchronize(stream);
+    if(frameDt - elapsedTimeThisFrame < dt){
+        dt = frameDt - elapsedTimeThisFrame;
+    }
+    std::cout<<"mod dt: "<<dt<<std::endl;
     while(previousTerminatingResidual - (terminatingResidual = cudaGSiteration(numVoxelsPerNode, numVoxels1D, nodeIndexUsedVoxels, voxelIDsUsed, solids, divU, p, residuals, radius, density, dt, grid, threshold, maxIterations, stream)) > 0){    //while residual getting smaller
+        gpuErrchk(cudaPeekAtLastError());
+        if(terminatingResidual < threshold){
+            break;
+        }
+        removeGravity(solids, voxelsUz, dt, stream);
+        gpuErrchk(cudaPeekAtLastError());
         dt /= 2.0f;
         p.zeroDeviceAsync(stream);
+        gpuErrchk(cudaPeekAtLastError());
+        applyGravity(solids, voxelsUz, dt, stream);
+        gpuErrchk(cudaPeekAtLastError());
         previousTerminatingResidual = terminatingResidual;
         // residuals.zeroDeviceAsync(stream);
         cudaStreamSynchronize(stream);
+        cudaCalcDivU(nodeIndexUsedVoxels, voxelIDsUsed, voxelsUx, voxelsUy, voxelsUz,
+                radius, refinementLevel, grid, yDimNumUsedGridNodes, gridNodeIndicesToFirstParticleIndex,
+                gridCell, numVoxelsPerNode, numVoxels1D, divU, stream);
+        gpuErrchk(cudaPeekAtLastError());
+        cudaStreamSynchronize(stream);
+        gpuErrchk(cudaPeekAtLastError());
     }
-    std::cout<<"Terminating Residual: "<<terminatingResidual<<"\nThreshold: "<<threshold<<"\n";
+    elapsedTime += dt;
+    elapsedTimeThisFrame += dt;
+    std::cout<<"dt: "<<dt<<" ElapsedTime: "<<elapsedTime<<" elapsedTimeThisFrame: "<<elapsedTimeThisFrame<<"\nTerminating Residual: "<<terminatingResidual<<"\nThreshold: "<<threshold<<"\n";
     cudaStreamSynchronize(stream);
 }
 
@@ -508,9 +539,117 @@ void Particles::updateVoxelVelocities(){
     gpuErrchk(cudaPeekAtLastError());
 }
 
+__global__ void gatherVoxelVelsToParticles(uint numUsedGridNodes, uint numParticles, uint numVoxelsPerNode, uint numVoxels1D, uint* gridNodeIndicesToFirstParticleIndex, uint* gridPosition, float* px, float* py, float* pz, float* vDim, uint* numVoxelsEachNode, uint* voxelIDs, float* voxelUs, float radius, Grid grid, uint refinementLevel, VelocityGatherDimension dimension){
+    extern __shared__ float sharedVoxelU[];
+    __shared__ uint lastParticleIndex;
+    __shared__ uint xySize;
+    __shared__ uint startVoxelIndex;
+    // __shared__ uint gridIDx;
+    // __shared__ uint gridIDy;
+    // __shared__ uint gridIDz;
+
+    if(threadIdx.x == 0){
+        xySize = grid.sizeX*grid.sizeY;
+        // uint gridID = gridPosition[blockIdx.x];
+        // gridIDx = gridID % grid.sizeX;
+        // gridIDy = (gridID % xySize) / grid.sizeX;
+        // gridIDz = gridID / xySize;
+        if(blockIdx.x == numUsedGridNodes - 1){
+            lastParticleIndex = numParticles;
+        }
+        else{
+            lastParticleIndex = gridNodeIndicesToFirstParticleIndex[blockIdx.x + 1];
+        }
+        if(blockIdx.x == 0){
+            startVoxelIndex = 0;
+        }
+        else{
+            startVoxelIndex = numVoxelsEachNode[blockIdx.x - 1];
+        }
+    }
+    __syncthreads();
+    for(int i = threadIdx.x; i < numVoxelsPerNode; i += blockDim.x){
+        sharedVoxelU[i] = 0.0;
+    }
+    __syncthreads();
+
+    for(int i = startVoxelIndex + threadIdx.x; i < numVoxelsEachNode[blockIdx.x]; i += blockDim.x){
+        sharedVoxelU[voxelIDs[i]] = voxelUs[i];
+    }
+    
+    for(int index = gridNodeIndicesToFirstParticleIndex[blockIdx.x] + threadIdx.x; index < lastParticleIndex; index += blockDim.x){
+        uint moduloWRTxySize = gridPosition[index] % xySize;
+        uint gridIDz = gridPosition[index] / (xySize);
+        uint gridIDy = moduloWRTxySize / grid.sizeX;
+        uint gridIDx = moduloWRTxySize % grid.sizeX;
+        
+        uint apronCells = floorf(radius);
+        float subCellWidth = grid.cellSize/(2.0f*(1<<refinementLevel));
+        float pxInGridCell = (px[index] - grid.negX - gridIDx*grid.cellSize + apronCells*subCellWidth);
+        float pyInGridCell = (py[index] - grid.negY - gridIDy*grid.cellSize + apronCells*subCellWidth);
+        float pzInGridCell = (pz[index] - grid.negZ - gridIDz*grid.cellSize + apronCells*subCellWidth);
+
+        uint subCellPositionX = floorf(pxInGridCell/subCellWidth);
+        uint subCellPositionY = floorf(pyInGridCell/subCellWidth);
+        uint subCellPositionZ = floorf(pzInGridCell/subCellWidth);
+        
+
+        float halfSubCellWidth = subCellWidth / 2.0f;
+        float radiusSCW = radius*subCellWidth;
+
+        float particleVel = 0.0f;
+        float weightSum = 0.0f;
+
+        for(int x = subCellPositionX - apronCells; x < subCellPositionX + apronCells; ++x){
+            for(int y = subCellPositionY - apronCells; y < subCellPositionY + apronCells; ++y){
+                for(int z = subCellPositionZ - apronCells; z < subCellPositionZ + apronCells; ++z){
+                    float subCellBaseX = x * subCellWidth;
+                    float subCellBaseY = y * subCellWidth;
+                    float subCellBaseZ = z * subCellWidth;
+
+                    if(dimension == VelocityGatherDimension::X){
+                        subCellBaseY += halfSubCellWidth;
+                        subCellBaseZ += halfSubCellWidth;
+                    }
+                    else if(dimension == VelocityGatherDimension::Y){
+                        subCellBaseX += halfSubCellWidth;
+                        subCellBaseZ += halfSubCellWidth;
+                    }
+                    else{
+                        subCellBaseY += halfSubCellWidth;
+                        subCellBaseX += halfSubCellWidth;
+                    }
+
+                    float dpx = pxInGridCell - subCellBaseX;
+                    float dpy = pyInGridCell - subCellBaseY;
+                    float dpz = pzInGridCell - subCellBaseZ;
+
+                    float weight = weightFromDistance(distance(dpx, dpy, dpz), radiusSCW);
+
+                    weightSum += weight;
+                    particleVel += weight*sharedVoxelU[x + y*numVoxels1D + z*numVoxels1D*numVoxels1D];
+                }
+            }
+        }
+        vDim[index] = particleVel / weightSum;
+    }
+}
+
+__global__ void advectParticlePositions(uint numParticles, float dt, float* position, float* v, Grid grid){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(index < numParticles){
+        position[index] += dt*v[index];
+    }
+}
 
 void Particles::advectParticles(){
-    
+    gatherVoxelVelsToParticles<<<numUsedGridNodes, 32, 2*sizeof(float)*numVoxelsPerNode + numVoxelsPerNode, stream>>>(numUsedGridNodes, size, numVoxelsPerNode, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(), voxelsUx.devPtr(), radius, grid, refinementLevel, VelocityGatherDimension::X);
+    gatherVoxelVelsToParticles<<<numUsedGridNodes, 32, 2*sizeof(float)*numVoxelsPerNode + numVoxelsPerNode, stream>>>(numUsedGridNodes, size, numVoxelsPerNode, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(), vy.devPtr(), nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(), voxelsUy.devPtr(), radius, grid, refinementLevel, VelocityGatherDimension::Y);
+    gatherVoxelVelsToParticles<<<numUsedGridNodes, 32, 2*sizeof(float)*numVoxelsPerNode + numVoxelsPerNode, stream>>>(numUsedGridNodes, size, numVoxelsPerNode, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(), vz.devPtr(), nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(), voxelsUz.devPtr(), radius, grid, refinementLevel, VelocityGatherDimension::Z);
+    advectParticlePositions<<<size / WORKSIZE, WORKSIZE, 0, stream>>>(size, dt, px.devPtr(), vx.devPtr(), grid);
+    advectParticlePositions<<<size / WORKSIZE, WORKSIZE, 0, stream>>>(size, dt, py.devPtr(), vy.devPtr(), grid);
+    advectParticlePositions<<<size / WORKSIZE, WORKSIZE, 0, stream>>>(size, dt, pz.devPtr(), vz.devPtr(), grid);
+    cudaStreamSynchronize(stream);
 }
 
 
@@ -525,6 +664,37 @@ void Particles::setupCudaDevices(){
     for(int i = 0; i < deviceProp.size(); ++i){
         std::cout<<"Device "<<i<<": "<<deviceProp[i].name<<" with "<<deviceProp[i].totalGlobalMem / (1<<20)<<"MB VRAM available"<<std::endl;
     }
+}
+
+void Particles::solveFrame(float fps){
+    frameDt = 1.0f/fps;
+    dt = frameDt / 10.0f;
+    elapsedTimeThisFrame = 0.0f;
+    while(elapsedTimeThisFrame < frameDt){
+        alignParticlesToGrid();
+        sortParticles();
+        generateVoxels();
+        particleVelToVoxels();
+        pressureSolve();
+        updateVoxelVelocities();
+        advectParticles();
+    }
+}
+
+#include <iostream>
+#include <fstream>
+
+void Particles::writePositionsToFile(const std::string& fileName){
+    std::ofstream file;
+    px.download(stream);
+    py.download(stream);
+    pz.download(stream);
+    file.open(fileName);
+    cudaStreamSynchronize(stream);
+    for(int i = 0; i < size; ++i){
+        file<<px[i]<<", "<<py[i]<<", "<<pz[i]<<"\n";
+    }
+    file.close();
 }
 
 Particles::~Particles(){

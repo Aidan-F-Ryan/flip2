@@ -36,6 +36,7 @@ public:
     void print() const;
     void zeroDevice();
     void zeroDeviceAsync(cudaStream_t stream);
+    T getMax(cudaStream_t stream, bool abs = false);
     inline uint size() const{
         return numElements;
     }

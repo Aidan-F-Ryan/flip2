@@ -159,6 +159,33 @@ __device__ void loadVoxelDataForThisBlock(const uint numVoxelsPerNode, const uin
     __syncthreads();
 }
 
+__global__ void applyGravityKernel(uint numUsedVoxelsInGrid, const float dt, const char* solids, float* voxelsUz){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(index < numUsedVoxelsInGrid){
+        if(!solids[index]){
+            voxelsUz[index] += -9.8f*dt;
+        }
+    }
+}
+__global__ void removeGravityKernel(uint numUsedVoxelsInGrid, const float dt, const char* solids, float* voxelsUz){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(index < numUsedVoxelsInGrid){
+        if(!solids[index]){
+            voxelsUz[index] -= -9.8f*dt;
+        }
+    }
+}
+
+void applyGravity(const CudaVec<char>& solids, CudaVec<float>& voxelsUz, float dt, cudaStream_t stream){
+    applyGravityKernel<<<voxelsUz.size() / WORKSIZE + 1, WORKSIZE, 0, stream>>>(voxelsUz.size(), dt, solids.devPtr(), voxelsUz.devPtr());
+    cudaStreamSynchronize(stream);
+}
+
+void removeGravity(const CudaVec<char>& solids, CudaVec<float>& voxelsUz, float dt, cudaStream_t stream){
+    removeGravityKernel<<<voxelsUz.size() / WORKSIZE + 1, WORKSIZE, 0, stream>>>(voxelsUz.size(), dt, solids.devPtr(), voxelsUz.devPtr());
+    cudaStreamSynchronize(stream);
+}
+
 //velocities are along negative faces of each
 __global__ void calculateDivU(uint numVoxelsPerNode, uint numVoxels1D, uint numUsedVoxelsInGrid, const uint* nodeIndexToFirstVoxelIndex,
                                 const uint* voxelIDs, const float* voxelUs, float radius, uint refinementLevel, Grid grid,
@@ -259,7 +286,7 @@ __global__ void GSiteration(uint numVoxelsPerNode, uint numVoxels1D, float radiu
         sharedSolids = (char*)(processedVoxels + numVoxelsPerNode);
 
         float voxelSize = grid.cellSize / (numVoxels1D - 2*floorf(radius));
-        scale = dt / (density*voxelSize*voxelSize);
+        scale = dt / (density*voxelSize);//*voxelSize);
         if(blockIdx.x == 0){
             voxelIndexStart = 0;
         }
@@ -411,7 +438,7 @@ float cudaGSiteration(const uint& numVoxelsPerNode, const uint& numVoxels1D, con
         cudaMemcpyAsync(&maxResidual, residuals.devPtr(), sizeof(float), cudaMemcpyDeviceToHost, stream);
         ++iterations;
         cudaStreamSynchronize(stream);
-        std::cout<<"Residual: "<<maxResidual<<"\n\tdRes: "<<std::abs(maxResidual - prevMaxResidual)<<"\n\tdt: "<<dt<<"\n\tIteration: "<<iterations<<std::endl;
+        // std::cout<<"Residual: "<<maxResidual<<"\n\tdRes: "<<std::abs(maxResidual - prevMaxResidual)<<"\n\tdt: "<<dt<<"\n\tIteration: "<<iterations<<std::endl;
         if(iterations == maxIterations || (std::abs(prevMaxResidual - maxResidual) < 0.000001f && maxResidual > threshold)){    //if not converging
             return maxResidual;
         }
@@ -420,7 +447,7 @@ float cudaGSiteration(const uint& numVoxelsPerNode, const uint& numVoxels1D, con
 }
 
 //velocities are along negative faces of voxels
-__global__ void pressureToAcceleration(uint numVoxelsPerNode, uint numVoxels1D, float dt, float radius, float density, const uint* nodeIndexUsedVoxels, const uint* voxelIDs, const uint* solids, const float* p, const float* voxelUs, Grid grid, VelocityGatherDimension dim){
+__global__ void pressureToAcceleration(uint numVoxelsPerNode, uint numVoxels1D, float dt, float radius, float density, const uint* nodeIndexUsedVoxels, const uint* voxelIDs, const char* solids, const float* p, float* voxelUs, Grid grid, VelocityGatherDimension dim){
     extern __shared__ float sharedP[];
     __shared__ float* sharedU;
     __shared__ uint* processedVoxels;
@@ -433,7 +460,7 @@ __global__ void pressureToAcceleration(uint numVoxelsPerNode, uint numVoxels1D, 
         sharedSolids = (char*)(processedVoxels + numVoxelsPerNode);
 
         float voxelSize = grid.cellSize / (numVoxels1D - 2*floorf(radius));
-        scale = dt / (density*voxelSize*voxelSize);
+        scale = dt / (density*voxelSize);//*voxelSize);
         if(blockIdx.x == 0){
             voxelIndexStart = 0;
         }
@@ -497,9 +524,9 @@ __global__ void pressureToAcceleration(uint numVoxelsPerNode, uint numVoxels1D, 
     }
 }
 
-void cudaVelocityUpdate(uint numVoxelsPerNode, uint numVoxels1D, float dt, float radius, float density,  const CudaVec<uint>& nodeIndexUsedVoxels,  const CudaVec<uint>& voxelIDs,  const CudaVec<uint>& solids,  const CudaVec<float>& p,  const CudaVec<float>& voxelsUx, const CudaVec<float>& voxelsUy, const CudaVec<float>& voxelsUz, Grid grid, cudaStream_t stream){
-    pressureToAcceleration<<<nodeIndexUsedVoxels.size(), 32, 4*4*numVoxelsPerNode, stream>>>(numVoxelsPerNode, numVoxels1D, dt, radius, density, nodeIndexUsedVoxels.devPtr(), voxelIDs.devPtr(), solids.devPtr(), p.devPtr(), voxelsUx.devPtr(), grid, VelocityGatherDimension::X);
-    pressureToAcceleration<<<nodeIndexUsedVoxels.size(), 32, 4*4*numVoxelsPerNode, stream>>>(numVoxelsPerNode, numVoxels1D, dt, radius, density, nodeIndexUsedVoxels.devPtr(), voxelIDs.devPtr(), solids.devPtr(), p.devPtr(), voxelsUy.devPtr(), grid, VelocityGatherDimension::Y);
-    pressureToAcceleration<<<nodeIndexUsedVoxels.size(), 32, 4*4*numVoxelsPerNode, stream>>>(numVoxelsPerNode, numVoxels1D, dt, radius, density, nodeIndexUsedVoxels.devPtr(), voxelIDs.devPtr(), solids.devPtr(), p.devPtr(), voxelsUz.devPtr(), grid, VelocityGatherDimension::Z);
+void cudaVelocityUpdate(uint numVoxelsPerNode, uint numVoxels1D, float dt, float radius, float density,  const CudaVec<uint>& nodeIndexUsedVoxels,  const CudaVec<uint>& voxelIDs,  const CudaVec<char>& solids,  const CudaVec<float>& p,  CudaVec<float>& voxelsUx, CudaVec<float>& voxelsUy, CudaVec<float>& voxelsUz, Grid grid, cudaStream_t stream){
+    pressureToAcceleration<<<nodeIndexUsedVoxels.size(), 32, 3*4*numVoxelsPerNode + numVoxelsPerNode, stream>>>(numVoxelsPerNode, numVoxels1D, dt, radius, density, nodeIndexUsedVoxels.devPtr(), voxelIDs.devPtr(), solids.devPtr(), p.devPtr(), voxelsUx.devPtr(), grid, VelocityGatherDimension::X);
+    pressureToAcceleration<<<nodeIndexUsedVoxels.size(), 32, 3*4*numVoxelsPerNode + numVoxelsPerNode, stream>>>(numVoxelsPerNode, numVoxels1D, dt, radius, density, nodeIndexUsedVoxels.devPtr(), voxelIDs.devPtr(), solids.devPtr(), p.devPtr(), voxelsUy.devPtr(), grid, VelocityGatherDimension::Y);
+    pressureToAcceleration<<<nodeIndexUsedVoxels.size(), 32, 3*4*numVoxelsPerNode + numVoxelsPerNode, stream>>>(numVoxelsPerNode, numVoxels1D, dt, radius, density, nodeIndexUsedVoxels.devPtr(), voxelIDs.devPtr(), solids.devPtr(), p.devPtr(), voxelsUz.devPtr(), grid, VelocityGatherDimension::Z);
     cudaStreamSynchronize(stream);
 }
