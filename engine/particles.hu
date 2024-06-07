@@ -12,7 +12,7 @@ class Particles{
 public:
     Particles(uint size);
 
-    void setDomain(float nx, float ny, float nz, uint x, uint y, uint z, float cellSize);
+    void setDomain(double nx, double ny, double nz, uint x, uint y, uint z, double cellSize);
 
     void alignParticlesToGrid();
 
@@ -30,20 +30,26 @@ public:
 
     void advectParticles();
 
-    void solveFrame(float fps);
+    void solveFrame(double fps);
+
+    void initialize();
+    
+    void voxelVelsToParticles();
+
+    void moveSolidParticles();
 
     void writePositionsToFile(const std::string& fileName);
 
-    float getCourantDt();
+    double getCourantDt();
 
     ~Particles();
 private:
-    CudaVec<float> px, py, pz;
-    CudaVec<float> vx, vy, vz;
+    CudaVec<double> px, py, pz;
+    CudaVec<double> vx, vy, vz;
     CudaVec<uint> gridCell;
     CudaVec<char> solids;
-    CudaVec<float> p;
-    CudaVec<float> residuals;
+    CudaVec<double> p;
+    CudaVec<double> residuals;
 
     CudaVec<uint> yDimNumUsedGridNodes;
     
@@ -55,11 +61,11 @@ private:
     CudaVec<uint> nodeIndexUsedVoxels;
     CudaVec<uint> voxelIDsUsed;
 
-    CudaVec<float> divU;
+    CudaVec<double> divU;
 
-    CudaVec<float> voxelsUx;
-    CudaVec<float> voxelsUy;
-    CudaVec<float> voxelsUz;
+    CudaVec<double> voxelsUx;
+    CudaVec<double> voxelsUy;
+    CudaVec<double> voxelsUz;
 
     uint numUsedGridNodes;
     uint numUsedVoxelsX;
@@ -73,13 +79,13 @@ private:
     uint numVoxelsPerNode;
     uint numVoxels1D;
     uint size;
-    float radius;
+    double radius;
     Grid grid;
 
-    float frameDt; //overall timestep used for writing particle positions
-    float dt; //timestep used in pressure solve
-    float elapsedTime;
-    float elapsedTimeThisFrame;
+    double frameDt; //overall timestep used for writing particle positions
+    double dt; //timestep used in pressure solve
+    double elapsedTime;
+    double elapsedTimeThisFrame;
 
     cudaStream_t stream;
     std::vector<cudaDeviceProp> deviceProp;

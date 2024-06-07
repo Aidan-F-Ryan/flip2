@@ -7,17 +7,21 @@
     #include "../typedefs.h"
     #include "../cudaVec.hu"
 
-    void cudaCalcDivU(const CudaVec<uint>& nodeIndexToFirstVoxelIndex, const CudaVec<uint>& voxelIDs,   const CudaVec<float>& voxelsUx, const CudaVec<float>& voxelsUy, const CudaVec<float>& voxelsUz,
-        float radius, uint refinementLevel, const Grid& grid, const CudaVec<uint>& yDimFirstNodeIndex,
-        const CudaVec<uint>& gridNodeIndicesToFirstParticleIndex, const CudaVec<uint>& gridNodes, uint numVoxelsPerNode,
-        uint numVoxels1D, CudaVec<float>& divU, cudaStream_t stream);
-    
-    float cudaGSiteration(const uint& numVoxelsPerNode, const uint& numVoxels1D, const CudaVec<uint>& nodeIndexUsedVoxels, const CudaVec<uint>& voxelIDs, const CudaVec<char>& solids, const CudaVec<float>& divU, CudaVec<float>& p, CudaVec<float>& residuals, const float& radius, const float& density, const float& dt, const Grid& grid, const float& threshold, const uint& maxIterations, cudaStream_t stream);
+    __device__ inline double calcSubCellWidth(const uint& refinementLevel, const Grid& grid){
+        return grid.cellSize / (2<<refinementLevel);
+    }
 
-    __device__ void getNeighboringApronCellData(const uint thisThreadNodeIndexToHandle, const uint numVoxels1D, float* sharedBlockVoxelStorage, const uint* nodeIndexToFirstVoxelIndex,
-        const uint* voxelIDs, const float* voxelData, const int xOffset, const int yOffset, const int zOffset);
+    void cudaCalcDivU(const CudaVec<uint>& nodeIndexToFirstVoxelIndex, const CudaVec<uint>& voxelIDs,   const CudaVec<double>& voxelsUx, const CudaVec<double>& voxelsUy, const CudaVec<double>& voxelsUz,
+        double radius, uint refinementLevel, const Grid& grid, const CudaVec<uint>& yDimFirstNodeIndex,
+        const CudaVec<uint>& gridNodeIndicesToFirstParticleIndex, const CudaVec<uint>& gridNodes, uint numVoxelsPerNode,
+        uint numVoxels1D, CudaVec<double>& divU, cudaStream_t stream);
     
-    void cudaVelocityUpdate(uint numVoxelsPerNode, uint numVoxels1D, float dt, float radius, float density,  const CudaVec<uint>& nodeIndexUsedVoxels,  const CudaVec<uint>& voxelIDs,  const CudaVec<char>& solids,  const CudaVec<float>& p, CudaVec<float>& voxelsUx, CudaVec<float>& voxelsUy, CudaVec<float>& voxelsUz, Grid grid, cudaStream_t stream);
-    void applyGravity(const CudaVec<char>& solids, CudaVec<float>& voxelsUz, float dt, cudaStream_t stream);
-    void removeGravity(const CudaVec<char>& solids, CudaVec<float>& voxelsUz, float dt, cudaStream_t stream);
+    double cudaGSiteration(const uint& numVoxelsPerNode, const uint& numVoxels1D, const uint& refinementLevel, const CudaVec<uint>& nodeIndexUsedVoxels, const CudaVec<uint>& voxelIDs, const CudaVec<char>& solids, const CudaVec<double>& divU, CudaVec<double>& p, CudaVec<double>& residuals, const double& radius, const double& density, const double& dt, const Grid& grid, const double& threshold, const uint& maxIterations, cudaStream_t stream);
+
+    __device__ void getNeighboringApronCellData(const uint thisThreadNodeIndexToHandle, const uint numVoxels1D, double* sharedBlockVoxelStorage, const uint* nodeIndexToFirstVoxelIndex,
+        const uint* voxelIDs, const double* voxelData, const int xOffset, const int yOffset, const int zOffset);
+    
+    void cudaVelocityUpdate(uint numVoxelsPerNode, uint numVoxels1D, double dt, double radius, double density,  const CudaVec<uint>& nodeIndexUsedVoxels,  const CudaVec<uint>& voxelIDs,  const CudaVec<char>& solids,  const CudaVec<double>& p, CudaVec<double>& voxelsUx, CudaVec<double>& voxelsUy, CudaVec<double>& voxelsUz, uint refinementLevel, Grid grid, cudaStream_t stream);
+    void applyGravity(const CudaVec<char>& solids, CudaVec<double>& voxelsUz, double dt, cudaStream_t stream);
+    void removeGravity(const CudaVec<char>& solids, CudaVec<double>& voxelsUz, double dt, cudaStream_t stream);
 #endif

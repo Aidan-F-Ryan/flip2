@@ -66,8 +66,10 @@ template <typename T>
 void cudaParallelPrefixSum(uint numElements, T* array, cudaStream_t stream){
     uint totalBlockSumsSize = 0;
     T* blockSums;
-    for(uint i = numElements / WORKSIZE; i > 0; i = i / WORKSIZE ){
-        totalBlockSumsSize += i + 1;
+    for(uint i = numElements / WORKSIZE + 1; i >= 1; i = i / WORKSIZE + 1){
+        totalBlockSumsSize += i;
+        if(i == 1)
+            break;
     }
     gpuErrchk(cudaMallocAsync((void**)&blockSums, sizeof(T) * totalBlockSumsSize, stream));
     cudaParallelPrefixSum_internal(numElements, array, blockSums, stream);
