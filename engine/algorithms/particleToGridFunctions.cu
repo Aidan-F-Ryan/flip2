@@ -16,9 +16,27 @@
  * @return __global__ 
  */
 
-__global__ void rootCell(float* px, float* py, float* pz, uint numParticles, Grid grid, uint* gridPosition){
+__global__ void rootCell(double* px, double* py, double* pz, uint numParticles, Grid grid, uint* gridPosition){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
     if(index < numParticles){
+        if(px[index] < grid.negX){
+            px[index] = grid.negX;
+        }
+        else if(px[index] > grid.negX + grid.sizeX*grid.cellSize){
+            px[index] = grid.negX + grid.sizeX*grid.cellSize;
+        }
+        if(py[index] < grid.negY){
+            py[index] = grid.negY;
+        }
+        else if(py[index] > grid.negY + grid.sizeY*grid.cellSize){
+            py[index] = grid.negY + grid.sizeY*grid.cellSize;
+        }
+        if(pz[index] < grid.negZ){
+            pz[index] = grid.negZ;
+        }
+        else if(pz[index] > grid.negZ + grid.sizeZ*grid.cellSize){
+            pz[index] = grid.negZ + grid.sizeZ*grid.cellSize;
+        }
         uint x = floorf((px[index] - grid.negX) / grid.cellSize);
         uint y = floorf((py[index] - grid.negY) / grid.cellSize);
         uint z = floorf((pz[index] - grid.negZ) / grid.cellSize);
@@ -48,7 +66,7 @@ __device__ T square(T in){
  * @return __global__ 
  */
 
-__global__ void subCellCreateNumSubCellsTouchedEachDimension(float* px, float* py, float* pz, uint numParticles, Grid grid, uint* gridPosition, uint* subCellsTouchedX, uint* subCellsTouchedY, uint* subCellsTouchedZ, uint refinementLevel, float radius, uint xySize){
+__global__ void subCellCreateNumSubCellsTouchedEachDimension(double* px, double* py, double* pz, uint numParticles, Grid grid, uint* gridPosition, uint* subCellsTouchedX, uint* subCellsTouchedY, uint* subCellsTouchedZ, uint refinementLevel, double radius, uint xySize){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
     if(index < numParticles){
         uint moduloWRTxySize = gridPosition[index] % xySize;
@@ -57,10 +75,10 @@ __global__ void subCellCreateNumSubCellsTouchedEachDimension(float* px, float* p
         uint gridIDx = moduloWRTxySize % grid.sizeX;
         
         uint apronCells = floorf(radius);
-        float subCellWidth = grid.cellSize/(2.0f*(1<<refinementLevel));
-        float pxInGridCell = (px[index] - grid.negX - gridIDx*grid.cellSize + apronCells*subCellWidth);
-        float pyInGridCell = (py[index] - grid.negY - gridIDy*grid.cellSize + apronCells*subCellWidth);
-        float pzInGridCell = (pz[index] - grid.negZ - gridIDz*grid.cellSize + apronCells*subCellWidth);
+        double subCellWidth = grid.cellSize/(2.0f*(1<<refinementLevel));
+        double pxInGridCell = (px[index] - grid.negX - gridIDx*grid.cellSize + apronCells*subCellWidth);
+        double pyInGridCell = (py[index] - grid.negY - gridIDy*grid.cellSize + apronCells*subCellWidth);
+        double pzInGridCell = (pz[index] - grid.negZ - gridIDz*grid.cellSize + apronCells*subCellWidth);
 
         uint xTouched = 0;
         uint yTouched = 0;
@@ -71,23 +89,23 @@ __global__ void subCellCreateNumSubCellsTouchedEachDimension(float* px, float* p
         uint subCellPositionZ = floorf(pzInGridCell/subCellWidth);
         
 
-        float halfSubCellWidth = subCellWidth / 2.0f;
-        float radiusSCW = radius*subCellWidth;
+        double halfSubCellWidth = subCellWidth / 2.0f;
+        double radiusSCW = radius*subCellWidth;
 
         for(uint x = subCellPositionX - apronCells; x < subCellPositionX + apronCells; ++x){
             for(uint y = subCellPositionY - apronCells; y < subCellPositionY + apronCells; ++y){
                 for(uint z = subCellPositionZ - apronCells; z < subCellPositionZ + apronCells; ++z){
-                    float subCellBaseX = x * subCellWidth;
-                    float subCellBaseY = y * subCellWidth;
-                    float subCellBaseZ = z * subCellWidth;
+                    double subCellBaseX = x * subCellWidth;
+                    double subCellBaseY = y * subCellWidth;
+                    double subCellBaseZ = z * subCellWidth;
 
-                    float dpx = pxInGridCell - subCellBaseX;
-                    float dpy = pyInGridCell - subCellBaseY;
-                    float dpz = pzInGridCell - subCellBaseZ;
+                    double dpx = pxInGridCell - subCellBaseX;
+                    double dpy = pyInGridCell - subCellBaseY;
+                    double dpz = pzInGridCell - subCellBaseZ;
 
-                    float xCheck = sqrtf(square(dpx) + square(dpy + halfSubCellWidth) + square(dpz + halfSubCellWidth));
-                    float yCheck = sqrtf(square(dpx + halfSubCellWidth) + square(dpy) + square(dpz + halfSubCellWidth));
-                    float zCheck = sqrtf(square(dpx + halfSubCellWidth) + square(dpy + halfSubCellWidth) + square(dpz));
+                    double xCheck = sqrtf(square(dpx) + square(dpy + halfSubCellWidth) + square(dpz + halfSubCellWidth));
+                    double yCheck = sqrtf(square(dpx + halfSubCellWidth) + square(dpy) + square(dpz + halfSubCellWidth));
+                    double zCheck = sqrtf(square(dpx + halfSubCellWidth) + square(dpy + halfSubCellWidth) + square(dpz));
 
                     if(xCheck < radiusSCW){
                         ++xTouched;
@@ -108,9 +126,9 @@ __global__ void subCellCreateNumSubCellsTouchedEachDimension(float* px, float* p
     }
 }
 
-__global__ void subCellCreateLists(float* px, float* py, float* pz, uint numParticles, Grid grid, uint* gridPosition,
+__global__ void subCellCreateLists(double* px, double* py, double* pz, uint numParticles, Grid grid, uint* gridPosition,
         uint* numSubCellsTouchedX, uint* numSubCellsTouchedY, uint* numSubCellsTouchedZ, uint* subCellsX, uint* subCellsY,
-        uint* subCellsZ, uint refinementLevel, float radius, uint xySize){
+        uint* subCellsZ, uint refinementLevel, double radius, uint xySize){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
     if(index < numParticles){
         uint moduloWRTxySize = gridPosition[index] % xySize;
@@ -119,18 +137,18 @@ __global__ void subCellCreateLists(float* px, float* py, float* pz, uint numPart
         uint gridIDx = moduloWRTxySize % grid.sizeX;
         
         uint apronCells = floorf(radius);
-        float subCellWidth = grid.cellSize/(2.0f*(1<<refinementLevel));
-        float pxInGridCell = (px[index] - grid.negX - gridIDx*grid.cellSize + apronCells*subCellWidth);    //including apron cell width offset
-        float pyInGridCell = (py[index] - grid.negY - gridIDy*grid.cellSize + apronCells*subCellWidth);
-        float pzInGridCell = (pz[index] - grid.negZ - gridIDz*grid.cellSize + apronCells*subCellWidth);
+        double subCellWidth = grid.cellSize/(2.0f*(1<<refinementLevel));
+        double pxInGridCell = (px[index] - grid.negX - gridIDx*grid.cellSize + apronCells*subCellWidth);    //including apron cell width offset
+        double pyInGridCell = (py[index] - grid.negY - gridIDy*grid.cellSize + apronCells*subCellWidth);
+        double pzInGridCell = (pz[index] - grid.negZ - gridIDz*grid.cellSize + apronCells*subCellWidth);
 
         uint subCellPositionX = floorf(pxInGridCell/subCellWidth);
         uint subCellPositionY = floorf(pyInGridCell/subCellWidth);
         uint subCellPositionZ = floorf(pzInGridCell/subCellWidth);
         
 
-        float halfSubCellWidth = subCellWidth / 2.0f;
-        float radiusSCW = radius*subCellWidth;
+        double halfSubCellWidth = subCellWidth / 2.0f;
+        double radiusSCW = radius*subCellWidth;
 
         uint xWritten = 0;
         uint yWritten = 0;
@@ -155,17 +173,17 @@ __global__ void subCellCreateLists(float* px, float* py, float* pz, uint numPart
         for(uint x = subCellPositionX - apronCells; x < subCellPositionX + apronCells; ++x){
             for(uint y = subCellPositionY - apronCells; y < subCellPositionY + apronCells; ++y){
                 for(uint z = subCellPositionZ - apronCells; z < subCellPositionZ + apronCells; ++z){
-                    float subCellBaseX = x * subCellWidth;
-                    float subCellBaseY = y * subCellWidth;
-                    float subCellBaseZ = z * subCellWidth;
+                    double subCellBaseX = x * subCellWidth;
+                    double subCellBaseY = y * subCellWidth;
+                    double subCellBaseZ = z * subCellWidth;
                     
-                    float dpx = pxInGridCell - subCellBaseX;
-                    float dpy = pyInGridCell - subCellBaseY;
-                    float dpz = pzInGridCell - subCellBaseZ;
+                    double dpx = pxInGridCell - subCellBaseX;
+                    double dpy = pyInGridCell - subCellBaseY;
+                    double dpz = pzInGridCell - subCellBaseZ;
 
-                    float xCheck = sqrtf(square(dpx) + square(dpy + halfSubCellWidth) + square(dpz + halfSubCellWidth));
-                    float yCheck = sqrtf(square(dpx + halfSubCellWidth) + square(dpy) + square(dpz + halfSubCellWidth));
-                    float zCheck = sqrtf(square(dpx + halfSubCellWidth) + square(dpy + halfSubCellWidth) + square(dpz));
+                    double xCheck = sqrtf(square(dpx) + square(dpy + halfSubCellWidth) + square(dpz + halfSubCellWidth));
+                    double yCheck = sqrtf(square(dpx + halfSubCellWidth) + square(dpy) + square(dpz + halfSubCellWidth));
+                    double zCheck = sqrtf(square(dpx + halfSubCellWidth) + square(dpy + halfSubCellWidth) + square(dpz));
 
                     if(xCheck < radiusSCW){
                         subCellsX[subCellsTouchedStartX + xWritten++] = x + y*numVoxelsInNodeDimension + z*numVoxelsInNodeDimension*numVoxelsInNodeDimension; //x is x, y is y, z is z
@@ -195,17 +213,17 @@ __global__ void subCellCreateLists(float* px, float* py, float* pz, uint numPart
  */
 
 
-void cudaFindGridCell(float* px, float* py, float* pz, uint numParticles, Grid grid, uint* gridPosition, cudaStream_t stream){
+void cudaFindGridCell(double* px, double* py, double* pz, uint numParticles, Grid grid, uint* gridPosition, cudaStream_t stream){
     rootCell<<<numParticles / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(px, py, pz, numParticles, grid, gridPosition);
     cudaStreamSynchronize(stream);
 }
 
-void cudaFindSubCell(float* px, float* py, float* pz,
+void cudaFindSubCell(double* px, double* py, double* pz,
     uint numParticles, Grid grid, uint* gridPosition,
     uint* subCellsTouchedX, uint* subCellsTouchedY,
     uint* subCellsTouchedZ, CudaVec<uint>& subCellPositionX, 
     CudaVec<uint>& subCellPositionY, CudaVec<uint>& subCellPositionZ, 
-    uint numRefinementLevels, float radius, cudaStream_t stream)
+    uint numRefinementLevels, double radius, cudaStream_t stream)
 {
     cudaStream_t prefixSumStream;
     cudaStreamCreate(&prefixSumStream);

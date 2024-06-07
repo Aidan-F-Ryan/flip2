@@ -65,7 +65,7 @@ __global__ void reorderGridIndices(uint numElements, uint* sortedIndices, T* inA
 }
 
 template __global__ void reorderGridIndices(uint numElements, uint *sortedIndices, uint* inArray, uint* outArray);
-template __global__ void reorderGridIndices(uint numElements, uint *sortedIndices, float* inArray, float* outArray);
+template __global__ void reorderGridIndices(uint numElements, uint *sortedIndices, double* inArray, double* outArray);
 
 /**
  * @brief Wrapper for performing CUDA radix inclusive sort on uint array

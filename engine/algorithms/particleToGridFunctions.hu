@@ -7,11 +7,11 @@
     #include "../grid.hpp"
     #include "../cudaVec.hu"
 
-    void cudaFindGridCell(float* px, float* py, float* pz, uint numParticles, Grid grid, uint* gridPosition, cudaStream_t stream);
+    void cudaFindGridCell(double* px, double* py, double* pz, uint numParticles, Grid grid, uint* gridPosition, cudaStream_t stream);
 
-    void cudaFindSubCell(float* px, float* py, float* pz, uint numParticles, Grid grid, uint* gridPosition, uint* subCellsTouchedX,
+    void cudaFindSubCell(double* px, double* py, double* pz, uint numParticles, Grid grid, uint* gridPosition, uint* subCellsTouchedX,
         uint* subCellsTouchedY, uint* subCellsTouchedZ, CudaVec<uint>& subCellPositionX, CudaVec<uint>& subCellPositionY,
-        CudaVec<uint>& subCellPositionZ, uint numRefinementLevels, float radius, cudaStream_t stream);
+        CudaVec<uint>& subCellPositionZ, uint numRefinementLevels, double radius, cudaStream_t stream);
 
     void cudaSortParticlesByGridNode(uint numParticles, uint*& gridPosition, uint*& reorderedIndicesRelativeToOriginal, cudaStream_t stream);
 

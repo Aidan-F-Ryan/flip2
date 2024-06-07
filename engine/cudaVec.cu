@@ -212,12 +212,12 @@ T CudaVec<T>::getMax(cudaStream_t stream, bool abs){
     getMaxFromArray<<<numElements / WORKSIZE + 1, BLOCKSIZE, 0, stream>>>(abs, numElements, d_vec, outArray);
     gpuErrchk(cudaPeekAtLastError());
     cudaMallocAsync((void**)&outArray2, sizeof(T) * ((numElements / WORKSIZE + 1) / WORKSIZE + 1), stream);
+    // cudaStreamSynchronize(stream);
     gpuErrchk(cudaPeekAtLastError());
-    cudaStreamSynchronize(stream);
     for(int i = numElements / WORKSIZE + 1; i > 1; i = i / WORKSIZE + 1){
         getMaxFromArray<<<i / WORKSIZE + 1, BLOCKSIZE, 0, stream>>>(abs, i, outArray, outArray2);
+        // cudaStreamSynchronize(stream);
         gpuErrchk(cudaPeekAtLastError());
-        cudaStreamSynchronize(stream);
         T* temp = outArray;
         outArray = outArray2;
         outArray2 = temp;
@@ -227,7 +227,7 @@ T CudaVec<T>::getMax(cudaStream_t stream, bool abs){
     cudaStreamSynchronize(stream);
     cudaFreeAsync(outArray, stream);
     cudaFreeAsync(outArray2, stream);
-    cudaStreamSynchronize(stream);
+    // cudaStreamSynchronize(stream);
     gpuErrchk(cudaPeekAtLastError());
     return out;
 }
@@ -240,10 +240,10 @@ CudaVec<T>::~CudaVec(){
     }
 }
 
-template class CudaVec<float>;
+// template class CudaVec<float>;
 template class CudaVec<uint>;
 template class CudaVec<char>;
-// template class CudaVec<bool>;
+template class CudaVec<double>;
 
 template <typename T>
 uint CudaVec<T>::GPU_MEMORY_ALLOCATED = 0;

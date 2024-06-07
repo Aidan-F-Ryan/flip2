@@ -61,7 +61,7 @@ void cudaParallelMaximum(uint numElements, T* array, cudaStream_t stream){
     }
 }
 
-template void cudaParallelMaximum(uint, float*, cudaStream_t);
+template void cudaParallelMaximum(uint, double*, cudaStream_t);
 template void cudaParallelMaximum(uint, uint*, cudaStream_t);
 template void cudaParallelMaximum(uint, int*, cudaStream_t);
 template void cudaParallelMaximum(uint, char*, cudaStream_t);

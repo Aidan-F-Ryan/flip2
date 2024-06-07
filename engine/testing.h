@@ -18,7 +18,7 @@ public:
     : particles(size)
     {}
 
-    void setDomain(float nx, float ny, float nz, uint x, uint y, uint z, float cellSize){
+    void setDomain(double nx, double ny, double nz, uint x, uint y, uint z, double cellSize){
         particles.setDomain(nx, ny, nz, x, y, z, cellSize);
     }
 
@@ -55,9 +55,9 @@ public:
     void randomizeParticlePositions(){
         std::random_device rd;
         std::default_random_engine e2(rd());
-        float oneThirdYDimension = particles.grid.sizeY*particles.grid.cellSize / 3.0f;
+        double oneThirdYDimension = particles.grid.sizeY*particles.grid.cellSize / 3.0f;
         std::uniform_real_distribution<> distX(particles.grid.negX + oneThirdYDimension, particles.grid.negX + particles.grid.sizeX*particles.grid.cellSize - oneThirdYDimension);
-        std::uniform_real_distribution<> distY(particles.grid.negY + oneThirdYDimension, particles.grid.negY + particles.grid.sizeY*particles.grid.cellSize - oneThirdYDimension);
+        std::uniform_real_distribution<> distY(particles.grid.negY, particles.grid.negY + particles.grid.sizeY*particles.grid.cellSize - oneThirdYDimension);
         std::uniform_real_distribution<> distZ(particles.grid.negZ + oneThirdYDimension, particles.grid.negZ + particles.grid.sizeZ*particles.grid.cellSize - oneThirdYDimension);
 
         std::uniform_real_distribution<> vDist(-1.0f, 1.0f);
@@ -66,16 +66,13 @@ public:
             particles.px[i] = distX(e2);
             particles.py[i] = distY(e2);
             particles.pz[i] = distZ(e2);
-            particles.vx[i] = vDist(e2);
-            particles.vy[i] = vDist(e2);
-            particles.vz[i] = vDist(e2);
         }
         particles.px.upload(particles.stream);
         particles.py.upload(particles.stream);
         particles.pz.upload(particles.stream);
-        particles.vx.upload(particles.stream);
-        particles.vy.upload(particles.stream);
-        particles.vz.upload(particles.stream);
+        particles.vx.zeroDeviceAsync(particles.stream);
+        particles.vy.zeroDeviceAsync(particles.stream);
+        particles.vz.zeroDeviceAsync(particles.stream);
     }
 
     void runVerify(){
@@ -106,7 +103,9 @@ public:
             std::cout<<particles.px[i]<<", "<<particles.py[i]<<", "<<particles.pz[i]<<"\n";
         }
     }
-
+    void initialize(){
+        particles.initialize();
+    }
     void run(){
         particles.alignParticlesToGrid();
         particles.sortParticles();
@@ -118,7 +117,7 @@ public:
         particles.advectParticles();
     }
 
-    void solveFrame(float fps){
+    void solveFrame(double fps){
         particles.solveFrame(fps);
     }
 
