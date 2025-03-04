@@ -4,6 +4,8 @@
 #include "parallelPrefixSumKernels.hu"
 #include "radixSortKernels.hu"
 
+#include <cub/cub.cuh>
+
 /**
  * @brief find root node containing each particle in domain
  * 
@@ -259,6 +261,13 @@ void cudaFindSubCell(double* px, double* py, double* pz,
     cudaStreamDestroy(prefixSumStream);
 }
 
+__global__ void initializeParticleIndices(uint* indices, uint numParticles){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(index < numParticles){
+        indices[index] = index;
+    }
+}
+
 /**
  * @brief Sort particles globally by containing root nodes
  * 
@@ -273,19 +282,34 @@ void cudaSortParticlesByGridNode(uint numParticles, uint*& gridPosition, uint*& 
 
     uint* sortedGridPosition;
     uint* sortedParticleIndices;
-    uint* front;
-    uint* back;
+    uint* particleIndices;
+    //uint* front;
+    //uint* back;
 
+    cudaMallocAsync((void**)&particleIndices, sizeof(uint)*numParticles, stream);
+    initializeParticleIndices<<<numParticles / 512 + 1, 512, 0, stream>>>(particleIndices, numParticles);
     cudaMallocAsync((void**)&sortedGridPosition, sizeof(uint)*numParticles, stream);
-    cudaMallocAsync((void**)&sortedParticleIndices, sizeof(uint)*numParticles, stream);
-    cudaMallocAsync((void**)&front, sizeof(uint)*numParticles, stream);
-    cudaMallocAsync((void**)&back, sizeof(uint)*numParticles, stream);
+    //cudaMallocAsync((void**)&sortedParticleIndices, sizeof(uint)*numParticles, stream);
+    //cudaMallocAsync((void**)&front, sizeof(uint)*numParticles, stream);
+    //cudaMallocAsync((void**)&back, sizeof(uint)*numParticles, stream);
 
-    cudaStream_t backStream;
-    cudaStreamCreate(&backStream);
+    //cudaStream_t backStream;
+    //cudaStreamCreate(&backStream);
     // cudaStreamSynchronize(stream);
 
-    cudaRadixSortUint(numParticles, gridPosition, sortedGridPosition, sortedParticleIndices, front, back, stream, backStream, reorderedIndicesRelativeToOriginal);
+    //cudaRadixSortUint(numParticles, gridPosition, sortedGridPosition, sortedParticleIndices, front, back, stream, backStream, reorderedIndicesRelativeToOriginal);
+
+    uint* d_temp = nullptr;
+    size_t d_temp_size;
+    cub::DeviceRadixSort::SortPairs(d_temp, d_temp_size, gridPosition, sortedGridPosition, particleIndices, reorderedIndicesRelativeToOriginal, numParticles, 0, sizeof(uint)*8, stream);
+    cudaMallocAsync((void**)&d_temp, d_temp_size, stream);
+    cub::DeviceRadixSort::SortPairs(d_temp, d_temp_size, gridPosition, sortedGridPosition, particleIndices, reorderedIndicesRelativeToOriginal, numParticles, 0, sizeof(uint)*8, stream);
+    std::cout<<"done sorting\n";
+    
+    uint* t = gridPosition;
+    gridPosition = sortedGridPosition;
+    sortedGridPosition = t;
+
 
     if(ogGridPosition != sortedGridPosition){
         cudaFreeAsync(sortedGridPosition, stream);
@@ -296,8 +320,9 @@ void cudaSortParticlesByGridNode(uint numParticles, uint*& gridPosition, uint*& 
     // }
 
     cudaFreeAsync(sortedParticleIndices, stream);
-    cudaFreeAsync(front, stream);
-    cudaFreeAsync(back, stream);
+    //cudaFreeAsync(front, stream);
+    //cudaFreeAsync(back, stream);
+    cudaStreamSynchronize(stream);
 }
 
 __global__ void markUniqueGridCells(uint numElements, uint* gridCells, uint* uniqueGridNodes){

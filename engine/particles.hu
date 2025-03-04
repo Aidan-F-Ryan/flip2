@@ -67,6 +67,14 @@ private:
     CudaVec<double> voxelsUy;
     CudaVec<double> voxelsUz;
 
+    CudaVec<double> Anx;
+    CudaVec<double> Apx;
+    CudaVec<double> Any;
+    CudaVec<double> Apy;
+    CudaVec<double> Anz;
+    CudaVec<double> Apz;
+    CudaVec<double> Adiag;
+
     uint numUsedGridNodes;
     uint numUsedVoxelsX;
     uint numUsedVoxelsY;
@@ -84,6 +92,7 @@ private:
 
     double frameDt; //overall timestep used for writing particle positions
     double dt; //timestep used in pressure solve
+    double prevDt;
     double elapsedTime;
     double elapsedTimeThisFrame;
 

@@ -16,12 +16,15 @@
         const CudaVec<uint>& gridNodeIndicesToFirstParticleIndex, const CudaVec<uint>& gridNodes, uint numVoxelsPerNode,
         uint numVoxels1D, CudaVec<double>& divU, cudaStream_t stream);
     
-    double cudaGSiteration(const uint& numVoxelsPerNode, const uint& numVoxels1D, const uint& refinementLevel, const CudaVec<uint>& nodeIndexUsedVoxels, const CudaVec<uint>& voxelIDs, const CudaVec<char>& solids, const CudaVec<double>& divU, CudaVec<double>& p, CudaVec<double>& residuals, const double& radius, const double& density, const double& dt, const Grid& grid, const double& threshold, const uint& maxIterations, cudaStream_t stream);
+    double cudaGSiteration(const uint& numVoxelsPerNode, const uint& numVoxels1D, const uint& refinementLevel, const CudaVec<uint>& nodeIndexUsedVoxels, const CudaVec<uint>& voxelIDs, const CudaVec<char>& solids, const CudaVec<double>& divU, CudaVec<double>& p, CudaVec<double>& residuals, const double& radius, const double& density, const double& dt, const Grid& grid, const double& threshold, const uint& maxIterations, const CudaVec<double>& Anx, const CudaVec<double>& Apx, const CudaVec<double>& Any, const CudaVec<double>& Apy, const CudaVec<double>& Anz, const CudaVec<double>& Apz, const CudaVec<double>& Adiag, cudaStream_t stream);
 
     __device__ void getNeighboringApronCellData(const uint thisThreadNodeIndexToHandle, const uint numVoxels1D, double* sharedBlockVoxelStorage, const uint* nodeIndexToFirstVoxelIndex,
         const uint* voxelIDs, const double* voxelData, const int xOffset, const int yOffset, const int zOffset);
     
     void cudaVelocityUpdate(uint numVoxelsPerNode, uint numVoxels1D, double dt, double radius, double density,  const CudaVec<uint>& nodeIndexUsedVoxels,  const CudaVec<uint>& voxelIDs,  const CudaVec<char>& solids,  const CudaVec<double>& p, CudaVec<double>& voxelsUx, CudaVec<double>& voxelsUy, CudaVec<double>& voxelsUz, uint refinementLevel, Grid grid, cudaStream_t stream);
+    
     void applyGravity(const CudaVec<char>& solids, CudaVec<double>& voxelsUz, double dt, cudaStream_t stream);
     void removeGravity(const CudaVec<char>& solids, CudaVec<double>& voxelsUz, double dt, cudaStream_t stream);
+    
+    void cudaGetA(uint numVoxelsPerNode, uint numVoxels1D, uint refinementLevel, double radius, const CudaVec<uint>& nodeIndexUsedVoxels, const CudaVec<uint>& voxelIDs, const CudaVec<char>& solids, const CudaVec<double>& divU, CudaVec<double>& Anx, CudaVec<double>& Apx, CudaVec<double>& Any, CudaVec<double>& Apy, CudaVec<double>& Anz, CudaVec<double>& Apz, CudaVec<double>& Adiag, double density, double dt, Grid grid, cudaStream_t stream);
 #endif

@@ -36,7 +36,8 @@ Particles::Particles(uint size)
 
     numVoxels1D = 2*(uint)(std::floor(radius)) + (2<<refinementLevel);
     numVoxelsPerNode = numVoxels1D*numVoxels1D*numVoxels1D;
-    frameDt = 1.0f/24.0f;
+    frameDt = 1.0/24.0;
+    prevDt = 0.0;
 }
 
 void Particles::setDomain(double nx, double ny, double nz, uint x, uint y, uint z, double cellSize){
@@ -349,6 +350,13 @@ void Particles::generateVoxels(){
     divU.resizeAsync(numUsedVoxels, stream);
     p.resizeAsync(numUsedVoxels, stream);
     residuals.resizeAsync(numUsedVoxels, stream);
+    Adiag.resizeAsync(numUsedVoxels, stream);
+    Anx.resizeAsync(numUsedVoxels, stream);
+    Apx.resizeAsync(numUsedVoxels, stream);
+    Any.resizeAsync(numUsedVoxels, stream);
+    Apy.resizeAsync(numUsedVoxels, stream);
+    Anz.resizeAsync(numUsedVoxels, stream);
+    Apz.resizeAsync(numUsedVoxels, stream);
     p.zeroDeviceAsync(stream);
     cudaStreamSynchronize(stream);
 
@@ -491,10 +499,15 @@ __global__ void gatherParticleVelsToVoxels(uint numUsedGridNodes, uint numPartic
 #include <cmath>
 
 double Particles::getCourantDt(){
+    if(prevDt == 0.0){
     double maxVel = max(abs(vx.getMax(stream, true)), max(abs(vy.getMax(stream, true)), abs(vz.getMax(stream, true))));
     double voxelSize = (grid.cellSize / (numVoxels1D - 2*std::floor(radius)));
     std::cout<<"maxVel: "<<maxVel<<" voxelSize: "<<voxelSize<<"\n";
-    return 0.7 * (voxelSize / maxVel);
+    return 0.7 * (voxelSize / maxVel + 0.0001);
+    }
+    else{
+        return prevDt *= 2.0;
+    }
 }
 
 void Particles::particleVelToVoxels(){
@@ -506,7 +519,7 @@ void Particles::particleVelToVoxels(){
 
 void Particles::pressureSolve(){
     double density = 0.014;
-    double threshold = 0.01;
+    double threshold = 0.1;
     uint maxIterations = 16384;
     double previousTerminatingResidual = 100;
     double terminatingResidual;
@@ -524,8 +537,10 @@ void Particles::pressureSolve(){
             radius, refinementLevel, grid, yDimNumUsedGridNodes, gridNodeIndicesToFirstParticleIndex,
             gridCell, numVoxelsPerNode, numVoxels1D, divU, stream);
     cudaStreamSynchronize(stream);
+    cudaGetA(numVoxelsPerNode, numVoxels1D, refinementLevel, radius, nodeIndexUsedVoxels, voxelIDsUsed, solids, divU, Anx, Apx, Any, Apy, Anz, Apz, Adiag, density, dt, grid, stream);
+    cudaStreamSynchronize(stream);
     gpuErrchk(cudaPeekAtLastError());
-    while(previousTerminatingResidual - (terminatingResidual = cudaGSiteration(numVoxelsPerNode, numVoxels1D, refinementLevel, nodeIndexUsedVoxels, voxelIDsUsed, solids, divU, p, residuals, radius, density, dt, grid, threshold, maxIterations, stream)) > 0){    //while residual getting smaller
+    while(previousTerminatingResidual - (terminatingResidual = cudaGSiteration(numVoxelsPerNode, numVoxels1D, refinementLevel, nodeIndexUsedVoxels, voxelIDsUsed, solids, divU, p, residuals, radius, density, dt, grid, threshold, maxIterations, Anx, Apx, Any, Apy, Anz, Apz, Adiag, stream)) > 0.0){    //while residual getting smaller
         gpuErrchk(cudaPeekAtLastError());
         if(terminatingResidual < threshold){
             break;
@@ -543,12 +558,15 @@ void Particles::pressureSolve(){
         cudaCalcDivU(nodeIndexUsedVoxels, voxelIDsUsed, voxelsUx, voxelsUy, voxelsUz,
                 radius, refinementLevel, grid, yDimNumUsedGridNodes, gridNodeIndicesToFirstParticleIndex,
                 gridCell, numVoxelsPerNode, numVoxels1D, divU, stream);
+        cudaStreamSynchronize(stream);
+        cudaGetA(numVoxelsPerNode, numVoxels1D, refinementLevel, radius, nodeIndexUsedVoxels, voxelIDsUsed, solids, divU, Anx, Apx, Any, Apy, Anz, Apz, Adiag, density, dt, grid, stream);
         gpuErrchk(cudaPeekAtLastError());
         cudaStreamSynchronize(stream);
         gpuErrchk(cudaPeekAtLastError());
     }
     elapsedTime += dt;
     elapsedTimeThisFrame += dt;
+    prevDt = dt;
     std::cout<<"dt: "<<dt<<" ElapsedTime: "<<elapsedTime<<" elapsedTimeThisFrame: "<<elapsedTimeThisFrame<<"\nTerminating Residual: "<<terminatingResidual<<"\nThreshold: "<<threshold<<"\n";
     cudaStreamSynchronize(stream);
     gpuErrchk(cudaPeekAtLastError());

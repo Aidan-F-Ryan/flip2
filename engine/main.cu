@@ -12,8 +12,8 @@ int main(){
         // (1<<25) - 12 //32M
         // 1<<26
         );
-    // particles.setDomain(-100.0f, -100.0f, -100.0f, 256, 256, 256, 200.0f / 256.0f);
-    particles.setDomain(-10.0, -10.0, -10.0, 100, 100, 100, 0.25);
+    particles.setDomain(-100.0f, -100.0f, -100.0f, 256, 256, 256, 200.0f / 256.0f);
+    // particles.setDomain(-10.0, -10.0, -10.0, 100, 100, 100, 0.25);
     // particles.setDomain(-100.0f, -100.0f, -100.0f, 1024, 1024, 1024, 200.0f / 1024.0f);
     particles.randomizeParticlePositions();
     particles.initialize();

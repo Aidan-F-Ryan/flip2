@@ -290,7 +290,91 @@ __device__ inline bool isRed(const uint& voxelID, const uint& numVoxels1D){
     return !((x + y + z) & 1);
 }
 
-__global__ void GSiteration(uint numVoxelsPerNode, uint numVoxels1D, uint refinementLevel, double radius, const uint* nodeIndexUsedVoxels, const uint* voxelIDs, const char* solids, const double* divU, double* p, double* residuals, double density, double dt, Grid grid, bool red, double w){
+__global__ void generateA(uint numVoxelsPerNode, uint numVoxels1D, uint refinementLevel, double radius, const uint* nodeIndexUsedVoxels, const uint* voxelIDs, const char* solids, const double* divU, double* Adiag, double* Anx, double* Apx, double* Any, double* Apy, double* Anz, double* Apz, double density, double dt, Grid grid){
+    extern __shared__ char sharedSolids[];
+    __shared__ double* sharedDivU;
+    __shared__ double scale;
+    __shared__ uint voxelIndexStart;
+    if(threadIdx.x == 0){
+        double voxelSize = calcSubCellWidth(refinementLevel, grid);
+        scale = dt / (density*voxelSize*voxelSize);
+        sharedDivU = (double*)(sharedSolids + numVoxelsPerNode);
+        if(blockIdx.x == 0){
+            voxelIndexStart = 0;
+        }
+        else{
+            voxelIndexStart = nodeIndexUsedVoxels[blockIdx.x - 1]; 
+        }
+    }
+    __syncthreads();
+    for(int i = threadIdx.x; i < numVoxelsPerNode; i += blockDim.x){
+        sharedSolids[i] = false;
+        sharedDivU[i] = 0.0;
+    }
+    __syncthreads();
+    for(int i = threadIdx.x; voxelIndexStart + i < nodeIndexUsedVoxels[blockIdx.x]; i += blockDim.x){
+        sharedSolids[voxelIDs[voxelIndexStart + i]] = solids[voxelIndexStart + i];
+        sharedDivU[voxelIDs[voxelIndexStart + i]] = divU[voxelIndexStart + i];
+    }
+    __syncthreads();
+
+    for(int i = voxelIndexStart + threadIdx.x; i < nodeIndexUsedVoxels[blockIdx.x] ; i += blockDim.x){
+        uint voxelID = voxelIDs[i];
+        Adiag[i] = 0.0;
+        Anx[i] = 0.0;
+        Apx[i] = 0.0;
+        Any[i] = 0.0;
+        Apy[i] = 0.0;
+        Anz[i] = 0.0;
+        Apz[i] = 0.0;
+        if(!sharedSolids[voxelID] && !isApronCell(radius, numVoxels1D, voxelID)){
+            double lAdiag = 0.0;
+            if(!sharedSolids[voxelID-1]){
+                if(sharedDivU[voxelID-1] != 0.0){
+                    Anx[i] = -scale;
+                }
+                lAdiag += scale;
+            }
+            if(!sharedSolids[voxelID+1]){
+                if(sharedDivU[voxelID+1] != 0.0){
+                    Apx[i] = -scale;
+                }
+                lAdiag += scale;
+            }
+            if(!sharedSolids[voxelID - numVoxels1D]){
+                if(sharedDivU[voxelID - numVoxels1D] != 0.0){
+                    Any[i] = -scale;
+                }
+                lAdiag += scale;
+            }
+            if(!sharedSolids[voxelID + numVoxels1D]){
+                if(sharedDivU[voxelID + numVoxels1D] != 0.0){
+                    Apy[i] = -scale;
+                }
+                lAdiag += scale;
+            }
+            if(!sharedSolids[voxelID - numVoxels1D*numVoxels1D]){
+                if(sharedDivU[voxelID - numVoxels1D*numVoxels1D] != 0.0){
+                    Anz[i] = -scale;
+                }
+                lAdiag += scale;
+            }
+            if(!sharedSolids[voxelID + numVoxels1D*numVoxels1D]){
+                if(sharedDivU[voxelID + numVoxels1D*numVoxels1D] != 0.0){
+                    Apz[i] = -scale;
+                }
+                lAdiag += scale;
+            }
+            Adiag[i] = lAdiag;
+        }
+    }
+}
+
+void cudaGetA(uint numVoxelsPerNode, uint numVoxels1D, uint refinementLevel, double radius, const CudaVec<uint>& nodeIndexUsedVoxels, const CudaVec<uint>& voxelIDs, const CudaVec<char>& solids, const CudaVec<double>& divU, CudaVec<double>& Anx, CudaVec<double>& Apx, CudaVec<double>& Any, CudaVec<double>& Apy, CudaVec<double>& Anz, CudaVec<double>& Apz, CudaVec<double>& Adiag, double density, double dt, Grid grid, cudaStream_t stream){
+    generateA<<<nodeIndexUsedVoxels.size(), 32, sizeof(char)*numVoxelsPerNode + sizeof(double)*numVoxelsPerNode, stream>>>(numVoxelsPerNode, numVoxels1D, refinementLevel, radius, nodeIndexUsedVoxels.devPtr(), voxelIDs.devPtr(), solids.devPtr(), divU.devPtr(), Adiag.devPtr(), Anx.devPtr(), Apx.devPtr(), Any.devPtr(), Apy.devPtr(), Anz.devPtr(), Apz.devPtr(), density, dt, grid);
+}
+
+__global__ void GSiteration(uint numVoxelsPerNode, uint numVoxels1D, uint refinementLevel, double radius, const uint* nodeIndexUsedVoxels, const uint* voxelIDs, const char* solids, const double* divU, double* p, double* residuals, double density, double dt, Grid grid, bool red, double w, const double* Adiag, const double* Anx, const double* Apx, const double* Any, const double* Apy, const double* Anz, const double* Apz){
     extern __shared__ double sharedDivU[];
     __shared__ double* sharedP;
     __shared__ double* sharedRes;
@@ -333,52 +417,8 @@ __global__ void GSiteration(uint numVoxelsPerNode, uint numVoxels1D, uint refine
     for(int i = threadIdx.x; i < numVoxelsPerNode && processedVoxels[i] != numVoxelsPerNode ; i += blockDim.x){
         if((red == isRed(processedVoxels[i], numVoxels1D)) && !sharedSolids[processedVoxels[i]] && !isApronCell(radius, numVoxels1D, processedVoxels[i])){
             uint voxelID = processedVoxels[i];
-            double Adiag = 0.0;
-            double Apx = 0.0;
-            double Apy = 0.0;
-            double Apz = 0.0;
-            double Anx = 0.0;
-            double Any = 0.0;
-            double Anz = 0.0;
-
-            if(!sharedSolids[voxelID-1]){
-                if(sharedDivU[voxelID-1] != 0.0){
-                    Anx = -scale;
-                }
-                Adiag += scale;
-            }
-            if(!sharedSolids[voxelID+1]){
-                if(sharedDivU[voxelID+1] != 0.0){
-                    Apx = -scale;
-                }
-                Adiag += scale;
-            }
-            if(!sharedSolids[voxelID - numVoxels1D]){
-                if(sharedDivU[voxelID - numVoxels1D] != 0.0){
-                    Any = -scale;
-                }
-                Adiag += scale;
-            }
-            if(!sharedSolids[voxelID + numVoxels1D]){
-                if(sharedDivU[voxelID + numVoxels1D] != 0.0){
-                    Apy = -scale;
-                }
-                Adiag += scale;
-            }
-            if(!sharedSolids[voxelID - numVoxels1D*numVoxels1D]){
-                if(sharedDivU[voxelID - numVoxels1D*numVoxels1D] != 0.0){
-                    Anz = -scale;
-                }
-                Adiag += scale;
-            }
-            if(!sharedSolids[voxelID + numVoxels1D*numVoxels1D]){
-                if(sharedDivU[voxelID + numVoxels1D*numVoxels1D] != 0.0){
-                    Apz = -scale;
-                }
-                Adiag += scale;
-            }
-            sharedP[voxelID] = sharedP[voxelID] + w*((-sharedDivU[voxelID] - (Anx*sharedP[voxelID-1] + Apx*sharedP[voxelID + 1] + Any*sharedP[voxelID-numVoxels1D] + Apy*sharedP[voxelID+numVoxels1D] + Anz*sharedP[voxelID-numVoxels1D*numVoxels1D] + Apz*sharedP[voxelID+numVoxels1D*numVoxels1D])) / (Adiag + 0.000000001) - sharedP[voxelID]);
-            sharedRes[voxelID] = (-sharedDivU[voxelID] - (Adiag + 0.000000001)*sharedP[voxelID] + (Anx*sharedP[voxelID-1] + Apx*sharedP[voxelID + 1] + Any*sharedP[voxelID-numVoxels1D] + Apy*sharedP[voxelID+numVoxels1D] + Anz*sharedP[voxelID-numVoxels1D*numVoxels1D] + Apz*sharedP[voxelID+numVoxels1D*numVoxels1D]));
+            sharedP[voxelID] = sharedP[voxelID] + w*((-sharedDivU[voxelID] - (Anx[voxelIndexStart + i]*sharedP[voxelID-1] + Apx[voxelIndexStart + i]*sharedP[voxelID + 1] + Any[voxelIndexStart + i]*sharedP[voxelID-numVoxels1D] + Apy[voxelIndexStart + i]*sharedP[voxelID+numVoxels1D] + Anz[voxelIndexStart + i]*sharedP[voxelID-numVoxels1D*numVoxels1D] + Apz[voxelIndexStart + i]*sharedP[voxelID+numVoxels1D*numVoxels1D])) / (Adiag[voxelIndexStart + i] + 0.000000001) - sharedP[voxelID]);
+            sharedRes[voxelID] = (-sharedDivU[voxelID] - (Adiag[voxelIndexStart + i] + 0.000000001)*sharedP[voxelID] + (Anx[voxelIndexStart + i]*sharedP[voxelID-1] + Apx[voxelIndexStart + i]*sharedP[voxelID + 1] + Any[voxelIndexStart + i]*sharedP[voxelID-numVoxels1D] + Apy[voxelIndexStart + i]*sharedP[voxelID+numVoxels1D] + Anz[voxelIndexStart + i]*sharedP[voxelID-numVoxels1D*numVoxels1D] + Apz[voxelIndexStart + i]*sharedP[voxelID+numVoxels1D*numVoxels1D]));
         }
     }
     __syncthreads();
@@ -388,15 +428,15 @@ __global__ void GSiteration(uint numVoxelsPerNode, uint numVoxels1D, uint refine
     }
 }
 
-double cudaGSiteration(const uint& numVoxelsPerNode, const uint& numVoxels1D, const uint& refinementLevel, const CudaVec<uint>& nodeIndexUsedVoxels, const CudaVec<uint>& voxelIDs, const CudaVec<char>& solids, const CudaVec<double>& divU, CudaVec<double>& p, CudaVec<double>& residuals, const double& radius, const double& density, const double& dt, const Grid& grid, const double& threshold, const uint& maxIterations, cudaStream_t stream){
+double cudaGSiteration(const uint& numVoxelsPerNode, const uint& numVoxels1D, const uint& refinementLevel, const CudaVec<uint>& nodeIndexUsedVoxels, const CudaVec<uint>& voxelIDs, const CudaVec<char>& solids, const CudaVec<double>& divU, CudaVec<double>& p, CudaVec<double>& residuals, const double& radius, const double& density, const double& dt, const Grid& grid, const double& threshold, const uint& maxIterations, const CudaVec<double>& Anx, const CudaVec<double>& Apx, const CudaVec<double>& Any, const CudaVec<double>& Apy, const CudaVec<double>& Anz, const CudaVec<double>& Apz, const CudaVec<double>& Adiag, cudaStream_t stream){
     double maxResidual = 10.0;
     double prevMaxResidual = 100.0;
     uint iterations = 0;
     uint batchCheckEvery = 1024;
     double w = 1.9;
     while(maxResidual > threshold && iterations < maxIterations){
-        GSiteration<<<nodeIndexUsedVoxels.size(), 256, (3*sizeof(double) + sizeof(uint) + sizeof(char))*numVoxelsPerNode, stream >>>(numVoxelsPerNode, numVoxels1D, refinementLevel, radius, nodeIndexUsedVoxels.devPtr(), voxelIDs.devPtr(), solids.devPtr(), divU.devPtr(), p.devPtr(), residuals.devPtr(), density, dt, grid, true, w);
-        GSiteration<<<nodeIndexUsedVoxels.size(), 256, (3*sizeof(double) + sizeof(uint) + sizeof(char))*numVoxelsPerNode, stream >>>(numVoxelsPerNode, numVoxels1D, refinementLevel, radius, nodeIndexUsedVoxels.devPtr(), voxelIDs.devPtr(), solids.devPtr(), divU.devPtr(), p.devPtr(), residuals.devPtr(), density, dt, grid, false, w);
+        GSiteration<<<nodeIndexUsedVoxels.size(), 256, (3*sizeof(double) + sizeof(uint) + sizeof(char))*numVoxelsPerNode, stream >>>(numVoxelsPerNode, numVoxels1D, refinementLevel, radius, nodeIndexUsedVoxels.devPtr(), voxelIDs.devPtr(), solids.devPtr(), divU.devPtr(), p.devPtr(), residuals.devPtr(), density, dt, grid, true, w, Adiag.devPtr(), Anx.devPtr(), Apx.devPtr(), Any.devPtr(), Apy.devPtr(), Anz.devPtr(), Apz.devPtr());
+        GSiteration<<<nodeIndexUsedVoxels.size(), 256, (3*sizeof(double) + sizeof(uint) + sizeof(char))*numVoxelsPerNode, stream >>>(numVoxelsPerNode, numVoxels1D, refinementLevel, radius, nodeIndexUsedVoxels.devPtr(), voxelIDs.devPtr(), solids.devPtr(), divU.devPtr(), p.devPtr(), residuals.devPtr(), density, dt, grid, false, w, Adiag.devPtr(), Anx.devPtr(), Apx.devPtr(), Any.devPtr(), Apy.devPtr(), Anz.devPtr(), Apz.devPtr());
         if(iterations % batchCheckEvery == 0){
             prevMaxResidual = maxResidual;
             cudaStreamSynchronize(stream);
