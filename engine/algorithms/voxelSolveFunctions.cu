@@ -439,7 +439,7 @@ double cudaGSiteration(const uint& numVoxelsPerNode, const uint& numVoxels1D, co
         if(iterations % batchCheckEvery == 0){
             prevMaxResidual = maxResidual;
             cudaStreamSynchronize(stream);
-            maxResidual = residuals.getMax(stream, true);
+            maxResidual = std::abs(residuals.getMax(stream, true));  //getMax(abs) returns the signed value of the largest magnitude
         }
         ++iterations;
         if(iterations == maxIterations || (std::abs(prevMaxResidual - maxResidual) < threshold / 1000 && maxResidual > threshold)){    //if not converging

@@ -56,16 +56,6 @@ __global__ void coalesceFrontBack(uint numElements, uint* outArray, uint* front,
 }
 
 
-template <typename T>
-__global__ void reorderGridIndices(uint numElements, uint* sortedIndices, T* inArray, T* outArray){
-    uint index = threadIdx.x + blockIdx.x*blockDim.x;
-    if(index < numElements){
-        outArray[index] = inArray[sortedIndices[index]];
-    }
-}
-
-template __global__ void reorderGridIndices(uint numElements, uint *sortedIndices, uint* inArray, uint* outArray);
-template __global__ void reorderGridIndices(uint numElements, uint *sortedIndices, double* inArray, double* outArray);
 
 /**
  * @brief Wrapper for performing CUDA radix inclusive sort on uint array

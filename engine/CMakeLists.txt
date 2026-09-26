@@ -23,7 +23,7 @@ add_subdirectory(algorithms)
 
 foreach(lib ${cudaLibraries})
     add_library(${lib} ${lib}.cu)
-    set_target_properties(${lib} PROPERTIES CUDA_ARCHITECTURES "61;86;")
+    set_target_properties(${lib} PROPERTIES CUDA_ARCHITECTURES "86")
     target_link_libraries(${lib} radixSortKernels parallelPrefixSumKernels reductionKernels)
 endforeach()
 
@@ -32,8 +32,8 @@ add_library(particles SHARED
 )
 
 target_link_libraries(particles ${cudaLibraries}  parallelPrefixSumKernels radixSortKernels reductionKernels particleToGridFunctions perVoxelParticleListFunctions voxelSolveFunctions)
-set_target_properties(particles PROPERTIES CUDA_ARCHITECTURES "61;86;")
+set_target_properties(particles PROPERTIES CUDA_ARCHITECTURES "86")
 
 add_executable(main main.cu)
 target_link_libraries(main particles gomp)
-set_target_properties(main PROPERTIES CUDA_ARCHITECTURES "61;86;")
+set_target_properties(main PROPERTIES CUDA_ARCHITECTURES "86")

@@ -475,6 +475,7 @@ __global__ void gatherParticleVelsToVoxels(uint numUsedGridNodes, uint numPartic
     __syncthreads();
     for(int i = threadIdx.x; i < numVoxelsPerNode; i += blockDim.x){
         sharedVoxelU[i] = 0.0;
+        sharedWeightSums[i] = 0.0;
         sharedSolids[i] = false;
     }
     __syncthreads();
