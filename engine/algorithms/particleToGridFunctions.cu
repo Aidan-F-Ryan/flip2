@@ -24,25 +24,25 @@ __global__ void rootCell(double* px, double* py, double* pz, uint numParticles, 
         if(px[index] < grid.negX){
             px[index] = grid.negX;
         }
-        else if(px[index] > grid.negX + grid.sizeX*grid.cellSize){
-            px[index] = grid.negX + grid.sizeX*grid.cellSize;
+        else if(px[index] > grid.negX + (grid.sizeX - 0.001)*grid.cellSize){  //stay just inside the max face: a particle on the face itself lands in the wall voxels
+            px[index] = grid.negX + (grid.sizeX - 0.001)*grid.cellSize;
         }
         if(py[index] < grid.negY){
             py[index] = grid.negY;
         }
-        else if(py[index] > grid.negY + grid.sizeY*grid.cellSize){
-            py[index] = grid.negY + grid.sizeY*grid.cellSize;
+        else if(py[index] > grid.negY + (grid.sizeY - 0.001)*grid.cellSize){
+            py[index] = grid.negY + (grid.sizeY - 0.001)*grid.cellSize;
         }
         if(pz[index] < grid.negZ){
             pz[index] = grid.negZ;
         }
-        else if(pz[index] > grid.negZ + grid.sizeZ*grid.cellSize){
-            pz[index] = grid.negZ + grid.sizeZ*grid.cellSize;
+        else if(pz[index] > grid.negZ + (grid.sizeZ - 0.001)*grid.cellSize){
+            pz[index] = grid.negZ + (grid.sizeZ - 0.001)*grid.cellSize;
         }
         uint x = floorf((px[index] - grid.negX) / grid.cellSize);
         uint y = floorf((py[index] - grid.negY) / grid.cellSize);
         uint z = floorf((pz[index] - grid.negZ) / grid.cellSize);
-        gridPosition[index] = x + y*grid.sizeX + z*grid.sizeX*grid.sizeY;
+        gridPosition[index] = min(x, grid.sizeX - 1) + min(y, grid.sizeY - 1)*grid.sizeX + min(z, grid.sizeZ - 1)*grid.sizeX*grid.sizeY;  //positions clamped onto the max face would otherwise index one cell past the end
     }
 }
 
@@ -281,7 +281,6 @@ void cudaSortParticlesByGridNode(uint numParticles, uint*& gridPosition, uint*& 
     uint* ogReordered = reorderedIndicesRelativeToOriginal;
 
     uint* sortedGridPosition;
-    uint* sortedParticleIndices;
     uint* particleIndices;
     //uint* front;
     //uint* back;
@@ -319,7 +318,8 @@ void cudaSortParticlesByGridNode(uint numParticles, uint*& gridPosition, uint*& 
         // cudaFree(reorderedIndicesRelativeToOriginal);
     // }
 
-    cudaFreeAsync(sortedParticleIndices, stream);
+    cudaFreeAsync(particleIndices, stream);
+    cudaFreeAsync(d_temp, stream);
     //cudaFreeAsync(front, stream);
     //cudaFreeAsync(back, stream);
     cudaStreamSynchronize(stream);

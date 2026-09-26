@@ -60,6 +60,8 @@ private:
 
     CudaVec<uint> nodeIndexUsedVoxels;
     CudaVec<uint> voxelIDsUsed;
+    CudaVec<uint> voxelOwners;  //per used voxel: index of the used voxel holding its value (itself, or the neighbouring node's interior copy for apron voxels)
+    CudaVec<uint> cellToNode;   //grid cell -> used node index; never cleared, so entries are checked against the node's cell before use
 
     CudaVec<double> divU;
 
