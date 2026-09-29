@@ -6,6 +6,7 @@
 #include "typedefs.h"
 #include "cudaVec.hu"
 #include "grid.hpp"
+#include "frameWriter.hpp"
 #include <string>
 
 class Particles{
@@ -42,17 +43,27 @@ public:
 
     double getCourantDt();
 
+    void setRestDensity(double particlesPerVoxel){  //the particle density the density correction holds the fluid at, normally what the particles were seeded at
+        restParticlesPerVoxel = particlesPerVoxel;
+    }
+
+    void setDensityCorrectionTime(double seconds){  //how quickly the fluid's particle density is pulled back to rest (0 turns the correction off)
+        densityCorrectionTime = seconds;
+    }
+
+    void setFlipRatio(double ratio){    //the particle velocity update's share of FLIP, the rest PIC: 1 keeps the most energy and detail, 0 is the most damped and stable
+        flipRatio = ratio;
+    }
+
     ~Particles();
 private:
-    CudaVec<double> px, py, pz;
-    CudaVec<double> vx, vy, vz;
+    CudaVec<double> px, py, pz;    //positions stay double: in a large domain, float would round a slow particle's step away
+    CudaVec<float> vx, vy, vz;
     CudaVec<uint> gridCell;
     CudaVec<char> solids;
-    CudaVec<double> p;
-    CudaVec<double> residuals;
+    CudaVec<float> p;
+    CudaVec<float> residuals;
 
-    CudaVec<uint> yDimNumUsedGridNodes;
-    
     CudaVec<uint> reorderedGridIndices;
 
     CudaVec<uint> uniqueGridNodeIndices;
@@ -61,23 +72,46 @@ private:
     CudaVec<uint> nodeIndexUsedVoxels;
     CudaVec<uint> voxelIDsUsed;
     CudaVec<uint> voxelOwners;  //per used voxel: index of the used voxel holding its value (itself, or the neighbouring node's interior copy for apron voxels)
-    CudaVec<uint> cellToNode;   //grid cell -> used node index; never cleared, so entries are checked against the node's cell before use
+    CudaVec<uint> nodeCells;    //used node -> its grid cell
+    CudaVec<uint> cellToNode;   //grid cell -> used node index; never cleared, so entries are checked against nodeCells before use
+    CudaVec<uint> nodeCount;    //counts nodes as the empty ones are appended
 
-    CudaVec<double> divU;
+    CudaVec<float> divU;
 
-    CudaVec<double> voxelsUx;
-    CudaVec<double> voxelsUy;
-    CudaVec<double> voxelsUz;
+    CudaVec<float> voxelsUx;
+    CudaVec<float> voxelsUy;
+    CudaVec<float> voxelsUz;
+    CudaVec<float> voxelsUxOld;    //the grid velocities before gravity and the pressure solve, for FLIP
+    CudaVec<float> voxelsUyOld;
+    CudaVec<float> voxelsUzOld;
 
-    CudaVec<double> Anx;
-    CudaVec<double> Apx;
-    CudaVec<double> Any;
-    CudaVec<double> Apy;
-    CudaVec<double> Anz;
-    CudaVec<double> Apz;
-    CudaVec<double> Adiag;
+    CudaVec<float> voxelWeightsX;  //P2G weight sums
+    CudaVec<float> voxelWeightsY;
+    CudaVec<float> voxelWeightsZ;
+    CudaVec<float> particleCounts; //P2G: the particles in each voxel
+    CudaVec<char> footprintDepth;   //per voxel: how many voxels inside the fluid's footprint it is, up to CORRECTION_DEPTH
+    CudaVec<uint> freeSurface;      //whether any pressure unknown touches air
+
+    CudaVec<float> Anx;
+    CudaVec<float> Apx;
+    CudaVec<float> Any;
+    CudaVec<float> Apy;
+    CudaVec<float> Anz;
+    CudaVec<float> Apz;
+    CudaVec<float> Adiag;
+
+    CudaVec<uint> neighborNx;   //per pressure unknown: the used voxel owning each face neighbour (NO_VOXEL air, WALL_VOXEL outside the domain)
+    CudaVec<uint> neighborPx;
+    CudaVec<uint> neighborNy;
+    CudaVec<uint> neighborPy;
+    CudaVec<uint> neighborNz;
+    CudaVec<uint> neighborPz;
+    CudaVec<char> solveCodes;   //per used voxel: 0 if not a pressure unknown, else 1 red / 2 black
+
+    CudaVec<uint> usedVoxelMasks;   //per node: stored, fluid and reached masks, one bit per slot of its voxel block
 
     uint numUsedGridNodes;
+    uint numParticleNodes;  //the used nodes holding particles, which come first; the rest are their empty neighbours
     uint numUsedVoxelsX;
     uint numUsedVoxelsY;
     uint numUsedVoxelsZ;
@@ -90,6 +124,9 @@ private:
     uint numVoxels1D;
     uint size;
     double radius;
+    double flipRatio = 0.95;
+    double restParticlesPerVoxel = 8.0;
+    double densityCorrectionTime = 0.1;
     Grid grid;
 
     double frameDt; //overall timestep used for writing particle positions
@@ -101,6 +138,8 @@ private:
     cudaStream_t stream;
     std::vector<cudaDeviceProp> deviceProp;
     std::vector<uint> selectedDevices;
+
+    FrameWriter frameWriter;    //writes position frames from a background thread; declared last so it drains its queue first
 
     friend class ParticleSystemTester;
 };

@@ -18,27 +18,20 @@
  * @return __global__ 
  */
 
+//a particle that crossed a wall bounces back in as far as it overshot; clamping it onto the wall instead stacks particles into a sheet on the face.
+//Anything still outside, or on the max face (which puts it in the wall voxels), is kept just inside
+__device__ inline double reflectOffWalls(double p, double low, uint cells, double cellSize){
+    double high = low + cells*cellSize;
+    p = p < low ? 2.0*low - p : p > high ? 2.0*high - p : p;
+    return fmin(fmax(p, low), low + (cells - 0.001)*cellSize);
+}
+
 __global__ void rootCell(double* px, double* py, double* pz, uint numParticles, Grid grid, uint* gridPosition){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
     if(index < numParticles){
-        if(px[index] < grid.negX){
-            px[index] = grid.negX;
-        }
-        else if(px[index] > grid.negX + (grid.sizeX - 0.001)*grid.cellSize){  //stay just inside the max face: a particle on the face itself lands in the wall voxels
-            px[index] = grid.negX + (grid.sizeX - 0.001)*grid.cellSize;
-        }
-        if(py[index] < grid.negY){
-            py[index] = grid.negY;
-        }
-        else if(py[index] > grid.negY + (grid.sizeY - 0.001)*grid.cellSize){
-            py[index] = grid.negY + (grid.sizeY - 0.001)*grid.cellSize;
-        }
-        if(pz[index] < grid.negZ){
-            pz[index] = grid.negZ;
-        }
-        else if(pz[index] > grid.negZ + (grid.sizeZ - 0.001)*grid.cellSize){
-            pz[index] = grid.negZ + (grid.sizeZ - 0.001)*grid.cellSize;
-        }
+        px[index] = reflectOffWalls(px[index], grid.negX, grid.sizeX, grid.cellSize);
+        py[index] = reflectOffWalls(py[index], grid.negY, grid.sizeY, grid.cellSize);
+        pz[index] = reflectOffWalls(pz[index], grid.negZ, grid.sizeZ, grid.cellSize);
         uint x = floorf((px[index] - grid.negX) / grid.cellSize);
         uint y = floorf((py[index] - grid.negY) / grid.cellSize);
         uint z = floorf((pz[index] - grid.negZ) / grid.cellSize);
@@ -367,37 +360,4 @@ __global__ void mapNodeIndicesToParticles(uint numParticles, uint* uniqueGridNod
 
 void cudaMapNodeIndicesToParticles(uint numParticles, uint* uniqueGridNodes, uint* gridNodeIndicesToFirstParticleIndex, cudaStream_t stream){
     mapNodeIndicesToParticles<<<numParticles / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numParticles, uniqueGridNodes, gridNodeIndicesToFirstParticleIndex);
-}
-
-__global__ void zeroYDimArray(Grid grid, uint numUniqueGridNodes, uint* yDimFirstNodeIndex){
-    uint index = threadIdx.x + blockDim.x*blockIdx.x;
-    if(index < grid.sizeX*grid.sizeY){
-        yDimFirstNodeIndex[index] = numUniqueGridNodes;
-    }
-}
-
-//find first node index of each used y-dimension row in memory, allows for y dimension-scan)
-__global__ void getYDimPositionFirstInRow(uint numUniqueGridNodes, uint* gridNodeIndicesToFirstParticleIndex, uint* gridNodeIDs, uint* yDimFirstNodeIndex, Grid grid){
-    uint index = threadIdx.x + blockDim.x*blockIdx.x;
-    if(index < numUniqueGridNodes){
-        uint prevGridNodeUniqueIndex;
-        if(index != 0){
-            prevGridNodeUniqueIndex = gridNodeIDs[gridNodeIndicesToFirstParticleIndex[index - 1]];
-        }
-        else{
-            prevGridNodeUniqueIndex = numUniqueGridNodes;
-        }
-        uint gridNodeUniqueIndex = gridNodeIDs[gridNodeIndicesToFirstParticleIndex[index]];
-        uint prevYRow = prevGridNodeUniqueIndex / grid.sizeX;
-        uint yRow = gridNodeUniqueIndex / grid.sizeX;
-        if(prevYRow != yRow){
-            yDimFirstNodeIndex[yRow] = gridNodeUniqueIndex;
-        }
-    }
-}
-
-void cudaGetFirstNodeInYRows(uint numUniqueGridNodes, uint* gridNodeIndicesToFirstParticleIndex, uint* gridNodeIDs, uint* yDimFirstNodeIndex, const Grid& grid, cudaStream_t stream){
-    zeroYDimArray<<<grid.sizeX*grid.sizeY / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(grid, numUniqueGridNodes, yDimFirstNodeIndex);
-    cudaStreamSynchronize(stream);
-    getYDimPositionFirstInRow<<<numUniqueGridNodes / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numUniqueGridNodes, gridNodeIndicesToFirstParticleIndex, gridNodeIDs, yDimFirstNodeIndex, grid);
 }

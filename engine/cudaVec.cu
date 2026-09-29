@@ -242,7 +242,7 @@ CudaVec<T>::~CudaVec(){
     }
 }
 
-// template class CudaVec<float>;
+template class CudaVec<float>;
 template class CudaVec<uint>;
 template class CudaVec<char>;
 template class CudaVec<double>;

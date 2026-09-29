@@ -10,6 +10,7 @@
 #include <bitset>
 #include <omp.h>
 #include <string>
+#include <cmath>
 
 class ParticleSystemTester{
 public:
@@ -20,6 +21,14 @@ public:
 
     void setDomain(double nx, double ny, double nz, uint x, uint y, uint z, double cellSize){
         particles.setDomain(nx, ny, nz, x, y, z, cellSize);
+    }
+
+    void setFlipRatio(double ratio){
+        particles.setFlipRatio(ratio);
+    }
+
+    void setDensityCorrectionTime(double seconds){
+        particles.setDensityCorrectionTime(seconds);
     }
 
     void storeGridCellMap(){
@@ -52,27 +61,35 @@ public:
         }
     }
     
-    void randomizeParticlePositions(){
+    //particles at random positions in the box lo..hi, in fractions of the domain (by default the dam break's column), and at rest, or with swirl
+    //set, in one vortex filling the domain's xy cross section, swirl m/s at its fastest and not crossing the walls
+    void randomizeParticlePositions(double3 lo = make_double3(1.0/3.0, 0.0, 1.0/3.0), double3 hi = make_double3(2.0/3.0, 2.0/3.0, 2.0/3.0), double swirl = 0.0){
         std::random_device rd;
         std::default_random_engine e2(rd());
-        double oneThirdYDimension = particles.grid.sizeY*particles.grid.cellSize / 3.0f;
-        std::uniform_real_distribution<> distX(particles.grid.negX + oneThirdYDimension, particles.grid.negX + particles.grid.sizeX*particles.grid.cellSize - oneThirdYDimension);
-        std::uniform_real_distribution<> distY(particles.grid.negY, particles.grid.negY + particles.grid.sizeY*particles.grid.cellSize - oneThirdYDimension);
-        std::uniform_real_distribution<> distZ(particles.grid.negZ + oneThirdYDimension, particles.grid.negZ + particles.grid.sizeZ*particles.grid.cellSize - oneThirdYDimension);
-
-        std::uniform_real_distribution<> vDist(-1.0f, 1.0f);
-#pragma omp for
+        double width = particles.grid.sizeX*particles.grid.cellSize;
+        double height = particles.grid.sizeY*particles.grid.cellSize;
+        double depth = particles.grid.sizeZ*particles.grid.cellSize;
+        std::uniform_real_distribution<> distX(particles.grid.negX + lo.x*width, particles.grid.negX + hi.x*width);
+        std::uniform_real_distribution<> distY(particles.grid.negY + lo.y*height, particles.grid.negY + hi.y*height);
+        std::uniform_real_distribution<> distZ(particles.grid.negZ + lo.z*depth, particles.grid.negZ + hi.z*depth);
         for(uint i = 0; i < particles.size; ++i){
             particles.px[i] = distX(e2);
             particles.py[i] = distY(e2);
             particles.pz[i] = distZ(e2);
+            double x = M_PI*(particles.px[i] - particles.grid.negX)/width;
+            double y = M_PI*(particles.py[i] - particles.grid.negY)/height;
+            particles.vx[i] = swirl*sin(x)*cos(y);
+            particles.vy[i] = -swirl*cos(x)*sin(y);
+            particles.vz[i] = 0.0;
         }
-        particles.px.upload(particles.stream);
-        particles.py.upload(particles.stream);
-        particles.pz.upload(particles.stream);
-        particles.vx.zeroDeviceAsync(particles.stream);
-        particles.vy.zeroDeviceAsync(particles.stream);
-        particles.vz.zeroDeviceAsync(particles.stream);
+        for(CudaVec<double>* position : {&particles.px, &particles.py, &particles.pz}){
+            position->upload(particles.stream);
+        }
+        for(CudaVec<float>* velocity : {&particles.vx, &particles.vy, &particles.vz}){
+            velocity->upload(particles.stream);
+        }
+        double voxelSize = particles.grid.cellSize / (2<<particles.refinementLevel);
+        particles.setRestDensity(particles.size / ((hi.x - lo.x)*width*(hi.y - lo.y)*height*(hi.z - lo.z)*depth / (voxelSize*voxelSize*voxelSize)));   //what they start at
     }
 
     void runVerify(){
