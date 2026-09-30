@@ -6,9 +6,12 @@
 #include "typedefs.h"
 #include "cudaVec.hu"
 #include "grid.hpp"
-#include "frameWriter.hpp"
+#include "partitionContext.hu"
 #include "algorithms/conjugateGradientFunctions.hu"
 #include <string>
+#include <vector>
+
+class LocalExchange;
 
 enum class PressureSolver{
     sor,        //red/black SOR
@@ -17,9 +20,15 @@ enum class PressureSolver{
     multigrid   //conjugate gradient, preconditioned by a multigrid V-cycle
 };
 
+//The particles in one partition of the domain, and the grid they need: the nodes they occupy, the empty nodes their stencils reach into, and, when the
+//domain is split between partitions, copies of the neighbouring partitions' nodes next to its own (ghost nodes, with the same sparse voxels their owners
+//store). A partition owns the node planes [partitionPlanes[rank], partitionPlanes[rank + 1]) along z. On its own, a partition is the whole domain
 class Particles{
 public:
     Particles(uint size);
+
+    //makes this partition rank of numRanks, which run in lockstep and share the exchange, the context and the stream. Before setDomain
+    void setPartition(int rank, int numRanks, LocalExchange* exchange, PartitionContext* context, const std::vector<uint>& planes, cudaStream_t sharedStream);
 
     void setDomain(double nx, double ny, double nz, uint x, uint y, uint z, double cellSize);
 
@@ -45,8 +54,11 @@ public:
     
     void voxelVelsToParticles();
 
+    void packPositions(float* xyz);  //float32 x, y, z per particle, for a frame
 
-    void writePositionsToFile(const std::string& fileName);
+    uint numParticles() const{
+        return size;
+    }
 
     double getCourantDt();
 
@@ -82,6 +94,14 @@ public:
 
     ~Particles();
 private:
+    void exchangeParticles();
+    void receiveParticleNodes(uint maskWords);
+    void orderNodes(uint maskWords);
+    void findGhostRanges();
+    bool verbose() const{   //only one partition reports the values every partition shares
+        return rank == 0;
+    }
+
     CudaVec<double> px, py, pz;    //positions stay double: in a large domain, float would round a slow particle's step away
     CudaVec<float> vx, vy, vz;
     CudaVec<uint> gridCell;
@@ -137,9 +157,21 @@ private:
     CudaVec<uint> nodeInteriorVoxels;   //per node, its interior's voxels (x fastest): each one's index among the stored voxels, or NO_VOXEL
 
     CudaVec<uint> usedVoxelMasks;   //per node: stored, fluid and reached masks, one bit per slot of its voxel block
+    CudaVec<uint> particleNodeMasks;    //per node holding this partition's particles: the voxels they reach, as markReachedVoxels finds them
+    CudaVec<uint> foreignParticleNodeMasks; //the same, for the neighbouring partitions' particle nodes received by receiveParticleNodes
+    CudaVec<char> nodeHasParticles;     //per used node: whether it holds particles, here or in the partition that owns it
+    CudaVec<uint> nodeOrigins;          //orderNodes' working space: each node's index before it was put in order
+    CudaVec<uint> ghostRanges;          //per ghost node: its first voxel, its owner's first voxel of it, how many, and the owning partition
 
+    //the nodes, in this order: [0, numParticleNodes) this partition's holding particles; up to numOwnNodes its empty ones; up to numStoredNodes its ghost
+    //nodes; up to numUsedGridNodes the neighbours' particle nodes 2 planes out, which store no voxels but whose particles make ghost voxels fluid.
+    //Every voxel array holds the own nodes' voxels first, numOwnVoxels of them, then the ghosts'
     uint numUsedGridNodes;
-    uint numParticleNodes;  //the used nodes holding particles, which come first; the rest are their empty neighbours
+    uint numParticleNodes;
+    uint numForeignParticleNodes = 0;   //received, while the nodes are being ordered
+    uint numOwnNodes = 0;
+    uint numStoredNodes = 0;
+    uint numOwnVoxels = 0;
     uint numUsedVoxelsX;
     uint numUsedVoxelsY;
     uint numUsedVoxelsZ;
@@ -169,12 +201,28 @@ private:
     double elapsedTimeThisFrame;
 
     cudaStream_t stream;
+    bool ownsStream = true;
     std::vector<cudaDeviceProp> deviceProp;
     std::vector<uint> selectedDevices;
 
-    FrameWriter frameWriter;    //writes position frames from a background thread; declared last so it drains its queue first
+    //the partition: this is rank of numRanks, owning node planes [boxLo, boxHi). Partitions exchange through the exchange (on one GPU), and the solver's
+    //exchanges go through the context, which does nothing for a lone partition
+    int rank = 0;
+    int numRanks = 1;
+    LocalExchange* exchange = nullptr;
+    PartitionContext loneContext;
+    PartitionContext* context = &loneContext;
+    std::vector<uint> partitionPlanes;  //partition r owns node planes [partitionPlanes[r], partitionPlanes[r + 1])
+    uint boxLo = 0;
+    uint boxHi = 0;
+    bool distributed = false;           //whether it has dropped the particles other partitions own; at first every partition holds all of them
+    uint particlesBelow = 0;            //after the sort: how many particles are in the planes below this partition's, and above, on their way out
+    uint particlesAbove = 0;
+    uint lowerBoundaryParticleNodes = 0;    //how many of its particle nodes lie within 2 planes of the partition below it's, and above it's
+    uint upperBoundaryParticleNodes = 0;
 
     friend class ParticleSystemTester;
+    friend class LocalPartition;
 };
 
 #endif

@@ -1,0 +1,62 @@
+//Copyright 2023 Aberrant Behavior LLC
+
+#ifndef SIMULATION_HU
+#define SIMULATION_HU
+
+#include "particles.hu"
+#include "localExchange.hu"
+#include "frameWriter.hpp"
+#include <functional>
+#include <memory>
+#include <string>
+#include <vector>
+
+//A simulation split into partitions along z, each owning whole node planes and the particles in them; for now all on one GPU. The partitions run the same
+//steps in lockstep, each on its own host thread, taking what they need of each other's through a LocalExchange. One partition is the whole domain, run on
+//the calling thread, just as before the split
+class Simulation{
+public:
+    Simulation(uint numParticles, int numPartitions);
+
+    //the domain, and each partition's node planes: as even a split along z as whole pairs of planes allow, at least 2 planes each
+    void setDomain(double nx, double ny, double nz, uint x, uint y, uint z, double cellSize);
+
+    int numPartitions() const{
+        return (int)partitions.size();
+    }
+    Particles& partition(int rank){
+        return *partitions[rank];
+    }
+    void forEachPartition(const std::function<void(Particles&)>& setting){    //for settings, on this thread
+        for(auto& partition : partitions){
+            setting(*partition);
+        }
+    }
+
+    void initialize();      //each partition keeps its own particles and builds its grid
+    void solveFrame(double fps);
+    void writePositionsToFile(const std::string& fileName);    //every partition's particles, in partition order: the order one partition would have them in
+
+private:
+    void inLockstep(const std::function<void(Particles&)>& step);    //every partition runs step, each on its own thread
+
+    struct SharedStream{
+        cudaStream_t stream;
+        SharedStream(){
+            gpuErrchk(cudaStreamCreate(&stream));
+        }
+        ~SharedStream(){
+            cudaStreamSynchronize(stream);
+            cudaStreamDestroy(stream);
+        }
+    };
+
+    SharedStream shared;    //declared first, so it outlives everything using it
+    uint totalParticles;
+    LocalExchange exchange;
+    std::vector<std::unique_ptr<LocalPartition>> contexts;
+    std::vector<std::unique_ptr<Particles>> partitions;
+    FrameWriter frameWriter;    //writes position frames from a background thread; declared last so it drains its queue first
+};
+
+#endif

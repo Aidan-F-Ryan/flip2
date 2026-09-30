@@ -27,11 +27,15 @@ foreach(lib ${cudaLibraries})
     target_link_libraries(${lib} radixSortKernels parallelPrefixSumKernels reductionKernels)
 endforeach()
 
+find_package(Threads REQUIRED)
+
 add_library(particles SHARED
     particles.cu
+    localExchange.cu
+    simulation.cu
 )
 
-target_link_libraries(particles ${cudaLibraries}  parallelPrefixSumKernels radixSortKernels reductionKernels particleToGridFunctions perVoxelParticleListFunctions voxelSolveFunctions conjugateGradientFunctions multigridFunctions)
+target_link_libraries(particles ${cudaLibraries}  parallelPrefixSumKernels radixSortKernels reductionKernels particleToGridFunctions perVoxelParticleListFunctions voxelSolveFunctions conjugateGradientFunctions multigridFunctions Threads::Threads)
 set_target_properties(particles PROPERTIES CUDA_ARCHITECTURES "86")
 
 add_executable(main main.cu)

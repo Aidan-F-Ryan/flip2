@@ -210,7 +210,6 @@ __global__ void subCellCreateLists(double* px, double* py, double* pz, uint numP
 
 void cudaFindGridCell(double* px, double* py, double* pz, uint numParticles, Grid grid, uint* gridPosition, cudaStream_t stream){
     rootCell<<<numParticles / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(px, py, pz, numParticles, grid, gridPosition);
-    cudaStreamSynchronize(stream);
 }
 
 void cudaFindSubCell(double* px, double* py, double* pz,
@@ -269,7 +268,7 @@ __global__ void initializeParticleIndices(uint* indices, uint numParticles){
  * @param stream 
  */
 
-void cudaSortParticlesByGridNode(uint numParticles, uint*& gridPosition, uint*& reorderedIndicesRelativeToOriginal, cudaStream_t stream){
+void cudaSortParticlesByGridNode(uint numParticles, uint*& gridPosition, uint*& reorderedIndicesRelativeToOriginal, uint numCells, cudaStream_t stream){
     uint* ogGridPosition = gridPosition;
     uint* ogReordered = reorderedIndicesRelativeToOriginal;
 
@@ -293,10 +292,10 @@ void cudaSortParticlesByGridNode(uint numParticles, uint*& gridPosition, uint*& 
 
     uint* d_temp = nullptr;
     size_t d_temp_size;
-    cub::DeviceRadixSort::SortPairs(d_temp, d_temp_size, gridPosition, sortedGridPosition, particleIndices, reorderedIndicesRelativeToOriginal, numParticles, 0, sizeof(uint)*8, stream);
+    int endBit = keyBits(numCells - 1);     //cells only use the low bits: 15 of them for 32^3 nodes, so 2 passes rather than 4
+    cub::DeviceRadixSort::SortPairs(d_temp, d_temp_size, gridPosition, sortedGridPosition, particleIndices, reorderedIndicesRelativeToOriginal, numParticles, 0, endBit, stream);
     cudaMallocAsync((void**)&d_temp, d_temp_size, stream);
-    cub::DeviceRadixSort::SortPairs(d_temp, d_temp_size, gridPosition, sortedGridPosition, particleIndices, reorderedIndicesRelativeToOriginal, numParticles, 0, sizeof(uint)*8, stream);
-    std::cout<<"done sorting\n";
+    cub::DeviceRadixSort::SortPairs(d_temp, d_temp_size, gridPosition, sortedGridPosition, particleIndices, reorderedIndicesRelativeToOriginal, numParticles, 0, endBit, stream);
     
     uint* t = gridPosition;
     gridPosition = sortedGridPosition;
@@ -315,7 +314,6 @@ void cudaSortParticlesByGridNode(uint numParticles, uint*& gridPosition, uint*& 
     cudaFreeAsync(d_temp, stream);
     //cudaFreeAsync(front, stream);
     //cudaFreeAsync(back, stream);
-    cudaStreamSynchronize(stream);
 }
 
 __global__ void markUniqueGridCells(uint numElements, uint* gridCells, uint* uniqueGridNodes){
@@ -362,7 +360,27 @@ void cudaMapNodeIndicesToParticles(uint numParticles, uint* uniqueGridNodes, uin
     mapNodeIndicesToParticles<<<numParticles / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numParticles, uniqueGridNodes, gridNodeIndicesToFirstParticleIndex);
 }
 
-void cudaSortUints(uint numElements, uint* keys, cudaStream_t stream){
+void cudaSortNodeOrder(uint numElements, uint* keys, uint* values, int endBit, cudaStream_t stream){
+    if(numElements == 0){
+        return;
+    }
+    uint* sortedKeys;
+    uint* sortedValues;
+    void* temp = nullptr;
+    size_t tempSize = 0;
+    gpuErrchk(cudaMallocAsync((void**)&sortedKeys, sizeof(uint)*numElements, stream));
+    gpuErrchk(cudaMallocAsync((void**)&sortedValues, sizeof(uint)*numElements, stream));
+    cub::DeviceRadixSort::SortPairs(temp, tempSize, keys, sortedKeys, values, sortedValues, numElements, 0, endBit, stream);   //with no temp storage, this only sizes it
+    gpuErrchk(cudaMallocAsync(&temp, tempSize, stream));
+    cub::DeviceRadixSort::SortPairs(temp, tempSize, keys, sortedKeys, values, sortedValues, numElements, 0, endBit, stream);
+    cudaMemcpyAsync(keys, sortedKeys, sizeof(uint)*numElements, cudaMemcpyDeviceToDevice, stream);
+    cudaMemcpyAsync(values, sortedValues, sizeof(uint)*numElements, cudaMemcpyDeviceToDevice, stream);
+    cudaFreeAsync(temp, stream);
+    cudaFreeAsync(sortedKeys, stream);
+    cudaFreeAsync(sortedValues, stream);
+}
+
+void cudaSortUints(uint numElements, uint* keys, int endBit, cudaStream_t stream){
     if(numElements == 0){
         return;
     }
@@ -370,9 +388,9 @@ void cudaSortUints(uint numElements, uint* keys, cudaStream_t stream){
     void* temp = nullptr;
     size_t tempSize = 0;
     gpuErrchk(cudaMallocAsync((void**)&sorted, sizeof(uint)*numElements, stream));
-    cub::DeviceRadixSort::SortKeys(temp, tempSize, keys, sorted, numElements, 0, sizeof(uint)*8, stream);    //with no temp storage, this only sizes it
+    cub::DeviceRadixSort::SortKeys(temp, tempSize, keys, sorted, numElements, 0, endBit, stream);    //with no temp storage, this only sizes it
     gpuErrchk(cudaMallocAsync(&temp, tempSize, stream));
-    cub::DeviceRadixSort::SortKeys(temp, tempSize, keys, sorted, numElements, 0, sizeof(uint)*8, stream);
+    cub::DeviceRadixSort::SortKeys(temp, tempSize, keys, sorted, numElements, 0, endBit, stream);
     cudaMemcpyAsync(keys, sorted, sizeof(uint)*numElements, cudaMemcpyDeviceToDevice, stream);
     cudaFreeAsync(temp, stream);
     cudaFreeAsync(sorted, stream);

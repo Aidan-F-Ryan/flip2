@@ -4,6 +4,8 @@
 #define CUDAVEC_HU
 
 #include "typedefs.h"
+#include <atomic>
+#include <initializer_list>
 #include <vector>
 
 template <typename T>
@@ -29,6 +31,7 @@ public:
     void download(cudaStream_t stream);
     void swapDevicePtr(T* devPtr);
     void swapDevicePtrAsync(T* devPtr, cudaStream_t stream);
+    void adoptAsync(T* devPtr, uint size, cudaStream_t stream);   //frees the current device array and takes devPtr, holding size elements, in its place
     T* devPtr();
     const T* devPtr() const;
     void clear();
@@ -37,19 +40,24 @@ public:
     void zeroDevice();
     void zeroDeviceAsync(cudaStream_t stream);
     T getMax(cudaStream_t stream, bool abs = false);
+    T getMax(cudaStream_t stream, bool abs, uint count);   //over the first count elements. With abs, floats give the largest magnitude itself
     inline uint size() const{
         return numElements;
     }
     ~CudaVec();
 
-    static uint GPU_MEMORY_ALLOCATED;
+    static std::atomic<long long> GPU_MEMORY_ALLOCATED;    //atomic: partitions allocate from their own threads
 
 private:
+    friend float largestMagnitude(std::initializer_list<const CudaVec<float>*> arrays, cudaStream_t stream);
     void cuMalloc();
     void cuMallocAsync(const cudaStream_t& stream);
     std::vector<T> vec;
     T* d_vec;
     uint numElements;
 };
+
+//the largest |x| in all the arrays together, with one wait for the answer rather than one per array. Exact, and the same in any order; NaN beats everything
+float largestMagnitude(std::initializer_list<const CudaVec<float>*> arrays, cudaStream_t stream);
 
 #endif

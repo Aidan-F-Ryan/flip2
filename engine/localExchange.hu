@@ -1,0 +1,96 @@
+//Copyright 2023 Aberrant Behavior LLC
+
+#ifndef LOCALEXCHANGE_HU
+#define LOCALEXCHANGE_HU
+
+#include "partitionContext.hu"
+#include <condition_variable>
+#include <mutex>
+#include <vector>
+
+class Particles;
+
+static const int MAX_PARTITIONS = 16;
+
+//The partitions of one simulation on one GPU, each driven by its own host thread, like ranks. They share one stream, so their GPU work runs in the order
+//it's queued, and host barriers order the queuing: an exchange starts with a barrier, so all the work every partition has queued comes first, then each
+//queues its reads of the others' arrays, and ends with another barrier, so every read is queued before anyone queues writes that would change what it
+//reads. For developing and checking the split on one GPU; separate GPUs need a real transport
+class LocalExchange{
+public:
+    LocalExchange(int numPartitions, cudaStream_t stream);
+    ~LocalExchange();
+
+    int size() const{
+        return numPartitions;
+    }
+    cudaStream_t stream() const{
+        return sharedStream;
+    }
+    void barrier();
+
+    void attach(int rank, Particles* partition){
+        partitions[rank] = partition;
+    }
+    Particles& partition(int rank){
+        return *partitions[rank];
+    }
+
+    //a pointer or value from each partition, which every partition can read after the next barrier
+    void publish(int rank, const void* pointer){
+        pointers[rank] = pointer;
+    }
+    const void* published(int rank) const{
+        return pointers[rank];
+    }
+    void publishValue(int rank, double value){
+        values[rank] = value;
+    }
+    double publishedValue(int rank) const{
+        return values[rank];
+    }
+
+    //each partition's scratch space on the device, for sums
+    void* scratch(int rank){
+        return scratchSpace[rank];
+    }
+
+private:
+    int numPartitions;
+    cudaStream_t sharedStream;
+    std::mutex mutex;
+    std::condition_variable released;
+    int arrived = 0;
+    unsigned long long generation = 0;
+    std::vector<Particles*> partitions;
+    std::vector<const void*> pointers;
+    std::vector<double> values;
+    std::vector<void*> scratchSpace;
+};
+
+//one partition's side of a LocalExchange. With a single partition every call returns straight away, so a lone partition runs exactly as it always has
+class LocalPartition : public PartitionContext{
+public:
+    LocalPartition(LocalExchange& exchange, int rank)
+    : exchange(exchange)
+    , rank(rank)
+    {}
+
+    void fillGhosts(float* values, cudaStream_t stream) override;
+    void fillGhosts(char* values, cudaStream_t stream) override;
+    void reduceGhosts(int* values, cudaStream_t stream) override;
+    double maxOverPartitions(double value) override;
+    bool anyOverPartitions(bool value) override;
+    void sumOverPartitions(long long* values, uint count, cudaStream_t stream) override;
+    void sumOverPartitions(double* value, cudaStream_t stream) override;
+    void gatherFirstLevel(void* cells, size_t bytesPerCell, cudaStream_t stream) override;
+
+private:
+    template <typename T>
+    void fill(T* values, cudaStream_t stream);
+
+    LocalExchange& exchange;
+    int rank;
+};
+
+#endif

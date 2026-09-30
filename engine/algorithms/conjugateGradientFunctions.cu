@@ -83,12 +83,13 @@ static const int EXACT_DIGITS = 9;      //32-bit digits from 2^-149, the smalles
 static const uint NODE_SLOTS = 64;      //a node's interior voxels, 4^3
 
 //an exact sum of floats in fixed point: digit k counts units of 2^(32k - 149). Each digit is a 64-bit integer holding its 32 bits plus carries not yet
-//passed up, so it takes 2^31 additions before anything could overflow, and integers add up the same in any order. Summing across GPUs later is just
-//adding these digits up, one allreduce
+//passed up, so it takes 2^31 additions before anything could overflow, and integers add up the same in any order. Summing across partitions is just
+//adding these words up, one allreduce
 struct ExactSum{
     long long digits[EXACT_DIGITS];
-    int nonFinite;      //set if an inf or NaN went in, so the result is NaN as a float sum's would be
+    long long nonFinite;    //how many infs or NaNs went in, so the result is NaN as a float sum's would be
 };
+static const uint EXACT_WORDS = sizeof(ExactSum) / sizeof(long long);
 
 //adds a float to an exact sum: its 24-bit significand, shifted to its binary exponent, straddles at most two digits
 __device__ inline void addExactly(float value, ExactSum& sum){
@@ -98,7 +99,7 @@ __device__ inline void addExactly(float value, ExactSum& sum){
         return;
     }
     if(exponent == 0xFF){
-        atomicExch(&sum.nonFinite, 1);
+        atomicAdd((unsigned long long*)&sum.nonFinite, 1ull);
         return;
     }
     unsigned long long significand = bits & 0x7FFFFF;
@@ -149,7 +150,7 @@ __global__ void addNodeDotShares(uint numNodes, const uint* interiorVoxels, cons
         atomicAdd((unsigned long long*)sum->digits + threadIdx.x, (unsigned long long)blockSum.digits[threadIdx.x]);
     }
     if(threadIdx.x == 0 && blockSum.nonFinite){
-        sum->nonFinite = 1;
+        atomicAdd((unsigned long long*)&sum->nonFinite, (unsigned long long)blockSum.nonFinite);
     }
 }
 
@@ -184,11 +185,13 @@ __global__ void finishExactSum(const ExactSum* sum, double* total){
     *total = negative ? -magnitude : magnitude;
 }
 
-//total = a*b over the unknowns, the same bit for bit however the nodes are stored or split up
-static void exactDotProduct(const VoxelLayout& layout, const char* solveCodes, const float* a, const float* b, ExactSum* sum, double* total, cudaStream_t stream){
+//total = a*b over the unknowns, the same bit for bit however the nodes are stored or split up: each partition sums its own nodes' shares (layout.numNodes
+//are its own), then the partitions add their digits together
+static void exactDotProduct(const VoxelLayout& layout, const char* solveCodes, const float* a, const float* b, ExactSum* sum, double* total, PartitionContext& context, cudaStream_t stream){
     uint blocks = layout.numNodes*32 / BLOCKSIZE + 1;
     cudaMemsetAsync(sum, 0, sizeof(ExactSum), stream);
     addNodeDotShares<<<blocks < 1024 ? blocks : 1024, BLOCKSIZE, 0, stream>>>(layout.numNodes, layout.interiorVoxels, solveCodes, a, b, sum);
+    context.sumOverPartitions((long long*)sum, EXACT_WORDS, stream);
     finishExactSum<<<1, 1, 0, stream>>>(sum, total);
 }
 
@@ -202,14 +205,16 @@ __global__ void startDownhill(uint numUsedVoxels, const char* solveCodes, Stenci
     }
 }
 
-//1: q = A*d; d*q sets how far to step along d. With partials (perBlock), also d*q's blocks' shares
-__global__ void multiplyByA(uint numUsedVoxels, const char* solveCodes, Stencil A, const float* d, float* q, float* partials){
+//1: q = A*d; d*q sets how far to step along d. With partials (perBlock), also d*q's blocks' shares, over this partition's own voxels (the first numOwnVoxels)
+__global__ void multiplyByA(uint numUsedVoxels, uint numOwnVoxels, const char* solveCodes, Stencil A, const float* d, float* q, float* partials){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
     float dq = 0.0f;
     if(index < numUsedVoxels){
         float product = solveCodes[index] ? A.rowTimes(index, d) : 0.0f;
         q[index] = product;
-        dq = d[index]*product;
+        if(index < numOwnVoxels){
+            dq = d[index]*product;
+        }
     }
     if(partials != nullptr){    //the same for every thread
         addBlockSum(dq, partials);
@@ -232,7 +237,7 @@ __global__ void stepDownhill(uint numUsedVoxels, const float* d, const float* q,
 
 //3, for the preconditioners that just scale each unknown: z = r / its own coefficient (Jacobi), or z = r with none (z is r itself then, so there's
 //nothing to write). With partials (perBlock), also r*z's blocks' shares
-__global__ void preconditionByDiagonal(uint numUsedVoxels, const float* r, const float* diagonal, float* z, float* partials){
+__global__ void preconditionByDiagonal(uint numUsedVoxels, uint numOwnVoxels, const float* r, const float* diagonal, float* z, float* partials){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
     float rz = 0.0f;
     if(index < numUsedVoxels){
@@ -240,17 +245,19 @@ __global__ void preconditionByDiagonal(uint numUsedVoxels, const float* r, const
         if(z != r){
             z[index] = preconditioned;
         }
-        rz = r[index]*preconditioned;
+        if(index < numOwnVoxels){
+            rz = r[index]*preconditioned;
+        }
     }
     if(partials != nullptr){    //the same for every thread
         addBlockSum(rz, partials);
     }
 }
 
-//r*z's blocks' shares, once a V-cycle has made z
-__global__ void dotResidual(uint numUsedVoxels, const float* r, const float* z, float* partials){
+//r*z's blocks' shares, once a V-cycle has made z, over this partition's own voxels
+__global__ void dotResidual(uint numOwnVoxels, const float* r, const float* z, float* partials){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
-    addBlockSum(index < numUsedVoxels ? r[index]*z[index] : 0.0f, partials);
+    addBlockSum(index < numOwnVoxels ? r[index]*z[index] : 0.0f, partials);
 }
 
 //4: the next direction is z, plus beta = r*z(new) / r*z(old) of the last one, which keeps it A-conjugate to all the earlier directions. The first time
@@ -274,12 +281,16 @@ __global__ void nextIteration(DotProducts* dots){
 
 //CG with the preconditioner handed in: precondition(r, z, partials) leaves z = M^-1*r, and with partials (perBlock only; null for exact) r*z's blocks'
 //shares in them. Finding the largest residual waits on the host, so like the SOR it's only checked every checkEvery iterations
+//
+//Split between partitions, each holds its own unknowns and copies of its neighbours' next to them (ghosts, codes 3 and 4), and every step runs in all of
+//them at once. The sums and maxima cover each partition's own voxels, then every partition's; z's ghosts take their owners' values once it's made, which
+//keeps d's and p's ghosts equal to their owners' too, as they're only ever combined from z's; and q = A*d reads ghost d's
 template <typename Precondition>
 static float conjugateGradient(const CudaVec<char>& solveCodes, Stencil A, const VoxelLayout& layout, DotProductSums sums, CudaVec<float>& divU, CudaVec<float>& p, CudaVec<float>& residuals,
-                                float tolerance, uint maxIterations, uint checkEvery, cudaStream_t stream, float* z, DotProducts* dots, Precondition precondition){
+                                float tolerance, uint maxIterations, uint checkEvery, uint numOwnVoxels, PartitionContext& context, cudaStream_t stream, float* z, DotProducts* dots, Precondition precondition){
     uint numUsedVoxels = p.size();
     uint blocks = numUsedVoxels / BLOCKSIZE + 1;
-    float maxDivergence = std::abs(divU.getMax(stream, true));
+    float maxDivergence = (float)context.maxOverPartitions(std::abs(divU.getMax(stream, true, numOwnVoxels)));
     if(maxDivergence == 0.0f){
         return 0.0f;
     }
@@ -296,34 +307,37 @@ static float conjugateGradient(const CudaVec<char>& solveCodes, Stencil A, const
     else{
         gpuErrchk(cudaMallocAsync((void**)&exact, sizeof(ExactSum), stream));
     }
-    //total = a*b; perBlock has its blocks' shares in partials already, from the kernel that made b
+    //total = a*b; perBlock has its blocks' shares in partials already, from the kernel that made b, and adds the partitions' totals in partition order
     auto dotProduct = [&](const float* a, const float* b, double* total){
         if(sums == DotProductSums::perBlock){
             sumPartials<<<1, SUM_THREADS, 0, stream>>>(blocks, partials, total);
+            context.sumOverPartitions(total, stream);
         }
         else{
-            exactDotProduct(layout, solveCodes.devPtr(), a, b, exact, total, stream);
+            exactDotProduct(layout, solveCodes.devPtr(), a, b, exact, total, context, stream);
         }
     };
     cudaMemsetAsync(d, 0, sizeof(float)*numUsedVoxels, stream);
     cudaMemsetAsync(dots, 0, sizeof(DotProducts), stream);
     startDownhill<<<blocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, solveCodes.devPtr(), A, divU.devPtr(), p.devPtr(), r);
     precondition(r, z, partials);
+    context.fillGhosts(z, stream);
     dotProduct(r, z, &dots->rzNext);
     turnDirection<<<blocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, z, d, dots);
     nextIteration<<<1, 1, 0, stream>>>(dots);
     float maxResidual = 1.0f;
     for(uint iteration = 1; iteration <= maxIterations; ++iteration){
-        multiplyByA<<<blocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, solveCodes.devPtr(), A, d, q, partials);
+        multiplyByA<<<blocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, numOwnVoxels, solveCodes.devPtr(), A, d, q, partials);
         dotProduct(d, q, &dots->dq);
         stepDownhill<<<blocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, d, q, p.devPtr(), r, dots);
         precondition(r, z, partials);
+        context.fillGhosts(z, stream);
         dotProduct(r, z, &dots->rzNext);
         turnDirection<<<blocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, z, d, dots);
         nextIteration<<<1, 1, 0, stream>>>(dots);
         if(iteration % checkEvery == 0){    //the SOR's stopping rule: the largest residual, relative to the largest divergence
             float previousResidual = maxResidual;
-            maxResidual = std::abs(residuals.getMax(stream, true)) / maxDivergence;
+            maxResidual = (float)context.maxOverPartitions(std::abs(residuals.getMax(stream, true, numOwnVoxels))) / maxDivergence;
             if(maxResidual < tolerance || std::abs(previousResidual - maxResidual) < tolerance / 1000){  //converged, or stalled
                 break;
             }
@@ -348,7 +362,7 @@ static Stencil makeStencil(const CudaVec<uint>& neighborNx, const CudaVec<uint>&
 
 //with no preconditioner (z = r) or Jacobi's (z = r / the unknown's own coefficient)
 static float diagonallyPreconditioned(bool jacobi, const CudaVec<char>& solveCodes, Stencil A, const VoxelLayout& layout, DotProductSums sums, CudaVec<float>& divU, CudaVec<float>& p,
-                                      CudaVec<float>& residuals, float tolerance, uint maxIterations, cudaStream_t stream){
+                                      CudaVec<float>& residuals, float tolerance, uint maxIterations, uint numOwnVoxels, PartitionContext& context, cudaStream_t stream){
     uint numUsedVoxels = p.size();
     float* z = residuals.devPtr();  //with none, z is r itself
     DotProducts* dots;
@@ -356,9 +370,9 @@ static float diagonallyPreconditioned(bool jacobi, const CudaVec<char>& solveCod
     if(jacobi){
         gpuErrchk(cudaMallocAsync((void**)&z, sizeof(float)*numUsedVoxels, stream));
     }
-    float residual = conjugateGradient(solveCodes, A, layout, sums, divU, p, residuals, tolerance, maxIterations, 16, stream, z, dots, [&](const float* r, float* preconditioned, float* partials){
+    float residual = conjugateGradient(solveCodes, A, layout, sums, divU, p, residuals, tolerance, maxIterations, 16, numOwnVoxels, context, stream, z, dots, [&](const float* r, float* preconditioned, float* partials){
         if(jacobi || partials != nullptr){  //with no preconditioner, exact sums leave nothing for it to do
-            preconditionByDiagonal<<<numUsedVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numUsedVoxels, r, jacobi ? A.Adiag : nullptr, preconditioned, partials);
+            preconditionByDiagonal<<<numUsedVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numUsedVoxels, numOwnVoxels, r, jacobi ? A.Adiag : nullptr, preconditioned, partials);
         }
     });
     if(jacobi){
@@ -370,33 +384,36 @@ static float diagonallyPreconditioned(bool jacobi, const CudaVec<char>& solveCod
 
 float cudaConjugateGradient(const CudaVec<char>& solveCodes, const CudaVec<uint>& neighborNx, const CudaVec<uint>& neighborPx, const CudaVec<uint>& neighborNy, const CudaVec<uint>& neighborPy, const CudaVec<uint>& neighborNz, const CudaVec<uint>& neighborPz,
     const CudaVec<float>& Anx, const CudaVec<float>& Apx, const CudaVec<float>& Any, const CudaVec<float>& Apy, const CudaVec<float>& Anz, const CudaVec<float>& Apz, const CudaVec<float>& Adiag,
-    CudaVec<float>& divU, CudaVec<float>& p, CudaVec<float>& residuals, float tolerance, uint maxIterations, const VoxelLayout& layout, DotProductSums sums, cudaStream_t stream){
+    CudaVec<float>& divU, CudaVec<float>& p, CudaVec<float>& residuals, float tolerance, uint maxIterations, const VoxelLayout& layout, DotProductSums sums, uint numOwnVoxels,
+    PartitionContext& context, cudaStream_t stream){
     return diagonallyPreconditioned(false, solveCodes, makeStencil(neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag), layout, sums, divU, p, residuals,
-                                    tolerance, maxIterations, stream);
+                                    tolerance, maxIterations, numOwnVoxels, context, stream);
 }
 
 float cudaJacobiConjugateGradient(const CudaVec<char>& solveCodes, const CudaVec<uint>& neighborNx, const CudaVec<uint>& neighborPx, const CudaVec<uint>& neighborNy, const CudaVec<uint>& neighborPy, const CudaVec<uint>& neighborNz, const CudaVec<uint>& neighborPz,
     const CudaVec<float>& Anx, const CudaVec<float>& Apx, const CudaVec<float>& Any, const CudaVec<float>& Apy, const CudaVec<float>& Anz, const CudaVec<float>& Apz, const CudaVec<float>& Adiag,
-    CudaVec<float>& divU, CudaVec<float>& p, CudaVec<float>& residuals, float tolerance, uint maxIterations, const VoxelLayout& layout, DotProductSums sums, cudaStream_t stream){
+    CudaVec<float>& divU, CudaVec<float>& p, CudaVec<float>& residuals, float tolerance, uint maxIterations, const VoxelLayout& layout, DotProductSums sums, uint numOwnVoxels,
+    PartitionContext& context, cudaStream_t stream){
     return diagonallyPreconditioned(true, solveCodes, makeStencil(neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag), layout, sums, divU, p, residuals,
-                                    tolerance, maxIterations, stream);
+                                    tolerance, maxIterations, numOwnVoxels, context, stream);
 }
 
 float cudaMultigridConjugateGradient(const CudaVec<char>& solveCodes, const CudaVec<uint>& neighborNx, const CudaVec<uint>& neighborPx, const CudaVec<uint>& neighborNy, const CudaVec<uint>& neighborPy, const CudaVec<uint>& neighborNz, const CudaVec<uint>& neighborPz,
     const CudaVec<float>& Anx, const CudaVec<float>& Apx, const CudaVec<float>& Any, const CudaVec<float>& Apy, const CudaVec<float>& Anz, const CudaVec<float>& Apz, const CudaVec<float>& Adiag,
-    CudaVec<float>& divU, CudaVec<float>& p, CudaVec<float>& residuals, float tolerance, uint maxIterations, const VoxelLayout& layout, float scale, DotProductSums sums, cudaStream_t stream){
+    CudaVec<float>& divU, CudaVec<float>& p, CudaVec<float>& residuals, float tolerance, uint maxIterations, const VoxelLayout& layout, float scale, DotProductSums sums, uint numOwnVoxels,
+    PartitionContext& context, cudaStream_t stream){
     uint numUsedVoxels = p.size();
     Stencil A = makeStencil(neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag);
-    Multigrid multigrid = buildMultigrid(A, solveCodes.devPtr(), numUsedVoxels, layout, scale, stream);
+    Multigrid multigrid = buildMultigrid(A, solveCodes.devPtr(), numUsedVoxels, layout, scale, context, stream);
     float* z;
     DotProducts* dots;
     gpuErrchk(cudaMallocAsync((void**)&z, sizeof(float)*numUsedVoxels, stream));
     gpuErrchk(cudaMallocAsync((void**)&dots, sizeof(DotProducts), stream));
     //a V-cycle costs dozens of plain iterations and it should take few of them, so it checks sooner
-    float residual = conjugateGradient(solveCodes, A, layout, sums, divU, p, residuals, tolerance, maxIterations, 2, stream, z, dots, [&](const float* r, float* preconditioned, float* partials){
+    float residual = conjugateGradient(solveCodes, A, layout, sums, divU, p, residuals, tolerance, maxIterations, 2, numOwnVoxels, context, stream, z, dots, [&](const float* r, float* preconditioned, float* partials){
         vCycle(multigrid, r, preconditioned, stream);
         if(partials != nullptr){
-            dotResidual<<<numUsedVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numUsedVoxels, r, preconditioned, partials);
+            dotResidual<<<numUsedVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numOwnVoxels, r, preconditioned, partials);
         }
     });
     cudaFreeAsync(z, stream);

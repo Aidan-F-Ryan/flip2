@@ -12,15 +12,19 @@
 #include <thread>
 #include <vector>
 
-//Writes frames to disk on a background thread so the simulation never waits on the disk. The caller packs a frame into deviceFrame() on its stream, then write()
-//queues an async copy into one of a few pinned host buffers and returns; the thread writes each buffer out once its copy has landed. The simulation only
-//blocks if every buffer is still being written. The destructor finishes all queued frames.
+//Writes frames to disk on a background thread so the simulation never waits on the disk. The caller packs a frame into deviceFrame(stream) on its stream, then
+//write() queues an async copy into one of a few pinned host buffers and returns; the thread writes each buffer out once its copy has landed. The copy runs on
+//the writer's own stream once the pack is done, so the simulation's next kernels run alongside it rather than behind it, and the next pack waits for it to
+//finish reading. The simulation only blocks if every buffer is still being written. The destructor finishes all queued frames.
 class FrameWriter{
 public:
     FrameWriter(size_t bytesPerFrame, int numBuffers = 3)
     : bytes(bytesPerFrame)
     {
         gpuErrchk(cudaMalloc((void**)&deviceBuffer, bytes));
+        gpuErrchk(cudaStreamCreateWithFlags(&copyStream, cudaStreamNonBlocking));
+        gpuErrchk(cudaEventCreateWithFlags(&packed, cudaEventDisableTiming));
+        gpuErrchk(cudaEventCreateWithFlags(&deviceFree, cudaEventDisableTiming));
         for(int i = 0; i < numBuffers; ++i){
             float* hostBuffer;
             cudaEvent_t event;
@@ -40,14 +44,20 @@ public:
         }
         changed.notify_all();
         thread.join();
+        cudaStreamSynchronize(copyStream);
         for(size_t i = 0; i < hostBuffers.size(); ++i){
             cudaFreeHost(hostBuffers[i]);
             cudaEventDestroy(copied[i]);
         }
+        cudaEventDestroy(packed);
+        cudaEventDestroy(deviceFree);
+        cudaStreamDestroy(copyStream);
         cudaFree(deviceBuffer);
     }
 
-    float* deviceFrame(){
+    //the device array to pack the next frame into, once the last frame's copy out of it is done: stream waits for that, not the host
+    float* deviceFrame(cudaStream_t stream){
+        gpuErrchk(cudaStreamWaitEvent(stream, deviceFree, 0));
         return deviceBuffer;
     }
 
@@ -59,8 +69,11 @@ public:
             buffer = freeBuffers.back();
             freeBuffers.pop_back();
         }
-        gpuErrchk(cudaMemcpyAsync(hostBuffers[buffer], deviceBuffer, bytes, cudaMemcpyDeviceToHost, stream));
-        gpuErrchk(cudaEventRecord(copied[buffer], stream));
+        gpuErrchk(cudaEventRecord(packed, stream));
+        gpuErrchk(cudaStreamWaitEvent(copyStream, packed, 0));
+        gpuErrchk(cudaMemcpyAsync(hostBuffers[buffer], deviceBuffer, bytes, cudaMemcpyDeviceToHost, copyStream));
+        gpuErrchk(cudaEventRecord(copied[buffer], copyStream));
+        gpuErrchk(cudaEventRecord(deviceFree, copyStream));
         {
             std::lock_guard<std::mutex> lock(mutex);
             jobs.push({buffer, fileName});
@@ -104,6 +117,9 @@ private:
 
     size_t bytes;
     float* deviceBuffer;
+    cudaStream_t copyStream;
+    cudaEvent_t packed;         //on the simulation's stream: the frame is in deviceBuffer
+    cudaEvent_t deviceFree;     //on copyStream: deviceBuffer has been copied out
     std::vector<float*> hostBuffers;
     std::vector<cudaEvent_t> copied;
     std::vector<int> freeBuffers;

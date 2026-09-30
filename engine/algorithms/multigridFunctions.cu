@@ -228,8 +228,8 @@ static uint firstLevelThreads(const VoxelLayout& layout){  //a thread per first-
     return layout.numNodes*perAxis*perAxis*perAxis;
 }
 
-Multigrid buildMultigrid(Stencil A, const char* solveCodes, uint numUsedVoxels, const VoxelLayout& layout, float scale, cudaStream_t stream){
-    Multigrid multigrid = {A, solveCodes, layout, numUsedVoxels, nullptr, {}, 0};
+Multigrid buildMultigrid(Stencil A, const char* solveCodes, uint numUsedVoxels, const VoxelLayout& layout, float scale, PartitionContext& context, cudaStream_t stream){
+    Multigrid multigrid = {A, solveCodes, layout, numUsedVoxels, nullptr, {}, 0, &context};
     gpuErrchk(cudaMallocAsync((void**)&multigrid.residual, sizeof(float)*numUsedVoxels, stream));
     uint3 cells = make_uint3(layout.domainVoxels.x / 2, layout.domainVoxels.y / 2, layout.domainVoxels.z / 2);
     float coupling = 2.0f*scale;
@@ -250,7 +250,8 @@ Multigrid buildMultigrid(Stencil A, const char* solveCodes, uint numUsedVoxels, 
     //which cells are unknowns: the first grid's from the voxels, each coarser one's from the one above
     CoarseLevel& first = multigrid.levels[0];
     cudaMemsetAsync(first.fluid, 0, numCellsOf(first), stream);
-    markFirstLevel<<<firstLevelThreads(layout) / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(layout, solveCodes, first);
+    markFirstLevel<<<firstLevelThreads(layout) / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(layout, solveCodes, first);   //this partition's own nodes' cells
+    context.gatherFirstLevel(first.fluid, sizeof(char), stream);    //and the other partitions', so every partition has the whole grid
     for(int level = 1; level < multigrid.numLevels; ++level){
         markCoarserLevel<<<numCellsOf(multigrid.levels[level]) / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(multigrid.levels[level - 1], multigrid.levels[level]);
     }
@@ -270,15 +271,19 @@ void vCycle(const Multigrid& multigrid, const float* r, float* z, cudaStream_t s
     const CoarseLevel* levels = multigrid.levels;
     int coarsest = multigrid.numLevels - 1;
 
-    //down: relax each grid, then hand its leftover residual to the next coarser one
+    //down: relax each grid, then hand its leftover residual to the next coarser one. The half-sweeps update this partition's own unknowns, then the
+    //ghosts take their owners' values for the next to read
+    PartitionContext& context = *multigrid.context;
     cudaMemsetAsync(z, 0, sizeof(float)*numUsedVoxels, stream);
     for(int sweep = 0; sweep < SWEEPS; ++sweep){
         for(char color = 1; color <= 2; ++color){   //red, then black
             relaxVoxels<<<voxelBlocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, multigrid.colors, color, multigrid.A, r, z);
+            context.fillGhosts(z, stream);
         }
     }
     findResidual<<<voxelBlocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, multigrid.colors, multigrid.A, r, z, multigrid.residual);
     restrictFromVoxels<<<firstLevelThreads(multigrid.layout) / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(multigrid.layout, multigrid.residual, levels[0]);
+    context.gatherFirstLevel(levels[0].b, sizeof(float), stream);   //the coarse grids from here on come out the same in every partition
     for(int level = 0; level < coarsest; ++level){
         cudaMemsetAsync(levels[level].z, 0, sizeof(float)*numCellsOf(levels[level]), stream);
         relaxLevel(levels[level], 0, stream);
@@ -307,6 +312,7 @@ void vCycle(const Multigrid& multigrid, const float* r, float* z, cudaStream_t s
     for(int sweep = 0; sweep < SWEEPS; ++sweep){
         for(char color = 2; color >= 1; --color){   //black, then red
             relaxVoxels<<<voxelBlocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, multigrid.colors, color, multigrid.A, r, z);
+            context.fillGhosts(z, stream);
         }
     }
 }

@@ -14,19 +14,23 @@
     };
 
     //solves the same pressure equations as cudaGSiteration, Adiag*p + sum(A*neighbour p) = -divU over the unknowns, by conjugate gradient. Same arguments
-    //plus where the unknowns sit in the nodes (the exact dot products sum node by node) and how to add up the dot products, same stopping rule (the largest residual relative to the largest divergence), same return value, so pressureSolve can use either
+    //plus where the unknowns sit in the nodes (the exact dot products sum node by node), how to add up the dot products, and, split between partitions, how
+    //many voxels are this partition's own (they come first) and the other partitions (see partitionContext.hu). Same stopping rule (the largest residual relative to the largest divergence), same return value, so pressureSolve can use either
     float cudaConjugateGradient(const CudaVec<char>& solveCodes, const CudaVec<uint>& neighborNx, const CudaVec<uint>& neighborPx, const CudaVec<uint>& neighborNy, const CudaVec<uint>& neighborPy, const CudaVec<uint>& neighborNz, const CudaVec<uint>& neighborPz,
         const CudaVec<float>& Anx, const CudaVec<float>& Apx, const CudaVec<float>& Any, const CudaVec<float>& Apy, const CudaVec<float>& Anz, const CudaVec<float>& Apz, const CudaVec<float>& Adiag,
-        CudaVec<float>& divU, CudaVec<float>& p, CudaVec<float>& residuals, float tolerance, uint maxIterations, const VoxelLayout& layout, DotProductSums sums, cudaStream_t stream);
+        CudaVec<float>& divU, CudaVec<float>& p, CudaVec<float>& residuals, float tolerance, uint maxIterations, const VoxelLayout& layout, DotProductSums sums, uint numOwnVoxels,
+        PartitionContext& context, cudaStream_t stream);
 
     //the same, preconditioned by Jacobi: z = r / each unknown's own coefficient
     float cudaJacobiConjugateGradient(const CudaVec<char>& solveCodes, const CudaVec<uint>& neighborNx, const CudaVec<uint>& neighborPx, const CudaVec<uint>& neighborNy, const CudaVec<uint>& neighborPy, const CudaVec<uint>& neighborNz, const CudaVec<uint>& neighborPz,
         const CudaVec<float>& Anx, const CudaVec<float>& Apx, const CudaVec<float>& Any, const CudaVec<float>& Apy, const CudaVec<float>& Anz, const CudaVec<float>& Apz, const CudaVec<float>& Adiag,
-        CudaVec<float>& divU, CudaVec<float>& p, CudaVec<float>& residuals, float tolerance, uint maxIterations, const VoxelLayout& layout, DotProductSums sums, cudaStream_t stream);
+        CudaVec<float>& divU, CudaVec<float>& p, CudaVec<float>& residuals, float tolerance, uint maxIterations, const VoxelLayout& layout, DotProductSums sums, uint numOwnVoxels,
+        PartitionContext& context, cudaStream_t stream);
 
     //the same, preconditioned by a multigrid V-cycle (multigridFunctions.cu). It also needs where the unknowns sit in the domain, and the coefficient
     //between neighbouring unknowns
     float cudaMultigridConjugateGradient(const CudaVec<char>& solveCodes, const CudaVec<uint>& neighborNx, const CudaVec<uint>& neighborPx, const CudaVec<uint>& neighborNy, const CudaVec<uint>& neighborPy, const CudaVec<uint>& neighborNz, const CudaVec<uint>& neighborPz,
         const CudaVec<float>& Anx, const CudaVec<float>& Apx, const CudaVec<float>& Any, const CudaVec<float>& Apy, const CudaVec<float>& Anz, const CudaVec<float>& Apz, const CudaVec<float>& Adiag,
-        CudaVec<float>& divU, CudaVec<float>& p, CudaVec<float>& residuals, float tolerance, uint maxIterations, const VoxelLayout& layout, float scale, DotProductSums sums, cudaStream_t stream);
+        CudaVec<float>& divU, CudaVec<float>& p, CudaVec<float>& residuals, float tolerance, uint maxIterations, const VoxelLayout& layout, float scale, DotProductSums sums, uint numOwnVoxels,
+        PartitionContext& context, cudaStream_t stream);
 #endif
