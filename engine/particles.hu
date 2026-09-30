@@ -9,6 +9,13 @@
 #include "frameWriter.hpp"
 #include <string>
 
+enum class PressureSolver{
+    sor,        //red/black SOR
+    cg,         //conjugate gradient
+    jacobi,     //conjugate gradient, Jacobi-preconditioned
+    multigrid   //conjugate gradient, preconditioned by a multigrid V-cycle
+};
+
 class Particles{
 public:
     Particles(uint size);
@@ -51,8 +58,8 @@ public:
         densityCorrectionTime = seconds;
     }
 
-    void setConjugateGradient(bool on){ //the pressure solver: conjugate gradient, or else red/black SOR
-        useConjugateGradient = on;
+    void setPressureSolver(PressureSolver solver){
+        pressureSolver = solver;
     }
 
     void setFlipRatio(double ratio){    //the particle velocity update's share of FLIP, the rest PIC: 1 keeps the most energy and detail, 0 is the most damped and stable
@@ -111,6 +118,7 @@ private:
     CudaVec<uint> neighborNz;
     CudaVec<uint> neighborPz;
     CudaVec<char> solveCodes;   //per used voxel: 0 if not a pressure unknown, else 1 red / 2 black
+    CudaVec<uint> coarseCells;  //per pressure unknown: the multigrid's first coarse cell holding it
 
     CudaVec<uint> usedVoxelMasks;   //per node: stored, fluid and reached masks, one bit per slot of its voxel block
 
@@ -129,7 +137,7 @@ private:
     uint size;
     double radius;
     double flipRatio = 0.95;
-    bool useConjugateGradient = false;  //unpreconditioned CG is no faster than the red/black SOR yet
+    PressureSolver pressureSolver = PressureSolver::sor;
     double maxVelocity = 0.0;   //the fastest particle velocity component, found each substep by P2G
     double restParticlesPerVoxel = 8.0;
     double densityCorrectionTime = 0.1;

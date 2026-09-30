@@ -333,7 +333,7 @@ __global__ void writeUsedVoxelIDs(uint numVoxels1D, const uint* usedVoxelMasks, 
 //apron voxels mirror voxels in the 26 neighbouring nodes' interiors. Point every used voxel at the used voxel that owns its value (itself if interior, or if the owning node doesn't use it).
 //Interior fluid voxels are the pressure solve's unknowns: also record their red/black colour and the owners of their six face neighbours (NO_VOXEL for air, WALL_VOXEL outside the domain)
 __global__ void buildVoxelTopology(uint numUsedGridNodes, uint numVoxels1D, double radius, const uint* nodeCells, const uint* cellToNode, const uint* numVoxelsEachNode, const uint* voxelIDs, uint* voxelOwners,
-                                    uint* neighborNx, uint* neighborPx, uint* neighborNy, uint* neighborPy, uint* neighborNz, uint* neighborPz, char* solveCodes, Grid grid, uint refinementLevel){
+                                    uint* neighborNx, uint* neighborPx, uint* neighborNy, uint* neighborPy, uint* neighborNz, uint* neighborPz, char* solveCodes, uint* coarseCells, Grid grid, uint refinementLevel){
     extern __shared__ uint sharedOwners[];
     __shared__ uint neighborNodes[27];
     int voxels1D = numVoxels1D;
@@ -386,6 +386,10 @@ __global__ void buildVoxelTopology(uint numUsedGridNodes, uint numVoxels1D, doub
                 int neighborSlot = slot + (face % 2 ? 1 : -1)*(face < 2 ? 1 : face < 4 ? voxels1D : voxels1D*voxels1D);
                 neighbors[face][i] = isWallVoxel(cell, neighborSlot, voxels1D, apronCells, grid, refinementLevel) ? WALL_VOXEL : sharedOwners[neighborSlot];
             }
+            uint globalX = (cell % grid.sizeX)*interiorWidth + x - apronCells;  //the 2x2x2 block of the domain's voxels holding it
+            uint globalY = (cell / grid.sizeX % grid.sizeY)*interiorWidth + y - apronCells;
+            uint globalZ = cell / (grid.sizeX*grid.sizeY)*interiorWidth + z - apronCells;
+            coarseCells[i] = globalX/2 + globalY/2*(grid.sizeX*interiorWidth/2) + globalZ/2*(grid.sizeX*interiorWidth/2)*(grid.sizeY*interiorWidth/2);
         }
     }
 }
@@ -425,7 +429,7 @@ void Particles::generateVoxels(){
     solids.resizeAsync(numUsedVoxels, stream);
     solveCodes.resizeAsync(numUsedVoxels, stream);
     footprintDepth.resizeAsync(numUsedVoxels, stream);
-    for(CudaVec<uint>* neighbor : {&neighborNx, &neighborPx, &neighborNy, &neighborPy, &neighborNz, &neighborPz}){
+    for(CudaVec<uint>* neighbor : {&neighborNx, &neighborPx, &neighborNy, &neighborPy, &neighborNz, &neighborPz, &coarseCells}){
         neighbor->resizeAsync(numUsedVoxels, stream);
     }
     for(CudaVec<float>* voxelData : {&voxelsUx, &voxelsUy, &voxelsUz, &voxelsUxOld, &voxelsUyOld, &voxelsUzOld, &voxelWeightsX, &voxelWeightsY, &voxelWeightsZ, &particleCounts, &divU, &p, &residuals, &Anx, &Apx, &Any, &Apy, &Anz, &Apz, &Adiag}){
@@ -435,7 +439,7 @@ void Particles::generateVoxels(){
 
     writeUsedVoxelIDs<<<numUsedGridNodes, 32, 0, stream>>>(numVoxels1D, usedVoxelMasks.devPtr(), nodeIndexUsedVoxels.devPtr(), nodeCells.devPtr(), voxelIDsUsed.devPtr(), solids.devPtr(), solveCodes.devPtr(), radius, grid, refinementLevel);
     buildVoxelTopology<<<numUsedGridNodes, 64, sizeof(uint)*numVoxelsPerNode, stream>>>(numUsedGridNodes, numVoxels1D, radius, nodeCells.devPtr(), cellToNode.devPtr(), nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(), voxelOwners.devPtr(),
-        neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(), neighborPy.devPtr(), neighborNz.devPtr(), neighborPz.devPtr(), solveCodes.devPtr(), grid, refinementLevel);
+        neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(), neighborPy.devPtr(), neighborNz.devPtr(), neighborPz.devPtr(), solveCodes.devPtr(), coarseCells.devPtr(), grid, refinementLevel);
     cudaStreamSynchronize(stream);
 
     std::cout<<"Nodes: "<<numParticleNodes<<" with particles, "<<numUsedGridNodes<<" in all, holding "<<numUsedVoxels<<" voxels\n";
@@ -553,8 +557,22 @@ void Particles::pressureSolve(){
     cudaCalcDivU(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, voxelsUx, voxelsUy, voxelsUz, particleCounts, footprintDepth, restParticlesPerVoxel, correctionRate, divU, stream);
     cudaGetA(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, dt/(density*voxelSize*voxelSize), stream);
     gpuErrchk(cudaPeekAtLastError());
-    auto solve = useConjugateGradient ? cudaConjugateGradient : cudaGSiteration;    //the two pressure solvers take the same arguments
-    while(previousTerminatingResidual - (terminatingResidual = solve(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, divU, p, residuals, tolerance, maxIterations, stream)) > 0.0){    //while residual getting smaller
+    uint interiorWidth = numVoxels1D - 2*(uint)std::floor(radius);
+    uint3 domainVoxels = make_uint3(grid.sizeX*interiorWidth, grid.sizeY*interiorWidth, grid.sizeZ*interiorWidth);
+    auto solve = [&](){
+        switch(pressureSolver){
+            case PressureSolver::cg:
+                return cudaConjugateGradient(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, divU, p, residuals, tolerance, maxIterations, stream);
+            case PressureSolver::jacobi:
+                return cudaJacobiConjugateGradient(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, divU, p, residuals, tolerance, maxIterations, stream);
+            case PressureSolver::multigrid:
+                return cudaMultigridConjugateGradient(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, divU, p, residuals, tolerance, maxIterations,
+                                                      coarseCells, domainVoxels, dt/(density*voxelSize*voxelSize), stream);
+            default:
+                return cudaGSiteration(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, divU, p, residuals, tolerance, maxIterations, stream);
+        }
+    };
+    while(previousTerminatingResidual - (terminatingResidual = solve()) > 0.0){    //while residual getting smaller
         gpuErrchk(cudaPeekAtLastError());
         if(terminatingResidual < tolerance){
             break;

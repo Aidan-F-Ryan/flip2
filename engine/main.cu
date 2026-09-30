@@ -37,8 +37,9 @@ int main(int argc, char** argv){
     }
     particles.setFlipRatio(flipRatio);
     particles.setDensityCorrectionTime(densityCorrectionTime);
-    if(const char* solver = std::getenv("FLIP2_SOLVER")){    //FLIP2_SOLVER=cg picks the conjugate gradient pressure solver, sor (the default) red/black SOR
-        particles.setConjugateGradient(std::string(solver) == "cg");
+    if(const char* solver = std::getenv("FLIP2_SOLVER")){    //FLIP2_SOLVER picks the pressure solver: sor (the default), cg, jacobi or multigrid
+        std::string name = solver;
+        particles.setPressureSolver(name == "cg" ? PressureSolver::cg : name == "jacobi" ? PressureSolver::jacobi : name == "multigrid" ? PressureSolver::multigrid : PressureSolver::sor);
     }
     particles.initialize();
     particles.writePositionsToFile(std::to_string(0) + ".bin");

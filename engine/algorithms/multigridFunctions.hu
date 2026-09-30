@@ -1,0 +1,56 @@
+//Copyright 2023 Aberrant Behavior LLC
+
+#ifndef MULTIGRIDFUNCTIONS_HU
+#define MULTIGRIDFUNCTIONS_HU
+
+    #include "../typedefs.h"
+    #include "../cudaVec.hu"
+
+    //an unknown's row of the pressure matrix A: its own coefficient and its six neighbours'. They're 0 across walls and air, so only unknowns count
+    struct Stencil{
+        const uint* neighbors[6];
+        const float* A[6];
+        const float* Adiag;
+
+        __device__ float offDiagonalTimes(uint index, const float* x) const{
+            float sum = 0.0f;
+            #pragma unroll
+            for(int face = 0; face < 6; ++face){
+                if(A[face][index] != 0.0f){
+                    sum += A[face][index]*x[neighbors[face][index]];
+                }
+            }
+            return sum;
+        }
+
+        __device__ float rowTimes(uint index, const float* x) const{     //(A*x) at an unknown, the same row the SOR relaxes
+            return Adiag[index]*x[index] + offDiagonalTimes(index, x);
+        }
+    };
+
+    //one of the V-cycle's grids below the unknowns: a dense grid over the whole domain, each cell 2x2x2 of the grid above
+    struct CoarseLevel{
+        uint3 cells;        //along x, y and z
+        float coupling;     //the coefficient between neighbouring cells: twice the finer grid's, as a coarse face is 4 finer faces at twice the spacing
+        char* fluid;        //whether the cell's an unknown (all its children are); else it's air, pinned at 0. Walls are the domain's edges
+        float* b;           //its right-hand side: the finer grid's leftover residual, summed over its children
+        float* z;           //its correction
+    };
+
+    struct Multigrid{
+        Stencil A;                  //the finest grid, the pressure unknowns themselves
+        const char* colors;         //their red/black colours (the solveCodes)
+        const uint* coarseCells;    //the first coarse grid's cell holding each unknown
+        uint numUsedVoxels;
+        CoarseLevel levels[16];     //each coarser than the last, the last small enough for one block to solve
+        int numLevels;
+    };
+
+    //the coarse grids for this solve, from which unknowns there are
+    Multigrid buildMultigrid(Stencil A, const char* solveCodes, const uint* coarseCells, uint numUsedVoxels, uint3 domainVoxels, float scale, cudaStream_t stream);
+
+    //z = M^-1*r: one V-cycle, an approximate solve of A*z = r
+    void vCycle(const Multigrid& multigrid, const float* r, float* z, cudaStream_t stream);
+
+    void freeMultigrid(Multigrid& multigrid, cudaStream_t stream);
+#endif

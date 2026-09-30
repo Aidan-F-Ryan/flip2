@@ -31,7 +31,7 @@ add_library(particles SHARED
     particles.cu
 )
 
-target_link_libraries(particles ${cudaLibraries}  parallelPrefixSumKernels radixSortKernels reductionKernels particleToGridFunctions perVoxelParticleListFunctions voxelSolveFunctions conjugateGradientFunctions)
+target_link_libraries(particles ${cudaLibraries}  parallelPrefixSumKernels radixSortKernels reductionKernels particleToGridFunctions perVoxelParticleListFunctions voxelSolveFunctions conjugateGradientFunctions multigridFunctions)
 set_target_properties(particles PROPERTIES CUDA_ARCHITECTURES "86")
 
 add_executable(main main.cu)

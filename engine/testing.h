@@ -31,8 +31,8 @@ public:
         particles.setDensityCorrectionTime(seconds);
     }
 
-    void setConjugateGradient(bool on){
-        particles.setConjugateGradient(on);
+    void setPressureSolver(PressureSolver solver){
+        particles.setPressureSolver(solver);
     }
 
     void storeGridCellMap(){
