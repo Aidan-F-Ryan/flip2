@@ -37,9 +37,15 @@ int main(int argc, char** argv){
     }
     particles.setFlipRatio(flipRatio);
     particles.setDensityCorrectionTime(densityCorrectionTime);
-    if(const char* solver = std::getenv("FLIP2_SOLVER")){    //FLIP2_SOLVER picks the pressure solver: sor (the default), cg, jacobi or multigrid
+    if(const char* solver = std::getenv("FLIP2_SOLVER")){    //FLIP2_SOLVER picks the pressure solver: multigrid (the default), sor, cg or jacobi
         std::string name = solver;
-        particles.setPressureSolver(name == "cg" ? PressureSolver::cg : name == "jacobi" ? PressureSolver::jacobi : name == "multigrid" ? PressureSolver::multigrid : PressureSolver::sor);
+        particles.setPressureSolver(name == "sor" ? PressureSolver::sor : name == "cg" ? PressureSolver::cg : name == "jacobi" ? PressureSolver::jacobi : PressureSolver::multigrid);
+    }
+    if(const char* cfl = std::getenv("FLIP2_CFL")){  //FLIP2_CFL sets how many voxels the fastest particle may move per substep (default 0.7)
+        particles.setCfl(std::stod(cfl));
+    }
+    if(const char* advection = std::getenv("FLIP2_ADVECTION")){  //FLIP2_ADVECTION=euler moves particles straight along the grid velocity instead of RK3
+        particles.setRungeKutta3(std::string(advection) != "euler");
     }
     particles.initialize();
     particles.writePositionsToFile(std::to_string(0) + ".bin");

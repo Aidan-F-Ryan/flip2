@@ -18,7 +18,9 @@
     void applyGravity(const CudaVec<char>& solids, CudaVec<float>& voxelsUz, float dt, cudaStream_t stream);
     void removeGravity(const CudaVec<char>& solids, CudaVec<float>& voxelsUz, float dt, cudaStream_t stream);
 
-    void cudaNormalizeVoxelVelocities(const CudaVec<char>& solids, const CudaVec<float>& voxelWeightsX, const CudaVec<float>& voxelWeightsY, const CudaVec<float>& voxelWeightsZ, CudaVec<float>& voxelsUx, CudaVec<float>& voxelsUy, CudaVec<float>& voxelsUz, cudaStream_t stream);
+    //P2G's fixed-point sums (momentumScale and weightScale per unit) to float weights, counts and face velocities
+    void cudaNormalizeVoxelVelocities(const CudaVec<char>& solids, CudaVec<float>& voxelWeightsX, CudaVec<float>& voxelWeightsY, CudaVec<float>& voxelWeightsZ, CudaVec<float>& voxelsUx, CudaVec<float>& voxelsUy, CudaVec<float>& voxelsUz,
+        CudaVec<float>& particleCounts, float momentumScale, float weightScale, cudaStream_t stream);
 
     void cudaExtrapolateUnreachedFaces(const CudaVec<char>& solveCodes, const CudaVec<uint>& neighborNx, const CudaVec<uint>& neighborPx, const CudaVec<uint>& neighborNy, const CudaVec<uint>& neighborPy, const CudaVec<uint>& neighborNz, const CudaVec<uint>& neighborPz,
         const CudaVec<float>& voxelWeightsX, const CudaVec<float>& voxelWeightsY, const CudaVec<float>& voxelWeightsZ, CudaVec<float>& voxelsUx, CudaVec<float>& voxelsUy, CudaVec<float>& voxelsUz, cudaStream_t stream);

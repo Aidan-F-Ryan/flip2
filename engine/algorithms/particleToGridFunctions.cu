@@ -361,3 +361,19 @@ __global__ void mapNodeIndicesToParticles(uint numParticles, uint* uniqueGridNod
 void cudaMapNodeIndicesToParticles(uint numParticles, uint* uniqueGridNodes, uint* gridNodeIndicesToFirstParticleIndex, cudaStream_t stream){
     mapNodeIndicesToParticles<<<numParticles / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numParticles, uniqueGridNodes, gridNodeIndicesToFirstParticleIndex);
 }
+
+void cudaSortUints(uint numElements, uint* keys, cudaStream_t stream){
+    if(numElements == 0){
+        return;
+    }
+    uint* sorted;
+    void* temp = nullptr;
+    size_t tempSize = 0;
+    gpuErrchk(cudaMallocAsync((void**)&sorted, sizeof(uint)*numElements, stream));
+    cub::DeviceRadixSort::SortKeys(temp, tempSize, keys, sorted, numElements, 0, sizeof(uint)*8, stream);    //with no temp storage, this only sizes it
+    gpuErrchk(cudaMallocAsync(&temp, tempSize, stream));
+    cub::DeviceRadixSort::SortKeys(temp, tempSize, keys, sorted, numElements, 0, sizeof(uint)*8, stream);
+    cudaMemcpyAsync(keys, sorted, sizeof(uint)*numElements, cudaMemcpyDeviceToDevice, stream);
+    cudaFreeAsync(temp, stream);
+    cudaFreeAsync(sorted, stream);
+}

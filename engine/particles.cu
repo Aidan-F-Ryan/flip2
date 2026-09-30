@@ -333,7 +333,8 @@ __global__ void writeUsedVoxelIDs(uint numVoxels1D, const uint* usedVoxelMasks, 
 //apron voxels mirror voxels in the 26 neighbouring nodes' interiors. Point every used voxel at the used voxel that owns its value (itself if interior, or if the owning node doesn't use it).
 //Interior fluid voxels are the pressure solve's unknowns: also record their red/black colour and the owners of their six face neighbours (NO_VOXEL for air, WALL_VOXEL outside the domain)
 __global__ void buildVoxelTopology(uint numUsedGridNodes, uint numVoxels1D, double radius, const uint* nodeCells, const uint* cellToNode, const uint* numVoxelsEachNode, const uint* voxelIDs, uint* voxelOwners,
-                                    uint* neighborNx, uint* neighborPx, uint* neighborNy, uint* neighborPy, uint* neighborNz, uint* neighborPz, char* solveCodes, uint* coarseCells, Grid grid, uint refinementLevel){
+                                    uint* neighborNx, uint* neighborPx, uint* neighborNy, uint* neighborPy, uint* neighborNz, uint* neighborPz, char* solveCodes, uint* coarseCells, uint* interiorVoxels,
+                                    Grid grid, uint refinementLevel){
     extern __shared__ uint sharedOwners[];
     __shared__ uint neighborNodes[27];
     int voxels1D = numVoxels1D;
@@ -379,6 +380,9 @@ __global__ void buildVoxelTopology(uint numUsedGridNodes, uint numVoxels1D, doub
         bool unknown = solveCodes[i] && x >= apronCells && y >= apronCells && z >= apronCells && x < voxels1D - apronCells && y < voxels1D - apronCells && z < voxels1D - apronCells;  //fluid and interior
         voxelOwners[i] = sharedOwners[slot];
         solveCodes[i] = unknown ? 1 + (x + y + z) % 2 : 0;    //1 red, 2 black
+        if(x >= apronCells && y >= apronCells && z >= apronCells && x < voxels1D - apronCells && y < voxels1D - apronCells && z < voxels1D - apronCells){
+            interiorVoxels[blockIdx.x*interiorWidth*interiorWidth*interiorWidth + (x - apronCells) + (y - apronCells)*interiorWidth + (z - apronCells)*interiorWidth*interiorWidth] = i;
+        }
         if(unknown){
             uint* neighbors[6] = {neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz};
             #pragma unroll
@@ -408,6 +412,8 @@ void Particles::generateVoxels(){
     claimEmptyNeighborNodes<<<numParticleNodes, 32, 0, stream>>>(numParticleNodes, nodeCells.devPtr(), cellToNode.devPtr(), nodeCount.devPtr(), grid);
     cudaMemcpyAsync(&numUsedGridNodes, nodeCount.devPtr(), sizeof(uint), cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream);
+    //the empty nodes were appended in whatever order their claims landed: put them in cell order, so every run numbers the nodes, and so the voxels, the same
+    cudaSortUints(numUsedGridNodes - numParticleNodes, nodeCells.devPtr() + numParticleNodes, stream);
     mapCellsToNodes<<<(numUsedGridNodes - numParticleNodes) / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numParticleNodes, numUsedGridNodes, numParticleNodes, size, gridCell.devPtr(), gridNodeIndicesToFirstParticleIndex.devPtr(), nodeCells.devPtr(), cellToNode.devPtr());
 
     uint maskWords = (numVoxelsPerNode + 31) / 32;
@@ -432,6 +438,9 @@ void Particles::generateVoxels(){
     for(CudaVec<uint>* neighbor : {&neighborNx, &neighborPx, &neighborNy, &neighborPy, &neighborNz, &neighborPz, &coarseCells}){
         neighbor->resizeAsync(numUsedVoxels, stream);
     }
+    uint interiorWidth = numVoxels1D - 2*(uint)std::floor(radius);
+    nodeInteriorVoxels.resizeAsync(numUsedGridNodes*interiorWidth*interiorWidth*interiorWidth, stream);
+    cudaMemsetAsync(nodeInteriorVoxels.devPtr(), 0xFF, sizeof(uint)*nodeInteriorVoxels.size(), stream);   //NO_VOXEL until buildVoxelTopology finds one
     for(CudaVec<float>* voxelData : {&voxelsUx, &voxelsUy, &voxelsUz, &voxelsUxOld, &voxelsUyOld, &voxelsUzOld, &voxelWeightsX, &voxelWeightsY, &voxelWeightsZ, &particleCounts, &divU, &p, &residuals, &Anx, &Apx, &Any, &Apy, &Anz, &Apz, &Adiag}){
         voxelData->resizeAsync(numUsedVoxels, stream);
     }
@@ -439,7 +448,8 @@ void Particles::generateVoxels(){
 
     writeUsedVoxelIDs<<<numUsedGridNodes, 32, 0, stream>>>(numVoxels1D, usedVoxelMasks.devPtr(), nodeIndexUsedVoxels.devPtr(), nodeCells.devPtr(), voxelIDsUsed.devPtr(), solids.devPtr(), solveCodes.devPtr(), radius, grid, refinementLevel);
     buildVoxelTopology<<<numUsedGridNodes, 64, sizeof(uint)*numVoxelsPerNode, stream>>>(numUsedGridNodes, numVoxels1D, radius, nodeCells.devPtr(), cellToNode.devPtr(), nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(), voxelOwners.devPtr(),
-        neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(), neighborPy.devPtr(), neighborNz.devPtr(), neighborPz.devPtr(), solveCodes.devPtr(), coarseCells.devPtr(), grid, refinementLevel);
+        neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(), neighborPy.devPtr(), neighborNz.devPtr(), neighborPz.devPtr(), solveCodes.devPtr(), coarseCells.devPtr(), nodeInteriorVoxels.devPtr(),
+        grid, refinementLevel);
     cudaStreamSynchronize(stream);
 
     std::cout<<"Nodes: "<<numParticleNodes<<" with particles, "<<numUsedGridNodes<<" in all, holding "<<numUsedVoxels<<" voxels\n";
@@ -448,11 +458,13 @@ void Particles::generateVoxels(){
 
 //P2G: a block per node and a thread per particle. Each particle adds its momentum and weight on the 27 faces of each component around it into the
 //node's voxel block in shared memory, and 1 to the count of the voxel holding it; then each voxel the node stores adds the block's sums into its owner.
-//It sums in 32-bit fixed point, as sm_86 has native shared integer atomics but not float ones. 7 ints per slot: 14 KB for an 8^3 block
+//It sums in 32-bit fixed point, as sm_86 has native shared integer atomics but not float ones. 7 ints per slot: 14 KB for an 8^3 block. The owners'
+//sums stay fixed point too, in the float arrays' storage: integers add up the same in any order, so the result doesn't depend on which node gets there
+//first. normalizeVoxelVelocities turns them into floats
 __global__ void scatterParticleVelsToVoxels(uint numParticleNodes, uint numParticles, uint numVoxels1D, const uint* gridNodeIndicesToFirstParticleIndex, const uint* gridPosition,
                                             const double* px, const double* py, const double* pz, const float* vx, const float* vy, const float* vz,
                                             const uint* numVoxelsEachNode, const uint* voxelIDs, const uint* voxelOwners,
-                                            float* ux, float* uy, float* uz, float* weightsX, float* weightsY, float* weightsZ, float* particleCounts, float momentumScale, float weightScale, double radius, Grid grid, uint refinementLevel){
+                                            int* ux, int* uy, int* uz, int* weightsX, int* weightsY, int* weightsZ, int* particleCounts, float momentumScale, float weightScale, double radius, Grid grid, uint refinementLevel){
     extern __shared__ int fixedSums[];    //per slot: x, y, z momentum, then x, y, z weight, then particle count
     int voxels1D = numVoxels1D;
     int voxels3D = voxels1D*voxels1D*voxels1D;
@@ -491,8 +503,7 @@ __global__ void scatterParticleVelsToVoxels(uint numParticleNodes, uint numParti
         atomicAdd(fixedSums + 6*voxels3D + (int)pos.x + (int)pos.y*voxels1D + (int)pos.z*voxels1D*voxels1D, 1);
     }
     __syncthreads();
-    float* accumulators[7] = {ux, uy, uz, weightsX, weightsY, weightsZ, particleCounts};
-    float unscale[7] = {1.0f/momentumScale, 1.0f/momentumScale, 1.0f/momentumScale, 1.0f/weightScale, 1.0f/weightScale, 1.0f/weightScale, 1.0f};
+    int* accumulators[7] = {ux, uy, uz, weightsX, weightsY, weightsZ, particleCounts};
     for(uint i = (blockIdx.x == 0 ? 0 : numVoxelsEachNode[blockIdx.x - 1]) + threadIdx.x; i < numVoxelsEachNode[blockIdx.x]; i += blockDim.x){    //coalesced over the node's voxels
         int slot = voxelIDs[i];
         uint owner = voxelOwners[i];    //itself for interior voxels, so these atomics are mostly consecutive
@@ -500,7 +511,7 @@ __global__ void scatterParticleVelsToVoxels(uint numParticleNodes, uint numParti
         for(int sum = 0; sum < 7; ++sum){
             int value = fixedSums[sum*voxels3D + slot];
             if(value != 0){
-                atomicAdd(accumulators[sum] + owner, value*unscale[sum]);
+                atomicAdd(accumulators[sum] + owner, value);
             }
         }
     }
@@ -509,10 +520,10 @@ __global__ void scatterParticleVelsToVoxels(uint numParticleNodes, uint numParti
 #include "algorithms/reductionKernels.hu"
 #include <cmath>
 
-double Particles::getCourantDt(){    //every substep: the fastest particle moves at most 0.7 voxels. P2G finds the fastest
+double Particles::getCourantDt(){    //every substep: the fastest particle moves at most cfl voxels. P2G finds the fastest
     double voxelSize = (grid.cellSize / (numVoxels1D - 2*std::floor(radius)));
     std::cout<<"maxVel: "<<maxVelocity<<" voxelSize: "<<voxelSize<<"\n";
-    return 0.7 * (voxelSize / maxVelocity + 0.0001);
+    return cfl * (voxelSize / maxVelocity + 0.0001);
 }
 
 void Particles::particleVelToVoxels(){
@@ -524,8 +535,9 @@ void Particles::particleVelToVoxels(){
     float weightScale = (1 << 30) / 128.0f;
     float momentumScale = weightScale / fmax(maxVelocity, 1e-6);
     scatterParticleVelsToVoxels<<<numParticleNodes, NODE_THREADS, 7*sizeof(int)*numVoxelsPerNode, stream>>>(numParticleNodes, size, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(),
-        nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(), voxelOwners.devPtr(), voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr(), voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), particleCounts.devPtr(), momentumScale, weightScale, radius, grid, refinementLevel);
-    cudaNormalizeVoxelVelocities(solids, voxelWeightsX, voxelWeightsY, voxelWeightsZ, voxelsUx, voxelsUy, voxelsUz, stream);
+        nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(), voxelOwners.devPtr(), (int*)voxelsUx.devPtr(), (int*)voxelsUy.devPtr(), (int*)voxelsUz.devPtr(),
+        (int*)voxelWeightsX.devPtr(), (int*)voxelWeightsY.devPtr(), (int*)voxelWeightsZ.devPtr(), (int*)particleCounts.devPtr(), momentumScale, weightScale, radius, grid, refinementLevel);
+    cudaNormalizeVoxelVelocities(solids, voxelWeightsX, voxelWeightsY, voxelWeightsZ, voxelsUx, voxelsUy, voxelsUz, particleCounts, momentumScale, weightScale, stream);
     cudaExtrapolateUnreachedFaces(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, voxelWeightsX, voxelWeightsY, voxelWeightsZ, voxelsUx, voxelsUy, voxelsUz, stream);
     cudaFindFootprintDepth(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, footprintDepth, freeSurface, stream);
     for(auto [velocity, before] : {std::pair{&voxelsUx, &voxelsUxOld}, {&voxelsUy, &voxelsUyOld}, {&voxelsUz, &voxelsUzOld}}){    //for FLIP's velocity change over the solve
@@ -559,6 +571,7 @@ void Particles::pressureSolve(){
     gpuErrchk(cudaPeekAtLastError());
     uint interiorWidth = numVoxels1D - 2*(uint)std::floor(radius);
     uint3 domainVoxels = make_uint3(grid.sizeX*interiorWidth, grid.sizeY*interiorWidth, grid.sizeZ*interiorWidth);
+    VoxelLayout layout = {nodeCells.devPtr(), nodeInteriorVoxels.devPtr(), coarseCells.devPtr(), numUsedGridNodes, interiorWidth, domainVoxels};
     auto solve = [&](){
         switch(pressureSolver){
             case PressureSolver::cg:
@@ -567,7 +580,7 @@ void Particles::pressureSolve(){
                 return cudaJacobiConjugateGradient(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, divU, p, residuals, tolerance, maxIterations, stream);
             case PressureSolver::multigrid:
                 return cudaMultigridConjugateGradient(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, divU, p, residuals, tolerance, maxIterations,
-                                                      coarseCells, domainVoxels, dt/(density*voxelSize*voxelSize), stream);
+                                                      layout, dt/(density*voxelSize*voxelSize), stream);
             default:
                 return cudaGSiteration(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, divU, p, residuals, tolerance, maxIterations, stream);
         }
@@ -609,7 +622,7 @@ __global__ void gatherVoxelVelsToParticles(uint numParticleNodes, uint numPartic
                                             double* px, double* py, double* pz, float* vx, float* vy, float* vz,
                                             const uint* numVoxelsEachNode, const uint* voxelIDs, const uint* voxelOwners, const char* solids,
                                             const float* ux, const float* uy, const float* uz, const float* oldUx, const float* oldUy, const float* oldUz,
-                                            float flipRatio, float dt, double radius, Grid grid, uint refinementLevel){
+                                            float flipRatio, double radius, Grid grid, uint refinementLevel){
     extern __shared__ float blockVelocities[];  //per slot: new x, y, z, then old x, y, z
     int voxels1D = numVoxels1D;
     int voxels3D = voxels1D*voxels1D*voxels1D;
@@ -650,7 +663,6 @@ __global__ void gatherVoxelVelsToParticles(uint numParticleNodes, uint numPartic
         }
     }
     __syncthreads();
-    double* positions[3] = {px, py, pz};
     float* particleVelocities[3] = {vx, vy, vz};
     for(uint index = firstParticle + threadIdx.x; index < lastParticle; index += blockDim.x){    //consecutive threads, consecutive particles
         float3 pos = positionInNodeBlock(index, gridPosition, px, py, pz, grid, refinementLevel, apronCells);
@@ -677,7 +689,6 @@ __global__ void gatherVoxelVelsToParticles(uint numParticleNodes, uint numPartic
                 }
             }
             particleVelocities[dim][index] = newVelocity + flipRatio*(particleVelocities[dim][index] - oldVelocity);
-            positions[dim][index] += dt*newVelocity;
         }
     }
 }
@@ -689,86 +700,113 @@ __global__ void advectParticlePositions(uint numParticles, double dt, double* po
     }
 }
 
-//cheap counter-based random number in [0, 1), instead of initialising a curand state for every thread
-__device__ inline double hashToUniform(uint a, uint b){
-    uint hash = a*0x9E3779B1u ^ (b + 0x7F4A7C15u)*0x85EBCA77u;
-    hash ^= hash >> 15;
-    hash *= 0x2C1B3C6Du;
-    hash ^= hash >> 12;
-    hash *= 0x297A2D39u;
-    hash ^= hash >> 15;
-    return (hash >> 8) * (1.0/16777216.0);
+//a MAC velocity component at a point of an advection tile (in voxels), trilinear between the 8 faces around it. Component dim's faces sit on voxel
+//boundaries along dim and mid-voxel along the other axes. NaN if a face it leans on has no velocity
+__device__ inline float sampleTile(const float* tile, int tileWidth, int dim, float3 point){
+    float coordinates[3] = {point.x, point.y, point.z};
+    int base[3];
+    float fraction[3];
+    #pragma unroll
+    for(int axis = 0; axis < 3; ++axis){
+        float c = coordinates[axis] - (axis == dim ? 0.0f : 0.5f);
+        base[axis] = min(max((int)floorf(c), 0), tileWidth - 2);   //never off the tile, even past CFL 4
+        fraction[axis] = fminf(fmaxf(c - base[axis], 0.0f), 1.0f);
+    }
+    float sum = 0.0f;
+    #pragma unroll
+    for(int corner = 0; corner < 8; ++corner){
+        int dx = corner & 1, dy = corner >> 1 & 1, dz = corner >> 2;
+        float weight = (dx ? fraction[0] : 1.0f - fraction[0])*(dy ? fraction[1] : 1.0f - fraction[1])*(dz ? fraction[2] : 1.0f - fraction[2]);
+        if(weight != 0.0f){     //a face with no say can't spoil it
+            sum += weight*tile[base[0] + dx + (base[1] + dy)*tileWidth + (base[2] + dz)*tileWidth*tileWidth];
+        }
+    }
+    return sum;
 }
 
-__global__ void moveSolids(uint numUsedGridNodes, uint numParticles, uint numVoxelsPerNode, uint numVoxels1D, uint* gridNodeIndicesToFirstParticleIndex, uint* gridPosition, double* px, double* py, double* pz, uint* numVoxelsEachNode, uint* voxelIDs, char* solids, double radius, Grid grid, uint refinementLevel, uint seed){
-    extern __shared__ char sharedSolids[];
-    __shared__ uint* processedVoxels;
-    __shared__ uint lastParticleIndex;
-    __shared__ uint xySize;
-    __shared__ uint startVoxelIndex;
-    if(threadIdx.x == 0){
-        xySize = grid.sizeX*grid.sizeY;
-        processedVoxels = (uint*)(sharedSolids + numVoxelsPerNode);
-        if(blockIdx.x == numUsedGridNodes - 1){
-            lastParticleIndex = numParticles;
+//the grid's velocity at a point of the tile, any component with no velocity there taking fallback's. Each component's point is first kept inside the
+//walls: a wall's own faces hold its no-flow condition, and beside a wall the tangential velocity carries on to it unchanged, like G2P's mirrored ghosts
+__device__ inline float3 sampleVelocity(const float* tile, int tileWidth, float3 point, int3 tileOrigin, int3 domainVoxels, float3 fallback){
+    int origin[3] = {tileOrigin.x, tileOrigin.y, tileOrigin.z};
+    int size[3] = {domainVoxels.x, domainVoxels.y, domainVoxels.z};
+    float fallbacks[3] = {fallback.x, fallback.y, fallback.z};
+    float velocity[3];
+    #pragma unroll
+    for(int dim = 0; dim < 3; ++dim){
+        float coordinates[3] = {point.x, point.y, point.z};
+        #pragma unroll
+        for(int axis = 0; axis < 3; ++axis){
+            float inset = axis == dim ? 0.0f : 0.5f;
+            coordinates[axis] = fminf(fmaxf(coordinates[axis], inset - origin[axis]), size[axis] - inset - origin[axis]);
         }
-        else{
-            lastParticleIndex = gridNodeIndicesToFirstParticleIndex[blockIdx.x + 1];
-        }
-        if(blockIdx.x == 0){
-            startVoxelIndex = 0;
-        }
-        else{
-            startVoxelIndex = numVoxelsEachNode[blockIdx.x - 1];
+        float v = sampleTile(tile + dim*tileWidth*tileWidth*tileWidth, tileWidth, dim, make_float3(coordinates[0], coordinates[1], coordinates[2]));
+        velocity[dim] = isnan(v) ? fallbacks[dim] : v;
+    }
+    return make_float3(velocity[0], velocity[1], velocity[2]);
+}
+
+//moves each particle through the grid's new velocity field for the whole step: with Ralston's RK3, which samples the field 3 times along the way, or
+//straight along it (forward Euler). A straight step squeezes particles together where the flow stretches and spreads them where it turns, by an amount
+//growing with dt^2, which clumps them at large CFL; RK3 leaves that at dt^4. A block per node with particles: its interior and its 26 neighbours' go
+//into shared memory, a tile 3 nodes wide, which holds every trilinear sample RK3 takes up to CFL 4. Where nothing reached (spray leaving the fluid), a
+//stage reuses the stage before, so the particle flies straight
+__global__ void advectThroughGrid(uint numParticleNodes, uint numParticles, const uint* gridNodeIndicesToFirstParticleIndex, const uint* gridPosition,
+                                  double* px, double* py, double* pz, const float* vx, const float* vy, const float* vz,
+                                  uint numUsedGridNodes, const uint* nodeCells, const uint* cellToNode, const uint* interiorVoxels,
+                                  const float* ux, const float* uy, const float* uz, const float* weightsX, const float* weightsY, const float* weightsZ,
+                                  float dt, bool rungeKutta3, Grid grid, uint refinementLevel){
+    extern __shared__ float tile[];     //per component, the tile's voxels' negative faces
+    __shared__ uint neighborNodes[27];
+    int interiorWidth = 2<<refinementLevel;
+    int tileWidth = 3*interiorWidth;
+    int tileVoxels = tileWidth*tileWidth*tileWidth;
+    uint firstParticle = gridNodeIndicesToFirstParticleIndex[blockIdx.x];
+    uint lastParticle = blockIdx.x == numParticleNodes - 1 ? numParticles : gridNodeIndicesToFirstParticleIndex[blockIdx.x + 1];
+    uint cell = gridPosition[firstParticle];
+    loadNeighborNodes(neighborNodes, cell, numUsedGridNodes, nodeCells, cellToNode, grid);
+    int3 domainVoxels = make_int3(grid.sizeX*interiorWidth, grid.sizeY*interiorWidth, grid.sizeZ*interiorWidth);
+    int3 tileOrigin = make_int3(((int)(cell % grid.sizeX) - 1)*interiorWidth, ((int)(cell / grid.sizeX % grid.sizeY) - 1)*interiorWidth, ((int)(cell / (grid.sizeX*grid.sizeY)) - 1)*interiorWidth);
+    __syncthreads();
+    const float* velocities[3] = {ux, uy, uz};
+    const float* weights[3] = {weightsX, weightsY, weightsZ};
+    for(int t = threadIdx.x; t < tileVoxels; t += blockDim.x){
+        int x = t % tileWidth, y = t / tileWidth % tileWidth, z = t / (tileWidth*tileWidth);
+        int3 global = make_int3(tileOrigin.x + x, tileOrigin.y + y, tileOrigin.z + z);
+        bool inside = global.x >= 0 && global.y >= 0 && global.z >= 0 && global.x < domainVoxels.x && global.y < domainVoxels.y && global.z < domainVoxels.z;
+        uint node = neighborNodes[x / interiorWidth + 3*(y / interiorWidth) + 9*(z / interiorWidth)];
+        uint voxel = inside && node < numUsedGridNodes ?
+            interiorVoxels[node*interiorWidth*interiorWidth*interiorWidth + x % interiorWidth + (y % interiorWidth)*interiorWidth + (z % interiorWidth)*interiorWidth*interiorWidth] : NO_VOXEL;
+        #pragma unroll
+        for(int dim = 0; dim < 3; ++dim){   //past the walls, their faces at rest; inside, where nothing is stored or no particle reached, no velocity
+            tile[dim*tileVoxels + t] = !inside ? 0.0f : voxel != NO_VOXEL && weights[dim][voxel] > 0.0f ? velocities[dim][voxel] : nanf("");
         }
     }
     __syncthreads();
-    for(int i = threadIdx.x; i < numVoxelsPerNode; i += blockDim.x){
-        sharedSolids[i] = 0;
-        processedVoxels[i] = numVoxelsPerNode;
-    }
-    __syncthreads();
-
-    for(int i = startVoxelIndex + threadIdx.x; i < numVoxelsEachNode[blockIdx.x]; i += blockDim.x){
-        sharedSolids[voxelIDs[i]] = solids[i];
-        processedVoxels[i - startVoxelIndex] = voxelIDs[i];
-    }
-    __syncthreads();
-    for(int index = gridNodeIndicesToFirstParticleIndex[blockIdx.x] + threadIdx.x; index < lastParticleIndex; index += blockDim.x){
-        uint moduloWRTxySize = gridPosition[index] % xySize;
-        uint gridIDz = gridPosition[index] / (xySize);
-        uint gridIDy = moduloWRTxySize / grid.sizeX;
-        uint gridIDx = moduloWRTxySize % grid.sizeX;
-        
-        int apronCells = floor(radius);
-        double subCellWidth = calcSubCellWidth(refinementLevel, grid);
-        double pxInGridCell = (px[index] - grid.negX - gridIDx*grid.cellSize + apronCells*subCellWidth);
-        double pyInGridCell = (py[index] - grid.negY - gridIDy*grid.cellSize + apronCells*subCellWidth);
-        double pzInGridCell = (pz[index] - grid.negZ - gridIDz*grid.cellSize + apronCells*subCellWidth);
-
-        uint subCellPositionX = floor(pxInGridCell/subCellWidth);
-        uint subCellPositionY = floor(pyInGridCell/subCellWidth);
-        uint subCellPositionZ = floor(pzInGridCell/subCellWidth);
-        
-        if(subCellPositionX >= numVoxels1D || subCellPositionY >= numVoxels1D || subCellPositionZ >= numVoxels1D){
-            //particle left its node's block (shouldn't happen under the CFL limit): move it to a fluid voxel. Particles in wall voxels are left to rootCell, which reflects them back inside
-            int i = 0;
-            for(; i < numVoxelsEachNode[blockIdx.x] - startVoxelIndex && sharedSolids[processedVoxels[i]]; ++i){  //stop at this node's first fluid voxel
-            }
-            int newVoxelX = processedVoxels[i] % numVoxels1D;
-            int newVoxelY = (processedVoxels[i] % (numVoxels1D*numVoxels1D)) / numVoxels1D;
-            int newVoxelZ = processedVoxels[i] / (numVoxels1D*numVoxels1D);
-
-            px[index] = grid.negX + gridIDx*grid.cellSize + (newVoxelX - apronCells)*subCellWidth + hashToUniform(index, 3*seed)*subCellWidth;
-            py[index] = grid.negY + gridIDy*grid.cellSize + (newVoxelY - apronCells)*subCellWidth + hashToUniform(index, 3*seed + 1)*subCellWidth;
-            pz[index] = grid.negZ + gridIDz*grid.cellSize + (newVoxelZ - apronCells)*subCellWidth + hashToUniform(index, 3*seed + 2)*subCellWidth;
+    float voxelSize = grid.cellSize / interiorWidth;
+    float step = dt / voxelSize;    //turns a velocity into voxels moved this step
+    for(uint index = firstParticle + threadIdx.x; index < lastParticle; index += blockDim.x){
+        float3 point = make_float3((px[index] - grid.negX)/voxelSize - tileOrigin.x, (py[index] - grid.negY)/voxelSize - tileOrigin.y, (pz[index] - grid.negZ)/voxelSize - tileOrigin.z);
+        float3 k1 = sampleVelocity(tile, tileWidth, point, tileOrigin, domainVoxels, make_float3(vx[index], vy[index], vz[index]));
+        float3 velocity = k1;
+        if(rungeKutta3){
+            float3 k2 = sampleVelocity(tile, tileWidth, make_float3(point.x + 0.5f*step*k1.x, point.y + 0.5f*step*k1.y, point.z + 0.5f*step*k1.z), tileOrigin, domainVoxels, k1);
+            float3 k3 = sampleVelocity(tile, tileWidth, make_float3(point.x + 0.75f*step*k2.x, point.y + 0.75f*step*k2.y, point.z + 0.75f*step*k2.z), tileOrigin, domainVoxels, k2);
+            velocity = make_float3((2.0f*k1.x + 3.0f*k2.x + 4.0f*k3.x)/9.0f, (2.0f*k1.y + 3.0f*k2.y + 4.0f*k3.y)/9.0f, (2.0f*k1.z + 3.0f*k2.z + 4.0f*k3.z)/9.0f);
         }
+        px[index] += dt*velocity.x;
+        py[index] += dt*velocity.y;
+        pz[index] += dt*velocity.z;
     }
 }
 
 void Particles::voxelVelsToParticles(){
     gatherVoxelVelsToParticles<<<numParticleNodes, NODE_THREADS, 6*sizeof(float)*numVoxelsPerNode, stream>>>(numParticleNodes, size, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(),
-        nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(), voxelOwners.devPtr(), solids.devPtr(), voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr(), voxelsUxOld.devPtr(), voxelsUyOld.devPtr(), voxelsUzOld.devPtr(), flipRatio, dt, radius, grid, refinementLevel);
+        nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(), voxelOwners.devPtr(), solids.devPtr(), voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr(), voxelsUxOld.devPtr(), voxelsUyOld.devPtr(), voxelsUzOld.devPtr(), flipRatio, radius, grid, refinementLevel);
+    gpuErrchk(cudaPeekAtLastError());
+    uint tileWidth = 3*(numVoxels1D - 2*(uint)std::floor(radius));
+    advectThroughGrid<<<numParticleNodes, NODE_THREADS, 3*sizeof(float)*tileWidth*tileWidth*tileWidth, stream>>>(numParticleNodes, size, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(),
+        px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(), numUsedGridNodes, nodeCells.devPtr(), cellToNode.devPtr(), nodeInteriorVoxels.devPtr(),
+        voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr(), voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), dt, rungeKutta3, grid, refinementLevel);
     gpuErrchk(cudaPeekAtLastError());
 }
 
@@ -781,14 +819,6 @@ void Particles::advectParticles(){
     gpuErrchk(cudaPeekAtLastError());
     gpuErrchk(cudaStreamSynchronize(stream));
     gpuErrchk(cudaPeekAtLastError());
-}
-
-void Particles::moveSolidParticles(){
-    //move particles that move to solid cell/out of bounds back to a fluid voxel in that grid
-    static uint substep = 0;    //varies moveSolids' random offsets from substep to substep
-    moveSolids<<<numParticleNodes, 32, sizeof(char)*numVoxelsPerNode + sizeof(uint)*numVoxelsPerNode, stream>>>(numParticleNodes, size, numVoxelsPerNode, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(), nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(), solids.devPtr(), radius, grid, refinementLevel, substep++);
-    gpuErrchk(cudaPeekAtLastError());
-    gpuErrchk(cudaStreamSynchronize(stream));
 }
 
 void Particles::setupCudaDevices(){
@@ -815,9 +845,7 @@ void Particles::solveFrame(double fps){
         cudaStreamSynchronize(stream);
         updateVoxelVelocities();
         cudaStreamSynchronize(stream);
-        voxelVelsToParticles();   //also moves the particles
-        cudaStreamSynchronize(stream);
-        moveSolidParticles();
+        voxelVelsToParticles();   //also moves the particles; initialize re-bins them wherever they landed, reflecting any that crossed a wall
         cudaStreamSynchronize(stream);
         initialize();
     }

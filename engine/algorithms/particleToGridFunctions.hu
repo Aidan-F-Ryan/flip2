@@ -15,6 +15,9 @@
 
     void cudaSortParticlesByGridNode(uint numParticles, uint*& gridPosition, uint*& reorderedIndicesRelativeToOriginal, cudaStream_t stream);
 
+    //sorts keys in place, ascending
+    void cudaSortUints(uint numElements, uint* keys, cudaStream_t stream);
+
     uint cudaMarkUniqueGridCellsAndCount(uint numParticles, uint* gridPosition, uint* uniqueGridNodes, cudaStream_t stream);
 
     void cudaMapNodeIndicesToParticles(uint numParticles, uint* uniqueGridNodes, uint* gridNodeIndicesToFirstParticleIndex, cudaStream_t stream);

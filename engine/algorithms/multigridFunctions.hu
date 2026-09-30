@@ -37,17 +37,28 @@
         float* z;           //its correction
     };
 
+    //where the unknowns sit in the domain, which the coarse grids are laid over. The first coarse grid's cells are 2x2x2 voxels, so each lies inside one node
+    struct VoxelLayout{
+        const uint* nodeCells;          //each node's cell in the grid of nodes
+        const uint* interiorVoxels;     //per node, its interior's voxels (x fastest): each one's index among the stored voxels, or NO_VOXEL
+        const uint* coarseCells;        //per unknown, the first coarse grid's cell holding it
+        uint numNodes;
+        uint interiorWidth;             //voxels along a node's interior
+        uint3 domainVoxels;             //the domain's size in voxels
+    };
+
     struct Multigrid{
         Stencil A;                  //the finest grid, the pressure unknowns themselves
         const char* colors;         //their red/black colours (the solveCodes)
-        const uint* coarseCells;    //the first coarse grid's cell holding each unknown
+        VoxelLayout layout;
         uint numUsedVoxels;
+        float* residual;            //the unknowns' leftover residual, r - A*z, on its way to the first coarse grid
         CoarseLevel levels[16];     //each coarser than the last, the last small enough for one block to solve
         int numLevels;
     };
 
     //the coarse grids for this solve, from which unknowns there are
-    Multigrid buildMultigrid(Stencil A, const char* solveCodes, const uint* coarseCells, uint numUsedVoxels, uint3 domainVoxels, float scale, cudaStream_t stream);
+    Multigrid buildMultigrid(Stencil A, const char* solveCodes, uint numUsedVoxels, const VoxelLayout& layout, float scale, cudaStream_t stream);
 
     //z = M^-1*r: one V-cycle, an approximate solve of A*z = r
     void vCycle(const Multigrid& multigrid, const float* r, float* z, cudaStream_t stream);

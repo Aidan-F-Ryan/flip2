@@ -14,6 +14,7 @@
 //the opposite colour order to those on the way down. That makes the whole cycle symmetric, as CG needs of a preconditioner
 
 #include "multigridFunctions.hu"
+#include "voxelSolveFunctions.hu"     //NO_VOXEL
 
 static const int SWEEPS = 2;                    //Gauss-Seidel sweeps on each grid, each way
 static const uint MAX_COARSEST_CELLS = 1024;    //one block solves the coarsest grid
@@ -30,11 +31,48 @@ __global__ void relaxVoxels(uint numUsedVoxels, const char* colors, char color, 
     }
 }
 
-//hands the unknowns' leftover residual, r - A*z, down to the first coarse grid: each cell sums its children's
-__global__ void restrictFromVoxels(uint numUsedVoxels, const char* colors, Stencil A, const uint* coarseCells, const float* r, const float* z, float* coarseB){
+//the unknowns' leftover residual, r - A*z, for restrictFromVoxels to hand down
+__global__ void findResidual(uint numUsedVoxels, const char* colors, Stencil A, const float* r, const float* z, float* residual){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
     if(index < numUsedVoxels && colors[index]){
-        atomicAdd(coarseB + coarseCells[index], r[index] - A.rowTimes(index, z));
+        residual[index] = r[index] - A.rowTimes(index, z);
+    }
+}
+
+//one of the first coarse grid's cells inside a node, from a thread index running over every node's: its index in that grid, and its 8 voxels' indices
+//among the stored voxels (x fastest; NO_VOXEL where nothing's stored). False past the last node
+__device__ inline bool firstLevelCell(uint thread, const VoxelLayout& layout, uint3 cells, uint& index, uint children[8]){
+    uint perAxis = layout.interiorWidth / 2;
+    uint perNode = perAxis*perAxis*perAxis;
+    uint node = thread / perNode;
+    if(node >= layout.numNodes){
+        return false;
+    }
+    uint local = thread % perNode;
+    uint3 nodes = make_uint3(layout.domainVoxels.x / layout.interiorWidth, layout.domainVoxels.y / layout.interiorWidth, layout.domainVoxels.z / layout.interiorWidth);
+    uint nodeCell = layout.nodeCells[node];
+    uint3 local3 = make_uint3(local % perAxis, local / perAxis % perAxis, local / (perAxis*perAxis));
+    uint3 cell = make_uint3(nodeCell % nodes.x*perAxis + local3.x, nodeCell / nodes.x % nodes.y*perAxis + local3.y, nodeCell / (nodes.x*nodes.y)*perAxis + local3.z);
+    index = cell.x + cell.y*cells.x + cell.z*cells.x*cells.y;
+    const uint* interior = layout.interiorVoxels + node*layout.interiorWidth*layout.interiorWidth*layout.interiorWidth;
+    for(int child = 0; child < 8; ++child){
+        uint x = 2*local3.x + child % 2, y = 2*local3.y + child / 2 % 2, z = 2*local3.z + child / 4;
+        children[child] = interior[x + y*layout.interiorWidth + z*layout.interiorWidth*layout.interiorWidth];
+    }
+    return true;
+}
+
+//hands the unknowns' leftover residual down to the first coarse grid: each of its unknowns sums its 8 children's, always in the same order, so the
+//result doesn't depend on thread timing the way atomics' would. Air cells get nothing; nothing reads them
+__global__ void restrictFromVoxels(VoxelLayout layout, const float* residual, CoarseLevel first){
+    uint index;
+    uint children[8];
+    if(firstLevelCell(threadIdx.x + blockIdx.x*blockDim.x, layout, first.cells, index, children) && first.fluid[index]){
+        float sum = 0.0f;
+        for(int child = 0; child < 8; ++child){
+            sum += residual[children[child]];
+        }
+        first.b[index] = sum;
     }
 }
 
@@ -46,17 +84,16 @@ __global__ void prolongToVoxels(uint numUsedVoxels, const char* colors, const ui
     }
 }
 
-__global__ void countUnknownChildren(uint numUsedVoxels, const char* colors, const uint* coarseCells, uint* unknownChildren){
-    uint index = threadIdx.x + blockIdx.x*blockDim.x;
-    if(index < numUsedVoxels && colors[index]){
-        atomicAdd(unknownChildren + coarseCells[index], 1u);
-    }
-}
-
-__global__ void markFirstLevel(uint numCells, const uint* unknownChildren, char* fluid){
-    uint index = threadIdx.x + blockIdx.x*blockDim.x;
-    if(index < numCells){
-        fluid[index] = unknownChildren[index] == 8;
+//the first coarse grid's unknowns: the cells whose 8 voxels all are. Cells outside every node stay air
+__global__ void markFirstLevel(VoxelLayout layout, const char* colors, CoarseLevel first){
+    uint index;
+    uint children[8];
+    if(firstLevelCell(threadIdx.x + blockIdx.x*blockDim.x, layout, first.cells, index, children)){
+        bool all = true;
+        for(int child = 0; child < 8; ++child){
+            all = all && children[child] != NO_VOXEL && colors[children[child]];
+        }
+        first.fluid[index] = all;
     }
 }
 
@@ -186,9 +223,15 @@ __global__ void solveCoarsest(CoarseLevel level){
     }
 }
 
-Multigrid buildMultigrid(Stencil A, const char* solveCodes, const uint* coarseCells, uint numUsedVoxels, uint3 domainVoxels, float scale, cudaStream_t stream){
-    Multigrid multigrid = {A, solveCodes, coarseCells, numUsedVoxels, {}, 0};
-    uint3 cells = make_uint3(domainVoxels.x / 2, domainVoxels.y / 2, domainVoxels.z / 2);
+static uint firstLevelThreads(const VoxelLayout& layout){  //a thread per first-level cell inside each node
+    uint perAxis = layout.interiorWidth / 2;
+    return layout.numNodes*perAxis*perAxis*perAxis;
+}
+
+Multigrid buildMultigrid(Stencil A, const char* solveCodes, uint numUsedVoxels, const VoxelLayout& layout, float scale, cudaStream_t stream){
+    Multigrid multigrid = {A, solveCodes, layout, numUsedVoxels, nullptr, {}, 0};
+    gpuErrchk(cudaMallocAsync((void**)&multigrid.residual, sizeof(float)*numUsedVoxels, stream));
+    uint3 cells = make_uint3(layout.domainVoxels.x / 2, layout.domainVoxels.y / 2, layout.domainVoxels.z / 2);
     float coupling = 2.0f*scale;
     while(true){    //halve until the grid fits one block, or can't halve further
         CoarseLevel& level = multigrid.levels[multigrid.numLevels++];
@@ -206,12 +249,8 @@ Multigrid buildMultigrid(Stencil A, const char* solveCodes, const uint* coarseCe
     }
     //which cells are unknowns: the first grid's from the voxels, each coarser one's from the one above
     CoarseLevel& first = multigrid.levels[0];
-    uint* unknownChildren;
-    gpuErrchk(cudaMallocAsync((void**)&unknownChildren, sizeof(uint)*numCellsOf(first), stream));
-    cudaMemsetAsync(unknownChildren, 0, sizeof(uint)*numCellsOf(first), stream);
-    countUnknownChildren<<<numUsedVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numUsedVoxels, solveCodes, coarseCells, unknownChildren);
-    markFirstLevel<<<numCellsOf(first) / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numCellsOf(first), unknownChildren, first.fluid);
-    cudaFreeAsync(unknownChildren, stream);
+    cudaMemsetAsync(first.fluid, 0, numCellsOf(first), stream);
+    markFirstLevel<<<firstLevelThreads(layout) / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(layout, solveCodes, first);
     for(int level = 1; level < multigrid.numLevels; ++level){
         markCoarserLevel<<<numCellsOf(multigrid.levels[level]) / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(multigrid.levels[level - 1], multigrid.levels[level]);
     }
@@ -238,8 +277,8 @@ void vCycle(const Multigrid& multigrid, const float* r, float* z, cudaStream_t s
             relaxVoxels<<<voxelBlocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, multigrid.colors, color, multigrid.A, r, z);
         }
     }
-    cudaMemsetAsync(levels[0].b, 0, sizeof(float)*numCellsOf(levels[0]), stream);
-    restrictFromVoxels<<<voxelBlocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, multigrid.colors, multigrid.A, multigrid.coarseCells, r, z, levels[0].b);
+    findResidual<<<voxelBlocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, multigrid.colors, multigrid.A, r, z, multigrid.residual);
+    restrictFromVoxels<<<firstLevelThreads(multigrid.layout) / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(multigrid.layout, multigrid.residual, levels[0]);
     for(int level = 0; level < coarsest; ++level){
         cudaMemsetAsync(levels[level].z, 0, sizeof(float)*numCellsOf(levels[level]), stream);
         relaxLevel(levels[level], 0, stream);
@@ -264,7 +303,7 @@ void vCycle(const Multigrid& multigrid, const float* r, float* z, cudaStream_t s
         prolongCells<<<numCellsOf(levels[level]) / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(levels[level + 1], levels[level]);
         relaxLevel(levels[level], 1, stream);
     }
-    prolongToVoxels<<<voxelBlocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, multigrid.colors, multigrid.coarseCells, levels[0].z, z);
+    prolongToVoxels<<<voxelBlocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, multigrid.colors, multigrid.layout.coarseCells, levels[0].z, z);
     for(int sweep = 0; sweep < SWEEPS; ++sweep){
         for(char color = 2; color >= 1; --color){   //black, then red
             relaxVoxels<<<voxelBlocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, multigrid.colors, color, multigrid.A, r, z);
@@ -273,6 +312,7 @@ void vCycle(const Multigrid& multigrid, const float* r, float* z, cudaStream_t s
 }
 
 void freeMultigrid(Multigrid& multigrid, cudaStream_t stream){
+    cudaFreeAsync(multigrid.residual, stream);
     for(int level = 0; level < multigrid.numLevels; ++level){
         cudaFreeAsync(multigrid.levels[level].fluid, stream);
         cudaFreeAsync(multigrid.levels[level].b, stream);

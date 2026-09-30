@@ -27,6 +27,14 @@ public:
         particles.setFlipRatio(ratio);
     }
 
+    void setCfl(double voxels){
+        particles.setCfl(voxels);
+    }
+
+    void setRungeKutta3(bool on){
+        particles.setRungeKutta3(on);
+    }
+
     void setDensityCorrectionTime(double seconds){
         particles.setDensityCorrectionTime(seconds);
     }
@@ -68,8 +76,7 @@ public:
     //particles at random positions in the box lo..hi, in fractions of the domain (by default the dam break's column), and at rest, or with swirl
     //set, in one vortex filling the domain's xy cross section, swirl m/s at its fastest and not crossing the walls
     void randomizeParticlePositions(double3 lo = make_double3(1.0/3.0, 0.0, 1.0/3.0), double3 hi = make_double3(2.0/3.0, 2.0/3.0, 2.0/3.0), double swirl = 0.0){
-        std::random_device rd;
-        std::default_random_engine e2(rd());
+        std::default_random_engine e2(1);   //a fixed seed: the same run gives the same result every time
         double width = particles.grid.sizeX*particles.grid.cellSize;
         double height = particles.grid.sizeY*particles.grid.cellSize;
         double depth = particles.grid.sizeZ*particles.grid.cellSize;

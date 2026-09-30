@@ -31,17 +31,28 @@ void removeGravity(const CudaVec<char>& solids, CudaVec<float>& voxelsUy, float 
 }
 
 //P2G accumulated weighted velocities and weights into each owning voxel; turn them into velocities, walls stay at rest
-__global__ void normalizeVoxelVelocities(uint numUsedVoxels, const char* solids, const float* weightsX, const float* weightsY, const float* weightsZ, float* ux, float* uy, float* uz){
+//P2G leaves 32-bit fixed-point sums in these arrays' storage: turn the weights and counts into floats, and each face's momentum into its velocity
+__global__ void normalizeVoxelVelocities(uint numUsedVoxels, const char* solids, float* weightsX, float* weightsY, float* weightsZ, float* ux, float* uy, float* uz, float* particleCounts,
+                                         float unscaleMomentum, float unscaleWeight){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
     if(index < numUsedVoxels){
-        ux[index] = solids[index] ? 0.0f : ux[index] / (weightsX[index] + 0.0000001f);
-        uy[index] = solids[index] ? 0.0f : uy[index] / (weightsY[index] + 0.0000001f);
-        uz[index] = solids[index] ? 0.0f : uz[index] / (weightsZ[index] + 0.0000001f);
+        float* weights[3] = {weightsX, weightsY, weightsZ};
+        float* velocities[3] = {ux, uy, uz};
+        #pragma unroll
+        for(int dim = 0; dim < 3; ++dim){
+            float weight = ((int*)weights[dim])[index]*unscaleWeight;
+            float momentum = ((int*)velocities[dim])[index]*unscaleMomentum;
+            weights[dim][index] = weight;
+            velocities[dim][index] = solids[index] ? 0.0f : momentum / (weight + 0.0000001f);
+        }
+        particleCounts[index] = ((int*)particleCounts)[index];
     }
 }
 
-void cudaNormalizeVoxelVelocities(const CudaVec<char>& solids, const CudaVec<float>& voxelWeightsX, const CudaVec<float>& voxelWeightsY, const CudaVec<float>& voxelWeightsZ, CudaVec<float>& voxelsUx, CudaVec<float>& voxelsUy, CudaVec<float>& voxelsUz, cudaStream_t stream){
-    normalizeVoxelVelocities<<<solids.size() / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(solids.size(), solids.devPtr(), voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr());
+void cudaNormalizeVoxelVelocities(const CudaVec<char>& solids, CudaVec<float>& voxelWeightsX, CudaVec<float>& voxelWeightsY, CudaVec<float>& voxelWeightsZ, CudaVec<float>& voxelsUx, CudaVec<float>& voxelsUy, CudaVec<float>& voxelsUz,
+    CudaVec<float>& particleCounts, float momentumScale, float weightScale, cudaStream_t stream){
+    normalizeVoxelVelocities<<<solids.size() / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(solids.size(), solids.devPtr(), voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr(),
+        particleCounts.devPtr(), 1.0f/momentumScale, 1.0f/weightScale);
 }
 
 //P2G leaves the faces no particle reaches at 0, and on the edge of the fluid the pressure solve would then drag on every surface moving outward, speeding
