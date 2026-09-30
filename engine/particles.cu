@@ -331,7 +331,9 @@ __global__ void writeUsedVoxelIDs(uint numVoxels1D, const uint* usedVoxelMasks, 
 }
 
 //apron voxels mirror voxels in the 26 neighbouring nodes' interiors. Point every used voxel at the used voxel that owns its value (itself if interior, or if the owning node doesn't use it).
-//Interior fluid voxels are the pressure solve's unknowns: also record their red/black colour and the owners of their six face neighbours (NO_VOXEL for air, WALL_VOXEL outside the domain)
+//Interior fluid voxels are the pressure solve's unknowns: also record their red/black colour and the owners of their six face neighbours (NO_VOXEL for air, WALL_VOXEL outside the domain).
+//An air voxel above an unknown stores the face between them, and updates it itself from the unknown's values, so each unknown also records itself as that
+//air voxel's lower neighbour in the same arrays (they're otherwise unused for voxels that aren't unknowns, and start as NO_VOXEL)
 __global__ void buildVoxelTopology(uint numUsedGridNodes, uint numVoxels1D, double radius, const uint* nodeCells, const uint* cellToNode, const uint* numVoxelsEachNode, const uint* voxelIDs, uint* voxelOwners,
                                     uint* neighborNx, uint* neighborPx, uint* neighborNy, uint* neighborPy, uint* neighborNz, uint* neighborPz, char* solveCodes, uint* coarseCells, uint* interiorVoxels,
                                     Grid grid, uint refinementLevel){
@@ -390,6 +392,13 @@ __global__ void buildVoxelTopology(uint numUsedGridNodes, uint numVoxels1D, doub
                 int neighborSlot = slot + (face % 2 ? 1 : -1)*(face < 2 ? 1 : face < 4 ? voxels1D : voxels1D*voxels1D);
                 neighbors[face][i] = isWallVoxel(cell, neighborSlot, voxels1D, apronCells, grid, refinementLevel) ? WALL_VOXEL : sharedOwners[neighborSlot];
             }
+            #pragma unroll
+            for(int axis = 0; axis < 3; ++axis){
+                uint upper = neighbors[2*axis + 1][i];
+                if(upper < WALL_VOXEL && !solveCodes[upper]){   //only its lower neighbour writes here. solveCodes is being rewritten meanwhile, but only from fluid (1) to a colour
+                    neighbors[2*axis][upper] = i;
+                }
+            }
             uint globalX = (cell % grid.sizeX)*interiorWidth + x - apronCells;  //the 2x2x2 block of the domain's voxels holding it
             uint globalY = (cell / grid.sizeX % grid.sizeY)*interiorWidth + y - apronCells;
             uint globalZ = cell / (grid.sizeX*grid.sizeY)*interiorWidth + z - apronCells;
@@ -446,6 +455,9 @@ void Particles::generateVoxels(){
     }
     p.zeroDeviceAsync(stream);
 
+    for(CudaVec<uint>* lower : {&neighborNx, &neighborNy, &neighborNz}){   //air voxels' lower neighbours: NO_VOXEL unless an unknown below claims them
+        cudaMemsetAsync(lower->devPtr(), 0xFF, sizeof(uint)*numUsedVoxels, stream);
+    }
     writeUsedVoxelIDs<<<numUsedGridNodes, 32, 0, stream>>>(numVoxels1D, usedVoxelMasks.devPtr(), nodeIndexUsedVoxels.devPtr(), nodeCells.devPtr(), voxelIDsUsed.devPtr(), solids.devPtr(), solveCodes.devPtr(), radius, grid, refinementLevel);
     buildVoxelTopology<<<numUsedGridNodes, 64, sizeof(uint)*numVoxelsPerNode, stream>>>(numUsedGridNodes, numVoxels1D, radius, nodeCells.devPtr(), cellToNode.devPtr(), nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(), voxelOwners.devPtr(),
         neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(), neighborPy.devPtr(), neighborNz.devPtr(), neighborPz.devPtr(), solveCodes.devPtr(), coarseCells.devPtr(), nodeInteriorVoxels.devPtr(),
@@ -575,12 +587,14 @@ void Particles::pressureSolve(){
     auto solve = [&](){
         switch(pressureSolver){
             case PressureSolver::cg:
-                return cudaConjugateGradient(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, divU, p, residuals, tolerance, maxIterations, stream);
+                return cudaConjugateGradient(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, divU, p, residuals, tolerance, maxIterations,
+                                             layout, dotProductSums, stream);
             case PressureSolver::jacobi:
-                return cudaJacobiConjugateGradient(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, divU, p, residuals, tolerance, maxIterations, stream);
+                return cudaJacobiConjugateGradient(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, divU, p, residuals, tolerance, maxIterations,
+                                                   layout, dotProductSums, stream);
             case PressureSolver::multigrid:
                 return cudaMultigridConjugateGradient(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, divU, p, residuals, tolerance, maxIterations,
-                                                      layout, dt/(density*voxelSize*voxelSize), stream);
+                                                      layout, dt/(density*voxelSize*voxelSize), dotProductSums, stream);
             default:
                 return cudaGSiteration(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, divU, p, residuals, tolerance, maxIterations, stream);
         }

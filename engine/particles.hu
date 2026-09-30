@@ -7,6 +7,7 @@
 #include "cudaVec.hu"
 #include "grid.hpp"
 #include "frameWriter.hpp"
+#include "algorithms/conjugateGradientFunctions.hu"
 #include <string>
 
 enum class PressureSolver{
@@ -59,6 +60,12 @@ public:
 
     void setPressureSolver(PressureSolver solver){
         pressureSolver = solver;
+    }
+
+    //how CG adds up its dot products: exactly (the default), so runs match bit for bit however the nodes are split between GPUs, or per thread block,
+    //the original, which repeats only for one split and may be a little faster. Kept so the exact sums can be backed out if they cost too much
+    void setDotProductSums(DotProductSums sums){
+        dotProductSums = sums;
     }
 
     void setFlipRatio(double ratio){    //the particle velocity update's share of FLIP, the rest PIC: 1 keeps the most energy and detail, 0 is the most damped and stable
@@ -118,7 +125,8 @@ private:
     CudaVec<float> Apz;
     CudaVec<float> Adiag;
 
-    CudaVec<uint> neighborNx;   //per pressure unknown: the used voxel owning each face neighbour (NO_VOXEL air, WALL_VOXEL outside the domain)
+    CudaVec<uint> neighborNx;   //per pressure unknown: the used voxel owning each face neighbour (NO_VOXEL air, WALL_VOXEL outside the domain). Per air voxel
+                                //above an unknown, the lower ones hold that unknown: the face between them is the air voxel's to update (NO_VOXEL otherwise)
     CudaVec<uint> neighborPx;
     CudaVec<uint> neighborNy;
     CudaVec<uint> neighborPy;
@@ -148,6 +156,7 @@ private:
     double cfl = 4.0;   //RK3 advection holds up to 4: past it, its stages reach beyond advectThroughGrid's 3-node tile
     bool rungeKutta3 = true;
     PressureSolver pressureSolver = PressureSolver::multigrid;
+    DotProductSums dotProductSums = DotProductSums::exact;
     double maxVelocity = 0.0;   //the fastest particle velocity component, found each substep by P2G
     double restParticlesPerVoxel = 8.0;
     double densityCorrectionTime = 0.1;

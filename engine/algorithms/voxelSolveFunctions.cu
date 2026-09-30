@@ -56,9 +56,10 @@ void cudaNormalizeVoxelVelocities(const CudaVec<char>& solids, CudaVec<float>& v
 }
 
 //P2G leaves the faces no particle reaches at 0, and on the edge of the fluid the pressure solve would then drag on every surface moving outward, speeding
-//those faces back up each step. Give an unknown's unreached face the average of the reached faces of the same component around it, and its unreached
-//upper face, which sits on air, its own face's value. Only unreached faces are written and only reached ones read by other threads, so this is race free
-__device__ inline void extrapolateFace(uint index, uint upper, const uint* const neighbors[6], const char* solveCodes, const float* weights, float* u){
+//those faces back up each step. Give an unknown's unreached face the average of the reached faces of the same component around it; then an unreached face
+//on top of an unknown, which an air voxel stores, takes the unknown's own face value (extrapolateAirFaces, once the unknowns are done). Only unreached
+//faces are written and only reached ones read by other threads, so the first pass is race free
+__device__ inline void extrapolateFace(uint index, const uint* const neighbors[6], const float* weights, float* u){
     if(weights[index] == 0.0f){
         float sum = 0.0f;
         int count = 0;
@@ -74,9 +75,6 @@ __device__ inline void extrapolateFace(uint index, uint upper, const uint* const
             u[index] = sum / count;
         }
     }
-    if(upper < WALL_VOXEL && !solveCodes[upper] && weights[upper] == 0.0f){
-        u[upper] = u[index];
-    }
 }
 
 __global__ void extrapolateUnreachedFaces(uint numUsedVoxels, const char* solveCodes, const uint* neighborNx, const uint* neighborPx, const uint* neighborNy, const uint* neighborPy, const uint* neighborNz, const uint* neighborPz,
@@ -84,15 +82,35 @@ __global__ void extrapolateUnreachedFaces(uint numUsedVoxels, const char* solveC
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
     if(index < numUsedVoxels && solveCodes[index]){
         const uint* const neighbors[6] = {neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz};
-        extrapolateFace(index, neighborPx[index], neighbors, solveCodes, weightsX, ux);
-        extrapolateFace(index, neighborPy[index], neighbors, solveCodes, weightsY, uy);
-        extrapolateFace(index, neighborPz[index], neighbors, solveCodes, weightsZ, uz);
+        extrapolateFace(index, neighbors, weightsX, ux);
+        extrapolateFace(index, neighbors, weightsY, uy);
+        extrapolateFace(index, neighbors, weightsZ, uz);
+    }
+}
+
+//an air voxel above an unknown, whose face between them no particle reached, takes the unknown's (extrapolated) face value. The voxel updates its own
+//face from its lower neighbour's, rather than the unknown writing it, so each voxel's values are computed where the voxel is stored
+__device__ inline void extrapolateAirFace(uint index, uint lower, const float* weights, float* u){
+    if(lower < WALL_VOXEL && weights[index] == 0.0f){
+        u[index] = u[lower];
+    }
+}
+
+__global__ void extrapolateAirFaces(uint numUsedVoxels, const char* solveCodes, const uint* neighborNx, const uint* neighborNy, const uint* neighborNz,
+                                    const float* weightsX, const float* weightsY, const float* weightsZ, float* ux, float* uy, float* uz){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(index < numUsedVoxels && !solveCodes[index]){
+        extrapolateAirFace(index, neighborNx[index], weightsX, ux);
+        extrapolateAirFace(index, neighborNy[index], weightsY, uy);
+        extrapolateAirFace(index, neighborNz[index], weightsZ, uz);
     }
 }
 
 void cudaExtrapolateUnreachedFaces(const CudaVec<char>& solveCodes, const CudaVec<uint>& neighborNx, const CudaVec<uint>& neighborPx, const CudaVec<uint>& neighborNy, const CudaVec<uint>& neighborPy, const CudaVec<uint>& neighborNz, const CudaVec<uint>& neighborPz,
     const CudaVec<float>& voxelWeightsX, const CudaVec<float>& voxelWeightsY, const CudaVec<float>& voxelWeightsZ, CudaVec<float>& voxelsUx, CudaVec<float>& voxelsUy, CudaVec<float>& voxelsUz, cudaStream_t stream){
     extrapolateUnreachedFaces<<<solveCodes.size() / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(solveCodes.size(), solveCodes.devPtr(), neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(), neighborPy.devPtr(), neighborNz.devPtr(), neighborPz.devPtr(),
+        voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr());
+    extrapolateAirFaces<<<solveCodes.size() / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(solveCodes.size(), solveCodes.devPtr(), neighborNx.devPtr(), neighborNy.devPtr(), neighborNz.devPtr(),
         voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr());
 }
 
@@ -266,33 +284,44 @@ float cudaGSiteration(const CudaVec<char>& solveCodes, const CudaVec<uint>& neig
     return maxResidual;
 }
 
-//an unknown updates the faces it's responsible for in one dimension: its own negative face, u -= scale*(p - lower neighbour's p) (held at 0 on a wall),
-//and its upper face when the voxel storing that face isn't an unknown (air, at p = 0)
-__device__ inline void accelerateFaces(uint index, uint lowerNeighbor, uint upperNeighbor, const char* solveCodes, const float* p, float* u, float scale){
+//every voxel updates the faces it stores, its negative faces, in one dimension. An unknown's: u -= scale*(p - lower neighbour's p), held at 0 on a wall.
+//An air voxel's above an unknown: the same, with the air's p = 0, so u += scale*(the unknown's p). Each voxel's values are computed where it's stored,
+//from its lower neighbours', never written from next door
+__device__ inline void accelerateOwnFace(uint index, uint lowerNeighbor, const float* p, float* u, float scale){
     if(lowerNeighbor == WALL_VOXEL){
         u[index] = 0.0f;
     }
     else{
         u[index] -= scale*(p[index] - (lowerNeighbor == NO_VOXEL ? 0.0f : p[lowerNeighbor]));
     }
-    if(upperNeighbor < WALL_VOXEL && !solveCodes[upperNeighbor]){
-        u[upperNeighbor] += scale*p[index];
+}
+
+__device__ inline void accelerateAirFace(uint lowerUnknown, uint index, const float* p, float* u, float scale){
+    if(lowerUnknown < WALL_VOXEL){
+        u[index] += scale*p[lowerUnknown];
     }
 }
 
-__global__ void pressureToAcceleration(uint numUsedVoxels, const char* solveCodes, const uint* neighborNx, const uint* neighborPx, const uint* neighborNy, const uint* neighborPy, const uint* neighborNz, const uint* neighborPz,
+__global__ void pressureToAcceleration(uint numUsedVoxels, const char* solveCodes, const uint* neighborNx, const uint* neighborNy, const uint* neighborNz,
                                         const float* p, float* ux, float* uy, float* uz, float scale){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
-    if(index < numUsedVoxels && solveCodes[index]){
-        accelerateFaces(index, neighborNx[index], neighborPx[index], solveCodes, p, ux, scale);
-        accelerateFaces(index, neighborNy[index], neighborPy[index], solveCodes, p, uy, scale);
-        accelerateFaces(index, neighborNz[index], neighborPz[index], solveCodes, p, uz, scale);
+    if(index < numUsedVoxels){
+        if(solveCodes[index]){
+            accelerateOwnFace(index, neighborNx[index], p, ux, scale);
+            accelerateOwnFace(index, neighborNy[index], p, uy, scale);
+            accelerateOwnFace(index, neighborNz[index], p, uz, scale);
+        }
+        else{   //the lower neighbours only name an unknown if the face between is this voxel's
+            accelerateAirFace(neighborNx[index], index, p, ux, scale);
+            accelerateAirFace(neighborNy[index], index, p, uy, scale);
+            accelerateAirFace(neighborNz[index], index, p, uz, scale);
+        }
     }
 }
 
 void cudaVelocityUpdate(const CudaVec<char>& solveCodes, const CudaVec<uint>& neighborNx, const CudaVec<uint>& neighborPx, const CudaVec<uint>& neighborNy, const CudaVec<uint>& neighborPy, const CudaVec<uint>& neighborNz, const CudaVec<uint>& neighborPz, const CudaVec<float>& p,
     CudaVec<float>& voxelsUx, CudaVec<float>& voxelsUy, CudaVec<float>& voxelsUz, float scale, cudaStream_t stream){
-    pressureToAcceleration<<<p.size() / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(p.size(), solveCodes.devPtr(), neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(), neighborPy.devPtr(), neighborNz.devPtr(), neighborPz.devPtr(),
+    pressureToAcceleration<<<p.size() / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(p.size(), solveCodes.devPtr(), neighborNx.devPtr(), neighborNy.devPtr(), neighborNz.devPtr(),
         p.devPtr(), voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr(), scale);
     cudaStreamSynchronize(stream);
 }

@@ -44,6 +44,9 @@ int main(int argc, char** argv){
     if(const char* cfl = std::getenv("FLIP2_CFL")){  //FLIP2_CFL sets how many voxels the fastest particle may move per substep (default 4)
         particles.setCfl(std::stod(cfl));
     }
+    if(const char* dots = std::getenv("FLIP2_DOTS")){    //FLIP2_DOTS=blocks adds CG's dot products per thread block, as before 2026-09-30: repeatable only for one split of the nodes between GPUs
+        particles.setDotProductSums(std::string(dots) == "blocks" ? DotProductSums::perBlock : DotProductSums::exact);
+    }
     if(const char* advection = std::getenv("FLIP2_ADVECTION")){  //FLIP2_ADVECTION=euler moves particles straight along the grid velocity instead of RK3
         particles.setRungeKutta3(std::string(advection) != "euler");
     }

@@ -43,6 +43,10 @@ public:
         particles.setPressureSolver(solver);
     }
 
+    void setDotProductSums(DotProductSums sums){
+        particles.setDotProductSums(sums);
+    }
+
     void storeGridCellMap(){
         gridMap.clear();
         particles.gridCell.download(particles.stream);
