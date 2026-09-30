@@ -6,6 +6,7 @@
 #include "algorithms/particleToGridFunctions.hu"
 #include "algorithms/perVoxelParticleListFunctions.hu"
 #include "algorithms/voxelSolveFunctions.hu"
+#include "algorithms/conjugateGradientFunctions.hu"
 #include "algorithms/parallelPrefixSumKernels.hu"
 
 #include "typedefs.h"
@@ -552,7 +553,8 @@ void Particles::pressureSolve(){
     cudaCalcDivU(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, voxelsUx, voxelsUy, voxelsUz, particleCounts, footprintDepth, restParticlesPerVoxel, correctionRate, divU, stream);
     cudaGetA(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, dt/(density*voxelSize*voxelSize), stream);
     gpuErrchk(cudaPeekAtLastError());
-    while(previousTerminatingResidual - (terminatingResidual = cudaGSiteration(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, divU, p, residuals, tolerance, maxIterations, stream)) > 0.0){    //while residual getting smaller
+    auto solve = useConjugateGradient ? cudaConjugateGradient : cudaGSiteration;    //the two pressure solvers take the same arguments
+    while(previousTerminatingResidual - (terminatingResidual = solve(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, divU, p, residuals, tolerance, maxIterations, stream)) > 0.0){    //while residual getting smaller
         gpuErrchk(cudaPeekAtLastError());
         if(terminatingResidual < tolerance){
             break;

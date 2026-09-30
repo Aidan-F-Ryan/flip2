@@ -1,0 +1,14 @@
+//Copyright 2023 Aberrant Behavior LLC
+
+#ifndef CONJUGATEGRADIENTFUNCTIONS_HU
+#define CONJUGATEGRADIENTFUNCTIONS_HU
+
+    #include "../typedefs.h"
+    #include "../cudaVec.hu"
+
+    //solves the same pressure equations as cudaGSiteration, Adiag*p + sum(A*neighbour p) = -divU over the unknowns, by conjugate gradient. Same arguments,
+    //same stopping rule (the largest residual relative to the largest divergence), same return value, so pressureSolve can use either
+    float cudaConjugateGradient(const CudaVec<char>& solveCodes, const CudaVec<uint>& neighborNx, const CudaVec<uint>& neighborPx, const CudaVec<uint>& neighborNy, const CudaVec<uint>& neighborPy, const CudaVec<uint>& neighborNz, const CudaVec<uint>& neighborPz,
+        const CudaVec<float>& Anx, const CudaVec<float>& Apx, const CudaVec<float>& Any, const CudaVec<float>& Apy, const CudaVec<float>& Anz, const CudaVec<float>& Apz, const CudaVec<float>& Adiag,
+        CudaVec<float>& divU, CudaVec<float>& p, CudaVec<float>& residuals, float tolerance, uint maxIterations, cudaStream_t stream);
+#endif

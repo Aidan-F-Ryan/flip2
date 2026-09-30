@@ -7,6 +7,7 @@ set(cudaLibraries
     particleToGridFunctions
     perVoxelParticleListFunctions
     voxelSolveFunctions
+    conjugateGradientFunctions
 )
 
 foreach(lib ${cudaLibraries})

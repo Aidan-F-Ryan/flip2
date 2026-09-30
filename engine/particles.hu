@@ -51,6 +51,10 @@ public:
         densityCorrectionTime = seconds;
     }
 
+    void setConjugateGradient(bool on){ //the pressure solver: conjugate gradient, or else red/black SOR
+        useConjugateGradient = on;
+    }
+
     void setFlipRatio(double ratio){    //the particle velocity update's share of FLIP, the rest PIC: 1 keeps the most energy and detail, 0 is the most damped and stable
         flipRatio = ratio;
     }
@@ -125,6 +129,7 @@ private:
     uint size;
     double radius;
     double flipRatio = 0.95;
+    bool useConjugateGradient = false;  //unpreconditioned CG is no faster than the red/black SOR yet
     double maxVelocity = 0.0;   //the fastest particle velocity component, found each substep by P2G
     double restParticlesPerVoxel = 8.0;
     double densityCorrectionTime = 0.1;

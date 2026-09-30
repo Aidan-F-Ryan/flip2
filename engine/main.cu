@@ -2,6 +2,7 @@
 
 #include "testing.h"
 #include <string>
+#include <cstdlib>
 
 int main(int argc, char** argv){
     //main [frames] [flipRatio] [densityCorrectionTime] [nodes | tank [height] [swirl]]
@@ -36,6 +37,9 @@ int main(int argc, char** argv){
     }
     particles.setFlipRatio(flipRatio);
     particles.setDensityCorrectionTime(densityCorrectionTime);
+    if(const char* solver = std::getenv("FLIP2_SOLVER")){    //FLIP2_SOLVER=cg picks the conjugate gradient pressure solver, sor (the default) red/black SOR
+        particles.setConjugateGradient(std::string(solver) == "cg");
+    }
     particles.initialize();
     particles.writePositionsToFile(std::to_string(0) + ".bin");
     for(int i = 0; i < numFrames; ++i){

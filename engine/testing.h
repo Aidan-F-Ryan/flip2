@@ -31,6 +31,10 @@ public:
         particles.setDensityCorrectionTime(seconds);
     }
 
+    void setConjugateGradient(bool on){
+        particles.setConjugateGradient(on);
+    }
+
     void storeGridCellMap(){
         gridMap.clear();
         particles.gridCell.download(particles.stream);
