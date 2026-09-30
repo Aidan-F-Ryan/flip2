@@ -141,17 +141,19 @@ __global__ void calculateDivU(uint numUsedVoxels, const char* solveCodes, const 
         }
         if(footprintDepth[index] >= CORRECTION_DEPTH){  //the solve can't see particles bunching up or spreading out, so ask it for the divergence that restores the rest density
             const uint* neighbors[6] = {neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz};
-            float count = particleCounts[index];
-            int voxels = 1;
+            //the voxel weighs half and its neighbours 1/12 each: an even average over the 7 reads a checkerboard of dense and sparse voxels with its sign
+            //flipped, so the correction would feed it and clump particles into every other voxel. These weights never flip a pattern's sign
+            float count = 6.0f*particleCounts[index];
+            float weight = 6.0f;
             #pragma unroll
             for(int face = 0; face < 6; ++face){
                 uint neighbor = neighbors[face][index];
                 if(neighbor < WALL_VOXEL){
                     count += particleCounts[neighbor];
-                    ++voxels;
+                    weight += 1.0f;
                 }
             }
-            divergence -= (count / (voxels*restParticlesPerVoxel) - 1.0f)*correctionRate;   //spread a denser than rest voxel, gather a sparser one
+            divergence -= (count / (weight*restParticlesPerVoxel) - 1.0f)*correctionRate;   //spread a denser than rest voxel, gather a sparser one
         }
         divU[index] = divergence;
     }

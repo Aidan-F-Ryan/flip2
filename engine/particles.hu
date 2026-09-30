@@ -125,6 +125,7 @@ private:
     uint size;
     double radius;
     double flipRatio = 0.95;
+    double maxVelocity = 0.0;   //the fastest particle velocity component, found each substep by P2G
     double restParticlesPerVoxel = 8.0;
     double densityCorrectionTime = 0.1;
     Grid grid;

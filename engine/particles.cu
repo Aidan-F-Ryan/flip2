@@ -93,23 +93,42 @@ __device__ inline float3 positionInNodeBlock(uint index, const uint* gridPositio
                        (float)(pz[index] - grid.negZ - cellZ*grid.cellSize)*perVoxel + apronCells);
 }
 
-//offset-th voxel of the stencil around a particle, which voxel marking, P2G and G2P all walk. It spans floor(p) - radius .. floor(p) + radius on each axis:
-//every voxel with a face centre within radius, so the weights change smoothly as a particle crosses a voxel face
-__device__ inline int3 stencilVoxel(float3 pos, int offset, int stencilWidth, int apronCells){
-    return make_int3((int)floorf(pos.x) - apronCells + offset % stencilWidth,
-                     (int)floorf(pos.y) - apronCells + offset / stencilWidth % stencilWidth,
-                     (int)floorf(pos.z) - apronCells + offset / (stencilWidth*stencilWidth));
+//threads per node block in the particle kernels, which give each thread a particle: about 2 each in a full node
+static constexpr uint NODE_THREADS = 256;
+
+//the quadratic B-spline's three nonzero weights for a point at q, with nodes at the integers; base is the first node
+struct Spline3{
+    int base;
+    float w[3];
+};
+
+__device__ inline Spline3 quadraticBSpline(float q){
+    Spline3 s;
+    s.base = (int)floorf(q - 0.5f);
+    float g = q - s.base - 1.0f;    //offset from the middle node, in [-1/2, 1/2)
+    s.w[0] = 0.5f*(0.5f - g)*(0.5f - g);
+    s.w[1] = 0.75f - g*g;
+    s.w[2] = 0.5f*(0.5f + g)*(0.5f + g);
+    return s;
 }
 
-//a particle's weights on the x, y and z face centres of voxel (x, y, z), which sit on the voxel's negative faces: 1 at the face, falling linearly to 0 at radius
-__device__ inline float3 faceWeights(float3 pos, int x, int y, int z, float radius){
-    float dx = pos.x - x;
-    float dy = pos.y - y;
-    float dz = pos.z - z;
-    return make_float3(fmaxf(0.0f, 1.0f - sqrtf(dx*dx + (dy - 0.5f)*(dy - 0.5f) + (dz - 0.5f)*(dz - 0.5f))/radius),
-                       fmaxf(0.0f, 1.0f - sqrtf((dx - 0.5f)*(dx - 0.5f) + dy*dy + (dz - 0.5f)*(dz - 0.5f))/radius),
-                       fmaxf(0.0f, 1.0f - sqrtf((dx - 0.5f)*(dx - 0.5f) + (dy - 0.5f)*(dy - 0.5f) + dz*dz)/radius));
-}
+//a particle's per-axis weights: a component's faces sit on voxel boundaries along its own axis (onFaces) and mid-voxel along the other two (onCentres).
+//Component dim's face at (x, y, z) weighs axis(dim, 0).w[x]*axis(dim, 1).w[y]*axis(dim, 2).w[z], and its slot in the block is the voxel it belongs to
+struct FaceStencil{
+    Spline3 onFaces[3];
+    Spline3 onCentres[3];
+    __device__ explicit FaceStencil(float3 p){
+        float q[3] = {p.x, p.y, p.z};
+        #pragma unroll
+        for(int a = 0; a < 3; ++a){
+            onFaces[a] = quadraticBSpline(q[a]);
+            onCentres[a] = quadraticBSpline(q[a] - 0.5f);
+        }
+    }
+    __device__ const Spline3& axis(int dim, int a) const{
+        return a == dim ? onFaces[a] : onCentres[a];
+    }
+};
 
 //whether a slot of a node's voxel block lies outside the domain
 __device__ inline bool isWallVoxel(uint cell, int slot, int voxels1D, int apronCells, Grid grid, uint refinementLevel){
@@ -186,28 +205,37 @@ __global__ void claimEmptyNeighborNodes(uint numParticleNodes, uint* nodeCells, 
     }
 }
 
-//marking pass 1, per node holding particles: every voxel of its block that its particles reach, having a face within radius of one.
-//Each node's masks are laid out stored, fluid, reached
-__global__ void markReachedVoxels(uint numParticleNodes, uint numParticles, uint numVoxels1D, const uint* gridNodeIndicesToFirstParticleIndex, const uint* gridPosition, const double* px, const double* py, const double* pz, uint* usedVoxelMasks, double radius, Grid grid, uint refinementLevel){
+//marking pass 1, per node holding particles: every voxel of its block with a face in one of its particles' stencils. voxels1D is 8, so a block row
+//starts on a multiple of 8 and the stencil's 3 voxels of it are 3 bits of one word. Each node's masks are laid out stored, fluid, reached
+__global__ void markReachedVoxels(uint numParticleNodes, uint numParticles, uint numVoxels1D, const uint* gridNodeIndicesToFirstParticleIndex, const uint* gridPosition, const double* px, const double* py, const double* pz,
+                                    uint* usedVoxelMasks, double radius, Grid grid, uint refinementLevel){
     extern __shared__ uint reached[];
     int voxels1D = numVoxels1D;
     int maskWords = (voxels1D*voxels1D*voxels1D + 31) / 32;
     int apronCells = floor(radius);
-    int stencilWidth = 2*apronCells + 1;
-    int stencilSize = stencilWidth*stencilWidth*stencilWidth;
     uint firstParticle = gridNodeIndicesToFirstParticleIndex[blockIdx.x];
     uint lastParticle = blockIdx.x == numParticleNodes - 1 ? numParticles : gridNodeIndicesToFirstParticleIndex[blockIdx.x + 1];
     for(int word = threadIdx.x; word < maskWords; word += blockDim.x){
         reached[word] = 0;
     }
     __syncthreads();
-    for(uint item = threadIdx.x; item < (lastParticle - firstParticle)*stencilSize; item += blockDim.x){
-        float3 pos = positionInNodeBlock(firstParticle + item/stencilSize, gridPosition, px, py, pz, grid, refinementLevel, apronCells);
-        int3 voxel = stencilVoxel(pos, item % stencilSize, stencilWidth, apronCells);
-        float3 weights = faceWeights(pos, voxel.x, voxel.y, voxel.z, radius);
-        if(voxel.x >= 0 && voxel.y >= 0 && voxel.z >= 0 && voxel.x < voxels1D && voxel.y < voxels1D && voxel.z < voxels1D && (weights.x > 0.0f || weights.y > 0.0f || weights.z > 0.0f)){
-            int slot = voxel.x + voxel.y*voxels1D + voxel.z*voxels1D*voxels1D;
-            atomicOr(reached + slot/32, 1u << slot%32);
+    for(uint index = firstParticle + threadIdx.x; index < lastParticle; index += blockDim.x){    //consecutive threads, consecutive particles
+        float3 pos = positionInNodeBlock(index, gridPosition, px, py, pz, grid, refinementLevel, apronCells);
+        int onFaces[3] = {(int)floorf(pos.x - 0.5f), (int)floorf(pos.y - 0.5f), (int)floorf(pos.z - 0.5f)};
+        int onCentres[3] = {(int)floorf(pos.x - 1.0f), (int)floorf(pos.y - 1.0f), (int)floorf(pos.z - 1.0f)};
+        #pragma unroll
+        for(int dim = 0; dim < 3; ++dim){
+            int x = dim == 0 ? onFaces[0] : onCentres[0];
+            int y = dim == 1 ? onFaces[1] : onCentres[1];
+            int z = dim == 2 ? onFaces[2] : onCentres[2];
+            #pragma unroll
+            for(int k = 0; k < 3; ++k){
+                #pragma unroll
+                for(int j = 0; j < 3; ++j){
+                    int rowStart = x + (y + j)*voxels1D + (z + k)*voxels1D*voxels1D;
+                    atomicOr(reached + rowStart/32, 7u << rowStart%32);
+                }
+            }
         }
     }
     __syncthreads();
@@ -380,7 +408,7 @@ void Particles::generateVoxels(){
     uint maskWords = (numVoxelsPerNode + 31) / 32;
     nodeIndexUsedVoxels.resizeAsync(numUsedGridNodes, stream);
     usedVoxelMasks.resizeAsync(3*numUsedGridNodes*maskWords, stream);
-    markReachedVoxels<<<numParticleNodes, 64, sizeof(uint)*maskWords, stream>>>(numParticleNodes, size, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(), usedVoxelMasks.devPtr(), radius, grid, refinementLevel);
+    markReachedVoxels<<<numParticleNodes, NODE_THREADS, sizeof(uint)*maskWords, stream>>>(numParticleNodes, size, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(), usedVoxelMasks.devPtr(), radius, grid, refinementLevel);
     markUsedVoxels<<<numUsedGridNodes, 64, 2*sizeof(uint)*maskWords, stream>>>(numUsedGridNodes, numParticleNodes, numVoxels1D, nodeCells.devPtr(), cellToNode.devPtr(), usedVoxelMasks.devPtr(), nodeIndexUsedVoxels.devPtr(), radius, grid, refinementLevel);
     cudaStreamSynchronize(stream);
 
@@ -413,54 +441,61 @@ void Particles::generateVoxels(){
     std::cout<<"Using "<<(CudaVec<uint>::GPU_MEMORY_ALLOCATED + CudaVec<float>::GPU_MEMORY_ALLOCATED + CudaVec<double>::GPU_MEMORY_ALLOCATED + CudaVec<char>::GPU_MEMORY_ALLOCATED) / (1<<20)<<" MB on GPU\n";
 }
 
-//a node's slot -> owning voxel map, in shared memory; NO_VOXEL where the node stores nothing
-__device__ void loadSlotOwners(uint* slotOwners, int voxels3D, uint startVoxelIndex, uint endVoxelIndex, const uint* voxelIDs, const uint* voxelOwners){
-    for(int slot = threadIdx.x; slot < voxels3D; slot += blockDim.x){
-        slotOwners[slot] = NO_VOXEL;
-    }
-    __syncthreads();
-    for(uint i = startVoxelIndex + threadIdx.x; i < endVoxelIndex; i += blockDim.x){
-        slotOwners[voxelIDs[i]] = voxelOwners[i];
-    }
-    __syncthreads();
-}
-
-//P2G: one thread per (particle, stencil voxel) pair of a node, all three face components at once, accumulated straight into the voxel that owns each face.
-//The stencil's centre voxel is the one holding the particle, which counts it
-__global__ void scatterParticleVelsToVoxels(uint numUsedGridNodes, uint numParticles, uint numVoxels1D, const uint* gridNodeIndicesToFirstParticleIndex, const uint* gridPosition, const double* px, const double* py, const double* pz, const float* vx, const float* vy, const float* vz,
-                                            const uint* numVoxelsEachNode, const uint* voxelIDs, const uint* voxelOwners, float* ux, float* uy, float* uz, float* weightsX, float* weightsY, float* weightsZ, float* particleCounts, double radius, Grid grid, uint refinementLevel){
-    extern __shared__ uint slotOwners[];
+//P2G: a block per node and a thread per particle. Each particle adds its momentum and weight on the 27 faces of each component around it into the
+//node's voxel block in shared memory, and 1 to the count of the voxel holding it; then each voxel the node stores adds the block's sums into its owner.
+//It sums in 32-bit fixed point, as sm_86 has native shared integer atomics but not float ones. 7 ints per slot: 14 KB for an 8^3 block
+__global__ void scatterParticleVelsToVoxels(uint numParticleNodes, uint numParticles, uint numVoxels1D, const uint* gridNodeIndicesToFirstParticleIndex, const uint* gridPosition,
+                                            const double* px, const double* py, const double* pz, const float* vx, const float* vy, const float* vz,
+                                            const uint* numVoxelsEachNode, const uint* voxelIDs, const uint* voxelOwners,
+                                            float* ux, float* uy, float* uz, float* weightsX, float* weightsY, float* weightsZ, float* particleCounts, float momentumScale, float weightScale, double radius, Grid grid, uint refinementLevel){
+    extern __shared__ int fixedSums[];    //per slot: x, y, z momentum, then x, y, z weight, then particle count
     int voxels1D = numVoxels1D;
+    int voxels3D = voxels1D*voxels1D*voxels1D;
     int apronCells = floor(radius);
-    int stencilWidth = 2*apronCells + 1;
-    int stencilSize = stencilWidth*stencilWidth*stencilWidth;
     uint firstParticle = gridNodeIndicesToFirstParticleIndex[blockIdx.x];
-    uint lastParticle = blockIdx.x == numUsedGridNodes - 1 ? numParticles : gridNodeIndicesToFirstParticleIndex[blockIdx.x + 1];
-    loadSlotOwners(slotOwners, voxels1D*voxels1D*voxels1D, blockIdx.x == 0 ? 0 : numVoxelsEachNode[blockIdx.x - 1], numVoxelsEachNode[blockIdx.x], voxelIDs, voxelOwners);
-    for(uint item = threadIdx.x; item < (lastParticle - firstParticle)*stencilSize; item += blockDim.x){
-        uint index = firstParticle + item/stencilSize;
+    uint lastParticle = blockIdx.x == numParticleNodes - 1 ? numParticles : gridNodeIndicesToFirstParticleIndex[blockIdx.x + 1];
+    for(int i = threadIdx.x; i < 7*voxels3D; i += blockDim.x){
+        fixedSums[i] = 0;
+    }
+    __syncthreads();
+    const float* velocities[3] = {vx, vy, vz};
+    for(uint index = firstParticle + threadIdx.x; index < lastParticle; index += blockDim.x){    //consecutive threads, consecutive particles
         float3 pos = positionInNodeBlock(index, gridPosition, px, py, pz, grid, refinementLevel, apronCells);
-        int3 voxel = stencilVoxel(pos, item % stencilSize, stencilWidth, apronCells);
-        if(voxel.x < 0 || voxel.y < 0 || voxel.z < 0 || voxel.x >= voxels1D || voxel.y >= voxels1D || voxel.z >= voxels1D){
-            continue;
+        FaceStencil stencil(pos);
+        #pragma unroll
+        for(int dim = 0; dim < 3; ++dim){
+            const Spline3& x = stencil.axis(dim, 0);
+            const Spline3& y = stencil.axis(dim, 1);
+            const Spline3& z = stencil.axis(dim, 2);
+            float velocity = velocities[dim][index];
+            #pragma unroll
+            for(int k = 0; k < 3; ++k){
+                #pragma unroll
+                for(int j = 0; j < 3; ++j){
+                    int rowStart = x.base + (y.base + j)*voxels1D + (z.base + k)*voxels1D*voxels1D;
+                    float yz = y.w[j]*z.w[k];
+                    #pragma unroll
+                    for(int i = 0; i < 3; ++i){
+                        float weight = x.w[i]*yz;
+                        atomicAdd(fixedSums + dim*voxels3D + rowStart + i, __float2int_rn(weight*velocity*momentumScale));
+                        atomicAdd(fixedSums + (3 + dim)*voxels3D + rowStart + i, __float2int_rn(weight*weightScale));
+                    }
+                }
+            }
         }
-        uint owner = slotOwners[voxel.x + voxel.y*voxels1D + voxel.z*voxels1D*voxels1D];
-        float3 w = faceWeights(pos, voxel.x, voxel.y, voxel.z, radius);
-        if(owner != NO_VOXEL){
-            if(item % stencilSize == stencilSize/2){
-                atomicAdd(particleCounts + owner, 1.0f);
-            }
-            if(w.x > 0.0f){
-                atomicAdd(ux + owner, w.x*vx[index]);
-                atomicAdd(weightsX + owner, w.x);
-            }
-            if(w.y > 0.0f){
-                atomicAdd(uy + owner, w.y*vy[index]);
-                atomicAdd(weightsY + owner, w.y);
-            }
-            if(w.z > 0.0f){
-                atomicAdd(uz + owner, w.z*vz[index]);
-                atomicAdd(weightsZ + owner, w.z);
+        atomicAdd(fixedSums + 6*voxels3D + (int)pos.x + (int)pos.y*voxels1D + (int)pos.z*voxels1D*voxels1D, 1);
+    }
+    __syncthreads();
+    float* accumulators[7] = {ux, uy, uz, weightsX, weightsY, weightsZ, particleCounts};
+    float unscale[7] = {1.0f/momentumScale, 1.0f/momentumScale, 1.0f/momentumScale, 1.0f/weightScale, 1.0f/weightScale, 1.0f/weightScale, 1.0f};
+    for(uint i = (blockIdx.x == 0 ? 0 : numVoxelsEachNode[blockIdx.x - 1]) + threadIdx.x; i < numVoxelsEachNode[blockIdx.x]; i += blockDim.x){    //coalesced over the node's voxels
+        int slot = voxelIDs[i];
+        uint owner = voxelOwners[i];    //itself for interior voxels, so these atomics are mostly consecutive
+        #pragma unroll
+        for(int sum = 0; sum < 7; ++sum){
+            int value = fixedSums[sum*voxels3D + slot];
+            if(value != 0){
+                atomicAdd(accumulators[sum] + owner, value*unscale[sum]);
             }
         }
     }
@@ -469,19 +504,22 @@ __global__ void scatterParticleVelsToVoxels(uint numUsedGridNodes, uint numParti
 #include "algorithms/reductionKernels.hu"
 #include <cmath>
 
-double Particles::getCourantDt(){    //every substep: the fastest particle moves at most 0.7 voxels
-    double maxVel = fmax(fabs(vx.getMax(stream, true)), fmax(fabs(vy.getMax(stream, true)), fabs(vz.getMax(stream, true))));
+double Particles::getCourantDt(){    //every substep: the fastest particle moves at most 0.7 voxels. P2G finds the fastest
     double voxelSize = (grid.cellSize / (numVoxels1D - 2*std::floor(radius)));
-    std::cout<<"maxVel: "<<maxVel<<" voxelSize: "<<voxelSize<<"\n";
-    return 0.7 * (voxelSize / maxVel + 0.0001);
+    std::cout<<"maxVel: "<<maxVelocity<<" voxelSize: "<<voxelSize<<"\n";
+    return 0.7 * (voxelSize / maxVelocity + 0.0001);
 }
 
 void Particles::particleVelToVoxels(){
     for(CudaVec<float>* accumulator : {&voxelsUx, &voxelsUy, &voxelsUz, &voxelWeightsX, &voxelWeightsY, &voxelWeightsZ, &particleCounts}){
         accumulator->zeroDeviceAsync(stream);
     }
-    scatterParticleVelsToVoxels<<<numParticleNodes, 64, sizeof(uint)*numVoxelsPerNode, stream>>>(numParticleNodes, size, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(),
-        nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(), voxelOwners.devPtr(), voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr(), voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), particleCounts.devPtr(), radius, grid, refinementLevel);
+    maxVelocity = fmax(fabs(vx.getMax(stream, true)), fmax(fabs(vy.getMax(stream, true)), fabs(vz.getMax(stream, true))));  //also sets the CFL timestep
+    //P2G sums in fixed point: a face's weight sum is about the particles per voxel, so budget 128 (15x rest) and keep every sum under 2^30
+    float weightScale = (1 << 30) / 128.0f;
+    float momentumScale = weightScale / fmax(maxVelocity, 1e-6);
+    scatterParticleVelsToVoxels<<<numParticleNodes, NODE_THREADS, 7*sizeof(int)*numVoxelsPerNode, stream>>>(numParticleNodes, size, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(),
+        nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(), voxelOwners.devPtr(), voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr(), voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), particleCounts.devPtr(), momentumScale, weightScale, radius, grid, refinementLevel);
     cudaNormalizeVoxelVelocities(solids, voxelWeightsX, voxelWeightsY, voxelWeightsZ, voxelsUx, voxelsUy, voxelsUz, stream);
     cudaExtrapolateUnreachedFaces(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, voxelWeightsX, voxelWeightsY, voxelWeightsZ, voxelsUx, voxelsUy, voxelsUz, stream);
     cudaFindFootprintDepth(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, footprintDepth, freeSurface, stream);
@@ -542,63 +580,84 @@ void Particles::updateVoxelVelocities(){
     gpuErrchk(cudaPeekAtLastError());
 }
 
-//G2P: one warp per particle; the lanes split its stencil and read the owning copy of each face, or its mirror image for a face inside a wall.
-//PIC takes the grid's new velocity and FLIP adds the grid's change over the solve to the particle's own; flipRatio blends them. The particle then moves
-//with the grid's velocity, which is divergence free: the blend only carries momentum to the next P2G, as moving with FLIP's noise would scatter the particles
-__global__ void gatherVoxelVelsToParticles(uint numUsedGridNodes, uint numParticles, uint numVoxels1D, const uint* gridNodeIndicesToFirstParticleIndex, const uint* gridPosition, double* px, double* py, double* pz, float* vx, float* vy, float* vz,
-                                            const uint* numVoxelsEachNode, const uint* voxelIDs, const uint* voxelOwners, const float* ux, const float* uy, const float* uz, const float* oldUx, const float* oldUy, const float* oldUz, float flipRatio, float dt, double radius, Grid grid, uint refinementLevel){
-    extern __shared__ uint slotOwners[];
+//G2P: a block per node and a thread per particle. The block copies the new and old face velocities of every voxel the node stores into shared memory,
+//from their owners, and turns the faces inside walls into their mirror images (the wall's normal component reversed, so it's 0 on the wall, and the
+//tangential ones as they are, so walls don't drag). Each particle then reads its 27 faces per component from there; the weights sum to 1, so no
+//normalizing. PIC takes the new grid velocity, FLIP adds its change to the particle's own, flipRatio blends them, and the particle moves with the
+//grid's. 6 floats per slot: 12 KB for an 8^3 block
+__global__ void gatherVoxelVelsToParticles(uint numParticleNodes, uint numParticles, uint numVoxels1D, const uint* gridNodeIndicesToFirstParticleIndex, const uint* gridPosition,
+                                            double* px, double* py, double* pz, float* vx, float* vy, float* vz,
+                                            const uint* numVoxelsEachNode, const uint* voxelIDs, const uint* voxelOwners, const char* solids,
+                                            const float* ux, const float* uy, const float* uz, const float* oldUx, const float* oldUy, const float* oldUz,
+                                            float flipRatio, float dt, double radius, Grid grid, uint refinementLevel){
+    extern __shared__ float blockVelocities[];  //per slot: new x, y, z, then old x, y, z
     int voxels1D = numVoxels1D;
+    int voxels3D = voxels1D*voxels1D*voxels1D;
     int apronCells = floor(radius);
-    int stencilWidth = 2*apronCells + 1;
-    int stencilSize = stencilWidth*stencilWidth*stencilWidth;
     uint firstParticle = gridNodeIndicesToFirstParticleIndex[blockIdx.x];
-    uint lastParticle = blockIdx.x == numUsedGridNodes - 1 ? numParticles : gridNodeIndicesToFirstParticleIndex[blockIdx.x + 1];
+    uint lastParticle = blockIdx.x == numParticleNodes - 1 ? numParticles : gridNodeIndicesToFirstParticleIndex[blockIdx.x + 1];
+    uint startVoxel = blockIdx.x == 0 ? 0 : numVoxelsEachNode[blockIdx.x - 1];
+    uint endVoxel = numVoxelsEachNode[blockIdx.x];
+    const float* velocities[6] = {ux, uy, uz, oldUx, oldUy, oldUz};
+    for(int i = threadIdx.x; i < 6*voxels3D; i += blockDim.x){    //every face a particle reaches is stored, but never leave garbage to read
+        blockVelocities[i] = 0.0f;
+    }
+    __syncthreads();
+    for(uint i = startVoxel + threadIdx.x; i < endVoxel; i += blockDim.x){  //coalesced over the node's voxels
+        int slot = voxelIDs[i];
+        uint owner = voxelOwners[i];
+        #pragma unroll
+        for(int v = 0; v < 6; ++v){
+            blockVelocities[v*voxels3D + slot] = velocities[v][owner];
+        }
+    }
+    __syncthreads();
     uint cell = gridPosition[firstParticle];
     int interiorWidth = voxels1D - 2*apronCells;
     int3 origin = make_int3((int)(cell % grid.sizeX)*interiorWidth - apronCells, (int)(cell / grid.sizeX % grid.sizeY)*interiorWidth - apronCells, (int)(cell / (grid.sizeX*grid.sizeY))*interiorWidth - apronCells);
     int3 domainVoxels = make_int3(grid.sizeX*interiorWidth, grid.sizeY*interiorWidth, grid.sizeZ*interiorWidth);
-    const float* faceVelocities[3] = {ux, uy, uz};
-    const float* oldFaceVelocities[3] = {oldUx, oldUy, oldUz};
-    loadSlotOwners(slotOwners, voxels1D*voxels1D*voxels1D, blockIdx.x == 0 ? 0 : numVoxelsEachNode[blockIdx.x - 1], numVoxelsEachNode[blockIdx.x], voxelIDs, voxelOwners);
-    for(uint index = firstParticle + threadIdx.x/32; index < lastParticle; index += blockDim.x/32){
-        float3 pos = positionInNodeBlock(index, gridPosition, px, py, pz, grid, refinementLevel, apronCells);
-        float sums[9] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};    //weighted x, y, z velocity after the solve, then before it, then x, y, z weight
-        for(int offset = threadIdx.x % 32; offset < stencilSize; offset += 32){
-            int3 voxel = stencilVoxel(pos, offset, stencilWidth, apronCells);
-            if(voxel.x < 0 || voxel.y < 0 || voxel.z < 0 || voxel.x >= voxels1D || voxel.y >= voxels1D || voxel.z >= voxels1D){
-                continue;
-            }
-            uint owner = slotOwners[voxel.x + voxel.y*voxels1D + voxel.z*voxels1D*voxels1D];
-            if(owner == NO_VOXEL){
-                continue;
-            }
-            float3 w = faceWeights(pos, voxel.x, voxel.y, voxel.z, radius);
-            float faceWeight[3] = {w.x, w.y, w.z};
+    for(uint i = startVoxel + threadIdx.x; i < endVoxel; i += blockDim.x){  //a wall face's mirror image is always inside the domain, so never another wall face
+        if(solids[i]){
+            int slot = voxelIDs[i];
+            int3 voxel = make_int3(slot % voxels1D, slot / voxels1D % voxels1D, slot / (voxels1D*voxels1D));
             #pragma unroll
             for(int dim = 0; dim < 3; ++dim){
                 float sign = 1.0f;
-                uint source = slotOwners[mirroredSlot(voxel, dim, origin, domainVoxels, voxels1D, sign)];
-                if(source != NO_VOXEL){
-                    sums[dim] += faceWeight[dim]*sign*faceVelocities[dim][source];
-                    sums[3 + dim] += faceWeight[dim]*sign*oldFaceVelocities[dim][source];
-                    sums[6 + dim] += faceWeight[dim];
+                int source = mirroredSlot(voxel, dim, origin, domainVoxels, voxels1D, sign);
+                blockVelocities[dim*voxels3D + slot] = sign*blockVelocities[dim*voxels3D + source];
+                blockVelocities[(3 + dim)*voxels3D + slot] = sign*blockVelocities[(3 + dim)*voxels3D + source];
+            }
+        }
+    }
+    __syncthreads();
+    double* positions[3] = {px, py, pz};
+    float* particleVelocities[3] = {vx, vy, vz};
+    for(uint index = firstParticle + threadIdx.x; index < lastParticle; index += blockDim.x){    //consecutive threads, consecutive particles
+        float3 pos = positionInNodeBlock(index, gridPosition, px, py, pz, grid, refinementLevel, apronCells);
+        FaceStencil stencil(pos);
+        #pragma unroll
+        for(int dim = 0; dim < 3; ++dim){
+            const Spline3& x = stencil.axis(dim, 0);
+            const Spline3& y = stencil.axis(dim, 1);
+            const Spline3& z = stencil.axis(dim, 2);
+            float newVelocity = 0.0f;
+            float oldVelocity = 0.0f;
+            #pragma unroll
+            for(int k = 0; k < 3; ++k){
+                #pragma unroll
+                for(int j = 0; j < 3; ++j){
+                    int rowStart = x.base + (y.base + j)*voxels1D + (z.base + k)*voxels1D*voxels1D;
+                    float yz = y.w[j]*z.w[k];
+                    #pragma unroll
+                    for(int i = 0; i < 3; ++i){
+                        float weight = x.w[i]*yz;
+                        newVelocity += weight*blockVelocities[dim*voxels3D + rowStart + i];
+                        oldVelocity += weight*blockVelocities[(3 + dim)*voxels3D + rowStart + i];
+                    }
                 }
             }
-        }
-        for(int lanes = 16; lanes > 0; lanes >>= 1){
-            for(int sum = 0; sum < 9; ++sum){
-                sums[sum] += __shfl_xor_sync(0xffffffff, sums[sum], lanes);
-            }
-        }
-        if(threadIdx.x % 32 == 0){
-            double* position[3] = {px, py, pz};
-            float* velocity[3] = {vx, vy, vz};
-            for(int dim = 0; dim < 3; ++dim){
-                float weight = sums[6 + dim] + 0.00000001f;
-                velocity[dim][index] = sums[dim] / weight + flipRatio*(velocity[dim][index] - sums[3 + dim] / weight);    //new grid velocity + flipRatio*(particle's - old grid velocity)
-                position[dim][index] += dt*sums[dim] / weight;
-            }
+            particleVelocities[dim][index] = newVelocity + flipRatio*(particleVelocities[dim][index] - oldVelocity);
+            positions[dim][index] += dt*newVelocity;
         }
     }
 }
@@ -688,8 +747,8 @@ __global__ void moveSolids(uint numUsedGridNodes, uint numParticles, uint numVox
 }
 
 void Particles::voxelVelsToParticles(){
-    gatherVoxelVelsToParticles<<<numParticleNodes, 64, sizeof(uint)*numVoxelsPerNode, stream>>>(numParticleNodes, size, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(),
-        nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(), voxelOwners.devPtr(), voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr(), voxelsUxOld.devPtr(), voxelsUyOld.devPtr(), voxelsUzOld.devPtr(), flipRatio, dt, radius, grid, refinementLevel);
+    gatherVoxelVelsToParticles<<<numParticleNodes, NODE_THREADS, 6*sizeof(float)*numVoxelsPerNode, stream>>>(numParticleNodes, size, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(),
+        nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(), voxelOwners.devPtr(), solids.devPtr(), voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr(), voxelsUxOld.devPtr(), voxelsUyOld.devPtr(), voxelsUzOld.devPtr(), flipRatio, dt, radius, grid, refinementLevel);
     gpuErrchk(cudaPeekAtLastError());
 }
 
