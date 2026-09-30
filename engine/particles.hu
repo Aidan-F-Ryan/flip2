@@ -11,7 +11,7 @@
 #include <string>
 #include <vector>
 
-class LocalExchange;
+class Transport;
 
 enum class PressureSolver{
     sor,        //red/black SOR
@@ -27,8 +27,8 @@ class Particles{
 public:
     Particles(uint size);
 
-    //makes this partition rank of numRanks, which run in lockstep and share the exchange and the context. Before setDomain
-    void setPartition(int rank, int numRanks, LocalExchange* exchange, PartitionContext* context, const std::vector<uint>& planes);
+    //makes this partition rank of numRanks, which run in lockstep, exchanging through the transport; the solver's exchanges go through the context. Before setDomain
+    void setPartition(int rank, int numRanks, Transport* transport, PartitionContext* context, const std::vector<uint>& planes);
 
     void setDomain(double nx, double ny, double nz, uint x, uint y, uint z, double cellSize);
 
@@ -54,7 +54,8 @@ public:
     
     void voxelVelsToParticles();
 
-    void copyPositionsToHost(float* xyz, cudaEvent_t copied);   //float32 x, y, z per particle, for a frame: into pinned xyz, recording copied once it's there
+    const float* packPositions();   //float32 x, y, z per particle, for a frame, on this partition's GPU; valid for the work queued on its stream after this
+    void copyPositionsToHost(float* xyz, cudaEvent_t copied);   //the same, into pinned xyz, recording copied once it's there
 
     uint numParticles() const{
         return size;
@@ -227,11 +228,11 @@ private:
     cudaEvent_t frameCopied = nullptr;      //framePositions has been copied out, so it can take the next frame
     std::vector<uint> selectedDevices;
 
-    //the partition: this is rank of numRanks, owning node planes [boxLo, boxHi). Partitions exchange through the exchange, and the solver's exchanges go
+    //the partition: this is rank of numRanks, owning node planes [boxLo, boxHi). Partitions exchange through the transport, and the solver's exchanges go
     //through the context, which does nothing for a lone partition
     int rank = 0;
     int numRanks = 1;
-    LocalExchange* exchange = nullptr;
+    Transport* transport = nullptr;
     PartitionContext loneContext;
     PartitionContext* context = &loneContext;
     std::vector<uint> partitionPlanes;  //partition r owns node planes [partitionPlanes[r], partitionPlanes[r + 1])
@@ -244,8 +245,8 @@ private:
     uint upperBoundaryParticleNodes = 0;
 
     friend class ParticleSystemTester;
-    friend class LocalExchange;
-    friend class LocalPartition;
+    friend class PartitionExchange;
+    friend class Simulation;
 };
 
 #endif

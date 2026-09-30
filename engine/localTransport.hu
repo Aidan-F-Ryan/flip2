@@ -1,0 +1,64 @@
+//Copyright 2023 Aberrant Behavior LLC
+
+#ifndef LOCALTRANSPORT_HU
+#define LOCALTRANSPORT_HU
+
+#include "transport.hu"
+#include <condition_variable>
+#include <mutex>
+#include <vector>
+
+//What the ranks in one process share, each rank driven by its own host thread and on its own stream, on one GPU or several: a host barrier, the sends
+//and host values each rank posts, and each rank's events
+class LocalHub{
+public:
+    explicit LocalHub(int size);
+    ~LocalHub();
+
+    int size() const{
+        return numRanks;
+    }
+    void barrier();
+    void attach(int rank, int device);  //makes the rank's events on its GPU, which must be the current one
+
+private:
+    friend class LocalTransport;
+    int numRanks;
+    std::mutex mutex;
+    std::condition_variable released;
+    int arrived = 0;
+    unsigned long long generation = 0;
+    std::vector<int> devices;
+    std::vector<cudaEvent_t> ready;     //recorded on a rank's stream once what it sends is written
+    std::vector<cudaEvent_t> consumed;  //recorded once its copies out of the others are queued ahead of it
+    std::vector<const std::vector<TransportSend>*> posted;  //each rank's sends in the current exchange
+    std::vector<int> matched;           //[from*size + to]: how many of from's sends to has matched, this exchange
+    std::vector<const void*> hostValues;
+};
+
+//A rank of a LocalHub. Receivers copy straight out of their senders' arrays with cudaMemcpyPeerAsync on their own streams, once the senders' ready
+//events have passed, and a sender's stream waits for its receivers' consumed events before anything after the exchange can change what it sent. No
+//kernel touches another rank's memory, so ranks can sit on different GPUs, with or without peer access (without it, the driver stages the copies
+//through the host)
+class LocalTransport : public Transport{
+public:
+    LocalTransport(LocalHub& hub, int rank)
+    : hub(hub)
+    , me(rank)
+    {}
+
+    int rank() const override{
+        return me;
+    }
+    int size() const override{
+        return hub.size();
+    }
+    void exchange(const std::vector<TransportSend>& sends, const std::vector<TransportReceive>& receives, cudaStream_t stream) override;
+    void allGatherHost(const void* mine, void* all, size_t bytes) override;
+
+private:
+    LocalHub& hub;
+    int me;
+};
+
+#endif

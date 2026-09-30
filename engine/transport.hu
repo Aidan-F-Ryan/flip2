@@ -1,0 +1,55 @@
+//Copyright 2023 Aberrant Behavior LLC
+
+#ifndef TRANSPORT_HU
+#define TRANSPORT_HU
+
+#include "typedefs.h"
+#include <vector>
+
+struct TransportSend{
+    int to;
+    const void* data;   //on this rank's GPU
+    size_t bytes;
+};
+
+struct TransportReceive{
+    int from;
+    void* data;         //on this rank's GPU
+    size_t bytes;
+};
+
+//One rank's handle on all the ranks of a simulation, however they're connected: partitions in one process (LocalTransport), processes over TCP
+//(TcpTransport), NCCL later. Every call is collective: every rank makes the same calls in the same order. Sends and receives pair up in order between
+//each pair of ranks and both sides know the sizes, so only data travels. Device data follows the rank's stream: a send reads what the work queued before
+//it wrote, a receive's data is there for the work queued after it, and the work queued after may change what was sent
+class Transport{
+public:
+    virtual ~Transport() = default;
+    virtual int rank() const = 0;
+    virtual int size() const = 0;
+
+    //the stream this rank's work runs on, given once, with the rank's GPU current: a transport whose own calls have to follow that work takes it here
+    virtual void attach(cudaStream_t stream){}
+
+    //all of this rank's sends and receives at once
+    virtual void exchange(const std::vector<TransportSend>& sends, const std::vector<TransportReceive>& receives, cudaStream_t stream) = 0;
+
+    //bytes of host memory from every rank, in rank order, into all (size() times bytes); returns once they're there
+    virtual void allGatherHost(const void* mine, void* all, size_t bytes) = 0;
+
+    //bytes of device memory from every rank, in rank order, into all (size() times bytes)
+    virtual void allGather(const void* mine, void* all, size_t bytes, cudaStream_t stream){
+        std::vector<TransportSend> sends;
+        std::vector<TransportReceive> receives;
+        for(int other = 0; other < size(); ++other){
+            if(other != rank()){
+                sends.push_back({other, mine, bytes});
+                receives.push_back({other, (char*)all + other*bytes, bytes});
+            }
+        }
+        gpuErrchk(cudaMemcpyAsync((char*)all + rank()*bytes, mine, bytes, cudaMemcpyDeviceToDevice, stream));
+        exchange(sends, receives, stream);
+    }
+};
+
+#endif

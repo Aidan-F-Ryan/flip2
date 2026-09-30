@@ -1,8 +1,13 @@
 //Copyright 2023 Aberrant Behavior LLC
 
 #include "testing.h"
-#include <string>
+#include "tcpTransport.hu"
+#ifdef FLIP2_WITH_NCCL
+#include "ncclTransport.hu"
+#endif
 #include <cstdlib>
+#include <memory>
+#include <string>
 
 int main(int argc, char** argv){
     //main [frames] [flipRatio] [densityCorrectionTime] [nodes | tank [height] [swirl]]
@@ -16,15 +21,50 @@ int main(int argc, char** argv){
     uint nodes = argc > 4 && !tank ? std::stoi(argv[4]) : 32;    //the dam break's grid, nodes per side of its 1 m cube (4 voxels each)
     int partitions = std::getenv("FLIP2_PARTITIONS") ? std::stoi(std::getenv("FLIP2_PARTITIONS")) : 1;  //FLIP2_PARTITIONS splits the domain along z
     int devices = std::getenv("FLIP2_DEVICES") ? std::stoi(std::getenv("FLIP2_DEVICES")) : 0;  //FLIP2_DEVICES spreads the partitions over that many GPUs; every GPU by default
-    ParticleSystemTester particles(tank ? 32*32*height*8 :    //~8 per fluid voxel
+    //FLIP2_WORLD_SIZE over 1 makes this process rank FLIP2_RANK of that many, each one partition on GPU FLIP2_DEVICE (default 0), meeting through rank 0
+    //at FLIP2_RENDEZVOUS (host:port) and joined over FLIP2_TRANSPORT: tcp (the default) or nccl, one GPU per rank, if flip2 was built with NCCL. Setting
+    //FLIP2_TRANSPORT alone runs one such rank, to try the transport out. tools/launch-local.sh starts them
+    int worldSize = std::getenv("FLIP2_WORLD_SIZE") ? std::stoi(std::getenv("FLIP2_WORLD_SIZE")) : 1;
+    std::string transport = std::getenv("FLIP2_TRANSPORT") ? std::getenv("FLIP2_TRANSPORT") : "";
+    uint numParticles = tank ? 32*32*height*8 :    //~8 per fluid voxel
         // 33
         // 1024
         // (1<<19) - 24//512K
-        40*nodes*nodes*nodes    //~8.4 per fluid voxel: 1.3M on 32^3 nodes
+        40*nodes*nodes*nodes;   //~8.4 per fluid voxel: 1.3M on 32^3 nodes
         // (1<<24) - 13 //16M
         // (1<<25) - 12 //32M
         // 1<<26
-        , partitions, devices);
+    std::unique_ptr<ParticleSystemTester> tester;
+    if(worldSize > 1 || !transport.empty()){
+        const char* rank = std::getenv("FLIP2_RANK");
+        const char* rendezvous = std::getenv("FLIP2_RENDEZVOUS");
+        if(rank == nullptr || rendezvous == nullptr){
+            std::cerr<<"running as a rank needs FLIP2_RANK and FLIP2_RENDEZVOUS too\n";
+            return 1;
+        }
+        int device = std::getenv("FLIP2_DEVICE") ? std::stoi(std::getenv("FLIP2_DEVICE")) : 0;
+        std::unique_ptr<Transport> link;
+        if(transport.empty() || transport == "tcp"){
+            link = std::make_unique<TcpTransport>(std::stoi(rank), worldSize, rendezvous);
+        }
+        else if(transport == "nccl"){
+#ifdef FLIP2_WITH_NCCL
+            link = std::make_unique<NcclTransport>(std::stoi(rank), worldSize, rendezvous);
+#else
+            std::cerr<<"FLIP2_TRANSPORT=nccl, but this build has no NCCL: build with NCCL_HOME set to where it's installed\n";
+            return 1;
+#endif
+        }
+        else{
+            std::cerr<<"FLIP2_TRANSPORT is tcp or nccl, not "<<transport<<"\n";
+            return 1;
+        }
+        tester = std::make_unique<ParticleSystemTester>(numParticles, std::move(link), device);
+    }
+    else{
+        tester = std::make_unique<ParticleSystemTester>(numParticles, partitions, devices);
+    }
+    ParticleSystemTester& particles = *tester;
     if(tank){
         particles.setDomain(0.0f, 0.0f, 0.0f, 8, 8, 8, 1.0f / 32.0f);
         particles.randomizeParticlePositions(make_double3(0.0, 0.0, 0.0), make_double3(1.0, height / 32.0, 1.0), argc > 6 ? std::stod(argv[6]) : 0.0);

@@ -8,7 +8,7 @@
 #include "algorithms/voxelSolveFunctions.hu"
 #include "algorithms/conjugateGradientFunctions.hu"
 #include "algorithms/parallelPrefixSumKernels.hu"
-#include "localExchange.hu"
+#include "transport.hu"
 
 #include "typedefs.h"
 #include <cmath>
@@ -47,10 +47,10 @@ Particles::Particles(uint size)
     prevDt = 0.0;
 }
 
-void Particles::setPartition(int rank, int numRanks, LocalExchange* exchange, PartitionContext* context, const std::vector<uint>& planes){
+void Particles::setPartition(int rank, int numRanks, Transport* transport, PartitionContext* context, const std::vector<uint>& planes){
     this->rank = rank;
     this->numRanks = numRanks;
-    this->exchange = exchange;
+    this->transport = transport;
     this->context = context;
     partitionPlanes = planes;
 }
@@ -547,29 +547,32 @@ void Particles::exchangeParticles(){
             exit(1);
         }
     }
-    std::vector<int> neighbours = exchange->neighbours(rank);
-    exchange->startReads(rank, neighbours);     //every partition has sorted and counted its leavers
-    Particles* below = rank > 0 ? &exchange->partition(rank - 1) : nullptr;
-    Particles* above = rank < numRanks - 1 ? &exchange->partition(rank + 1) : nullptr;
-    uint fromBelow = distributed && below != nullptr ? below->particlesAbove : 0;
-    uint fromAbove = distributed && above != nullptr ? above->particlesBelow : 0;
+    uint leaving[2] = {distributed ? particlesBelow : 0u, distributed ? particlesAbove : 0u};  //the first time, nobody sends: each keeps its own
+    std::vector<uint> allLeaving(2*numRanks);
+    transport->allGatherHost(leaving, allLeaving.data(), sizeof(leaving));
+    uint fromBelow = rank > 0 ? allLeaving[2*(rank - 1) + 1] : 0;
+    uint fromAbove = rank < numRanks - 1 ? allLeaving[2*(rank + 1)] : 0;
     uint kept = size - particlesBelow - particlesAbove;
     uint newSize = fromBelow + kept + fromAbove;
-    auto rebuild = [&](auto member){    //a per-particle array's new contents: from below, kept, from above
+    std::vector<TransportSend> sends;
+    std::vector<TransportReceive> receives;
+    auto rebuild = [&](auto member){    //a per-particle array's new contents: from below, kept, from above. The same order of arrays on every partition
         auto& mine = this->*member;
         using T = std::remove_reference_t<decltype(*mine.devPtr())>;
         T* fresh = nullptr;
         if(newSize > 0){
             gpuErrchk(cudaMallocAsync((void**)&fresh, sizeof(T)*newSize, stream));
         }
-        if(fromBelow > 0){
-            exchange->copyFrom(rank, fresh, rank - 1, (below->*member).devPtr() + below->size - fromBelow, sizeof(T)*fromBelow);
-        }
         if(kept > 0){
             cudaMemcpyAsync(fresh + fromBelow, mine.devPtr() + particlesBelow, sizeof(T)*kept, cudaMemcpyDeviceToDevice, stream);
         }
-        if(fromAbove > 0){
-            exchange->copyFrom(rank, fresh + fromBelow + kept, rank + 1, (above->*member).devPtr(), sizeof(T)*fromAbove);
+        if(rank > 0){
+            sends.push_back({rank - 1, mine.devPtr(), sizeof(T)*leaving[0]});
+            receives.push_back({rank - 1, fresh, sizeof(T)*fromBelow});
+        }
+        if(rank < numRanks - 1){
+            sends.push_back({rank + 1, mine.devPtr() + size - leaving[1], sizeof(T)*leaving[1]});
+            receives.push_back({rank + 1, fresh + fromBelow + kept, sizeof(T)*fromAbove});
         }
         return fresh;
     };
@@ -581,7 +584,7 @@ void Particles::exchangeParticles(){
     float* newVz = rebuild(&Particles::vz);
     uint* newCells = rebuild(&Particles::gridCell);
     gpuErrchk(cudaPeekAtLastError());
-    exchange->finishReads(rank, neighbours);    //the neighbours' copies from this partition are done before it frees what they copied
+    transport->exchange(sends, receives, stream);   //the old arrays are freed after it, in stream order
     px.adoptAsync(newPx, newSize, stream);
     py.adoptAsync(newPy, newSize, stream);
     pz.adoptAsync(newPz, newSize, stream);
@@ -620,25 +623,29 @@ void Particles::receiveParticleNodes(uint maskWords){
     }
     lowerBoundaryParticleNodes = ends[0];
     upperBoundaryParticleNodes = numParticleNodes - ends[1];
-    std::vector<int> neighbours = exchange->neighbours(rank);
-    exchange->startReads(rank, neighbours);     //every partition has its particle nodes, their masks and these counts
-    Particles* below = rank > 0 ? &exchange->partition(rank - 1) : nullptr;
-    Particles* above = rank < numRanks - 1 ? &exchange->partition(rank + 1) : nullptr;
-    uint fromBelow = below != nullptr ? below->upperBoundaryParticleNodes : 0;
-    uint fromAbove = above != nullptr ? above->lowerBoundaryParticleNodes : 0;
+    uint boundary[2] = {lowerBoundaryParticleNodes, upperBoundaryParticleNodes};
+    std::vector<uint> allBoundaries(2*numRanks);
+    transport->allGatherHost(boundary, allBoundaries.data(), sizeof(boundary));
+    uint fromBelow = rank > 0 ? allBoundaries[2*(rank - 1) + 1] : 0;
+    uint fromAbove = rank < numRanks - 1 ? allBoundaries[2*(rank + 1)] : 0;
     numForeignParticleNodes = fromBelow + fromAbove;
     foreignParticleNodeMasks.resizeAsync(numForeignParticleNodes*maskWords, stream);
-    if(fromBelow > 0){
-        uint first = below->numParticleNodes - fromBelow;
-        exchange->copyFrom(rank, nodeCells.devPtr() + numParticleNodes, rank - 1, below->nodeCells.devPtr() + first, sizeof(uint)*fromBelow);
-        exchange->copyFrom(rank, foreignParticleNodeMasks.devPtr(), rank - 1, below->particleNodeMasks.devPtr() + first*maskWords, sizeof(uint)*fromBelow*maskWords);
+    std::vector<TransportSend> sends;
+    std::vector<TransportReceive> receives;
+    if(rank > 0){   //cells, then masks, each way
+        sends.push_back({rank - 1, nodeCells.devPtr(), sizeof(uint)*lowerBoundaryParticleNodes});
+        sends.push_back({rank - 1, particleNodeMasks.devPtr(), sizeof(uint)*lowerBoundaryParticleNodes*maskWords});
+        receives.push_back({rank - 1, nodeCells.devPtr() + numParticleNodes, sizeof(uint)*fromBelow});
+        receives.push_back({rank - 1, foreignParticleNodeMasks.devPtr(), sizeof(uint)*fromBelow*maskWords});
     }
-    if(fromAbove > 0){
-        exchange->copyFrom(rank, nodeCells.devPtr() + numParticleNodes + fromBelow, rank + 1, above->nodeCells.devPtr(), sizeof(uint)*fromAbove);
-        exchange->copyFrom(rank, foreignParticleNodeMasks.devPtr() + fromBelow*maskWords, rank + 1, above->particleNodeMasks.devPtr(), sizeof(uint)*fromAbove*maskWords);
+    if(rank < numRanks - 1){
+        uint first = numParticleNodes - upperBoundaryParticleNodes;
+        sends.push_back({rank + 1, nodeCells.devPtr() + first, sizeof(uint)*upperBoundaryParticleNodes});
+        sends.push_back({rank + 1, particleNodeMasks.devPtr() + first*maskWords, sizeof(uint)*upperBoundaryParticleNodes*maskWords});
+        receives.push_back({rank + 1, nodeCells.devPtr() + numParticleNodes + fromBelow, sizeof(uint)*fromAbove});
+        receives.push_back({rank + 1, foreignParticleNodeMasks.devPtr() + fromBelow*maskWords, sizeof(uint)*fromAbove*maskWords});
     }
-    gpuErrchk(cudaPeekAtLastError());
-    exchange->finishReads(rank, neighbours);    //the neighbours' copies are done before anyone changes what they copied
+    transport->exchange(sends, receives, stream);
     if(numForeignParticleNodes > 0){    //registered in cellToNode, cells already known, and no particles here
         mapCellsToNodes<<<numForeignParticleNodes / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numParticleNodes, numParticleNodes + numForeignParticleNodes, numParticleNodes, size, gridCell.devPtr(),
             gridNodeIndicesToFirstParticleIndex.devPtr(), nodeCells.devPtr(), cellToNode.devPtr());
@@ -733,19 +740,20 @@ void Particles::checkGhostRuns(){
     if(numRanks == 1){
         return;
     }
-    exchange->barrier();    //every partition's runs are known, and stay put until after the next substep's exchangeParticles
+    uint edges[8] = {edgeParticles[0].nodes, edgeParticles[0].count, edgeEmpty[0].nodes, edgeEmpty[0].count, edgeParticles[1].nodes, edgeParticles[1].count, edgeEmpty[1].nodes, edgeEmpty[1].count};
+    std::vector<uint> allEdges(8*numRanks);
+    transport->allGatherHost(edges, allEdges.data(), sizeof(edges));
     for(int side = 0; side < 2; ++side){
         int neighbour = side == 0 ? rank - 1 : rank + 1;
         if(neighbour < 0 || neighbour >= numRanks){
             continue;
         }
-        Particles& other = exchange->partition(neighbour);
+        const uint* theirs = allEdges.data() + 8*neighbour + 4*(1 - side);  //its plane facing this partition: nodes and voxels holding particles, then empty
         const VoxelRun* mine[2] = {&ghostParticles[side], &ghostEmpty[side]};
-        const VoxelRun* theirs[2] = {&other.edgeParticles[1 - side], &other.edgeEmpty[1 - side]};
         for(int run = 0; run < 2; ++run){
-            if(mine[run]->nodes != theirs[run]->nodes || mine[run]->count != theirs[run]->count){
+            if(mine[run]->nodes != theirs[2*run] || mine[run]->count != theirs[2*run + 1]){
                 std::cerr<<"partition "<<rank<<": its ghost copies of partition "<<neighbour<<"'s "<<(run == 0 ? "nodes holding particles" : "empty nodes")<<" are "
-                         <<mine[run]->nodes<<" nodes with "<<mine[run]->count<<" voxels, but the owner has "<<theirs[run]->nodes<<" with "<<theirs[run]->count<<"\n";
+                         <<mine[run]->nodes<<" nodes with "<<mine[run]->count<<" voxels, but the owner has "<<theirs[2*run]<<" with "<<theirs[2*run + 1]<<"\n";
                 exit(1);
             }
         }
@@ -1317,10 +1325,8 @@ __global__ void packPositionsToFloats(uint numParticles, const double* px, const
     }
 }
 
-//a frame's float32 x, y, z per particle, this partition's run of it, into pinned host memory at xyz. Packed on this partition's stream, then copied out on
-//frameStream, so the simulation's next kernels run alongside the copy; copied is recorded once it's in. The next frame's pack waits for the copy to finish
-//reading framePositions
-void Particles::copyPositionsToHost(float* xyz, cudaEvent_t copied){
+//A frame's float32 x, y, z per particle, packed into framePositions on this partition's stream once the last frame's copy out of it is done
+const float* Particles::packPositions(){
     if(frameStream == nullptr){     //on this partition's GPU, which the caller has made current
         gpuErrchk(cudaStreamCreateWithFlags(&frameStream, cudaStreamNonBlocking));
         gpuErrchk(cudaEventCreateWithFlags(&framePacked, cudaEventDisableTiming));
@@ -1332,6 +1338,13 @@ void Particles::copyPositionsToHost(float* xyz, cudaEvent_t copied){
         packPositionsToFloats<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, px.devPtr(), py.devPtr(), pz.devPtr(), framePositions.devPtr());
         gpuErrchk(cudaPeekAtLastError());
     }
+    return framePositions.devPtr();
+}
+
+//this partition's run of a frame, into pinned host memory at xyz: packed on its stream, then copied out on frameStream, so the simulation's next kernels
+//run alongside the copy; copied is recorded once it's in
+void Particles::copyPositionsToHost(float* xyz, cudaEvent_t copied){
+    packPositions();
     gpuErrchk(cudaEventRecord(framePacked, stream));
     gpuErrchk(cudaStreamWaitEvent(frameStream, framePacked, 0));
     if(size > 0){

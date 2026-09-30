@@ -1,0 +1,46 @@
+//Copyright 2023 Aberrant Behavior LLC
+
+#ifndef NCCLTRANSPORT_HU
+#define NCCLTRANSPORT_HU
+
+#include "transport.hu"
+#include "tcpTransport.hu"
+#include <nccl.h>
+#include <memory>
+#include <string>
+
+//Ranks in separate processes, one GPU each, on one host or many, joined by NCCL, which picks NVLink, PCIe peer copies, shared memory, InfiniBand or TCP by
+//itself. Exchanges are grouped ncclSend/ncclRecv, which pair up in order between two ranks as a Transport's must, and everything runs in stream order on the
+//GPU: only the host-value gathers wait for it. The constructor meets the other ranks at the rendezvous over TCP, where rank 0 hands out NCCL's unique id;
+//attach makes the communicator on the rank's GPU, and every NCCL call on it goes on the stream it's given there, so the ranks all issue them in the same
+//order. NCCL won't put two ranks on one GPU
+class NcclTransport : public Transport{
+public:
+    NcclTransport(int rank, int size, const std::string& rendezvous, double timeoutSeconds = 300);
+    ~NcclTransport();
+
+    int rank() const override{
+        return me;
+    }
+    int size() const override{
+        return ranks;
+    }
+    void attach(cudaStream_t stream) override;
+    void exchange(const std::vector<TransportSend>& sends, const std::vector<TransportReceive>& receives, cudaStream_t stream) override;
+    void allGather(const void* mine, void* all, size_t bytes, cudaStream_t stream) override;
+    void allGatherHost(const void* mine, void* all, size_t bytes) override;
+
+private:
+    void check(ncclResult_t result, const char* doing);
+
+    int me;
+    int ranks;
+    ncclUniqueId id;
+    std::unique_ptr<TcpTransport> bootstrap;    //until the communicator is up
+    ncclComm_t communicator = nullptr;
+    cudaStream_t stream = nullptr;
+    char* staging = nullptr;    //on the GPU, for the host-value gathers
+    size_t stagingBytes = 0;
+};
+
+#endif

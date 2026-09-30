@@ -21,6 +21,11 @@ public:
     , particles(simulation.partition(0))
     {}
 
+    ParticleSystemTester(uint size, std::unique_ptr<Transport> transport, int device)     //this process is transport's rank, on GPU device
+    : simulation(size, std::move(transport), device)
+    , particles(simulation.partition(0))
+    {}
+
     void setDomain(double nx, double ny, double nz, uint x, uint y, uint z, double cellSize){
         simulation.setDomain(nx, ny, nz, x, y, z, cellSize);
     }
