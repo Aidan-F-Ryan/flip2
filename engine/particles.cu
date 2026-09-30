@@ -21,6 +21,7 @@ Particles::Particles(uint size)
 , radius(2)
 , refinementLevel(1)
 {
+    gpuErrchk(cudaGetDevice(&cudaDevice));     //everything this partition makes lives on the GPU that's current now
     setupCudaDevices();
 
     cudaStreamCreate(&stream);
@@ -46,18 +47,12 @@ Particles::Particles(uint size)
     prevDt = 0.0;
 }
 
-void Particles::setPartition(int rank, int numRanks, LocalExchange* exchange, PartitionContext* context, const std::vector<uint>& planes, cudaStream_t sharedStream){
+void Particles::setPartition(int rank, int numRanks, LocalExchange* exchange, PartitionContext* context, const std::vector<uint>& planes){
     this->rank = rank;
     this->numRanks = numRanks;
     this->exchange = exchange;
     this->context = context;
     partitionPlanes = planes;
-    if(ownsStream){
-        cudaStreamSynchronize(stream);
-        cudaStreamDestroy(stream);
-    }
-    stream = sharedStream;
-    ownsStream = false;
 }
 
 void Particles::setDomain(double nx, double ny, double nz, uint x, uint y, uint z, double cellSize){
@@ -68,8 +63,8 @@ void Particles::setDomain(double nx, double ny, double nz, uint x, uint y, uint 
     }
     boxLo = partitionPlanes[rank];
     boxHi = partitionPlanes[rank + 1];
-    if(numRanks > 1 && (unsigned long long)x*y*z > 1ull << 30){   //orderNodes keys each node by its group, in 2 bits above its cell
-        std::cerr<<"setDomain: "<<x<<"x"<<y<<"x"<<z<<" nodes is too many to split; up to 2^30 can be\n";
+    if(numRanks > 1 && (unsigned long long)x*y*z > 1ull << 29){   //orderNodes keys each node by its group, in 3 bits above its cell
+        std::cerr<<"setDomain: "<<x<<"x"<<y<<"x"<<z<<" nodes is too many to split; up to 2^29 can be\n";
         exit(1);
     }
     cellToNode.resizeAsync(x*y*z, stream);
@@ -467,15 +462,20 @@ __global__ void markParticleNodes(uint numParticleNodes, uint numNodes, uint* no
     }
 }
 
-//orderNodes' sort key for each node after this partition's particle nodes: its group, above the cellBits bits of its cell, then its cell. Group 0 is this
-//partition's empty nodes (the only nodes in its own planes besides its particle nodes), 1 its ghost nodes, in the planes next to its own, and 2 the
-//neighbours' particle nodes 2 planes out
-__global__ void nodeOrderKeys(uint firstNode, uint numNodes, const uint* nodeCells, uint firstOwnCell, uint endOwnCell, uint firstGhostCell, uint endGhostCell,
+//orderNodes' sort key for each node after this partition's particle nodes: its group, in the 3 bits above the cellBits of its cell, then its cell. The
+//groups: 0 this partition's empty nodes (the only nodes in its own planes besides its particle nodes); then its ghost nodes, in the planes next to its
+//own: 1 below holding particles, 2 below empty, 3 above holding particles, 4 above empty, the way their owners keep them; 5 the neighbours' particle
+//nodes 2 planes out. Nodes before particleNodes hold particles
+__global__ void nodeOrderKeys(uint firstNode, uint numNodes, uint particleNodes, const uint* nodeCells, uint firstOwnCell, uint endOwnCell, uint cellsPerPlane,
                               uint cellBits, uint* keys, uint* origins){
     uint node = firstNode + threadIdx.x + blockIdx.x*blockDim.x;
     if(node < numNodes){
         uint cell = nodeCells[node];
-        uint group = cell >= firstOwnCell && cell < endOwnCell ? 0 : cell >= firstGhostCell && cell < endGhostCell ? 1 : 2;
+        uint empty = node < particleNodes ? 0 : 1;
+        uint group = cell >= firstOwnCell && cell < endOwnCell ? 0
+                   : cell + cellsPerPlane >= firstOwnCell && cell < firstOwnCell ? 1 + empty
+                   : cell >= endOwnCell && cell < endOwnCell + cellsPerPlane ? 3 + empty
+                   : 5;
         keys[node - firstNode] = group << cellBits | cell;
         origins[node - firstNode] = node;
     }
@@ -503,47 +503,16 @@ __global__ void placeReachedMasks(uint maskWords, uint numOwnParticleNodes, cons
     }
 }
 
-//where a ghost node's owner keeps it
-struct NodesOfPartition{
-    const uint* nodeCells;
-    const uint* cellToNode;
-    const uint* voxelEnds;  //the prefix sums of its nodes' voxel counts
-    uint numOwnNodes;
+//the first voxel of each listed node: the prefix sums of the nodes' voxel counts end each node, so node numNodes's is the voxel count
+struct NodeIndices{
+    uint index[18];
+    uint count;
 };
 
-struct GhostOwners{
-    NodesOfPartition partition[MAX_PARTITIONS];
-    uint planes[MAX_PARTITIONS + 1];
-    int numPartitions;
-};
-
-//per ghost node: its first voxel here, the owning partition's first voxel of the same node, how many, and the owner. Its owner stores the same voxels in
-//the same order, so filling a ghost is copying a run. Counts that disagree mean the two built the node differently: counted, and the run stops
-__global__ void findGhostRangesKernel(uint firstGhost, uint numGhosts, const uint* nodeCells, const uint* voxelEnds, GhostOwners owners, uint cellsPerPlane, uint* ranges, uint* mismatches){
-    uint i = threadIdx.x + blockIdx.x*blockDim.x;
-    if(i < numGhosts){
-        uint node = firstGhost + i;
-        uint cell = nodeCells[node];
-        uint plane = cell / cellsPerPlane;
-        int owner = 0;
-        while(owner + 1 < owners.numPartitions && plane >= owners.planes[owner + 1]){
-            ++owner;
-        }
-        const NodesOfPartition& partition = owners.partition[owner];
-        uint ownerNode = partition.cellToNode[cell];
-        bool found = ownerNode < partition.numOwnNodes && partition.nodeCells[ownerNode] == cell;
-        uint start = node == 0 ? 0 : voxelEnds[node - 1];
-        uint count = voxelEnds[node] - start;
-        uint ownerStart = found ? (ownerNode == 0 ? 0 : partition.voxelEnds[ownerNode - 1]) : 0;
-        uint ownerCount = found ? partition.voxelEnds[ownerNode] - ownerStart : 0;
-        bool same = found && ownerCount == count;
-        if(!same){
-            atomicAdd(mismatches, 1u);
-        }
-        ranges[4*i] = start;
-        ranges[4*i + 1] = ownerStart;
-        ranges[4*i + 2] = same ? count : 0;
-        ranges[4*i + 3] = owner;
+__global__ void voxelStartsOf(NodeIndices nodes, const uint* voxelEnds, uint* starts){
+    uint i = threadIdx.x;
+    if(i < nodes.count){
+        starts[i] = nodes.index[i] == 0 ? 0 : voxelEnds[nodes.index[i] - 1];
     }
 }
 
@@ -578,7 +547,8 @@ void Particles::exchangeParticles(){
             exit(1);
         }
     }
-    exchange->barrier();    //every partition has sorted and counted its leavers
+    std::vector<int> neighbours = exchange->neighbours(rank);
+    exchange->startReads(rank, neighbours);     //every partition has sorted and counted its leavers
     Particles* below = rank > 0 ? &exchange->partition(rank - 1) : nullptr;
     Particles* above = rank < numRanks - 1 ? &exchange->partition(rank + 1) : nullptr;
     uint fromBelow = distributed && below != nullptr ? below->particlesAbove : 0;
@@ -593,13 +563,13 @@ void Particles::exchangeParticles(){
             gpuErrchk(cudaMallocAsync((void**)&fresh, sizeof(T)*newSize, stream));
         }
         if(fromBelow > 0){
-            cudaMemcpyAsync(fresh, (below->*member).devPtr() + below->size - fromBelow, sizeof(T)*fromBelow, cudaMemcpyDeviceToDevice, stream);
+            exchange->copyFrom(rank, fresh, rank - 1, (below->*member).devPtr() + below->size - fromBelow, sizeof(T)*fromBelow);
         }
         if(kept > 0){
             cudaMemcpyAsync(fresh + fromBelow, mine.devPtr() + particlesBelow, sizeof(T)*kept, cudaMemcpyDeviceToDevice, stream);
         }
         if(fromAbove > 0){
-            cudaMemcpyAsync(fresh + fromBelow + kept, (above->*member).devPtr(), sizeof(T)*fromAbove, cudaMemcpyDeviceToDevice, stream);
+            exchange->copyFrom(rank, fresh + fromBelow + kept, rank + 1, (above->*member).devPtr(), sizeof(T)*fromAbove);
         }
         return fresh;
     };
@@ -611,7 +581,7 @@ void Particles::exchangeParticles(){
     float* newVz = rebuild(&Particles::vz);
     uint* newCells = rebuild(&Particles::gridCell);
     gpuErrchk(cudaPeekAtLastError());
-    exchange->barrier();    //every partition's copies from its neighbours are queued before any frees what they copy
+    exchange->finishReads(rank, neighbours);    //the neighbours' copies from this partition are done before it frees what they copied
     px.adoptAsync(newPx, newSize, stream);
     py.adoptAsync(newPy, newSize, stream);
     pz.adoptAsync(newPz, newSize, stream);
@@ -650,7 +620,8 @@ void Particles::receiveParticleNodes(uint maskWords){
     }
     lowerBoundaryParticleNodes = ends[0];
     upperBoundaryParticleNodes = numParticleNodes - ends[1];
-    exchange->barrier();    //every partition has its particle nodes, their masks and these counts
+    std::vector<int> neighbours = exchange->neighbours(rank);
+    exchange->startReads(rank, neighbours);     //every partition has its particle nodes, their masks and these counts
     Particles* below = rank > 0 ? &exchange->partition(rank - 1) : nullptr;
     Particles* above = rank < numRanks - 1 ? &exchange->partition(rank + 1) : nullptr;
     uint fromBelow = below != nullptr ? below->upperBoundaryParticleNodes : 0;
@@ -659,23 +630,24 @@ void Particles::receiveParticleNodes(uint maskWords){
     foreignParticleNodeMasks.resizeAsync(numForeignParticleNodes*maskWords, stream);
     if(fromBelow > 0){
         uint first = below->numParticleNodes - fromBelow;
-        cudaMemcpyAsync(nodeCells.devPtr() + numParticleNodes, below->nodeCells.devPtr() + first, sizeof(uint)*fromBelow, cudaMemcpyDeviceToDevice, stream);
-        cudaMemcpyAsync(foreignParticleNodeMasks.devPtr(), below->particleNodeMasks.devPtr() + first*maskWords, sizeof(uint)*fromBelow*maskWords, cudaMemcpyDeviceToDevice, stream);
+        exchange->copyFrom(rank, nodeCells.devPtr() + numParticleNodes, rank - 1, below->nodeCells.devPtr() + first, sizeof(uint)*fromBelow);
+        exchange->copyFrom(rank, foreignParticleNodeMasks.devPtr(), rank - 1, below->particleNodeMasks.devPtr() + first*maskWords, sizeof(uint)*fromBelow*maskWords);
     }
     if(fromAbove > 0){
-        cudaMemcpyAsync(nodeCells.devPtr() + numParticleNodes + fromBelow, above->nodeCells.devPtr(), sizeof(uint)*fromAbove, cudaMemcpyDeviceToDevice, stream);
-        cudaMemcpyAsync(foreignParticleNodeMasks.devPtr() + fromBelow*maskWords, above->particleNodeMasks.devPtr(), sizeof(uint)*fromAbove*maskWords, cudaMemcpyDeviceToDevice, stream);
+        exchange->copyFrom(rank, nodeCells.devPtr() + numParticleNodes + fromBelow, rank + 1, above->nodeCells.devPtr(), sizeof(uint)*fromAbove);
+        exchange->copyFrom(rank, foreignParticleNodeMasks.devPtr() + fromBelow*maskWords, rank + 1, above->particleNodeMasks.devPtr(), sizeof(uint)*fromAbove*maskWords);
     }
     gpuErrchk(cudaPeekAtLastError());
-    exchange->barrier();    //every partition's copies are queued before any changes what they copied
+    exchange->finishReads(rank, neighbours);    //the neighbours' copies are done before anyone changes what they copied
     if(numForeignParticleNodes > 0){    //registered in cellToNode, cells already known, and no particles here
         mapCellsToNodes<<<numForeignParticleNodes / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numParticleNodes, numParticleNodes + numForeignParticleNodes, numParticleNodes, size, gridCell.devPtr(),
             gridNodeIndicesToFirstParticleIndex.devPtr(), nodeCells.devPtr(), cellToNode.devPtr());
     }
 }
 
-//Puts the nodes after this partition's particle nodes in their order, each group by cell: its own empty nodes, its ghost nodes, the neighbours' particle
-//nodes 2 planes out. Registers them in cellToNode, notes which hold particles and, split, puts each particle node's reached mask in its slot of usedVoxelMasks
+//Puts the nodes after this partition's particle nodes in their order: its own empty nodes; its ghost nodes below, holding particles first, then above,
+//the same way (as their owners keep them); the neighbours' particle nodes 2 planes out; each group by cell. Registers them in cellToNode, notes which hold
+//particles and, split, puts each particle node's reached mask in its slot of usedVoxelMasks and finds the runs of nodes neighbours exchange
 void Particles::orderNodes(uint maskWords){
     uint cellsPerPlane = grid.sizeX*grid.sizeY;
     uint numCells = cellsPerPlane*grid.sizeZ;
@@ -696,43 +668,57 @@ void Particles::orderNodes(uint maskWords){
         gpuErrchk(cudaPeekAtLastError());
         return;
     }
-    uint cellBits = keyBits(numCells - 1);      //setDomain made sure the group's 2 bits fit above them
+    uint cellBits = keyBits(numCells - 1);      //setDomain made sure the group's 3 bits fit above them
     uint particleNodes = numParticleNodes + numForeignParticleNodes;
-    uint numOwnEmpty = numOthers;
-    uint numGhosts = 0;
     nodeOrigins.resizeAsync(numUsedGridNodes, stream);
+    //where the runs start, found on the GPU and read back together: in the sorted keys, the starts of groups 1 to 5, and where this partition's empty
+    //nodes leave its first plane and reach its last (group 0's keys are just cells); then the same among its particle nodes
+    uint* found;
+    gpuErrchk(cudaMallocAsync((void**)&found, 9*sizeof(uint), stream));
+    gpuErrchk(cudaMemsetAsync(found, 0, 9*sizeof(uint), stream));
     if(numParticleNodes > 0){
         markParticleNodes<<<numParticleNodes / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numParticleNodes, numParticleNodes, nodeOrigins.devPtr(), nodeHasParticles.devPtr());
+        countCellsBefore<<<1, 1, 0, stream>>>(nodeCells.devPtr(), numParticleNodes, (boxLo + 1)*cellsPerPlane, found + 7);
+        countCellsBefore<<<1, 1, 0, stream>>>(nodeCells.devPtr(), numParticleNodes, (boxHi - 1)*cellsPerPlane, found + 8);
     }
+    uint* keys = nullptr;
+    uint* origins = nullptr;
     if(numOthers > 0){
-        uint* keys;
-        uint* origins;
-        uint* groupStarts;
         gpuErrchk(cudaMallocAsync((void**)&keys, sizeof(uint)*numOthers, stream));
         gpuErrchk(cudaMallocAsync((void**)&origins, sizeof(uint)*numOthers, stream));
-        gpuErrchk(cudaMallocAsync((void**)&groupStarts, 2*sizeof(uint), stream));
-        uint firstGhostCell = (boxLo > 0 ? boxLo - 1 : 0)*cellsPerPlane;
-        uint endGhostCell = (boxHi < grid.sizeZ ? boxHi + 1 : grid.sizeZ)*cellsPerPlane;
-        nodeOrderKeys<<<numOthers / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numParticleNodes, numUsedGridNodes, nodeCells.devPtr(), boxLo*cellsPerPlane, boxHi*cellsPerPlane, firstGhostCell, endGhostCell,
+        nodeOrderKeys<<<numOthers / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numParticleNodes, numUsedGridNodes, particleNodes, nodeCells.devPtr(), boxLo*cellsPerPlane, boxHi*cellsPerPlane, cellsPerPlane,
             cellBits, keys, origins);
-        cudaSortNodeOrder(numOthers, keys, origins, cellBits + 2, stream);
+        cudaSortNodeOrder(numOthers, keys, origins, cellBits + 3, stream);
         placeOrderedNodes<<<numOthers / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numParticleNodes, numOthers, keys, origins, particleNodes, (1u << cellBits) - 1, nodeCells.devPtr(), nodeOrigins.devPtr(),
             nodeHasParticles.devPtr());
-        countCellsBefore<<<1, 1, 0, stream>>>(keys, numOthers, 1u << cellBits, groupStarts);   //the keys are sorted, so each group is a run
-        countCellsBefore<<<1, 1, 0, stream>>>(keys, numOthers, 2u << cellBits, groupStarts + 1);
-        uint starts[2];
-        cudaMemcpyAsync(starts, groupStarts, 2*sizeof(uint), cudaMemcpyDeviceToHost, stream);
-        cudaFreeAsync(keys, stream);
-        cudaFreeAsync(origins, stream);
-        cudaFreeAsync(groupStarts, stream);
-        gpuErrchk(cudaStreamSynchronize(stream));
-        numOwnEmpty = starts[0];
-        numGhosts = starts[1] - starts[0];
+        for(uint group = 1; group <= 5; ++group){   //the keys are sorted, so each group is a run
+            countCellsBefore<<<1, 1, 0, stream>>>(keys, numOthers, group << cellBits, found + group - 1);
+        }
+        countCellsBefore<<<1, 1, 0, stream>>>(keys, numOthers, (boxLo + 1)*cellsPerPlane, found + 5);
+        countCellsBefore<<<1, 1, 0, stream>>>(keys, numOthers, (boxHi - 1)*cellsPerPlane, found + 6);
         mapCellsToNodes<<<numOthers / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numParticleNodes, numUsedGridNodes, numParticleNodes, size, gridCell.devPtr(), gridNodeIndicesToFirstParticleIndex.devPtr(),
             nodeCells.devPtr(), cellToNode.devPtr());
     }
+    uint counts[9];
+    cudaMemcpyAsync(counts, found, 9*sizeof(uint), cudaMemcpyDeviceToHost, stream);
+    cudaFreeAsync(found, stream);
+    if(numOthers > 0){
+        cudaFreeAsync(keys, stream);
+        cudaFreeAsync(origins, stream);
+    }
+    gpuErrchk(cudaStreamSynchronize(stream));
+    uint numOwnEmpty = counts[0];
     numOwnNodes = numParticleNodes + numOwnEmpty;
-    numStoredNodes = numOwnNodes + numGhosts;
+    numStoredNodes = numParticleNodes + counts[4];     //all but the neighbours' particle nodes 2 planes out
+    //the node runs at its edges and its ghosts either side, whose voxels generateVoxels finds
+    edgeParticles[0] = {0, counts[7]};
+    edgeParticles[1] = {counts[8], numParticleNodes - counts[8]};
+    edgeEmpty[0] = {numParticleNodes, counts[5]};
+    edgeEmpty[1] = {numParticleNodes + counts[6], numOwnEmpty - counts[6]};
+    ghostParticles[0] = {numParticleNodes + counts[0], counts[1] - counts[0]};
+    ghostEmpty[0] = {numParticleNodes + counts[1], counts[2] - counts[1]};
+    ghostParticles[1] = {numParticleNodes + counts[2], counts[3] - counts[2]};
+    ghostEmpty[1] = {numParticleNodes + counts[3], counts[4] - counts[3]};
     if(numUsedGridNodes > 0){
         placeReachedMasks<<<numUsedGridNodes, 32, 0, stream>>>(maskWords, numParticleNodes, nodeOrigins.devPtr(), nodeHasParticles.devPtr(), particleNodeMasks.devPtr(), foreignParticleNodeMasks.devPtr(),
             usedVoxelMasks.devPtr());
@@ -741,36 +727,29 @@ void Particles::orderNodes(uint maskWords){
 }
 
 //each ghost node's voxels here and in its owner, for filling and reducing; and the check that both partitions built it alike
-void Particles::findGhostRanges(){
-    uint numGhosts = numStoredNodes - numOwnNodes;
-    ghostRanges.resizeAsync(4*numGhosts, stream);
+//A partition's ghost runs have to be its neighbours' edge runs, node for node and voxel for voxel. Both sides build them from the same particles, so they
+//always should be; if they ever differ, filling ghosts would mix up voxels, so stop
+void Particles::checkGhostRuns(){
     if(numRanks == 1){
         return;
     }
-    exchange->barrier();    //every partition's nodes and voxels are in place
-    GhostOwners owners;
-    for(int partition = 0; partition < numRanks; ++partition){
-        Particles& other = exchange->partition(partition);
-        owners.partition[partition] = {other.nodeCells.devPtr(), other.cellToNode.devPtr(), other.nodeIndexUsedVoxels.devPtr(), other.numOwnNodes};
-        owners.planes[partition] = partitionPlanes[partition];
-    }
-    owners.planes[numRanks] = partitionPlanes[numRanks];
-    owners.numPartitions = numRanks;
-    if(numGhosts > 0){
-        uint* mismatches;
-        uint mismatched = 0;
-        gpuErrchk(cudaMallocAsync((void**)&mismatches, sizeof(uint), stream));
-        cudaMemsetAsync(mismatches, 0, sizeof(uint), stream);
-        findGhostRangesKernel<<<numGhosts / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numOwnNodes, numGhosts, nodeCells.devPtr(), nodeIndexUsedVoxels.devPtr(), owners, grid.sizeX*grid.sizeY, ghostRanges.devPtr(), mismatches);
-        cudaMemcpyAsync(&mismatched, mismatches, sizeof(uint), cudaMemcpyDeviceToHost, stream);
-        cudaFreeAsync(mismatches, stream);
-        gpuErrchk(cudaStreamSynchronize(stream));
-        if(mismatched > 0){
-            std::cerr<<"partition "<<rank<<": "<<mismatched<<" of its "<<numGhosts<<" ghost nodes don't match their owners' nodes\n";
-            exit(1);
+    exchange->barrier();    //every partition's runs are known, and stay put until after the next substep's exchangeParticles
+    for(int side = 0; side < 2; ++side){
+        int neighbour = side == 0 ? rank - 1 : rank + 1;
+        if(neighbour < 0 || neighbour >= numRanks){
+            continue;
+        }
+        Particles& other = exchange->partition(neighbour);
+        const VoxelRun* mine[2] = {&ghostParticles[side], &ghostEmpty[side]};
+        const VoxelRun* theirs[2] = {&other.edgeParticles[1 - side], &other.edgeEmpty[1 - side]};
+        for(int run = 0; run < 2; ++run){
+            if(mine[run]->nodes != theirs[run]->nodes || mine[run]->count != theirs[run]->count){
+                std::cerr<<"partition "<<rank<<": its ghost copies of partition "<<neighbour<<"'s "<<(run == 0 ? "nodes holding particles" : "empty nodes")<<" are "
+                         <<mine[run]->nodes<<" nodes with "<<mine[run]->count<<" voxels, but the owner has "<<theirs[run]->nodes<<" with "<<theirs[run]->count<<"\n";
+                exit(1);
+            }
         }
     }
-    exchange->barrier();    //every partition has read the others' nodes
 }
 
 void Particles::generateVoxels(){
@@ -823,13 +802,37 @@ void Particles::generateVoxels(){
 
     uint numUsedVoxels = 0;
     numOwnVoxels = 0;
-    if(numUsedGridNodes > 0){
-        cudaMemcpyAsync(&numUsedVoxels, nodeIndexUsedVoxels.devPtr() + numUsedGridNodes - 1, sizeof(uint), cudaMemcpyDeviceToHost, stream);
+    if(numRanks == 1){
+        if(numUsedGridNodes > 0){
+            cudaMemcpyAsync(&numUsedVoxels, nodeIndexUsedVoxels.devPtr() + numUsedGridNodes - 1, sizeof(uint), cudaMemcpyDeviceToHost, stream);
+        }
+        cudaStreamSynchronize(stream);
+        numOwnVoxels = numUsedVoxels;
     }
-    if(numOwnNodes > 0){
-        cudaMemcpyAsync(&numOwnVoxels, nodeIndexUsedVoxels.devPtr() + numOwnNodes - 1, sizeof(uint), cudaMemcpyDeviceToHost, stream);
+    else{   //the edge and ghost runs' voxels too, read back with the counts
+        VoxelRun* runs[8] = {&edgeParticles[0], &edgeParticles[1], &edgeEmpty[0], &edgeEmpty[1], &ghostParticles[0], &ghostParticles[1], &ghostEmpty[0], &ghostEmpty[1]};
+        NodeIndices nodes;
+        nodes.count = 18;
+        for(int run = 0; run < 8; ++run){
+            nodes.index[2*run] = runs[run]->firstNode;
+            nodes.index[2*run + 1] = runs[run]->firstNode + runs[run]->nodes;
+        }
+        nodes.index[16] = numOwnNodes;
+        nodes.index[17] = numUsedGridNodes;
+        uint* starts;
+        uint found[18];
+        gpuErrchk(cudaMallocAsync((void**)&starts, sizeof(found), stream));
+        voxelStartsOf<<<1, 32, 0, stream>>>(nodes, nodeIndexUsedVoxels.devPtr(), starts);
+        cudaMemcpyAsync(found, starts, sizeof(found), cudaMemcpyDeviceToHost, stream);
+        cudaFreeAsync(starts, stream);
+        gpuErrchk(cudaStreamSynchronize(stream));
+        for(int run = 0; run < 8; ++run){
+            runs[run]->start = found[2*run];
+            runs[run]->count = found[2*run + 1] - found[2*run];
+        }
+        numOwnVoxels = found[16];
+        numUsedVoxels = found[17];
     }
-    cudaStreamSynchronize(stream);
     voxelIDsUsed.resizeAsync(numUsedVoxels, stream);
     voxelOwners.resizeAsync(numUsedVoxels, stream);
     solids.resizeAsync(numUsedVoxels, stream);
@@ -856,7 +859,7 @@ void Particles::generateVoxels(){
             grid, refinementLevel);
     }
     gpuErrchk(cudaPeekAtLastError());
-    findGhostRanges();
+    checkGhostRuns();
 
     if(numRanks == 1){
         std::cout<<"Nodes: "<<numParticleNodes<<" with particles, "<<numUsedGridNodes<<" in all, holding "<<numUsedVoxels<<" voxels\n";
@@ -1314,15 +1317,36 @@ __global__ void packPositionsToFloats(uint numParticles, const double* px, const
     }
 }
 
-//a frame's float32 x, y, z per particle, this partition's run of it
-void Particles::packPositions(float* xyz){
-    if(size > 0){
-        packPositionsToFloats<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, px.devPtr(), py.devPtr(), pz.devPtr(), xyz);
+//a frame's float32 x, y, z per particle, this partition's run of it, into pinned host memory at xyz. Packed on this partition's stream, then copied out on
+//frameStream, so the simulation's next kernels run alongside the copy; copied is recorded once it's in. The next frame's pack waits for the copy to finish
+//reading framePositions
+void Particles::copyPositionsToHost(float* xyz, cudaEvent_t copied){
+    if(frameStream == nullptr){     //on this partition's GPU, which the caller has made current
+        gpuErrchk(cudaStreamCreateWithFlags(&frameStream, cudaStreamNonBlocking));
+        gpuErrchk(cudaEventCreateWithFlags(&framePacked, cudaEventDisableTiming));
+        gpuErrchk(cudaEventCreateWithFlags(&frameCopied, cudaEventDisableTiming));
     }
+    gpuErrchk(cudaStreamWaitEvent(stream, frameCopied, 0));    //never recorded yet: no wait
+    if(size > 0){
+        framePositions.resizeAsync(3*size, stream);
+        packPositionsToFloats<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, px.devPtr(), py.devPtr(), pz.devPtr(), framePositions.devPtr());
+        gpuErrchk(cudaPeekAtLastError());
+    }
+    gpuErrchk(cudaEventRecord(framePacked, stream));
+    gpuErrchk(cudaStreamWaitEvent(frameStream, framePacked, 0));
+    if(size > 0){
+        gpuErrchk(cudaMemcpyAsync(xyz, framePositions.devPtr(), sizeof(float)*3*size, cudaMemcpyDeviceToHost, frameStream));
+    }
+    gpuErrchk(cudaEventRecord(frameCopied, frameStream));
+    gpuErrchk(cudaEventRecord(copied, frameStream));
 }
 
-Particles::~Particles(){
-    if(ownsStream){
-        gpuErrchk( cudaStreamDestroy(stream) );
+Particles::~Particles(){     //with its GPU the current one
+    if(frameStream != nullptr){
+        cudaStreamSynchronize(frameStream);
+        cudaStreamDestroy(frameStream);
+        cudaEventDestroy(framePacked);
+        cudaEventDestroy(frameCopied);
     }
+    gpuErrchk( cudaStreamDestroy(stream) );
 }

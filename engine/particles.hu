@@ -27,8 +27,8 @@ class Particles{
 public:
     Particles(uint size);
 
-    //makes this partition rank of numRanks, which run in lockstep and share the exchange, the context and the stream. Before setDomain
-    void setPartition(int rank, int numRanks, LocalExchange* exchange, PartitionContext* context, const std::vector<uint>& planes, cudaStream_t sharedStream);
+    //makes this partition rank of numRanks, which run in lockstep and share the exchange and the context. Before setDomain
+    void setPartition(int rank, int numRanks, LocalExchange* exchange, PartitionContext* context, const std::vector<uint>& planes);
 
     void setDomain(double nx, double ny, double nz, uint x, uint y, uint z, double cellSize);
 
@@ -54,10 +54,14 @@ public:
     
     void voxelVelsToParticles();
 
-    void packPositions(float* xyz);  //float32 x, y, z per particle, for a frame
+    void copyPositionsToHost(float* xyz, cudaEvent_t copied);   //float32 x, y, z per particle, for a frame: into pinned xyz, recording copied once it's there
 
     uint numParticles() const{
         return size;
+    }
+
+    int device() const{     //the GPU this partition runs on: the current one when it was made
+        return cudaDevice;
     }
 
     double getCourantDt();
@@ -97,7 +101,7 @@ private:
     void exchangeParticles();
     void receiveParticleNodes(uint maskWords);
     void orderNodes(uint maskWords);
-    void findGhostRanges();
+    void checkGhostRuns();
     bool verbose() const{   //only one partition reports the values every partition shares
         return rank == 0;
     }
@@ -161,7 +165,20 @@ private:
     CudaVec<uint> foreignParticleNodeMasks; //the same, for the neighbouring partitions' particle nodes received by receiveParticleNodes
     CudaVec<char> nodeHasParticles;     //per used node: whether it holds particles, here or in the partition that owns it
     CudaVec<uint> nodeOrigins;          //orderNodes' working space: each node's index before it was put in order
-    CudaVec<uint> ghostRanges;          //per ghost node: its first voxel, its owner's first voxel of it, how many, and the owning partition
+
+    //The voxels neighbouring partitions exchange, by side: 0 the partition below, 1 the one above. A partition keeps each boundary plane's nodes as a run
+    //holding particles and a run of empty ones, each in cell order, and orders its ghost copies of a neighbour's plane the same way, so filling ghosts is
+    //copying two runs, whose voxels are consecutive. Matching runs must agree in nodes and voxels, which checkGhostRuns makes sure of
+    struct VoxelRun{
+        uint firstNode = 0;
+        uint nodes = 0;
+        uint start = 0;     //its voxels
+        uint count = 0;
+    };
+    VoxelRun edgeParticles[2];  //its own nodes holding particles in plane boxLo (side 0) and in plane boxHi - 1 (side 1)
+    VoxelRun edgeEmpty[2];      //its own empty nodes there
+    VoxelRun ghostParticles[2]; //its ghost nodes holding particles, in plane boxLo - 1 (side 0) and in plane boxHi (side 1)
+    VoxelRun ghostEmpty[2];     //its empty ghost nodes there, straight after them
 
     //the nodes, in this order: [0, numParticleNodes) this partition's holding particles; up to numOwnNodes its empty ones; up to numStoredNodes its ghost
     //nodes; up to numUsedGridNodes the neighbours' particle nodes 2 planes out, which store no voxels but whose particles make ghost voxels fluid.
@@ -200,13 +217,18 @@ private:
     double elapsedTime;
     double elapsedTimeThisFrame;
 
+    int cudaDevice = 0;
     cudaStream_t stream;
-    bool ownsStream = true;
     std::vector<cudaDeviceProp> deviceProp;
+
+    CudaVec<float> framePositions;          //a frame's x, y, z, packed for the copy to the host
+    cudaStream_t frameStream = nullptr;     //copies frames to the host alongside the simulation
+    cudaEvent_t framePacked = nullptr;
+    cudaEvent_t frameCopied = nullptr;      //framePositions has been copied out, so it can take the next frame
     std::vector<uint> selectedDevices;
 
-    //the partition: this is rank of numRanks, owning node planes [boxLo, boxHi). Partitions exchange through the exchange (on one GPU), and the solver's
-    //exchanges go through the context, which does nothing for a lone partition
+    //the partition: this is rank of numRanks, owning node planes [boxLo, boxHi). Partitions exchange through the exchange, and the solver's exchanges go
+    //through the context, which does nothing for a lone partition
     int rank = 0;
     int numRanks = 1;
     LocalExchange* exchange = nullptr;
@@ -222,6 +244,7 @@ private:
     uint upperBoundaryParticleNodes = 0;
 
     friend class ParticleSystemTester;
+    friend class LocalExchange;
     friend class LocalPartition;
 };
 

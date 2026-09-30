@@ -16,8 +16,8 @@
 class ParticleSystemTester{
 public:
 
-    ParticleSystemTester(uint size, int partitions = 1)
-    : simulation(size, partitions)
+    ParticleSystemTester(uint size, int partitions = 1, int devices = 0)     //devices 0: every GPU there is
+    : simulation(size, partitions, devices)
     , particles(simulation.partition(0))
     {}
 

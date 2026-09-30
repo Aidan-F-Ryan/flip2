@@ -14,7 +14,8 @@ int main(int argc, char** argv){
     bool tank = argc > 4 && std::string(argv[4]) == "tank";
     uint height = argc > 5 ? std::stoi(argv[5]) : 32;
     uint nodes = argc > 4 && !tank ? std::stoi(argv[4]) : 32;    //the dam break's grid, nodes per side of its 1 m cube (4 voxels each)
-    int partitions = std::getenv("FLIP2_PARTITIONS") ? std::stoi(std::getenv("FLIP2_PARTITIONS")) : 1;  //FLIP2_PARTITIONS splits the domain along z, on this GPU
+    int partitions = std::getenv("FLIP2_PARTITIONS") ? std::stoi(std::getenv("FLIP2_PARTITIONS")) : 1;  //FLIP2_PARTITIONS splits the domain along z
+    int devices = std::getenv("FLIP2_DEVICES") ? std::stoi(std::getenv("FLIP2_DEVICES")) : 0;  //FLIP2_DEVICES spreads the partitions over that many GPUs; every GPU by default
     ParticleSystemTester particles(tank ? 32*32*height*8 :    //~8 per fluid voxel
         // 33
         // 1024
@@ -23,7 +24,7 @@ int main(int argc, char** argv){
         // (1<<24) - 13 //16M
         // (1<<25) - 12 //32M
         // 1<<26
-        , partitions);
+        , partitions, devices);
     if(tank){
         particles.setDomain(0.0f, 0.0f, 0.0f, 8, 8, 8, 1.0f / 32.0f);
         particles.randomizeParticlePositions(make_double3(0.0, 0.0, 0.0), make_double3(1.0, height / 32.0, 1.0), argc > 6 ? std::stod(argv[6]) : 0.0);

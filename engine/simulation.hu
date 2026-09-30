@@ -11,12 +11,13 @@
 #include <string>
 #include <vector>
 
-//A simulation split into partitions along z, each owning whole node planes and the particles in them; for now all on one GPU. The partitions run the same
-//steps in lockstep, each on its own host thread, taking what they need of each other's through a LocalExchange. One partition is the whole domain, run on
-//the calling thread, just as before the split
+//A simulation split into partitions along z, each owning whole node planes and the particles in them, spread over this host's GPUs: with more partitions
+//than GPUs, neighbouring partitions share one. The partitions run the same steps in lockstep, each on its own host thread with its GPU current, taking
+//what they need of each other's through a LocalExchange. One partition is the whole domain, run on the calling thread, just as before the split
 class Simulation{
 public:
-    Simulation(uint numParticles, int numPartitions);
+    Simulation(uint numParticles, int numPartitions, int numDevices = 0);  //numDevices 0 uses every GPU there is
+    ~Simulation();
 
     //the domain, and each partition's node planes: as even a split along z as whole pairs of planes allow, at least 2 planes each
     void setDomain(double nx, double ny, double nz, uint x, uint y, uint z, double cellSize);
@@ -27,11 +28,7 @@ public:
     Particles& partition(int rank){
         return *partitions[rank];
     }
-    void forEachPartition(const std::function<void(Particles&)>& setting){    //for settings, on this thread
-        for(auto& partition : partitions){
-            setting(*partition);
-        }
-    }
+    void forEachPartition(const std::function<void(Particles&)>& setting);  //for settings, on this thread, with each partition's GPU current in turn
 
     void initialize();      //each partition keeps its own particles and builds its grid
     void solveFrame(double fps);
@@ -40,23 +37,13 @@ public:
 private:
     void inLockstep(const std::function<void(Particles&)>& step);    //every partition runs step, each on its own thread
 
-    struct SharedStream{
-        cudaStream_t stream;
-        SharedStream(){
-            gpuErrchk(cudaStreamCreate(&stream));
-        }
-        ~SharedStream(){
-            cudaStreamSynchronize(stream);
-            cudaStreamDestroy(stream);
-        }
-    };
-
-    SharedStream shared;    //declared first, so it outlives everything using it
     uint totalParticles;
+    int numDevices;     //the GPUs in use
     LocalExchange exchange;
     std::vector<std::unique_ptr<LocalPartition>> contexts;
     std::vector<std::unique_ptr<Particles>> partitions;
-    FrameWriter frameWriter;    //writes position frames from a background thread; declared last so it drains its queue first
+    std::unique_ptr<FrameWriter> frameWriter;       //writes position frames from a background thread
+    std::vector<std::vector<cudaEvent_t>> frameCopies;  //per partition, per frame buffer: its part of the frame has landed; on its GPU
 };
 
 #endif
