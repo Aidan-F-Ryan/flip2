@@ -189,10 +189,12 @@ __global__ void getMaxFromArray(bool absolute, uint numElements, T* array, T* ou
 
     for(int i = blockDim.x; i >= 1; i >>= 1){
         __syncthreads();
-        if(!absolute)
-            shared[threadIdx.x] = shared[threadIdx.x] > shared[threadIdx.x + blockDim.x] ? shared[threadIdx.x] : shared[threadIdx.x + blockDim.x];
-        else
-            shared[threadIdx.x] = abs(shared[threadIdx.x]) > abs(shared[threadIdx.x + blockDim.x]) ? shared[threadIdx.x] : shared[threadIdx.x + blockDim.x];
+        if(threadIdx.x < i){
+            if(!absolute)
+                shared[threadIdx.x] = shared[threadIdx.x] > shared[threadIdx.x + i] ? shared[threadIdx.x] : shared[threadIdx.x + i];
+            else
+                shared[threadIdx.x] = abs(shared[threadIdx.x]) > abs(shared[threadIdx.x + i]) ? shared[threadIdx.x] : shared[threadIdx.x + i];
+        }
     }
 
     __syncthreads();
@@ -240,7 +242,7 @@ CudaVec<T>::~CudaVec(){
     }
 }
 
-// template class CudaVec<float>;
+template class CudaVec<float>;
 template class CudaVec<uint>;
 template class CudaVec<char>;
 template class CudaVec<double>;

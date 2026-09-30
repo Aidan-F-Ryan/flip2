@@ -7,21 +7,38 @@
     #include "../typedefs.h"
     #include "../cudaVec.hu"
 
-    __device__ inline double calcSubCellWidth(const uint& refinementLevel, const Grid& grid){
+    #define NO_VOXEL 0xFFFFFFFFu    //neighbour arrays: nothing is stored there, so it's air (p = 0, face velocity 0)
+    #define WALL_VOXEL 0xFFFFFFFEu  //neighbour arrays: outside the domain, no flow through the shared face
+    #define CORRECTION_DEPTH 5      //how deep inside the fluid's footprint a voxel has to be for the density correction to measure it
+
+    __device__ inline float calcSubCellWidth(const uint& refinementLevel, const Grid& grid){
         return grid.cellSize / (2<<refinementLevel);
     }
 
-    void cudaCalcDivU(const CudaVec<uint>& nodeIndexToFirstVoxelIndex, const CudaVec<uint>& voxelIDs,   const CudaVec<double>& voxelsUx, const CudaVec<double>& voxelsUy, const CudaVec<double>& voxelsUz,
-        double radius, uint refinementLevel, const Grid& grid, const CudaVec<uint>& yDimFirstNodeIndex,
-        const CudaVec<uint>& gridNodeIndicesToFirstParticleIndex, const CudaVec<uint>& gridNodes, uint numVoxelsPerNode,
-        uint numVoxels1D, CudaVec<double>& divU, cudaStream_t stream);
-    
-    double cudaGSiteration(const uint& numVoxelsPerNode, const uint& numVoxels1D, const uint& refinementLevel, const CudaVec<uint>& nodeIndexUsedVoxels, const CudaVec<uint>& voxelIDs, const CudaVec<char>& solids, const CudaVec<double>& divU, CudaVec<double>& p, CudaVec<double>& residuals, const double& radius, const double& density, const double& dt, const Grid& grid, const double& threshold, const uint& maxIterations, cudaStream_t stream);
+    void applyGravity(const CudaVec<char>& solids, CudaVec<float>& voxelsUz, float dt, cudaStream_t stream);
+    void removeGravity(const CudaVec<char>& solids, CudaVec<float>& voxelsUz, float dt, cudaStream_t stream);
 
-    __device__ void getNeighboringApronCellData(const uint thisThreadNodeIndexToHandle, const uint numVoxels1D, double* sharedBlockVoxelStorage, const uint* nodeIndexToFirstVoxelIndex,
-        const uint* voxelIDs, const double* voxelData, const int xOffset, const int yOffset, const int zOffset);
-    
-    void cudaVelocityUpdate(uint numVoxelsPerNode, uint numVoxels1D, double dt, double radius, double density,  const CudaVec<uint>& nodeIndexUsedVoxels,  const CudaVec<uint>& voxelIDs,  const CudaVec<char>& solids,  const CudaVec<double>& p, CudaVec<double>& voxelsUx, CudaVec<double>& voxelsUy, CudaVec<double>& voxelsUz, uint refinementLevel, Grid grid, cudaStream_t stream);
-    void applyGravity(const CudaVec<char>& solids, CudaVec<double>& voxelsUz, double dt, cudaStream_t stream);
-    void removeGravity(const CudaVec<char>& solids, CudaVec<double>& voxelsUz, double dt, cudaStream_t stream);
+    //P2G's fixed-point sums (momentumScale and weightScale per unit) to float weights, counts and face velocities
+    void cudaNormalizeVoxelVelocities(const CudaVec<char>& solids, CudaVec<float>& voxelWeightsX, CudaVec<float>& voxelWeightsY, CudaVec<float>& voxelWeightsZ, CudaVec<float>& voxelsUx, CudaVec<float>& voxelsUy, CudaVec<float>& voxelsUz,
+        CudaVec<float>& particleCounts, float momentumScale, float weightScale, cudaStream_t stream);
+
+    void cudaExtrapolateUnreachedFaces(const CudaVec<char>& solveCodes, const CudaVec<uint>& neighborNx, const CudaVec<uint>& neighborPx, const CudaVec<uint>& neighborNy, const CudaVec<uint>& neighborPy, const CudaVec<uint>& neighborNz, const CudaVec<uint>& neighborPz,
+        const CudaVec<float>& voxelWeightsX, const CudaVec<float>& voxelWeightsY, const CudaVec<float>& voxelWeightsZ, CudaVec<float>& voxelsUx, CudaVec<float>& voxelsUy, CudaVec<float>& voxelsUz, cudaStream_t stream);
+
+    void cudaFindFootprintDepth(const CudaVec<char>& solveCodes, const CudaVec<uint>& neighborNx, const CudaVec<uint>& neighborPx, const CudaVec<uint>& neighborNy, const CudaVec<uint>& neighborPy, const CudaVec<uint>& neighborNz, const CudaVec<uint>& neighborPz,
+        CudaVec<char>& depth, CudaVec<uint>& freeSurface, cudaStream_t stream);
+
+    void cudaCalcDivU(const CudaVec<char>& solveCodes, const CudaVec<uint>& neighborNx, const CudaVec<uint>& neighborPx, const CudaVec<uint>& neighborNy, const CudaVec<uint>& neighborPy, const CudaVec<uint>& neighborNz, const CudaVec<uint>& neighborPz,
+        const CudaVec<float>& voxelsUx, const CudaVec<float>& voxelsUy, const CudaVec<float>& voxelsUz, const CudaVec<float>& particleCounts, const CudaVec<char>& footprintDepth, float restParticlesPerVoxel, float correctionRate,
+        CudaVec<float>& divU, cudaStream_t stream);
+
+    void cudaGetA(const CudaVec<char>& solveCodes, const CudaVec<uint>& neighborNx, const CudaVec<uint>& neighborPx, const CudaVec<uint>& neighborNy, const CudaVec<uint>& neighborPy, const CudaVec<uint>& neighborNz, const CudaVec<uint>& neighborPz,
+        CudaVec<float>& Anx, CudaVec<float>& Apx, CudaVec<float>& Any, CudaVec<float>& Apy, CudaVec<float>& Anz, CudaVec<float>& Apz, CudaVec<float>& Adiag, float scale, cudaStream_t stream);
+
+    float cudaGSiteration(const CudaVec<char>& solveCodes, const CudaVec<uint>& neighborNx, const CudaVec<uint>& neighborPx, const CudaVec<uint>& neighborNy, const CudaVec<uint>& neighborPy, const CudaVec<uint>& neighborNz, const CudaVec<uint>& neighborPz,
+        const CudaVec<float>& Anx, const CudaVec<float>& Apx, const CudaVec<float>& Any, const CudaVec<float>& Apy, const CudaVec<float>& Anz, const CudaVec<float>& Apz, const CudaVec<float>& Adiag,
+        CudaVec<float>& divU, CudaVec<float>& p, CudaVec<float>& residuals, float tolerance, uint maxIterations, cudaStream_t stream);
+
+    void cudaVelocityUpdate(const CudaVec<char>& solveCodes, const CudaVec<uint>& neighborNx, const CudaVec<uint>& neighborPx, const CudaVec<uint>& neighborNy, const CudaVec<uint>& neighborPy, const CudaVec<uint>& neighborNz, const CudaVec<uint>& neighborPz, const CudaVec<float>& p,
+        CudaVec<float>& voxelsUx, CudaVec<float>& voxelsUy, CudaVec<float>& voxelsUz, float scale, cudaStream_t stream);
 #endif

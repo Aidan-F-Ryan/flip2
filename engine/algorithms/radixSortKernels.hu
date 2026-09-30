@@ -10,8 +10,13 @@ __global__ void radixBinUintByBitIndex(uint numElements, uint* inArray, uint bit
 
 __global__ void coalesceFrontBack(uint numElements, uint* outArray, uint* front, uint* back);
 
-template <typename T>
-__global__ void reorderGridIndices(uint numElements, uint* sortedIndices, T* inArray, T* outArray);
+template <typename T>   //defined here so every file that launches it instantiates it (CUDA 13 makes template kernel stubs file-local by default)
+__global__ void reorderGridIndices(uint numElements, uint* sortedIndices, T* inArray, T* outArray){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(index < numElements){
+        outArray[index] = inArray[sortedIndices[index]];
+    }
+}
 
 void cudaRadixSortUint(uint numElements, uint* inArray, uint* outArray, uint* sortedIndices, uint* front, uint* back,
     cudaStream_t frontStream, cudaStream_t backStream, uint*& reorderedIndicesRelativeToOriginal);

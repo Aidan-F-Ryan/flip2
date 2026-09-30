@@ -4,6 +4,8 @@
 #include "parallelPrefixSumKernels.hu"
 #include "radixSortKernels.hu"
 
+#include <cub/cub.cuh>
+
 /**
  * @brief find root node containing each particle in domain
  * 
@@ -16,31 +18,24 @@
  * @return __global__ 
  */
 
+//a particle that crossed a wall bounces back in as far as it overshot; clamping it onto the wall instead stacks particles into a sheet on the face.
+//Anything still outside, or on the max face (which puts it in the wall voxels), is kept just inside
+__device__ inline double reflectOffWalls(double p, double low, uint cells, double cellSize){
+    double high = low + cells*cellSize;
+    p = p < low ? 2.0*low - p : p > high ? 2.0*high - p : p;
+    return fmin(fmax(p, low), low + (cells - 0.001)*cellSize);
+}
+
 __global__ void rootCell(double* px, double* py, double* pz, uint numParticles, Grid grid, uint* gridPosition){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
     if(index < numParticles){
-        if(px[index] < grid.negX){
-            px[index] = grid.negX;
-        }
-        else if(px[index] > grid.negX + grid.sizeX*grid.cellSize){
-            px[index] = grid.negX + grid.sizeX*grid.cellSize;
-        }
-        if(py[index] < grid.negY){
-            py[index] = grid.negY;
-        }
-        else if(py[index] > grid.negY + grid.sizeY*grid.cellSize){
-            py[index] = grid.negY + grid.sizeY*grid.cellSize;
-        }
-        if(pz[index] < grid.negZ){
-            pz[index] = grid.negZ;
-        }
-        else if(pz[index] > grid.negZ + grid.sizeZ*grid.cellSize){
-            pz[index] = grid.negZ + grid.sizeZ*grid.cellSize;
-        }
+        px[index] = reflectOffWalls(px[index], grid.negX, grid.sizeX, grid.cellSize);
+        py[index] = reflectOffWalls(py[index], grid.negY, grid.sizeY, grid.cellSize);
+        pz[index] = reflectOffWalls(pz[index], grid.negZ, grid.sizeZ, grid.cellSize);
         uint x = floorf((px[index] - grid.negX) / grid.cellSize);
         uint y = floorf((py[index] - grid.negY) / grid.cellSize);
         uint z = floorf((pz[index] - grid.negZ) / grid.cellSize);
-        gridPosition[index] = x + y*grid.sizeX + z*grid.sizeX*grid.sizeY;
+        gridPosition[index] = min(x, grid.sizeX - 1) + min(y, grid.sizeY - 1)*grid.sizeX + min(z, grid.sizeZ - 1)*grid.sizeX*grid.sizeY;  //positions clamped onto the max face would otherwise index one cell past the end
     }
 }
 
@@ -259,6 +254,13 @@ void cudaFindSubCell(double* px, double* py, double* pz,
     cudaStreamDestroy(prefixSumStream);
 }
 
+__global__ void initializeParticleIndices(uint* indices, uint numParticles){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(index < numParticles){
+        indices[index] = index;
+    }
+}
+
 /**
  * @brief Sort particles globally by containing root nodes
  * 
@@ -272,20 +274,34 @@ void cudaSortParticlesByGridNode(uint numParticles, uint*& gridPosition, uint*& 
     uint* ogReordered = reorderedIndicesRelativeToOriginal;
 
     uint* sortedGridPosition;
-    uint* sortedParticleIndices;
-    uint* front;
-    uint* back;
+    uint* particleIndices;
+    //uint* front;
+    //uint* back;
 
+    cudaMallocAsync((void**)&particleIndices, sizeof(uint)*numParticles, stream);
+    initializeParticleIndices<<<numParticles / 512 + 1, 512, 0, stream>>>(particleIndices, numParticles);
     cudaMallocAsync((void**)&sortedGridPosition, sizeof(uint)*numParticles, stream);
-    cudaMallocAsync((void**)&sortedParticleIndices, sizeof(uint)*numParticles, stream);
-    cudaMallocAsync((void**)&front, sizeof(uint)*numParticles, stream);
-    cudaMallocAsync((void**)&back, sizeof(uint)*numParticles, stream);
+    //cudaMallocAsync((void**)&sortedParticleIndices, sizeof(uint)*numParticles, stream);
+    //cudaMallocAsync((void**)&front, sizeof(uint)*numParticles, stream);
+    //cudaMallocAsync((void**)&back, sizeof(uint)*numParticles, stream);
 
-    cudaStream_t backStream;
-    cudaStreamCreate(&backStream);
+    //cudaStream_t backStream;
+    //cudaStreamCreate(&backStream);
     // cudaStreamSynchronize(stream);
 
-    cudaRadixSortUint(numParticles, gridPosition, sortedGridPosition, sortedParticleIndices, front, back, stream, backStream, reorderedIndicesRelativeToOriginal);
+    //cudaRadixSortUint(numParticles, gridPosition, sortedGridPosition, sortedParticleIndices, front, back, stream, backStream, reorderedIndicesRelativeToOriginal);
+
+    uint* d_temp = nullptr;
+    size_t d_temp_size;
+    cub::DeviceRadixSort::SortPairs(d_temp, d_temp_size, gridPosition, sortedGridPosition, particleIndices, reorderedIndicesRelativeToOriginal, numParticles, 0, sizeof(uint)*8, stream);
+    cudaMallocAsync((void**)&d_temp, d_temp_size, stream);
+    cub::DeviceRadixSort::SortPairs(d_temp, d_temp_size, gridPosition, sortedGridPosition, particleIndices, reorderedIndicesRelativeToOriginal, numParticles, 0, sizeof(uint)*8, stream);
+    std::cout<<"done sorting\n";
+    
+    uint* t = gridPosition;
+    gridPosition = sortedGridPosition;
+    sortedGridPosition = t;
+
 
     if(ogGridPosition != sortedGridPosition){
         cudaFreeAsync(sortedGridPosition, stream);
@@ -295,9 +311,11 @@ void cudaSortParticlesByGridNode(uint numParticles, uint*& gridPosition, uint*& 
         // cudaFree(reorderedIndicesRelativeToOriginal);
     // }
 
-    cudaFreeAsync(sortedParticleIndices, stream);
-    cudaFreeAsync(front, stream);
-    cudaFreeAsync(back, stream);
+    cudaFreeAsync(particleIndices, stream);
+    cudaFreeAsync(d_temp, stream);
+    //cudaFreeAsync(front, stream);
+    //cudaFreeAsync(back, stream);
+    cudaStreamSynchronize(stream);
 }
 
 __global__ void markUniqueGridCells(uint numElements, uint* gridCells, uint* uniqueGridNodes){
@@ -344,35 +362,18 @@ void cudaMapNodeIndicesToParticles(uint numParticles, uint* uniqueGridNodes, uin
     mapNodeIndicesToParticles<<<numParticles / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numParticles, uniqueGridNodes, gridNodeIndicesToFirstParticleIndex);
 }
 
-__global__ void zeroYDimArray(Grid grid, uint numUniqueGridNodes, uint* yDimFirstNodeIndex){
-    uint index = threadIdx.x + blockDim.x*blockIdx.x;
-    if(index < grid.sizeX*grid.sizeY){
-        yDimFirstNodeIndex[index] = numUniqueGridNodes;
+void cudaSortUints(uint numElements, uint* keys, cudaStream_t stream){
+    if(numElements == 0){
+        return;
     }
-}
-
-//find first node index of each used y-dimension row in memory, allows for y dimension-scan)
-__global__ void getYDimPositionFirstInRow(uint numUniqueGridNodes, uint* gridNodeIndicesToFirstParticleIndex, uint* gridNodeIDs, uint* yDimFirstNodeIndex, Grid grid){
-    uint index = threadIdx.x + blockDim.x*blockIdx.x;
-    if(index < numUniqueGridNodes){
-        uint prevGridNodeUniqueIndex;
-        if(index != 0){
-            prevGridNodeUniqueIndex = gridNodeIDs[gridNodeIndicesToFirstParticleIndex[index - 1]];
-        }
-        else{
-            prevGridNodeUniqueIndex = numUniqueGridNodes;
-        }
-        uint gridNodeUniqueIndex = gridNodeIDs[gridNodeIndicesToFirstParticleIndex[index]];
-        uint prevYRow = prevGridNodeUniqueIndex / grid.sizeX;
-        uint yRow = gridNodeUniqueIndex / grid.sizeX;
-        if(prevYRow != yRow){
-            yDimFirstNodeIndex[yRow] = gridNodeUniqueIndex;
-        }
-    }
-}
-
-void cudaGetFirstNodeInYRows(uint numUniqueGridNodes, uint* gridNodeIndicesToFirstParticleIndex, uint* gridNodeIDs, uint* yDimFirstNodeIndex, const Grid& grid, cudaStream_t stream){
-    zeroYDimArray<<<grid.sizeX*grid.sizeY / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(grid, numUniqueGridNodes, yDimFirstNodeIndex);
-    cudaStreamSynchronize(stream);
-    getYDimPositionFirstInRow<<<numUniqueGridNodes / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numUniqueGridNodes, gridNodeIndicesToFirstParticleIndex, gridNodeIDs, yDimFirstNodeIndex, grid);
+    uint* sorted;
+    void* temp = nullptr;
+    size_t tempSize = 0;
+    gpuErrchk(cudaMallocAsync((void**)&sorted, sizeof(uint)*numElements, stream));
+    cub::DeviceRadixSort::SortKeys(temp, tempSize, keys, sorted, numElements, 0, sizeof(uint)*8, stream);    //with no temp storage, this only sizes it
+    gpuErrchk(cudaMallocAsync(&temp, tempSize, stream));
+    cub::DeviceRadixSort::SortKeys(temp, tempSize, keys, sorted, numElements, 0, sizeof(uint)*8, stream);
+    cudaMemcpyAsync(keys, sorted, sizeof(uint)*numElements, cudaMemcpyDeviceToDevice, stream);
+    cudaFreeAsync(temp, stream);
+    cudaFreeAsync(sorted, stream);
 }
