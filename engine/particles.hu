@@ -145,7 +145,7 @@ private:
     uint size;
     double radius;
     double flipRatio = 0.95;
-    double cfl = 0.7;
+    double cfl = 4.0;   //RK3 advection holds up to 4: past it, its stages reach beyond advectThroughGrid's 3-node tile
     bool rungeKutta3 = true;
     PressureSolver pressureSolver = PressureSolver::multigrid;
     double maxVelocity = 0.0;   //the fastest particle velocity component, found each substep by P2G

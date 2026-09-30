@@ -41,7 +41,7 @@ int main(int argc, char** argv){
         std::string name = solver;
         particles.setPressureSolver(name == "sor" ? PressureSolver::sor : name == "cg" ? PressureSolver::cg : name == "jacobi" ? PressureSolver::jacobi : PressureSolver::multigrid);
     }
-    if(const char* cfl = std::getenv("FLIP2_CFL")){  //FLIP2_CFL sets how many voxels the fastest particle may move per substep (default 0.7)
+    if(const char* cfl = std::getenv("FLIP2_CFL")){  //FLIP2_CFL sets how many voxels the fastest particle may move per substep (default 4)
         particles.setCfl(std::stod(cfl));
     }
     if(const char* advection = std::getenv("FLIP2_ADVECTION")){  //FLIP2_ADVECTION=euler moves particles straight along the grid velocity instead of RK3
