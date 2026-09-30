@@ -6,3 +6,4 @@ latex/
 engine/Makefile
 engine/devManagerTestDriver.cu
 engine/deviceManagerTest
+**/__pycache__/
