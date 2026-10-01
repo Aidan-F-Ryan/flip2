@@ -1,6 +1,10 @@
 //Copyright 2023 Aberrant Behavior LLC
 
 #include "simulation.hu"
+#include <algorithm>
+#include "diagnostics.hu"
+#include <chrono>
+#include <cstdio>
 #include <thread>
 
 Simulation::Simulation(uint numParticles, int numPartitions, int numDevices)
@@ -56,7 +60,7 @@ Simulation::Simulation(uint numParticles, std::unique_ptr<Transport> transport, 
 }
 
 void Simulation::startFrameWriter(){
-    frameWriter = std::make_unique<FrameWriter>(3*sizeof(float)*totalParticles);
+    frameWriter = std::make_unique<FrameWriter>(std::max<size_t>(3*sizeof(float)*totalParticles, 4096));   //it grows if emitters add particles
     frameCopies.resize(partitions.size());
     for(size_t index = 0; index < partitions.size(); ++index){
         gpuErrchk(cudaSetDevice(partitions[index]->device()));
@@ -118,6 +122,14 @@ void Simulation::setDomain(double nx, double ny, double nz, uint x, uint y, uint
     }
 }
 
+size_t Simulation::particlesHere() const{
+    size_t total = 0;
+    for(const auto& partition : partitions){
+        total += partition->numParticles();
+    }
+    return total;
+}
+
 void Simulation::forEachPartition(const std::function<void(Particles&)>& setting){
     for(auto& partition : partitions){
         gpuErrchk(cudaSetDevice(partition->device()));
@@ -149,31 +161,86 @@ void Simulation::initialize(){
 }
 
 void Simulation::solveFrame(double fps){
+    auto start = std::chrono::steady_clock::now();
     inLockstep([fps](Particles& partition){ partition.solveFrame(fps); });
+    lastFrameSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+}
+
+//a JSON array of n numbers
+template <typename T>
+static std::string jsonArray(const T* values, int n, const char* format){
+    std::string text = "[";
+    char number[32];
+    for(int i = 0; i < n; ++i){
+        std::snprintf(number, sizeof(number), format, values[i]);
+        text += (i ? "," : "") + std::string(number);
+    }
+    return text + "]";
+}
+
+void Simulation::writeDiagnostics(const std::string& path, int frame){
+    std::vector<FrameDiagnostics> results(partitions.size());
+    inLockstep([&](Particles& partition){   //every partition takes part in the sums, and each ends with the same totals
+        for(size_t index = 0; index < partitions.size(); ++index){
+            if(partitions[index].get() == &partition){
+                results[index] = computeFrameDiagnostics(partition);
+            }
+        }
+    });
+    if(ranks[0] != 0){
+        return;
+    }
+    const Particles& first = *partitions[0];
+    if(!diagnostics.is_open()){
+        diagnostics.open(path, std::ios::trunc);
+        if(!diagnostics){
+            std::cerr<<"Simulation: can't write diagnostics to "<<path<<"\n";
+            exit(1);
+        }
+        cudaDeviceProp properties;
+        gpuErrchk(cudaGetDeviceProperties(&properties, first.device()));
+        int runtime = 0;
+        cudaRuntimeGetVersion(&runtime);
+        double voxelSize = first.grid.cellSize / (2<<first.refinementLevel);
+        uint nodes[3] = {first.grid.sizeX, first.grid.sizeY, first.grid.sizeZ};
+        char line[512];
+        std::snprintf(line, sizeof(line), "{\"flip2\":\"diagnostics\",\"version\":1,\"ranks\":%d,\"gpu\":\"%s\",\"sm\":%d,\"cudaRuntime\":%d,\"nodes\":%s,\"cellSize\":%.9g,\"voxelSize\":%.9g}\n",
+            numRanks, properties.name, properties.major*10 + properties.minor, runtime, jsonArray(nodes, 3, "%u").c_str(), (double)first.grid.cellSize, voxelSize);
+        diagnostics<<line;
+    }
+    const FrameDiagnostics& d = results[0];
+    double voxelSize = first.grid.cellSize / (2<<first.refinementLevel);
+    double centroid[3];
+    for(int axis = 0; axis < 3; ++axis){
+        centroid[axis] = d.particles > 0 ? d.positionSum[axis] / d.particles : 0.0;
+    }
+    char head[1024];
+    std::snprintf(head, sizeof(head), "{\"frame\":%d,\"time\":%.17g,\"substeps\":%u,\"dtMin\":%.17g,\"dtMax\":%.17g,\"wallSeconds\":%.6f,\"particles\":%llu,\"hash\":\"%016llx%016llx\",\"kineticEnergy\":%.17g,",
+        frame, first.elapsedTime, first.substepsThisFrame, first.smallestDtThisFrame, first.largestDtThisFrame, frame > 0 ? lastFrameSeconds : 0.0, d.particles, d.hashHigh, d.hashLow, d.kineticEnergy);
+    diagnostics<<head
+               <<"\"momentum\":"<<jsonArray(d.momentum, 3, "%.17g")<<",\"angularMomentum\":"<<jsonArray(d.angularMomentum, 3, "%.17g")
+               <<",\"centroid\":"<<jsonArray(centroid, 3, "%.17g")<<",\"lowest\":"<<jsonArray(d.lowest, 3, "%.17g")<<",\"highest\":"<<jsonArray(d.highest, 3, "%.17g");
+    char tail[256];
+    std::snprintf(tail, sizeof(tail), ",\"fastest\":%.9g,\"occupiedVoxels\":%llu,\"volume\":%.17g,", d.fastest, d.occupiedVoxels, d.occupiedVoxels*voxelSize*voxelSize*voxelSize);
+    diagnostics<<tail<<"\"perVoxel\":"<<jsonArray(d.perVoxel, DIAGNOSTIC_BUCKETS, "%llu")<<",\"core\":"<<jsonArray(d.core, DIAGNOSTIC_BUCKETS, "%llu")<<"}\n";
+    diagnostics.flush();
 }
 
 void Simulation::writePositionsToFile(const std::string& fileName){
     if(numPartitions() == numRanks){    //every partition here: each copies its part straight into the frame, from its own GPU
-        int buffer = frameWriter->acquire();
+        size_t total = particlesHere();     //emitters and sinks change it from frame to frame
+        int buffer = frameWriter->acquire(sizeof(float)*3*total);
         float* frame = frameWriter->hostBuffer(buffer);
         std::vector<cudaEvent_t> copies;
-        uint offset = 0;
+        size_t offset = 0;
         for(int index = 0; index < numPartitions(); ++index){
             Particles& partition = *partitions[index];
-            if(offset + partition.numParticles() > totalParticles){
-                std::cerr<<"Simulation: the partitions hold more than the "<<totalParticles<<" particles there are\n";
-                exit(1);
-            }
             gpuErrchk(cudaSetDevice(partition.device()));
-            partition.copyPositionsToHost(frame + 3*(size_t)offset, frameCopies[index][buffer]);
+            partition.copyPositionsToHost(frame + 3*offset, frameCopies[index][buffer]);
             copies.push_back(frameCopies[index][buffer]);
             offset += partition.numParticles();
         }
-        if(offset != totalParticles){
-            std::cerr<<"Simulation: the partitions hold "<<offset<<" particles between them, not "<<totalParticles<<"\n";
-            exit(1);
-        }
-        frameWriter->submit(buffer, fileName, copies);
+        frameWriter->submit(buffer, fileName, copies, sizeof(float)*3*total);
         return;
     }
     //across processes: every rank sends rank 0 its positions, which it gathers in rank order and writes out
@@ -183,13 +250,9 @@ void Simulation::writePositionsToFile(const std::string& fileName){
     uint mine = partition.numParticles();
     std::vector<uint> counts(numRanks);
     transport.allGatherHost(&mine, counts.data(), sizeof(mine));
-    uint total = 0;
+    size_t total = 0;
     for(uint count : counts){
         total += count;
-    }
-    if(total != totalParticles){
-        std::cerr<<"Simulation: the ranks hold "<<total<<" particles between them, not "<<totalParticles<<"\n";
-        exit(1);
     }
     const float* packed = partition.packPositions();
     std::vector<TransportSend> sends;
@@ -209,8 +272,8 @@ void Simulation::writePositionsToFile(const std::string& fileName){
         offset += counts[rank];
     }
     transport.exchange(sends, receives, partition.stream);
-    int buffer = frameWriter->acquire();
+    int buffer = frameWriter->acquire(sizeof(float)*3*total);
     gpuErrchk(cudaMemcpyAsync(frameWriter->hostBuffer(buffer), gatheredFrame.devPtr(), sizeof(float)*3*total, cudaMemcpyDeviceToHost, partition.stream));
     gpuErrchk(cudaEventRecord(frameCopies[0][buffer], partition.stream));
-    frameWriter->submit(buffer, fileName, {frameCopies[0][buffer]});
+    frameWriter->submit(buffer, fileName, {frameCopies[0][buffer]}, sizeof(float)*3*total);
 }

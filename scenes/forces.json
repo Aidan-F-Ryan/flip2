@@ -1,0 +1,14 @@
+{
+  "schema": "flip2.scene/1",
+  "fps": 24,
+  "frames": 48,
+  "domain": {"min": [-0.5, -0.5, -0.5], "max": [0.5, 0.5, 0.5], "voxelSize": 0.015625},
+  "gravity": [0, 0, 0],
+  "fluids": [{"shape": "sphere", "centre": [0, 0, 0], "radius": 0.25}],
+  "forces": [
+    {"type": "point", "position": [0, 0, 0], "strength": 4, "radius": 0.45, "falloff": 1},
+    {"type": "vortex", "position": [0, 0, 0], "axis": [0, 1, 0], "strength": 3, "radius": 0.45},
+    {"type": "turbulence", "strength": 2, "scale": 0.08, "speed": 0.5}
+  ],
+  "output": {"dir": "forces", "diagnostics": "diagnostics.jsonl"}
+}

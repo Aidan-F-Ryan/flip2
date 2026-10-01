@@ -12,19 +12,18 @@
 #include <thread>
 #include <vector>
 
-//Writes frames to disk on a background thread so the simulation never waits on the disk. The caller takes a free pinned host buffer with acquire(), has
-//each partition copy its part into it from its own GPU, recording an event when its copy lands, then submits the buffer with those events; the thread
-//writes the buffer out once every event has completed. The simulation only blocks if every buffer is still being written. The destructor finishes all
-//submitted frames
+//Writes frames to disk on a background thread so the simulation never waits on the disk. The caller takes a free pinned host buffer big enough for the
+//frame with acquire(), has each partition copy its part into it from its own GPU, recording an event when its copy lands, then submits the buffer with
+//those events; the thread writes the buffer out once every event has completed. The simulation only blocks if every buffer is still being written. A
+//frame can be any size: a buffer grows when one doesn't fit. The destructor finishes all submitted frames
 class FrameWriter{
 public:
-    FrameWriter(size_t bytesPerFrame, int numBuffers = 3)
-    : bytes(bytesPerFrame)
-    {
+    FrameWriter(size_t bytesPerFrame, int numBuffers = 3){
         for(int i = 0; i < numBuffers; ++i){
             float* hostBuffer;
-            gpuErrchk(cudaHostAlloc((void**)&hostBuffer, bytes, cudaHostAllocPortable));     //portable: pinned for every GPU's copies
+            gpuErrchk(cudaHostAlloc((void**)&hostBuffer, bytesPerFrame, cudaHostAllocPortable));     //portable: pinned for every GPU's copies
             hostBuffers.push_back(hostBuffer);
+            capacities.push_back(bytesPerFrame);
             freeBuffers.push_back(i);
         }
         thread = std::thread(&FrameWriter::run, this);
@@ -46,11 +45,19 @@ public:
         return (int)hostBuffers.size();
     }
 
-    int acquire(){  //a free buffer's index, once one is free
-        std::unique_lock<std::mutex> lock(mutex);
-        changed.wait(lock, [this]{ return !freeBuffers.empty(); });
-        int buffer = freeBuffers.back();
-        freeBuffers.pop_back();
+    int acquire(size_t bytes){  //a free buffer's index, once one is free, holding at least bytes
+        int buffer;
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            changed.wait(lock, [this]{ return !freeBuffers.empty(); });
+            buffer = freeBuffers.back();
+            freeBuffers.pop_back();
+        }
+        if(capacities[buffer] < bytes){     //nobody else touches a buffer between acquire and submit
+            gpuErrchk(cudaFreeHost(hostBuffers[buffer]));
+            gpuErrchk(cudaHostAlloc((void**)&hostBuffers[buffer], bytes, cudaHostAllocPortable));
+            capacities[buffer] = bytes;
+        }
         return buffer;
     }
 
@@ -58,11 +65,11 @@ public:
         return hostBuffers[buffer];
     }
 
-    //writes buffer to fileName once every event in copies has completed. The events mustn't be recorded again until the buffer is free
-    void submit(int buffer, const std::string& fileName, const std::vector<cudaEvent_t>& copies){
+    //writes bytes of buffer to fileName once every event in copies has completed. The events mustn't be recorded again until the buffer is free
+    void submit(int buffer, const std::string& fileName, const std::vector<cudaEvent_t>& copies, size_t bytes){
         {
             std::lock_guard<std::mutex> lock(mutex);
-            jobs.push({buffer, fileName, copies});
+            jobs.push({buffer, fileName, copies, bytes});
         }
         changed.notify_all();
     }
@@ -72,6 +79,7 @@ private:
         int buffer;
         std::string fileName;
         std::vector<cudaEvent_t> copies;
+        size_t bytes;
     };
 
     void run(){
@@ -90,7 +98,7 @@ private:
                 gpuErrchk(cudaEventSynchronize(copy));
             }
             FILE* file = std::fopen(job.fileName.c_str(), "wb");
-            if(file == nullptr || std::fwrite(hostBuffers[job.buffer], 1, bytes, file) != bytes){
+            if(file == nullptr || (job.bytes > 0 && std::fwrite(hostBuffers[job.buffer], 1, job.bytes, file) != job.bytes)){
                 std::fprintf(stderr, "FrameWriter: failed writing %s\n", job.fileName.c_str());
             }
             if(file != nullptr){
@@ -104,8 +112,8 @@ private:
         }
     }
 
-    size_t bytes;
     std::vector<float*> hostBuffers;
+    std::vector<size_t> capacities;
     std::vector<int> freeBuffers;
     std::queue<Job> jobs;
     std::mutex mutex;

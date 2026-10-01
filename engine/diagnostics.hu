@@ -1,0 +1,38 @@
+//Copyright 2023 Aberrant Behavior LLC
+
+#ifndef DIAGNOSTICS_HU
+#define DIAGNOSTICS_HU
+
+#include "typedefs.h"
+
+class Particles;
+
+//the histograms' buckets: voxels holding that many particles, the last one that many or more
+#define DIAGNOSTIC_BUCKETS 64
+
+//One frame's numbers for regression tests, over every partition: what the particles hold, how they fill the voxels, and a hash of every particle's exact
+//position and velocity. The hash, the counts and the histograms are integers, the same however the domain is split between partitions, and a rerun that
+//changes anything about any particle changes the hash. The sums are doubles, added in a fixed order for a given split, so they agree across splits only
+//to rounding. Energies and momenta are per unit mass
+struct FrameDiagnostics{
+    unsigned long long particles = 0;
+    unsigned long long hashHigh = 0;        //the sums of each particle's hash's high and low 32 bits: the same in any order, and for any split
+    unsigned long long hashLow = 0;
+    double kineticEnergy = 0.0;             //the sum of |v|^2/2
+    double momentum[3] = {0.0, 0.0, 0.0};   //the sum of v
+    double angularMomentum[3] = {0.0, 0.0, 0.0};   //the sum of r x v, r from the domain's centre
+    double positionSum[3] = {0.0, 0.0, 0.0};       //over the particle count, the centroid
+    double lowest[3] = {0.0, 0.0, 0.0};     //the box around the particles
+    double highest[3] = {0.0, 0.0, 0.0};
+    double fastest = 0.0;                   //the largest |v|
+    unsigned long long occupiedVoxels = 0;  //voxels holding a particle, as P2G counts them
+    unsigned long long perVoxel[DIAGNOSTIC_BUCKETS] = {};  //occupied voxels, by the particles each holds
+    unsigned long long core[DIAGNOSTIC_BUCKETS] = {};      //the same for each node's central voxels whose 6 neighbours, all in the node, hold particles:
+                                                           //a sample of the fluid's inside, away from its surface (bucket 0 counts holes)
+};
+
+//every partition calls it at once, as for any step, and each gets the totals over all of them. The particles and nodes have to be as initialize leaves
+//them; it changes nothing
+FrameDiagnostics computeFrameDiagnostics(Particles& partition);
+
+#endif

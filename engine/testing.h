@@ -50,6 +50,18 @@ public:
         simulation.forEachPartition([&](Particles& partition){ partition.setPressureSolver(solver); });
     }
 
+    void setGravity(float3 gravity){
+        simulation.forEachPartition([&](Particles& partition){ partition.setGravity(gravity); });
+    }
+
+    void setSources(const Sources& sources){
+        simulation.forEachPartition([&](Particles& partition){ partition.setSources(sources); });
+    }
+
+    void setForceFields(const std::vector<ForceField>& fields){
+        simulation.forEachPartition([&](Particles& partition){ partition.setForceFields(fields); });
+    }
+
     void setDotProductSums(DotProductSums sums){
         simulation.forEachPartition([&](Particles& partition){ partition.setDotProductSums(sums); });
     }
@@ -130,6 +142,29 @@ public:
         });
     }
 
+    //every partition starts with these particles, x[i] to w[i] each, and keeps its own when it initializes; the density correction holds them at
+    //restDensity particles per voxel
+    void setParticles(const std::vector<double>& x, const std::vector<double>& y, const std::vector<double>& z, const std::vector<float>& u, const std::vector<float>& v,
+                      const std::vector<float>& w, double restDensity){
+        simulation.forEachPartition([&](Particles& partition){
+            for(uint i = 0; i < partition.size; ++i){
+                partition.px[i] = x[i];
+                partition.py[i] = y[i];
+                partition.pz[i] = z[i];
+                partition.vx[i] = u[i];
+                partition.vy[i] = v[i];
+                partition.vz[i] = w[i];
+            }
+            for(CudaVec<double>* position : {&partition.px, &partition.py, &partition.pz}){
+                position->upload(partition.stream);
+            }
+            for(CudaVec<float>* velocity : {&partition.vx, &partition.vy, &partition.vz}){
+                velocity->upload(partition.stream);
+            }
+            partition.setRestDensity(restDensity);
+        });
+    }
+
     void runVerify(){
         particles.alignParticlesToGrid();
         storeGridCellMap();
@@ -178,6 +213,14 @@ public:
 
     void writePositionsToFile(const std::string& fileName){
         simulation.writePositionsToFile(fileName);
+    }
+
+    size_t particlesHere() const{
+        return simulation.particlesHere();
+    }
+
+    void writeDiagnostics(const std::string& path, int frame){
+        simulation.writeDiagnostics(path, frame);
     }
 
 private:

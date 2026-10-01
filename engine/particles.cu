@@ -81,7 +81,7 @@ void Particles::sortParticles(){
     }
     uint* tempGridCell = gridCell.devPtr();
     uint* tempSortedIndices = reorderedGridIndices.devPtr();
-    cudaSortParticlesByGridNode(size, tempGridCell, tempSortedIndices, grid.sizeX*grid.sizeY*grid.sizeZ, stream);
+    cudaSortParticlesByGridNode(size, tempGridCell, tempSortedIndices, grid.sizeX*grid.sizeY*grid.sizeZ + (sources.removes() ? 1 : 0), stream);  //removed particles' cell is one past the last
     // cudaStreamSynchronize(stream);
 
     //@TODO: need to create per-CudaVec stream for allocation/dealloc to get around this overlap issue when freeing on constant stream, leave compute streams in place for all else, CudaVec_stream sync on devPtr call
@@ -1005,7 +1005,7 @@ void Particles::pressureSolve(){
     if(frameDt - elapsedTimeThisFrame < dt){
         dt = frameDt - elapsedTimeThisFrame;
     }
-    applyGravity(solids, voxelsUy, dt, stream);
+    applyForces(forces, false, dt, elapsedTime, forceVoxels(), stream);
     cudaCalcDivU(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, voxelsUx, voxelsUy, voxelsUz, particleCounts, footprintDepth, restParticlesPerVoxel, correctionRate, divU, stream);
     cudaGetA(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, dt/(density*voxelSize*voxelSize), stream);
     gpuErrchk(cudaPeekAtLastError());
@@ -1033,10 +1033,10 @@ void Particles::pressureSolve(){
         if(terminatingResidual < tolerance){
             break;
         }
-        removeGravity(solids, voxelsUy, dt, stream);
+        applyForces(forces, true, dt, elapsedTime, forceVoxels(), stream);
         dt /= 2.0f;
         p.zeroDeviceAsync(stream);
-        applyGravity(solids, voxelsUy, dt, stream);
+        applyForces(forces, false, dt, elapsedTime, forceVoxels(), stream);
         previousTerminatingResidual = terminatingResidual;
         cudaCalcDivU(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, voxelsUx, voxelsUy, voxelsUz, particleCounts, footprintDepth, restParticlesPerVoxel, correctionRate, divU, stream);
         cudaGetA(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, dt/(density*voxelSize*voxelSize), stream);
@@ -1051,10 +1051,17 @@ void Particles::pressureSolve(){
     gpuErrchk(cudaPeekAtLastError());
 }
 
+//where the forces act: every stored voxel, own and ghost, so the ghosts' faces get what their owners' do
+ForceVoxels Particles::forceVoxels(){
+    return {voxelsUy.size(), numStoredNodes, nodeIndexUsedVoxels.devPtr(), nodeCells.devPtr(), voxelIDsUsed.devPtr(), solids.devPtr(), footprintDepth.devPtr(),
+            {voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr()}, {voxelsUxOld.devPtr(), voxelsUyOld.devPtr(), voxelsUzOld.devPtr()}, grid, refinementLevel, (int)std::floor(radius)};
+}
+
 void Particles::updateVoxelVelocities(){
     double voxelSize = grid.cellSize / (2<<refinementLevel);
     cudaVelocityUpdate(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, p, voxelsUx, voxelsUy, voxelsUz, dt/(0.014*voxelSize*voxelSize), stream);
     gpuErrchk(cudaPeekAtLastError());
+    pinEmitterVelocities();     //an emitter's fluid leaves at its velocity, whatever the solve made of it
     for(CudaVec<float>* velocity : {&voxelsUx, &voxelsUy, &voxelsUz}){   //G2P and advection read ghost faces
         context->fillGhosts(velocity->devPtr(), stream);
     }
@@ -1297,19 +1304,28 @@ void Particles::solveFrame(double fps){
     frameDt = 1.0f/fps;
     dt = frameDt / 10.0f;
     elapsedTimeThisFrame = 0.0f;
+    substepsThisFrame = 0;
     while(elapsedTimeThisFrame < frameDt){    //every step is queued on this partition's one stream, in order: the host only waits where it reads something back
         particleVelToVoxels();
         pressureSolve();
+        smallestDtThisFrame = substepsThisFrame == 0 ? dt : std::fmin(smallestDtThisFrame, dt);
+        largestDtThisFrame = substepsThisFrame == 0 ? dt : std::fmax(largestDtThisFrame, dt);
+        ++substepsThisFrame;
         updateVoxelVelocities();
         voxelVelsToParticles();   //also moves the particles; initialize re-bins them wherever they landed, reflecting any that crossed a wall
+        ++substepIndex;
         initialize();
     }
 }
 
 void Particles::initialize(){
+        markRemovedParticles();     //sinks and open faces, before rootCell reflects anything back into the domain
         alignParticlesToGrid();
+        killRemovedParticles();     //the removed particles' cell is one past the last, so the sort puts them at the end
         sortParticles();
+        dropRemovedParticles();
         exchangeParticles();    //particles that crossed into another partition's planes move there
+        emitParticles();        //then emitters see every particle in their cells
         generateVoxels();
 }
 

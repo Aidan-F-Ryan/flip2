@@ -1,0 +1,82 @@
+//Copyright 2023 Aberrant Behavior LLC
+
+#ifndef SOURCES_HU
+#define SOURCES_HU
+
+#include "typedefs.h"
+
+#define MAX_SOURCE_SHAPES 16
+
+//a region of space for emitting or removing fluid: a box, or a sphere. Positions are double, as the particles' are
+struct FluidShape{
+    enum Kind{BOX, SPHERE};
+    int kind = BOX;
+    double low[3] = {0.0, 0.0, 0.0};        //the box's corners, or the sphere's bounds
+    double high[3] = {0.0, 0.0, 0.0};
+    double centre[3] = {0.0, 0.0, 0.0};     //the sphere's
+    double radius = 0.0;
+    float velocity[3] = {0.0f, 0.0f, 0.0f}; //an emitter's fluid's
+
+    __host__ __device__ bool contains(double x, double y, double z) const{
+        return containsWithin(x, y, z, 0.0);
+    }
+
+    //whether the segment from a to b passes through the shape
+    __host__ __device__ bool crossedBy(const double a[3], const double b[3]) const{
+        double d[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
+        if(kind == SPHERE){     //the segment's closest point to the centre
+            double toCentre[3] = {centre[0] - a[0], centre[1] - a[1], centre[2] - a[2]};
+            double lengthSquared = d[0]*d[0] + d[1]*d[1] + d[2]*d[2];
+            double t = lengthSquared > 0.0 ? (toCentre[0]*d[0] + toCentre[1]*d[1] + toCentre[2]*d[2]) / lengthSquared : 0.0;
+            t = t < 0.0 ? 0.0 : t > 1.0 ? 1.0 : t;
+            return contains(a[0] + t*d[0], a[1] + t*d[1], a[2] + t*d[2]);
+        }
+        double enter = 0.0, leave = 1.0;    //the box's slabs
+        for(int axis = 0; axis < 3; ++axis){
+            if(d[axis] == 0.0){
+                if(a[axis] < low[axis] || a[axis] >= high[axis]){
+                    return false;
+                }
+                continue;
+            }
+            double t0 = (low[axis] - a[axis]) / d[axis], t1 = (high[axis] - a[axis]) / d[axis];
+            enter = fmax(enter, fmin(t0, t1));
+            leave = fmin(leave, fmax(t0, t1));
+        }
+        return enter <= leave;
+    }
+
+    //whether it's inside the shape grown by margin on every side
+    __host__ __device__ bool containsWithin(double x, double y, double z, double margin) const{
+        if(kind == SPHERE){
+            double dx = x - centre[0], dy = y - centre[1], dz = z - centre[2];
+            return dx*dx + dy*dy + dz*dz < (radius + margin)*(radius + margin);
+        }
+        return x >= low[0] - margin && x < high[0] + margin && y >= low[1] - margin && y < high[1] + margin && z >= low[2] - margin && z < high[2] + margin;
+    }
+};
+
+//What adds fluid to the domain and what takes it away, checked every substep:
+//- emitters (inflow) pour fluid in at their velocity: particlesPerVoxel per voxel of volume their velocity sweeps through them, from a jittered lattice
+//  sliding along with them (see emitParticles), and they set the velocity of the fluid inside them (and of the grid's faces there and a voxel around,
+//  after the pressure solve), so the fluid they made keeps up with the lattice
+//- sinks (outflow) delete the particles inside them
+//- open faces of the domain delete the particles within a voxel of them. The pressure solve still sees a wall there, so fluid can't leave through the
+//  face faster than it reaches it; it just stops piling up
+//Each partition emits into its own node planes only, after the particles that crossed into them have arrived, so it sees every particle that could fill
+//a cell, and the same particles come out however the domain is split
+struct Sources{
+    int numEmitters = 0;
+    FluidShape emitters[MAX_SOURCE_SHAPES];
+    int numSinks = 0;
+    FluidShape sinks[MAX_SOURCE_SHAPES];
+    uint openFaces = 0;                 //bits: -x, +x, -y, +y, -z, +z
+    int latticePerSide = 2;             //the seeding lattice's cells per voxel along each axis: 1, 2 or 3 (particlesPerVoxel 1, 8 or 27)
+    unsigned long long seed = 1;
+
+    bool removes() const{
+        return numSinks > 0 || openFaces != 0;
+    }
+};
+
+#endif

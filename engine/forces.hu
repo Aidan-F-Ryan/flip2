@@ -1,0 +1,62 @@
+//Copyright 2023 Aberrant Behavior LLC
+
+#ifndef FORCES_HU
+#define FORCES_HU
+
+#include "typedefs.h"
+#include "grid.hpp"
+
+#define MAX_FORCE_FIELDS 16
+
+enum ForceKind{
+    FORCE_POINT,        //pulls towards position (pushes away with a negative strength)
+    FORCE_VORTEX,       //swirls around the line through position along axis, by the right-hand rule
+    FORCE_TURBULENCE,   //curl noise: swirls of about scale metres, divergence free, drifting at speed eddies per second
+    FORCE_WIND          //pulls the faces within depth voxels of the surface towards velocity, at drag per second
+};
+
+//one force field on the fluid besides gravity; scene.hpp says what each kind's settings mean
+struct ForceField{
+    int kind = FORCE_POINT;
+    float3 position = {0.0f, 0.0f, 0.0f};
+    float3 axis = {0.0f, 1.0f, 0.0f};       //vortex: unit length
+    float3 velocity = {0.0f, 0.0f, 0.0f};
+    float strength = 0.0f;                  //m/s^2
+    float radius = 0.0f;                    //0: no fade
+    float falloff = 1.0f;
+    float scale = 0.1f;
+    float speed = 0.5f;
+    unsigned int seed = 0;
+    float drag = 1.0f;
+    float depth = 2.0f;
+};
+
+//every acceleration on the fluid: gravity, and up to MAX_FORCE_FIELDS fields
+struct Forces{
+    float3 gravity = {0.0f, -9.8f, 0.0f};
+    int numFields = 0;
+    ForceField fields[MAX_FORCE_FIELDS];
+};
+
+//the stored voxels the forces act on, own and ghost, and where they are
+struct ForceVoxels{
+    uint numVoxels;
+    uint numNodes;              //the nodes storing them
+    const uint* nodeVoxelEnds;  //per node, the end of its run of voxels
+    const uint* nodeCells;      //per node, its cell in the grid of nodes
+    const uint* voxelSlots;     //per voxel, its slot in its node's block
+    const char* solids;         //per voxel, whether it's in a wall
+    const char* depth;          //per voxel, how deep inside the fluid's footprint it is (0 outside)
+    float* velocities[3];       //per voxel, the face velocities the forces change
+    const float* before[3];     //per voxel, the face velocities before any force: what wind pulls from
+    Grid grid;
+    uint refinementLevel;
+    int apronCells;
+};
+
+//adds dt times every force's acceleration to the faces of every stored voxel outside the walls, or, with takeBack, takes it back off, as pressureSolve's
+//retry does when it halves dt. Gravity's faces get exactly the arithmetic applyGravity and removeGravity did. A field acts at each face's position, and
+//turbulence at the simulation's time; wind pulls from the velocities before any force, so taking a force back off subtracts what adding it added
+void applyForces(const Forces& forces, bool takeBack, float dt, double time, const ForceVoxels& voxels, cudaStream_t stream);
+
+#endif

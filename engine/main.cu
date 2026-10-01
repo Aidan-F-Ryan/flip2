@@ -92,11 +92,20 @@ int main(int argc, char** argv){
     if(const char* advection = std::getenv("FLIP2_ADVECTION")){  //FLIP2_ADVECTION=euler moves particles straight along the grid velocity instead of RK3
         particles.setRungeKutta3(std::string(advection) != "euler");
     }
+    //FLIP2_DIAGNOSTICS=file writes a line of JSON per frame there: the particles' energy, momentum and extent, how they fill the voxels, and a hash of
+    //every particle's state, which tools/golden.py compares between runs (see diagnostics.hu)
+    const char* diagnostics = std::getenv("FLIP2_DIAGNOSTICS");
     particles.initialize();
+    if(diagnostics){
+        particles.writeDiagnostics(diagnostics, 0);
+    }
     particles.writePositionsToFile(std::to_string(0) + ".bin");
     for(int i = 0; i < numFrames; ++i){
         // particles.run();
         particles.solveFrame(24.0f);
+        if(diagnostics){
+            particles.writeDiagnostics(diagnostics, i + 1);
+        }
         particles.writePositionsToFile(std::to_string(i+1) + ".bin");
     }
     return 0;

@@ -35,6 +35,9 @@ add_library(particles SHARED
     partitionExchange.cu
     tcpTransport.cu
     simulation.cu
+    diagnostics.cu
+    forces.cu
+    sources.cu
 )
 
 target_link_libraries(particles ${cudaLibraries}  parallelPrefixSumKernels radixSortKernels reductionKernels particleToGridFunctions perVoxelParticleListFunctions voxelSolveFunctions conjugateGradientFunctions multigridFunctions Threads::Threads)
@@ -57,3 +60,8 @@ endif()
 add_executable(main main.cu)
 target_link_libraries(main particles gomp)
 set_target_properties(main PROPERTIES CUDA_ARCHITECTURES "86")
+
+# flip2: the command line, which runs a scene file (scene.hpp)
+add_executable(flip2 flip2.cu scene.cpp)
+target_link_libraries(flip2 particles gomp)
+set_target_properties(flip2 PROPERTIES CUDA_ARCHITECTURES "86")

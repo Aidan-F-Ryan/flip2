@@ -7,11 +7,14 @@
 #include "cudaVec.hu"
 #include "grid.hpp"
 #include "partitionContext.hu"
+#include "forces.hu"
+#include "sources.hu"
 #include "algorithms/conjugateGradientFunctions.hu"
 #include <string>
 #include <vector>
 
 class Transport;
+struct FrameDiagnostics;
 
 enum class PressureSolver{
     sor,        //red/black SOR
@@ -97,9 +100,35 @@ public:
         rungeKutta3 = on;
     }
 
+    void setGravity(float3 gravity){    //m/s^2; (0, -9.8, 0) by default
+        forces.gravity = gravity;
+    }
+
+    void setSources(const Sources& emittersAndSinks){   //what adds fluid and what takes it away (see sources.hu)
+        sources = emittersAndSinks;
+    }
+
+    void setForceFields(const std::vector<ForceField>& fields){   //the force fields besides gravity, up to MAX_FORCE_FIELDS of them (see forces.hu)
+        forces.numFields = 0;
+        for(const ForceField& field : fields){
+            if(forces.numFields == MAX_FORCE_FIELDS){
+                std::cerr<<"Particles: only the first "<<MAX_FORCE_FIELDS<<" force fields act\n";
+                break;
+            }
+            forces.fields[forces.numFields++] = field;
+        }
+    }
+
     ~Particles();
 private:
     void exchangeParticles();
+    ForceVoxels forceVoxels();
+    void resizeParticleArrays(uint newSize, uint keep);
+    void markRemovedParticles();
+    void killRemovedParticles();
+    void dropRemovedParticles();
+    void emitParticles();
+    void pinEmitterVelocities();
     void receiveParticleNodes(uint maskWords);
     void orderNodes(uint maskWords);
     void checkGhostRuns();
@@ -208,6 +237,10 @@ private:
     PressureSolver pressureSolver = PressureSolver::multigrid;
     DotProductSums dotProductSums = DotProductSums::exact;
     double maxVelocity = 0.0;   //the fastest particle velocity component, found each substep by P2G
+    Forces forces;              //gravity and the force fields
+    Sources sources;            //emitters, sinks and open faces
+    CudaVec<char> removedFlags; //per particle, while initialize runs: whether a sink or an open face takes it
+    unsigned long long substepIndex = 0;    //substeps taken, which seeds the emitters' jitter
     double restParticlesPerVoxel = 8.0;
     double densityCorrectionTime = 0.1;
     Grid grid;
@@ -215,8 +248,11 @@ private:
     double frameDt; //overall timestep used for writing particle positions
     double dt; //timestep used in pressure solve
     double prevDt;
-    double elapsedTime;
+    double elapsedTime = 0.0;
     double elapsedTimeThisFrame;
+    uint substepsThisFrame = 0;     //for diagnostics: the substeps the last frame took, and their smallest and largest dt
+    double smallestDtThisFrame = 0.0;
+    double largestDtThisFrame = 0.0;
 
     int cudaDevice = 0;
     cudaStream_t stream;
@@ -247,6 +283,7 @@ private:
     friend class ParticleSystemTester;
     friend class PartitionExchange;
     friend class Simulation;
+    friend FrameDiagnostics computeFrameDiagnostics(Particles& partition);
 };
 
 #endif
