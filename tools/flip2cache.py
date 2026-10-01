@@ -57,18 +57,19 @@ def _decompress(data):
 
 
 def read_shard(path):
-    """a shard's header, and per attribute its components' planes, each bytes of float32"""
+    """a shard's header, and per attribute its components' planes, each bytes of float32 (or float64: a checkpoint's positions, see "types")"""
     with open(path, "rb") as file:
         data = file.read()
     magic, version, attributes, particles, frame, rank, world_size, flags, *bounds = HEADER.unpack_from(data, 0)
     if magic != b"FLIP2SHD" or version != 1:
         raise ValueError("%s: not a version 1 flip2 shard" % path)
-    shard = {"particles": particles, "frame": frame, "rank": rank, "worldSize": world_size, "low": bounds[:3], "high": bounds[3:], "attributes": {}}
+    shard = {"particles": particles, "frame": frame, "rank": rank, "worldSize": world_size, "low": bounds[:3], "high": bounds[3:], "attributes": {}, "types": {}}
     for index in range(attributes):
         name, kind, components, codec, _, offset, stored, raw, _ = ATTRIBUTE.unpack_from(data, HEADER.size + index*ATTRIBUTE.size)
         name = name.rstrip(b"\0").decode()
-        if kind != 1:
-            raise ValueError("%s: attribute %s isn't float32" % (path, name))
+        if kind not in (1, 2):
+            raise ValueError("%s: attribute %s isn't float32 or float64" % (path, name))
+        shard["types"][name] = "f" if kind == 1 else "d"
         sizes = struct.unpack_from("<%dQ" % components, data, offset)
         at = offset + 8*components
         planes = []
@@ -80,13 +81,13 @@ def read_shard(path):
     return shard
 
 
-def _column(planes):
-    """components' planes as an (n, k) numpy array, or a list of float arrays without numpy"""
+def _column(planes, kind="f"):
+    """components' planes as an (n, k) numpy array, or a list of arrays without numpy"""
     if numpy is not None:
-        return numpy.stack([numpy.frombuffer(plane, dtype=numpy.float32) for plane in planes], axis=1)
+        return numpy.stack([numpy.frombuffer(plane, dtype=numpy.float32 if kind == "f" else numpy.float64) for plane in planes], axis=1)
     columns = []
     for plane in planes:
-        values = array("f")
+        values = array(kind)
         values.frombytes(plane)
         columns.append(values)
     return columns

@@ -1560,6 +1560,40 @@ void Particles::copyFrameColumnsToHost(float* planes, cudaEvent_t copied){
     gpuErrchk(cudaEventRecord(copied, frameStream));
 }
 
+//positions (double) then velocities, and with APIC their gradients (particleFloats' order), each a plane of every particle's value: the layout of a
+//checkpoint's state shard. Copied on this partition's own stream, so they're the state at this point, whatever the next substep does to them
+void Particles::copyCheckpointToHost(char* host, cudaEvent_t copied){
+    size_t count = size;
+    char* at = host;
+    for(CudaVec<double>* position : {&px, &py, &pz}){
+        if(count > 0){
+            gpuErrchk(cudaMemcpyAsync(at, position->devPtr(), sizeof(double)*count, cudaMemcpyDeviceToHost, stream));
+        }
+        at += sizeof(double)*count;
+    }
+    for(CudaVec<float>* data : particleFloats()){
+        if(count > 0){
+            gpuErrchk(cudaMemcpyAsync(at, data->devPtr(), sizeof(float)*count, cudaMemcpyDeviceToHost, stream));
+        }
+        at += sizeof(float)*count;
+    }
+    gpuErrchk(cudaEventRecord(copied, stream));
+}
+
+//A checkpoint holds the particles as the end of its frame left them: its last substep had pushed them out of obstacles, deleted those in sinks, emitted,
+//exchanged and sorted them. So carrying on rebuilds only what follows from them: the obstacles where they are then, the particles' cells, this partition's
+//own particles (the first exchange keeps just those, as at the start; they're already in its planes, in order), and the grid. Running initialize again
+//would emit the last substep's fluid a second time
+void Particles::resume(double time, unsigned long long substep){
+    elapsedTime = time;
+    substepIndex = substep;
+    updateObstacles();
+    alignParticlesToGrid();
+    sortParticles();
+    exchangeParticles();
+    generateVoxels();
+}
+
 Particles::~Particles(){     //with its GPU the current one
     if(frameStream != nullptr){
         cudaStreamSynchronize(frameStream);

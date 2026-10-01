@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <sstream>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -26,10 +27,10 @@
 
 namespace{
 
-constexpr int PLANES = 6;   //P x, y, z, then v x, y, z
 constexpr uint32_t CODEC_RAW = 0;
 constexpr uint32_t CODEC_BLOSC = 1;
 constexpr uint32_t TYPE_FLOAT32 = 1;
+constexpr uint32_t TYPE_FLOAT64 = 2;
 
 struct ShardHeader{
     char magic[8];
@@ -64,9 +65,9 @@ std::string frameName(int frame){
     return name;
 }
 
-std::string shardName(int rank, const char* extension){
-    char name[32];
-    std::snprintf(name, sizeof(name), "particles.r%03d.%s", rank, extension);
+std::string shardName(const char* base, int rank, const char* extension){    //particles.r003.f2p, state.r003.json
+    char name[48];
+    std::snprintf(name, sizeof(name), "%s.r%03d.%s", base, rank, extension);
     return name;
 }
 
@@ -163,13 +164,101 @@ bool replaceFile(const std::string& path, const std::string& text, std::string& 
 
 }
 
-CacheWriter::CacheWriter(const std::string& directory, const CacheDescription& description, const std::vector<int>& localRanks, std::function<void(int)> committed,
-                         int numBuffers)
+const ShardData::Attribute* ShardData::find(const std::string& name) const{
+    for(const Attribute& attribute : attributes){
+        if(attribute.name == name){
+            return &attribute;
+        }
+    }
+    return nullptr;
+}
+
+bool readShard(const std::string& path, const std::string& xxh64, ShardData& out, std::string& why){
+    std::ifstream file(path, std::ios::binary);
+    if(!file){
+        why = path + ": missing";
+        return false;
+    }
+    std::string data((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    if(!xxh64.empty()){
+        Xxh64 hash;
+        hash.update(data.data(), data.size());
+        if(hex(hash.digest()) != xxh64){
+            why = path + ": its XXH64 is " + hex(hash.digest()) + ", not the " + xxh64 + " its record says: it's damaged";
+            return false;
+        }
+    }
+    ShardHeader header;
+    if(data.size() < sizeof(header)){
+        why = path + ": too short for a shard";
+        return false;
+    }
+    std::memcpy(&header, data.data(), sizeof(header));
+    if(std::memcmp(header.magic, "FLIP2SHD", 8) != 0 || header.version != 1 || data.size() < sizeof(header) + header.attributes*sizeof(ShardAttribute)){
+        why = path + ": not a version 1 flip2 shard";
+        return false;
+    }
+    out = ShardData();
+    out.particles = header.particles;
+    out.frame = header.frame;
+    out.rank = (int)header.rank;
+    out.worldSize = (int)header.worldSize;
+    for(uint32_t index = 0; index < header.attributes; ++index){
+        ShardAttribute entry;
+        std::memcpy(&entry, data.data() + sizeof(header) + index*sizeof(entry), sizeof(entry));
+        ShardData::Attribute attribute;
+        attribute.name = std::string(entry.name, strnlen(entry.name, sizeof(entry.name)));
+        attribute.type = entry.type;
+        attribute.components = entry.components;
+        size_t valueBytes = entry.type == TYPE_FLOAT64 ? 8 : 4;
+        size_t planeBytes = valueBytes*header.particles;
+        if((entry.type != TYPE_FLOAT32 && entry.type != TYPE_FLOAT64) || entry.offset + entry.storedBytes > data.size() || entry.rawBytes != planeBytes*entry.components){
+            why = path + ": attribute " + attribute.name + " doesn't fit the file";
+            return false;
+        }
+        attribute.planes.resize(entry.rawBytes);
+        size_t at = entry.offset + 8*entry.components;
+        for(uint32_t component = 0; component < entry.components; ++component){
+            uint64_t stored;
+            std::memcpy(&stored, data.data() + entry.offset + 8*component, 8);
+            if(at + stored > data.size()){
+                why = path + ": attribute " + attribute.name + " runs past the end of the file";
+                return false;
+            }
+            char* into = attribute.planes.data() + component*planeBytes;
+            if(entry.codec == CODEC_RAW){
+                if(stored != planeBytes){
+                    why = path + ": attribute " + attribute.name + " is the wrong size";
+                    return false;
+                }
+                std::memcpy(into, data.data() + at, planeBytes);
+            }
+            else{
+#ifdef FLIP2_WITH_BLOSC
+                if(planeBytes > 0 && blosc_decompress_ctx(data.data() + at, into, planeBytes, 1) != (int)planeBytes){
+                    why = path + ": attribute " + attribute.name + " doesn't decompress";
+                    return false;
+                }
+#else
+                why = path + ": its planes are compressed with blosc, which this build lacks (install libblosc-dev and rebuild)";
+                return false;
+#endif
+            }
+            at += stored;
+        }
+        out.attributes.push_back(std::move(attribute));
+    }
+    return true;
+}
+
+CacheWriter::CacheWriter(const std::string& directory, const CacheDescription& description, const std::vector<int>& localRanks, int committedBefore,
+                         std::function<void(const char*, int)> done, int numBuffers)
 : directory(directory)
 , description(description)
 , localRanks(localRanks)
 , commits(std::find(localRanks.begin(), localRanks.end(), 0) != localRanks.end())
-, committed(std::move(committed))
+, done(std::move(done))
+, lastCommitted(committedBefore)
 {
 #ifndef FLIP2_WITH_BLOSC
     if(this->description.compression != "none"){
@@ -177,17 +266,28 @@ CacheWriter::CacheWriter(const std::string& directory, const CacheDescription& d
         this->description.compression = "none";
     }
 #endif
-    for(int i = 0; i < numBuffers; ++i){    //allocated as frames ask for them
+    this->description.keepCheckpoints = std::max(1, this->description.keepCheckpoints);
+    for(int i = 0; i < numBuffers; ++i){    //allocated as jobs ask for them
         hostBuffers.push_back(nullptr);
         capacities.push_back(0);
         freeBuffers.push_back(i);
     }
     std::error_code made;
     std::filesystem::create_directories(directory + "/frames", made);
+    if(!made){
+        std::filesystem::create_directories(directory + "/checkpoints", made);
+    }
     if(made){
-        fail(directory + "/frames: " + made.message());
+        fail(directory + ": making frames/ and checkpoints/ in it: " + made.message());
     }
     else if(commits){
+        std::error_code listed;     //a resumed bake keeps the checkpoints it had
+        for(const auto& entry : std::filesystem::directory_iterator(directory + "/checkpoints", listed)){
+            std::string name = entry.path().filename().string();
+            if(entry.is_directory() && std::filesystem::exists(entry.path() / "ckpt.json") && !name.empty() && std::all_of(name.begin(), name.end(), ::isdigit)){
+                lastCheckpoint = std::max(lastCheckpoint, std::atoi(name.c_str()));
+            }
+        }
         describe();
     }
     thread = std::thread(&CacheWriter::run, this);
@@ -200,20 +300,20 @@ CacheWriter::~CacheWriter(){
     }
     changed.notify_all();
     thread.join();
-    if(timing.frames > 0){
-        double per = 1000.0/timing.frames;
-        std::fprintf(stderr, "CacheWriter: %d frames; per frame, %.1f ms compressing, %.1f writing, %.1f flushing to the disk, %.1f committing; the simulation waited "
-                     "for a buffer %d times, %.1f ms in all\n", timing.frames, per*timing.compress, per*timing.write, per*timing.flush, per*timing.commit, timing.waits,
-                     1000.0*timing.waited);
+    if(timing.frames + timing.checkpoints > 0){
+        double per = 1000.0/(timing.frames + timing.checkpoints);
+        std::fprintf(stderr, "CacheWriter: %d frames and %d checkpoints; per job, %.1f ms compressing, %.1f writing, %.1f flushing to the disk, %.1f committing; the "
+                     "simulation waited for a buffer %d times, %.1f ms in all\n", timing.frames, timing.checkpoints, per*timing.compress, per*timing.write, per*timing.flush,
+                     per*timing.commit, timing.waits, 1000.0*timing.waited);
     }
-    for(float* hostBuffer : hostBuffers){
+    for(char* hostBuffer : hostBuffers){
         if(hostBuffer != nullptr){
             cudaFreeHost(hostBuffer);
         }
     }
 }
 
-int CacheWriter::acquire(size_t floats){
+int CacheWriter::acquire(size_t bytes){
     int buffer;
     {
         std::unique_lock<std::mutex> lock(mutex);
@@ -226,21 +326,31 @@ int CacheWriter::acquire(size_t floats){
         buffer = freeBuffers.back();
         freeBuffers.pop_back();
     }
-    floats = std::max<size_t>(floats, 1024);
-    if(capacities[buffer] < floats){    //nobody else touches a buffer between acquire and submit
+    bytes = std::max<size_t>(bytes, 4096);
+    if(capacities[buffer] < bytes){     //nobody else touches a buffer between acquire and submit
         if(hostBuffers[buffer] != nullptr){
             gpuErrchk(cudaFreeHost(hostBuffers[buffer]));
         }
-        gpuErrchk(cudaHostAlloc((void**)&hostBuffers[buffer], sizeof(float)*floats, cudaHostAllocPortable));    //portable: pinned for every GPU's copies
-        capacities[buffer] = floats;
+        gpuErrchk(cudaHostAlloc((void**)&hostBuffers[buffer], bytes, cudaHostAllocPortable));     //portable: pinned for every GPU's copies
+        capacities[buffer] = bytes;
     }
     return buffer;
 }
 
 void CacheWriter::submit(int buffer, int frame, double time, const std::vector<CacheShard>& shards, const std::vector<cudaEvent_t>& copies){
+    Job job{false, buffer, frame, CheckpointState(), shards, copies};
+    job.state.time = time;
     {
         std::lock_guard<std::mutex> lock(mutex);
-        jobs.push({buffer, frame, time, shards, copies});
+        jobs.push(job);
+    }
+    changed.notify_all();
+}
+
+void CacheWriter::submitCheckpoint(int buffer, int frame, const CheckpointState& state, const std::vector<CacheShard>& shards, const std::vector<cudaEvent_t>& copies){
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        jobs.push({true, buffer, frame, state, shards, copies});
     }
     changed.notify_all();
 }
@@ -288,25 +398,30 @@ void CacheWriter::process(const Job& job){
     for(cudaEvent_t copy : job.copies){
         gpuErrchk(cudaEventSynchronize(copy));
     }
-    bool fine = error().empty();    //after a failure nothing more is committed, so the frames committed stay the ones before it
-    std::string frameDirectory = directory + "/frames/" + frameName(job.frame);
+    bool fine = error().empty();    //after a failure nothing more is committed, so what's committed stays what came before it
+    const char* base = job.checkpoint ? "state" : "particles";
+    std::string place = directory + (job.checkpoint ? "/checkpoints/" : "/frames/") + frameName(job.frame);
+    std::vector<Layout> layout = {{"P", 3, job.checkpoint ? 8 : 4}, {"v", 3, 4}};
+    if(job.checkpoint && job.state.apic){
+        layout.push_back({"c", 9, 4});
+    }
     if(fine){
         std::error_code made;
-        std::filesystem::create_directories(frameDirectory, made);
+        std::filesystem::create_directories(place, made);
         if(made){
-            fail(frameDirectory + ": " + made.message());
+            fail(place + ": " + made.message());
             fine = false;
         }
     }
     std::vector<ShardRecord> records;
     for(const CacheShard& shard : job.shards){
         ShardRecord record;
-        fine = fine && writeShard(frameDirectory, job.frame, shard, hostBuffers[job.buffer] + shard.offset, record);
+        fine = fine && writeShard(place + "/" + shardName(base, shard.rank, "f2p"), job.frame, shard, hostBuffers[job.buffer] + shard.offset, layout, record);
         if(fine && !commits){   //rank 0, in another process, commits it from this record
             std::string why;
             std::string text = "{\"rank\":" + std::to_string(record.rank) + ",\"particles\":" + std::to_string(record.particles) + ",\"bytes\":" +
                                std::to_string(record.bytes) + ",\"xxh64\":\"" + hex(record.hash) + "\",\"low\":" + triple(record.low) + ",\"high\":" + triple(record.high) + "}\n";
-            if(!replaceFile(frameDirectory + "/" + shardName(record.rank, "json"), text, why, false)){   //only for rank 0 to read: it needn't survive a crash
+            if(!replaceFile(place + "/" + shardName(base, record.rank, "json"), text, why, false)){   //only for rank 0 to read: it needn't survive a crash
                 fail(why);
                 fine = false;
             }
@@ -325,7 +440,7 @@ void CacheWriter::process(const Job& job){
         if(std::find(localRanks.begin(), localRanks.end(), rank) != localRanks.end()){
             continue;
         }
-        std::string path = frameDirectory + "/" + shardName(rank, "json");
+        std::string path = place + "/" + shardName(base, rank, "json");
         ShardRecord record;
         auto start = std::chrono::steady_clock::now();
         int minutes = 0;
@@ -334,10 +449,10 @@ void CacheWriter::process(const Job& job){
             int waited = (int)(std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() / 60.0);
             if(waited > minutes){
                 minutes = waited;
-                std::cerr<<"CacheWriter: frame "<<job.frame<<" has waited "<<minutes<<" minute"<<(minutes > 1 ? "s" : "")<<" for rank "<<rank<<"'s shard\n";
+                std::cerr<<"CacheWriter: "<<place<<" has waited "<<minutes<<" minute"<<(minutes > 1 ? "s" : "")<<" for rank "<<rank<<"'s shard\n";
             }
             if(minutes >= 30){
-                fail("frame " + std::to_string(job.frame) + ": rank " + std::to_string(rank) + "'s shard never came");
+                fail(place + ": rank " + std::to_string(rank) + "'s shard never came");
                 return;
             }
         }
@@ -345,24 +460,27 @@ void CacheWriter::process(const Job& job){
     }
     std::sort(records.begin(), records.end(), [](const ShardRecord& a, const ShardRecord& b){ return a.rank < b.rank; });
     auto start = std::chrono::steady_clock::now();
-    bool down = commit(frameDirectory, job.frame, job.time, records);
+    bool down = job.checkpoint ? commitCheckpoint(place, job, records) : commit(place, job.frame, job.state.time, records);
     timing.commit += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-    ++timing.frames;
-    if(down && committed){
-        committed(job.frame);
+    ++(job.checkpoint ? timing.checkpoints : timing.frames);
+    if(down && done){
+        done(job.checkpoint ? "checkpoint" : "committed", job.frame);
+    }
+    if(down && job.checkpoint){
+        pruneCheckpoints();
     }
     bool idle;
     {
         std::lock_guard<std::mutex> lock(mutex);
         idle = jobs.empty();
     }
-    if(down && (idle || std::chrono::steady_clock::now() - described > std::chrono::seconds(1))){
+    if(down && (idle || job.checkpoint || std::chrono::steady_clock::now() - described > std::chrono::seconds(1))){
         describe();
     }
 }
 
 bool CacheWriter::describe(){
-    if(lastDescribed == lastCommitted){
+    if(lastDescribed == lastCommitted && checkpointDescribed == lastCheckpoint){
         return true;
     }
     std::string why;
@@ -371,66 +489,84 @@ bool CacheWriter::describe(){
         return false;
     }
     lastDescribed = lastCommitted;
+    checkpointDescribed = lastCheckpoint;
     described = std::chrono::steady_clock::now();
     return true;
 }
 
 //a shard: compressed (or not), hashed as it's written, and flushed to the disk before its record says it's there
-bool CacheWriter::writeShard(const std::string& frameDirectory, int frame, const CacheShard& shard, const float* planes, ShardRecord& record){
+bool CacheWriter::writeShard(const std::string& path, int frame, const CacheShard& shard, const char* data, const std::vector<Layout>& layout, ShardRecord& record){
     size_t count = shard.particles;
     record.rank = shard.rank;
     record.particles = count;
-    for(int axis = 0; axis < 3; ++axis){
-        float low = INFINITY, high = -INFINITY;
-        const float* plane = planes + axis*count;
-        for(size_t i = 0; i < count; ++i){
-            low = std::min(low, plane[i]);
-            high = std::max(high, plane[i]);
+    struct Plane{
+        const char* stored;
+        uint64_t storedBytes;
+        size_t rawBytes;
+        int valueBytes;
+        const char* raw;
+    };
+    std::vector<Plane> planes;
+    size_t at = 0;
+    for(const Layout& attribute : layout){
+        for(int component = 0; component < attribute.components; ++component){
+            size_t bytes = (size_t)attribute.bytes*count;
+            planes.push_back({data + at, bytes, bytes, attribute.bytes, data + at});
+            at += bytes;
         }
-        record.low[axis] = count > 0 ? low : 0.0f;
-        record.high[axis] = count > 0 ? high : 0.0f;
     }
-    size_t planeBytes = sizeof(float)*count;
+    for(int axis = 0; axis < 3; ++axis){    //the bounds, from the positions: the first attribute
+        double low = INFINITY, high = -INFINITY;
+        for(size_t i = 0; i < count; ++i){
+            double x = layout[0].bytes == 8 ? ((const double*)planes[axis].raw)[i] : ((const float*)planes[axis].raw)[i];
+            low = std::min(low, x);
+            high = std::max(high, x);
+        }
+        record.low[axis] = count > 0 ? (float)low : 0.0f;
+        record.high[axis] = count > 0 ? (float)high : 0.0f;
+    }
     bool compress = description.compression != "none" && count > 0;
 #ifdef FLIP2_WITH_BLOSC
-    compress = compress && planeBytes <= (size_t)BLOSC_MAX_BUFFERSIZE;
-#endif
-    const char* stored[PLANES];
-    uint64_t storedBytes[PLANES];
-    for(int plane = 0; plane < PLANES; ++plane){
-        stored[plane] = (const char*)(planes + plane*count);
-        storedBytes[plane] = planeBytes;
+    for(const Plane& plane : planes){
+        compress = compress && plane.rawBytes <= (size_t)BLOSC_MAX_BUFFERSIZE;
     }
+#endif
     auto start = std::chrono::steady_clock::now();
 #ifdef FLIP2_WITH_BLOSC
     if(compress){
-        size_t room = planeBytes + BLOSC_MAX_OVERHEAD;
-        if(scratch.size() < PLANES*room){
-            scratch.resize(PLANES*room);
+        std::vector<size_t> into(planes.size());
+        size_t room = 0;
+        for(size_t plane = 0; plane < planes.size(); ++plane){
+            into[plane] = room;
+            room += planes[plane].rawBytes + BLOSC_MAX_OVERHEAD;
+        }
+        if(scratch.size() < room){
+            scratch.resize(room);
         }
         //a thread per plane, each running blosc on one thread: with more, blosc places its blocks in the order they finish, and the same frame would
         //come out a different file each time
         bool zstd = description.compression == "zstd";     //zstd at level 1 with bit shuffle packs simulation floats best for the time; lz4 is faster
         std::atomic<bool> packed{true};
         std::vector<std::thread> workers;
-        for(int plane = 0; plane < PLANES; ++plane){
+        for(size_t plane = 0; plane < planes.size(); ++plane){
             workers.emplace_back([&, plane]{
-                char* into = scratch.data() + plane*room;
-                int bytes = blosc_compress_ctx(zstd ? 1 : 5, zstd ? BLOSC_BITSHUFFLE : BLOSC_SHUFFLE, sizeof(float), planeBytes, planes + plane*count, into, room,
-                                               zstd ? BLOSC_ZSTD_COMPNAME : BLOSC_LZ4_COMPNAME, 0, 1);
+                Plane& mine = planes[plane];
+                char* out = scratch.data() + into[plane];
+                int bytes = blosc_compress_ctx(zstd ? 1 : 5, zstd ? BLOSC_BITSHUFFLE : BLOSC_SHUFFLE, mine.valueBytes, mine.rawBytes, mine.raw, out,
+                                               mine.rawBytes + BLOSC_MAX_OVERHEAD, zstd ? BLOSC_ZSTD_COMPNAME : BLOSC_LZ4_COMPNAME, 0, 1);
                 if(bytes <= 0){
                     packed = false;
                     return;
                 }
-                stored[plane] = into;
-                storedBytes[plane] = (uint64_t)bytes;
+                mine.stored = out;
+                mine.storedBytes = (uint64_t)bytes;
             });
         }
         for(std::thread& worker : workers){
             worker.join();
         }
         if(!packed){
-            fail("frame " + std::to_string(frame) + ": blosc couldn't compress rank " + std::to_string(shard.rank) + "'s shard");
+            fail(path + ": blosc couldn't compress it");
             return false;
         }
     }
@@ -440,7 +576,7 @@ bool CacheWriter::writeShard(const std::string& frameDirectory, int frame, const
     ShardHeader header = {};
     std::memcpy(header.magic, "FLIP2SHD", 8);
     header.version = 1;
-    header.attributes = 2;
+    header.attributes = (uint32_t)layout.size();
     header.particles = count;
     header.frame = frame;
     header.rank = (uint32_t)shard.rank;
@@ -449,39 +585,46 @@ bool CacheWriter::writeShard(const std::string& frameDirectory, int frame, const
         header.low[axis] = record.low[axis];
         header.high[axis] = record.high[axis];
     }
-    ShardAttribute attributes[2] = {};
-    uint64_t offset = sizeof(ShardHeader) + sizeof(attributes);
-    for(int attribute = 0; attribute < 2; ++attribute){
-        ShardAttribute& entry = attributes[attribute];
-        std::strncpy(entry.name, attribute == 0 ? "P" : "v", sizeof(entry.name));
-        entry.type = TYPE_FLOAT32;
-        entry.components = 3;
+    std::vector<ShardAttribute> entries(layout.size());
+    uint64_t offset = sizeof(ShardHeader) + entries.size()*sizeof(ShardAttribute);
+    size_t first = 0;   //the attribute's first plane
+    for(size_t attribute = 0; attribute < layout.size(); ++attribute){
+        ShardAttribute& entry = entries[attribute];
+        std::memset(&entry, 0, sizeof(entry));
+        std::strncpy(entry.name, layout[attribute].name.c_str(), sizeof(entry.name));
+        entry.type = layout[attribute].bytes == 8 ? TYPE_FLOAT64 : TYPE_FLOAT32;
+        entry.components = (uint32_t)layout[attribute].components;
         entry.codec = compress ? CODEC_BLOSC : CODEC_RAW;
         entry.offset = offset;
-        entry.storedBytes = 3*sizeof(uint64_t);
-        for(int component = 0; component < 3; ++component){
-            entry.storedBytes += storedBytes[3*attribute + component];
+        entry.storedBytes = entry.components*sizeof(uint64_t);
+        entry.rawBytes = 0;
+        for(uint32_t component = 0; component < entry.components; ++component){
+            entry.storedBytes += planes[first + component].storedBytes;
+            entry.rawBytes += planes[first + component].rawBytes;
         }
-        entry.rawBytes = 3*planeBytes;
         offset += entry.storedBytes;
+        first += entry.components;
     }
-    std::string path = frameDirectory + "/" + shardName(shard.rank, "f2p");
     int file = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if(file < 0){
         fail(path + ": " + std::strerror(errno));
         return false;
     }
     Xxh64 hash;
-    auto put = [&](const void* data, size_t bytes){
-        hash.update(data, bytes);
-        return writeAll(file, data, bytes);
+    auto put = [&](const void* bytes, size_t length){
+        hash.update(bytes, length);
+        return writeAll(file, bytes, length);
     };
-    bool written = put(&header, sizeof(header)) && put(attributes, sizeof(attributes));
-    for(int attribute = 0; attribute < 2 && written; ++attribute){
-        written = put(storedBytes + 3*attribute, 3*sizeof(uint64_t));
-        for(int component = 0; component < 3 && written; ++component){
-            written = put(stored[3*attribute + component], storedBytes[3*attribute + component]);
+    bool written = put(&header, sizeof(header)) && put(entries.data(), entries.size()*sizeof(ShardAttribute));
+    first = 0;
+    for(size_t attribute = 0; attribute < layout.size() && written; ++attribute){
+        for(int component = 0; component < layout[attribute].components && written; ++component){
+            written = put(&planes[first + component].storedBytes, sizeof(uint64_t));
         }
+        for(int component = 0; component < layout[attribute].components && written; ++component){
+            written = put(planes[first + component].stored, planes[first + component].storedBytes);
+        }
+        first += layout[attribute].components;
     }
     auto wrote = std::chrono::steady_clock::now();
     timing.write += std::chrono::duration<double>(wrote - compressed).count();
@@ -532,6 +675,18 @@ bool CacheWriter::readRecord(const std::string& path, int rank, ShardRecord& rec
     }
 }
 
+//the shards' list in a commit record
+std::string CacheWriter::shardsJson(const std::vector<ShardRecord>& records, const char* base) const{
+    std::string text;
+    for(size_t i = 0; i < records.size(); ++i){
+        const ShardRecord& record = records[i];
+        text += std::string(i ? "," : "") + "\n  {\"file\":\"" + shardName(base, record.rank, "f2p") + "\",\"rank\":" + std::to_string(record.rank) + ",\"particles\":" +
+                std::to_string(record.particles) + ",\"bytes\":" + std::to_string(record.bytes) + ",\"xxh64\":\"" + hex(record.hash) + "\",\"low\":" + triple(record.low) +
+                ",\"high\":" + triple(record.high) + "}";
+    }
+    return text;
+}
+
 //the frame's commit record, written last: the frame is in the cache once it's down
 bool CacheWriter::commit(const std::string& frameDirectory, int frame, double time, const std::vector<ShardRecord>& records){
     uint64_t total = 0;
@@ -539,14 +694,7 @@ bool CacheWriter::commit(const std::string& frameDirectory, int frame, double ti
         total += record.particles;
     }
     std::string text = "{\"flip2\":\"commit\",\"version\":1,\"frame\":" + std::to_string(frame) + ",\"time\":" + number(time) + ",\"particles\":" + std::to_string(total) +
-                       ",\"shards\":[";
-    for(size_t i = 0; i < records.size(); ++i){
-        const ShardRecord& record = records[i];
-        text += std::string(i ? "," : "") + "\n  {\"file\":\"" + shardName(record.rank, "f2p") + "\",\"rank\":" + std::to_string(record.rank) + ",\"particles\":" +
-                std::to_string(record.particles) + ",\"bytes\":" + std::to_string(record.bytes) + ",\"xxh64\":\"" + hex(record.hash) + "\",\"low\":" + triple(record.low) +
-                ",\"high\":" + triple(record.high) + "}";
-    }
-    text += "]}\n";
+                       ",\"shards\":[" + shardsJson(records, "particles") + "]}\n";
     //the shards were flushed as they were written, and flushing the frame's directory after the rename makes their names last along with the record's;
     //then the frame's own name in frames/
     std::string why;
@@ -562,6 +710,55 @@ bool CacheWriter::commit(const std::string& frameDirectory, int frame, double ti
     return true;
 }
 
+//a checkpoint's record, written last as a frame's is: what flip2 resume needs besides the particles, which are in the state shards
+bool CacheWriter::commitCheckpoint(const std::string& checkpointDirectory, const Job& job, const std::vector<ShardRecord>& records){
+    uint64_t total = 0;
+    for(const ShardRecord& record : records){
+        total += record.particles;
+    }
+    std::string planes;
+    for(size_t i = 0; i < description.partitionPlanes.size(); ++i){
+        planes += (i ? "," : "") + std::to_string(description.partitionPlanes[i]);
+    }
+    std::string text = "{\"flip2\":\"checkpoint\",\"version\":1,\"frame\":" + std::to_string(job.frame) + ",\"time\":" + number(job.state.time) + ",\"substep\":" +
+                       std::to_string(job.state.substep) + ",\"apic\":" + (job.state.apic ? "true" : "false") + ",\"particles\":" + std::to_string(total) +
+                       ",\n \"worldSize\":" + std::to_string(description.worldSize) + ",\"partitionPlanes\":[" + planes + "],\"sceneXxh64\":\"" + description.sceneHash +
+                       "\",\"build\":" + quoted(FLIP2_BUILD_ID) + ",\n \"states\":[" + shardsJson(records, "state") + "]}\n";
+    std::string why;
+    if(!replaceFile(checkpointDirectory + "/ckpt.json", text, why)){
+        fail(why);
+        return false;
+    }
+    if(!syncDirectory(directory + "/checkpoints")){
+        fail(directory + "/checkpoints: flushing it: " + std::strerror(errno));
+        return false;
+    }
+    lastCheckpoint = std::max(lastCheckpoint, job.frame);
+    return true;
+}
+
+//deletes all but the newest keepCheckpoints checkpoints, and any unfinished one older than the newest (one a crash left); not newer ones, which other
+//ranks may still be writing
+void CacheWriter::pruneCheckpoints(){
+    std::vector<std::pair<int, bool>> found;    //frame, whether it's committed
+    std::error_code listed;
+    for(const auto& entry : std::filesystem::directory_iterator(directory + "/checkpoints", listed)){
+        std::string name = entry.path().filename().string();
+        if(entry.is_directory() && !name.empty() && std::all_of(name.begin(), name.end(), ::isdigit)){
+            found.push_back({std::atoi(name.c_str()), std::filesystem::exists(entry.path() / "ckpt.json")});
+        }
+    }
+    std::sort(found.begin(), found.end(), [](const std::pair<int, bool>& a, const std::pair<int, bool>& b){ return a.first > b.first; });
+    int kept = 0;
+    for(const auto& [frame, committed] : found){
+        bool keep = committed ? ++kept <= description.keepCheckpoints : frame > lastCheckpoint;
+        if(!keep){
+            std::error_code removed;
+            std::filesystem::remove_all(directory + "/checkpoints/" + frameName(frame), removed);
+        }
+    }
+}
+
 std::string CacheWriter::cacheJson() const{
     const CacheDescription& d = description;
     std::string planes;
@@ -570,7 +767,8 @@ std::string CacheWriter::cacheJson() const{
     }
     return "{\"flip2\":\"cache\",\"version\":1,\n"
            " \"scene\":{\"path\":" + quoted(d.scenePath) + ",\"xxh64\":\"" + d.sceneHash + "\"},\n"
-           " \"fps\":" + number(d.fps) + ",\"frames\":" + std::to_string(d.frames) + ",\"committed\":" + std::to_string(lastCommitted) + ",\n"
+           " \"fps\":" + number(d.fps) + ",\"frames\":" + std::to_string(d.frames) + ",\"committed\":" + std::to_string(lastCommitted) + ",\"checkpoint\":" +
+           std::to_string(lastCheckpoint) + ",\n"
            " \"worldSize\":" + std::to_string(d.worldSize) + ",\"partitionPlanes\":[" + planes + "],\n"
            " \"nodes\":[" + std::to_string(d.nodes[0]) + "," + std::to_string(d.nodes[1]) + "," + std::to_string(d.nodes[2]) + "],\"nodeSize\":" + number(d.nodeSize) +
            ",\"voxelSize\":" + number(d.voxelSize) + ",\"domainMin\":[" + number(d.domainMin[0]) + "," + number(d.domainMin[1]) + "," + number(d.domainMin[2]) + "],\n"

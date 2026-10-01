@@ -32,6 +32,8 @@
 //               {"type": "wind", "velocity": [2, 0, 0], "drag": 1, "depth": 2}],               //drag per second, on the voxels within depth of the surface
 //    "partitions": 1, "devices": 0,
 //    "output": {"dir": ".", "cache": true, "compression": "zstd",           //the cache DCCs read (cacheWriter.hu), in dir; "zstd", "lz4" or "none"
+//               "checkpoints": {"every": 10, "keep": 2},                   //in the cache, for flip2 resume: every so many frames (0: only on cancel and at
+//                                                                          //the end), keeping the newest few
 //               "positions": false, "diagnostics": ""}                     //N.bin, float32 x, y, z per particle; diagnostics: a file name in dir, or ""
 //  }
 
@@ -138,6 +140,8 @@ struct Scene{
     std::string outputDirectory = ".";
     bool writeCache = true;     //frames/NNNN/ and cache.json in the output directory (cacheWriter.hu)
     std::string compression = "zstd";   //of the cache's shards: "zstd" or "lz4" (blosc), or "none"
+    int checkpointEvery = 10;   //frames between the cache's checkpoints: 0 for none but on cancel and at the end
+    int keepCheckpoints = 2;    //the newest kept
     bool writePositions = false;    //N.bin, float32 x, y, z per particle, gathered into one file per frame: for quick looks
     std::string diagnostics;    //a file name in the output directory, or empty for none
 

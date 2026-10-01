@@ -712,12 +712,20 @@ Scene loadScene(const std::string& path){
         read.fail("the scene", "partitions has to be at least 1 and devices at least 0");
     }
     if(const Json* output = read.object(root, "output", "the scene")){
-        read.checkKeys(*output, "output", {"dir", "cache", "compression", "positions", "diagnostics"});
+        read.checkKeys(*output, "output", {"dir", "cache", "compression", "checkpoints", "positions", "diagnostics"});
         scene.outputDirectory = read.text(*output, "dir", "output", scene.outputDirectory);
         scene.writeCache = read.flag(*output, "cache", "output", scene.writeCache);
         scene.compression = read.text(*output, "compression", "output", scene.compression);
         if(scene.compression != "zstd" && scene.compression != "lz4" && scene.compression != "none"){
             read.fail("output.compression", "is \"" + scene.compression + "\"; it can be \"zstd\", \"lz4\" or \"none\"");
+        }
+        if(const Json* checkpoints = read.object(*output, "checkpoints", "output")){
+            read.checkKeys(*checkpoints, "output.checkpoints", {"every", "keep"});
+            scene.checkpointEvery = (int)read.number(*checkpoints, "every", "output.checkpoints", scene.checkpointEvery);
+            scene.keepCheckpoints = (int)read.number(*checkpoints, "keep", "output.checkpoints", scene.keepCheckpoints);
+            if(scene.checkpointEvery < 0 || scene.keepCheckpoints < 1){
+                read.fail("output.checkpoints", "every has to be at least 0, and keep at least 1");
+            }
         }
         scene.writePositions = read.flag(*output, "positions", "output", scene.writePositions);
         scene.diagnostics = read.text(*output, "diagnostics", "output", scene.diagnostics);

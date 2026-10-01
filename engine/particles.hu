@@ -63,6 +63,10 @@ public:
     //a frame for the cache (cacheWriter.hu), into pinned planes: float32 P x, y, z, then v x, y, z, each a plane of every particle's value, recording
     //copied once they're there
     void copyFrameColumnsToHost(float* planes, cudaEvent_t copied);
+    //this partition's whole state for a checkpoint, into pinned host memory (CacheWriter::checkpointBytes), recording copied once it's there
+    void copyCheckpointToHost(char* host, cudaEvent_t copied);
+    //carries on from a checkpoint taken at time, after substep substeps, in place of initialize: its particles set as setParticles does
+    void resume(double time, unsigned long long substep);
 
     uint numParticles() const{
         return size;

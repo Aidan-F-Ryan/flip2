@@ -177,6 +177,15 @@ public:
         });
     }
 
+    //APIC's velocity gradients for setParticles' particles, after setApic(true): nine arrays of every particle's, component c along axis a at [3c + a]
+    void setAffine(const std::vector<std::vector<float>>& gradients){
+        simulation.forEachPartition([&](Particles& partition){
+            for(int k = 0; k < 9 && partition.size > 0; ++k){   //from pageable memory, so it's copied before this returns
+                gpuErrchk(cudaMemcpyAsync(partition.affine[k].devPtr(), gradients[k].data(), sizeof(float)*partition.size, cudaMemcpyHostToDevice, partition.stream));
+            }
+        });
+    }
+
     void runVerify(){
         particles.alignParticlesToGrid();
         storeGridCellMap();
@@ -235,8 +244,8 @@ public:
         simulation.writeDiagnostics(path, frame);
     }
 
-    void startCache(const std::string& directory, const CacheDescription& description, std::function<void(int)> committed){
-        simulation.startCache(directory, description, std::move(committed));
+    void startCache(const std::string& directory, const CacheDescription& description, int committedBefore, std::function<void(const char*, int)> done){
+        simulation.startCache(directory, description, committedBefore, std::move(done));
     }
 
     void writeCacheFrame(int frame){
@@ -249,6 +258,22 @@ public:
 
     std::string finishCache(){
         return simulation.finishCache();
+    }
+
+    void writeCheckpoint(int frame){
+        simulation.writeCheckpoint(frame);
+    }
+
+    void resume(double time, unsigned long long substep){
+        simulation.resume(time, substep);
+    }
+
+    bool anyRank(bool mine){
+        return simulation.anyRank(mine);
+    }
+
+    void continueDiagnostics(const std::string& path, int lastFrame){
+        simulation.continueDiagnostics(path, lastFrame);
     }
 
 private:

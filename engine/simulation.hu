@@ -24,8 +24,10 @@ public:
     Simulation(uint numParticles, std::unique_ptr<Transport> transport, int device);   //this process is transport's rank, on GPU device
     ~Simulation();
 
-    //the domain, and each rank's node planes: as even a split along z as whole pairs of planes allow, at least 2 planes each
+    //the domain, and each rank's node planes: as even a split along z as whole pairs of planes allow, at least 2 planes each (planesFor)
     void setDomain(double nx, double ny, double nz, uint x, uint y, uint z, double cellSize);
+    //each of numRanks ranks' first node plane of z, and the last one's end; empty if some rank would get fewer than 2
+    static std::vector<uint> planesFor(uint z, int numRanks);
 
     int numPartitions() const{  //the partitions in this process
         return (int)partitions.size();
@@ -47,14 +49,24 @@ public:
     //call it, and rank 0 writes
     void writeDiagnostics(const std::string& path, int frame);
 
-    //starts the cache (cacheWriter.hu) in directory, after setDomain; description says what made it, and this fills in the rest. committed(frame) is
-    //called on the cache's thread as each frame is committed, in the process with rank 0. Every rank has to call it
-    void startCache(const std::string& directory, CacheDescription description, std::function<void(int)> committed);
+    //starts the cache (cacheWriter.hu) in directory, after setDomain; description says what made it, and this fills in the rest. committedBefore: a resumed
+    //bake's last frame already there. done("committed" or "checkpoint", frame) is called on the cache's thread as each is committed, in the process with
+    //rank 0. Every rank has to call it
+    void startCache(const std::string& directory, CacheDescription description, int committedBefore, std::function<void(const char*, int)> done);
     //each rank here's particles into its own shard of frame, on the cache's thread; every rank has to call it. Each rank writes its own, so nothing is
     //gathered anywhere
     void writeCacheFrame(int frame);
     std::string cacheError();   //what went wrong writing the cache, if anything
     std::string finishCache();  //waits until every frame given to the cache is committed (or has failed), then says what went wrong, if anything
+    //each rank here's whole state at the end of frame (particles with double positions, and with APIC their gradients, the time and the substeps taken)
+    //into its own shard of a checkpoint, on the cache's thread; every rank has to call it. flip2 resume carries on from it exactly
+    void writeCheckpoint(int frame);
+    //carries on from a checkpoint in place of initialize, after setParticles (and with APIC setAffine) gave every partition here the checkpoint's particles
+    //(across processes, at least those in its planes); every rank has to call it
+    void resume(double time, unsigned long long substep);
+    bool anyRank(bool mine);    //whether any rank says yes; every rank has to call it, and across processes they agree
+    //a resumed bake's diagnostics on rank 0: the file keeps its first line and its frames up to lastFrame, and writeDiagnostics carries on after them
+    void continueDiagnostics(const std::string& path, int lastFrame);
 
 private:
     void inLockstep(const std::function<void(Particles&)>& step);    //every partition here runs step, each on its own thread
