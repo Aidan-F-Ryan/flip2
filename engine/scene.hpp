@@ -17,10 +17,12 @@
 //    "gravity": [0, -9.8, 0],
 //    "particlesPerVoxel": 8, "seed": 1,                                     //1, 8 or 27: seeded on a jittered 1^3, 2^3 or 3^3 lattice per voxel
 //    "fluids": [{"shape": "box", "min": [...], "max": [...], "velocity": [0, 0, 0]},
-//               {"shape": "sphere", "center": [...], "radius": 0.1, "velocity": [0, 0, 0]}],
+//               {"shape": "sphere", "center": [...], "radius": 0.1, "velocity": [0, 0, 0]},
+//               {"mesh": "blob.obj", "transform": [...], "velocity": [0, 0, 0]}],         //fluids, emitters and sinks can be meshes, placed as obstacles are
 //    "emitters": [{"shape": "box", "min": [...], "max": [...], "velocity": [0, 0, 2]}],   //inflow: keeps its shape full of fluid moving at velocity
 //    "sinks": [{"shape": "sphere", "center": [...], "radius": 0.1}],                       //outflow: deletes the fluid inside it
-//    "obstacles": [{"mesh": "rock.obj", "friction": 0, "thickness": 0,                   //or "vertices": "v.npy", "triangles": "t.npy"; or a box or sphere
+//    "obstacles": [{"mesh": "rock.obj", "friction": 0, "thickness": 0,                   //or "vertices": "v.npy", "triangles": "t.npy"; or a box or sphere;
+//                                                                                         //or "vdb": "rock.vdb", "grid": "surface", "velocityGrid": "vel"
 //                   "transform": [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1],                    //its own space to the world: row-major, acting on column vectors
 //                   "keyframes": [{"time": 0, "transform": [...]}, ...],                 //instead of a transform, it moves: linearly, rotations by slerp
 //                   "deforming": [{"time": 0, "mesh": "f1.obj"}, {"time": 0.04, "vertices": "f2.npy"}, ...]}],   //or it deforms: see SceneObstacle
@@ -37,16 +39,57 @@
 #include <string>
 #include <vector>
 
+//A distance field in the engine's own sparse layout (SolidSDF, obstacles.hu), sampled at the domain's voxel size: what a VDB level set is resampled to
+//(volumes.hpp). Bricks of 8^3 samples cover its bounds, x fastest; only those near its surface hold samples, and the rest are all inside or all outside
+struct SceneField{
+    double origin[3] = {0.0, 0.0, 0.0};     //sample (0, 0, 0)
+    double spacing = 0.0;                   //between samples
+    int bricks[3] = {0, 0, 0};
+    float band = 0.0f;                      //distances are clamped to +-band
+    std::vector<int> table;                 //per brick: its place in pool, in bricks, or -1 all outside, or -2 all inside
+    std::vector<float> pool;                //per brick there: 8^3 signed distances, negative inside, x fastest
+    std::vector<float> velocities;          //with a velocity grid: per brick in pool, 8^3 x velocities, then y, then z; otherwise empty
+    float fastest = 0.0f;                   //the largest speed among them
+    double low[3] = {0.0, 0.0, 0.0};        //the bounds of its surface
+    double high[3] = {0.0, 0.0, 0.0};
+};
+
+//Something solid the fluid flows around: a triangle mesh, a box or a sphere, in its own space, placed in the world by a transform or moved by keyframed
+//transforms. Each transform's scale is baked into the shape at the first key, so it moves rigidly from there on, and the fluid sees its true distances.
+//Or a deforming mesh: samples of its vertices in the world over time, with the same triangles throughout, each an OBJ (whose triangles have to be the
+//mesh's) or an (n, 3) .npy of vertices. Between samples its vertices move linearly, and before the first and after the last it holds still
+struct SceneObstacle{
+    enum Kind{MESH, BOX, SPHERE, FIELD};    //FIELD: a VDB level set, placed rigidly, with no scale
+    Kind kind = BOX;
+    std::vector<float> vertices;    //mesh: x, y, z per vertex
+    std::vector<int> triangles;     //mesh: 3 vertex indices per triangle
+    double min[3] = {0.0, 0.0, 0.0};        //box
+    double max[3] = {0.0, 0.0, 0.0};
+    double centre[3] = {0.0, 0.0, 0.0};     //sphere
+    double radius = 0.0;
+    std::vector<double> keyTimes;                       //empty: it stays where transforms[0] puts it
+    std::vector<std::array<double, 16>> transforms;     //own space to world, row-major, acting on column vectors (translation in elements 3, 7, 11)
+    double friction = 0.0;      //0: the fluid slips past freely; 1: the fluid touching it moves with it
+    double thickness = 0.0;     //mesh: 0 for a closed surface; for an open one, like a ground plane, the shell's thickness around it
+    std::vector<double> sampleTimes;                    //deforming: when each sample is; empty: it doesn't deform
+    std::shared_ptr<const std::vector<float>> samples;  //deforming: each sample's vertices in turn, x, y, z each, in the world (shared by the scene's copies)
+    std::shared_ptr<const SceneField> field;            //FIELD: its distances, and velocities if it came with a velocity grid (then it isn't placed)
+};
+
+//a fluid, emitter or sink: a box or sphere in the world, or a closed mesh placed and moved as an obstacle is ("mesh" or "vertices" and "triangles", with
+//a "transform", "keyframes" or "deforming" samples), which only the GPU tests: it seeds a mesh fluid's particles at the start, where no box or sphere
+//fluid, earlier mesh fluid or obstacle is
 struct SceneShape{
-    enum Kind{BOX, SPHERE};
+    enum Kind{BOX, SPHERE, MESH};
     Kind kind = BOX;
     double min[3] = {0.0, 0.0, 0.0};        //a box's corners
     double max[3] = {0.0, 0.0, 0.0};
     double centre[3] = {0.0, 0.0, 0.0};     //a sphere's
     double radius = 0.0;
     double velocity[3] = {0.0, 0.0, 0.0};   //what its fluid starts with
+    SceneObstacle mesh;                     //a mesh's, and where it is (friction and thickness unused)
 
-    bool contains(const double point[3]) const;
+    bool contains(const double point[3]) const;     //never, for a mesh
     void bounds(double low[3], double high[3]) const;
 };
 
@@ -64,27 +107,6 @@ struct SceneForce{
     unsigned int seed = 0;                  //turbulence
     double drag = 1.0;                      //wind: how quickly the surface takes up its velocity, per second
     double depth = 2.0;                     //wind: how many voxels below the surface it reaches
-};
-
-//Something solid the fluid flows around: a triangle mesh, a box or a sphere, in its own space, placed in the world by a transform or moved by keyframed
-//transforms. Each transform's scale is baked into the shape at the first key, so it moves rigidly from there on, and the fluid sees its true distances.
-//Or a deforming mesh: samples of its vertices in the world over time, with the same triangles throughout, each an OBJ (whose triangles have to be the
-//mesh's) or an (n, 3) .npy of vertices. Between samples its vertices move linearly, and before the first and after the last it holds still
-struct SceneObstacle{
-    enum Kind{MESH, BOX, SPHERE};
-    Kind kind = BOX;
-    std::vector<float> vertices;    //mesh: x, y, z per vertex
-    std::vector<int> triangles;     //mesh: 3 vertex indices per triangle
-    double min[3] = {0.0, 0.0, 0.0};        //box
-    double max[3] = {0.0, 0.0, 0.0};
-    double centre[3] = {0.0, 0.0, 0.0};     //sphere
-    double radius = 0.0;
-    std::vector<double> keyTimes;                       //empty: it stays where transforms[0] puts it
-    std::vector<std::array<double, 16>> transforms;     //own space to world, row-major, acting on column vectors (translation in elements 3, 7, 11)
-    double friction = 0.0;      //0: the fluid slips past freely; 1: the fluid touching it moves with it
-    double thickness = 0.0;     //mesh: 0 for a closed surface; for an open one, like a ground plane, the shell's thickness around it
-    std::vector<double> sampleTimes;                    //deforming: when each sample is; empty: it doesn't deform
-    std::shared_ptr<const std::vector<float>> samples;  //deforming: each sample's vertices in turn, x, y, z each, in the world (shared by the scene's copies)
 };
 
 struct Scene{

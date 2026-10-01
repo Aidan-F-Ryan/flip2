@@ -1,6 +1,7 @@
 //Copyright 2023 Aberrant Behavior LLC
 
 #include "scene.hpp"
+#include "volumes.hpp"
 #include <algorithm>
 #include <cmath>
 #include <initializer_list>
@@ -433,6 +434,9 @@ void loadNpyMesh(const std::string& verticesPath, const std::string& trianglesPa
 }
 
 bool SceneShape::contains(const double point[3]) const{
+    if(kind == MESH){
+        return false;
+    }
     if(kind == SPHERE){
         double squared = 0.0;
         for(int axis = 0; axis < 3; ++axis){
@@ -450,8 +454,30 @@ bool SceneShape::contains(const double point[3]) const{
 
 void SceneShape::bounds(double low[3], double high[3]) const{
     for(int axis = 0; axis < 3; ++axis){
-        low[axis] = kind == SPHERE ? centre[axis] - radius : min[axis];
-        high[axis] = kind == SPHERE ? centre[axis] + radius : max[axis];
+        low[axis] = kind == SPHERE ? centre[axis] - radius : kind == MESH ? INFINITY : min[axis];
+        high[axis] = kind == SPHERE ? centre[axis] + radius : kind == MESH ? -INFINITY : max[axis];
+    }
+    if(kind == MESH && mesh.field){     //a level set's box through its first transform: the box around its corners there
+        const std::array<double, 16>& m = mesh.transforms[0];
+        for(int corner = 0; corner < 8; ++corner){
+            double local[3] = {corner & 1 ? mesh.field->high[0] : mesh.field->low[0], corner & 2 ? mesh.field->high[1] : mesh.field->low[1], corner & 4 ? mesh.field->high[2] : mesh.field->low[2]};
+            for(int axis = 0; axis < 3; ++axis){
+                double world = m[4*axis]*local[0] + m[4*axis + 1]*local[1] + m[4*axis + 2]*local[2] + m[4*axis + 3];
+                low[axis] = std::min(low[axis], world);
+                high[axis] = std::max(high[axis], world);
+            }
+        }
+    }
+    else if(kind == MESH){   //at the start: its vertices through its first transform, or its first deforming sample
+        const std::array<double, 16>& m = mesh.transforms[0];
+        for(size_t vertex = 0; 3*vertex + 2 < mesh.vertices.size(); ++vertex){
+            const float* v = mesh.samples ? mesh.samples->data() + 3*vertex : mesh.vertices.data() + 3*vertex;
+            for(int axis = 0; axis < 3; ++axis){
+                double world = mesh.samples ? v[axis] : m[4*axis]*v[0] + m[4*axis + 1]*v[1] + m[4*axis + 2]*v[2] + m[4*axis + 3];
+                low[axis] = std::min(low[axis], world);
+                high[axis] = std::max(high[axis], world);
+            }
+        }
     }
 }
 
@@ -548,6 +574,161 @@ Scene loadScene(const std::string& path){
     }
     scene.seed = (unsigned long long)read.number(root, "seed", "the scene", (double)scene.seed);
 
+    std::string directory = path.find('/') == std::string::npos ? "" : path.substr(0, path.rfind('/') + 1);    //meshes are named relative to the scene
+    auto resolve = [&](const std::string& file){
+        return file.empty() || file[0] == '/' ? file : directory + file;
+    };
+    //runs load, saying where in the scene a file it reads was named if reading it fails
+    auto naming = [&](const std::string& where, auto load){
+        try{
+            load();
+        }
+        catch(const std::runtime_error& error){
+            if(std::string(error.what()).rfind(path, 0) == 0){
+                throw;
+            }
+            read.fail(where, error.what());
+        }
+    };
+    //a mesh's vertices and triangles, from "mesh" (an OBJ) or "vertices" and "triangles" (.npy files); or a level set from "vdb", resampled at the
+    //domain's voxel size (volumes.hpp), from its "grid", with velocities from its "velocityGrid": whether it names one
+    auto readMesh = [&](const Json& item, const std::string& where, SceneObstacle& placed){
+        if(item.find("vdb")){
+            if(item.find("mesh") || item.find("vertices") || item.find("triangles") || item.find("deforming")){
+                read.fail(where, "is a mesh or a \"vdb\", not both");
+            }
+            naming(where, [&]{
+                placed.field = loadLevelSet(resolve(read.text(item, "vdb", where, "")), read.text(item, "grid", where, ""), read.text(item, "velocityGrid", where, ""),
+                                            scene.voxelSize());
+            });
+            placed.kind = SceneObstacle::FIELD;
+            return true;
+        }
+        bool named = item.find("mesh") || item.find("vertices") || item.find("triangles");
+        naming(where, [&]{
+            if(item.find("mesh")){
+                loadObj(resolve(read.text(item, "mesh", where, "")), placed.vertices, placed.triangles);
+            }
+            else if(named){
+                loadNpyMesh(resolve(read.text(item, "vertices", where, "")), resolve(read.text(item, "triangles", where, "")), placed.vertices, placed.triangles);
+            }
+        });
+        if(named){
+            placed.kind = SceneObstacle::MESH;
+        }
+        return named;
+    };
+    auto matrix = [&](const Json& value, const std::string& at){
+        std::array<double, 16> out;
+        if(value.kind != Json::ARRAY || value.items.size() != 16){
+            read.fail(at, "should be 16 numbers: a row-major 4x4 matrix");
+        }
+        for(int i = 0; i < 16; ++i){
+            if(value.items[i].kind != Json::NUMBER){
+                read.fail(at, "should be 16 numbers: a row-major 4x4 matrix");
+            }
+            out[i] = value.items[i].number;
+        }
+        return out;
+    };
+    //where it is: placed by a "transform" (or none), moved by "keyframes", or for a mesh, "deforming" samples of its vertices in the world. A level set
+    //can only be turned and moved, as scaling would make its distances wrong, and one with velocities stays where it is, as they're the world's
+    auto readPlacement = [&](const Json& item, const std::string& where, SceneObstacle& placed){
+        if(item.find("deforming") && (item.find("transform") || item.find("keyframes"))){
+            read.fail(where, "a deforming mesh's samples are in the world already: it can't have a \"transform\" or \"keyframes\" too");
+        }
+        if(placed.kind == SceneObstacle::FIELD && !placed.field->velocities.empty() && (item.find("transform") || item.find("keyframes"))){
+            read.fail(where, "a level set with a \"velocityGrid\" is in the world already: it can't have a \"transform\" or \"keyframes\" too");
+        }
+        if(const Json* keyframes = read.array(item, "keyframes", where)){
+            for(size_t key = 0; key < keyframes->items.size(); ++key){
+                const Json& keyframe = keyframes->items[key];
+                std::string at = where + ".keyframes[" + std::to_string(key) + "]";
+                const Json* transform = keyframe.kind == Json::OBJECT ? keyframe.find("transform") : nullptr;
+                if(transform == nullptr || !keyframe.find("time")){
+                    read.fail(at, "needs a \"time\" and a \"transform\"");
+                }
+                double time = read.number(keyframe, "time", at, 0.0);
+                if(!placed.keyTimes.empty() && time <= placed.keyTimes.back()){
+                    read.fail(at, "keyframes have to be in increasing time");
+                }
+                placed.keyTimes.push_back(time);
+                placed.transforms.push_back(matrix(*transform, at + ".transform"));
+            }
+            if(placed.keyTimes.empty()){
+                read.fail(where + ".keyframes", "is empty");
+            }
+        }
+        else if(const Json* transform = item.find("transform")){
+            placed.transforms.push_back(matrix(*transform, where + ".transform"));
+        }
+        else{
+            placed.transforms.push_back({1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1});
+        }
+        for(const std::array<double, 16>& m : placed.transforms){
+            double determinant = m[0]*(m[5]*m[10] - m[6]*m[9]) - m[1]*(m[4]*m[10] - m[6]*m[8]) + m[2]*(m[4]*m[9] - m[5]*m[8]);
+            for(int column = 0; column < 3 && placed.kind == SceneObstacle::FIELD; ++column){
+                double length = std::sqrt(m[column]*m[column] + m[4 + column]*m[4 + column] + m[8 + column]*m[8 + column]);
+                if(std::fabs(length - 1.0) > 1e-4 || determinant < 0.0){
+                    read.fail(where, "a level set can only be turned and moved: its transforms can't scale or mirror it, which would make its distances wrong");
+                }
+            }
+        }
+        if(const Json* deforming = read.array(item, "deforming", where)){
+            auto samples = std::make_shared<std::vector<float>>();
+            for(size_t key = 0; key < deforming->items.size(); ++key){
+                const Json& sample = deforming->items[key];
+                std::string at = where + ".deforming[" + std::to_string(key) + "]";
+                if(sample.kind != Json::OBJECT || !sample.find("time") || (!sample.find("mesh") && !sample.find("vertices"))){
+                    read.fail(at, "needs a \"time\", and a \"mesh\" or \"vertices\"");
+                }
+                read.checkKeys(sample, at, {"time", "mesh", "vertices"});
+                double time = read.number(sample, "time", at, 0.0);
+                if(!placed.sampleTimes.empty() && time <= placed.sampleTimes.back()){
+                    read.fail(at, "samples have to be in increasing time");
+                }
+                std::vector<float> vertices;
+                std::vector<int> triangles;
+                try{
+                    if(sample.find("mesh")){
+                        loadObj(resolve(read.text(sample, "mesh", at, "")), vertices, triangles);
+                    }
+                    else{
+                        for(double value : loadNpy(resolve(read.text(sample, "vertices", at, "")))){
+                            vertices.push_back((float)value);
+                        }
+                    }
+                }
+                catch(const std::runtime_error& error){
+                    if(std::string(error.what()).rfind(path, 0) == 0){
+                        throw;
+                    }
+                    read.fail(at, error.what());
+                }
+                if(placed.triangles.empty()){     //the mesh's triangles come from its first sample
+                    if(triangles.empty()){
+                        read.fail(at, "the first sample has to be a \"mesh\" to give the triangles, unless it has a \"mesh\" or \"vertices\" and \"triangles\"");
+                    }
+                    placed.kind = SceneObstacle::MESH;
+                    placed.vertices = vertices;
+                    placed.triangles = triangles;
+                }
+                else if(!triangles.empty() && triangles != placed.triangles){
+                    read.fail(at, "its triangles aren't the mesh's: a deforming mesh keeps its triangles, and only its vertices move");
+                }
+                if(vertices.size() != placed.vertices.size()){
+                    read.fail(at, "has " + std::to_string(vertices.size() / 3) + " vertices, but the mesh has " + std::to_string(placed.vertices.size() / 3));
+                }
+                placed.sampleTimes.push_back(time);
+                samples->insert(samples->end(), vertices.begin(), vertices.end());
+            }
+            if(placed.sampleTimes.empty()){
+                read.fail(where + ".deforming", "is empty");
+            }
+            placed.samples = samples;
+        }
+    };
+
     auto readShapes = [&](const char* key, std::vector<SceneShape>& shapes){
         const Json* list = read.array(root, key, "the scene");
         if(list == nullptr){
@@ -559,10 +740,19 @@ Scene loadScene(const std::string& path){
             if(item.kind != Json::OBJECT){
                 read.fail(where, "should be an object, {...}");
             }
-            read.checkKeys(item, where, {"shape", "min", "max", "center", "centre", "radius", "velocity"});
+            read.checkKeys(item, where, {"shape", "min", "max", "center", "centre", "radius", "velocity", "mesh", "vertices", "triangles", "vdb", "grid", "velocityGrid",
+                                         "transform", "keyframes", "deforming"});
             SceneShape shape;
             std::string kind = read.text(item, "shape", where, "box");
-            if(kind == "box"){
+            if(item.find("mesh") || item.find("vertices") || item.find("triangles") || item.find("deforming") || item.find("vdb")){
+                if(item.find("shape")){
+                    read.fail(where, "is a mesh or a \"shape\", not both");
+                }
+                shape.kind = SceneShape::MESH;
+                readMesh(item, where, shape.mesh);
+                readPlacement(item, where, shape.mesh);
+            }
+            else if(kind == "box"){
                 shape.kind = SceneShape::BOX;
                 read.vector3(item, "min", where, shape.min, true);
                 read.vector3(item, "max", where, shape.max, true);
@@ -588,8 +778,17 @@ Scene loadScene(const std::string& path){
     if(scene.emitters.size() > 16 || scene.sinks.size() > 16){
         read.fail("the scene", "can have up to 16 emitters and 16 sinks");
     }
+    size_t meshes = 0, meshFluids = 0;
+    for(const std::vector<SceneShape>* shapes : {&scene.fluids, &scene.emitters, &scene.sinks}){
+        for(const SceneShape& shape : *shapes){
+            meshes += shape.kind == SceneShape::MESH;
+            meshFluids += shape.kind == SceneShape::MESH && shapes == &scene.fluids;
+        }
+    }
+    if(meshes > 16 || (meshFluids > 0 && scene.fluids.size() > 16)){
+        read.fail("the scene", "can have up to 16 meshes among its fluids, emitters and sinks, and up to 16 fluids if any is a mesh");
+    }
 
-    std::string directory = path.find('/') == std::string::npos ? "" : path.substr(0, path.rfind('/') + 1);    //meshes are named relative to the scene
     if(const Json* obstacles = read.array(root, "obstacles", "the scene")){
         for(size_t index = 0; index < obstacles->items.size(); ++index){
             const Json& item = obstacles->items[index];
@@ -597,147 +796,38 @@ Scene loadScene(const std::string& path){
             if(item.kind != Json::OBJECT){
                 read.fail(where, "should be an object, {...}");
             }
-            read.checkKeys(item, where, {"mesh", "vertices", "triangles", "shape", "min", "max", "center", "centre", "radius", "transform", "keyframes", "deforming", "friction",
-                                         "thickness"});
+            read.checkKeys(item, where, {"mesh", "vertices", "triangles", "vdb", "grid", "velocityGrid", "shape", "min", "max", "center", "centre", "radius", "transform", "keyframes",
+                                         "deforming", "friction", "thickness"});
             SceneObstacle obstacle;
             bool deforms = item.find("deforming") != nullptr;
-            if(deforms && (item.find("shape") || item.find("transform") || item.find("keyframes"))){
-                read.fail(where, "a deforming mesh's samples are in the world already: it can't have a \"shape\", \"transform\" or \"keyframes\" too");
+            if(deforms && item.find("shape")){
+                read.fail(where, "a deforming obstacle is a mesh: it can't have a \"shape\" too");
             }
-            auto resolve = [&](const std::string& file){
-                return file.empty() || file[0] == '/' ? file : directory + file;
-            };
-            try{
-                if(item.find("mesh")){
-                    obstacle.kind = SceneObstacle::MESH;
-                    loadObj(resolve(read.text(item, "mesh", where, "")), obstacle.vertices, obstacle.triangles);
-                }
-                else if(item.find("vertices") || item.find("triangles")){
-                    obstacle.kind = SceneObstacle::MESH;
-                    loadNpyMesh(resolve(read.text(item, "vertices", where, "")), resolve(read.text(item, "triangles", where, "")), obstacle.vertices, obstacle.triangles);
-                }
-                else if(!deforms){
-                    std::string shape = read.text(item, "shape", where, "");
-                    if(shape == "box"){
-                        obstacle.kind = SceneObstacle::BOX;
-                        read.vector3(item, "min", where, obstacle.min, true);
-                        read.vector3(item, "max", where, obstacle.max, true);
-                        for(int axis = 0; axis < 3; ++axis){
-                            if(obstacle.max[axis] <= obstacle.min[axis]){
-                                read.fail(where, "a box's max has to be above its min on every axis");
-                            }
+            if(!readMesh(item, where, obstacle) && !deforms){
+                std::string shape = read.text(item, "shape", where, "");
+                if(shape == "box"){
+                    obstacle.kind = SceneObstacle::BOX;
+                    read.vector3(item, "min", where, obstacle.min, true);
+                    read.vector3(item, "max", where, obstacle.max, true);
+                    for(int axis = 0; axis < 3; ++axis){
+                        if(obstacle.max[axis] <= obstacle.min[axis]){
+                            read.fail(where, "a box's max has to be above its min on every axis");
                         }
                     }
-                    else if(shape == "sphere"){
-                        obstacle.kind = SceneObstacle::SPHERE;
-                        read.vector3(item, item.find("centre") ? "centre" : "center", where, obstacle.centre, true);
-                        obstacle.radius = read.number(item, "radius", where, 0.0);
-                        if(obstacle.radius <= 0.0){
-                            read.fail(where, "a sphere needs a positive \"radius\"");
-                        }
+                }
+                else if(shape == "sphere"){
+                    obstacle.kind = SceneObstacle::SPHERE;
+                    read.vector3(item, item.find("centre") ? "centre" : "center", where, obstacle.centre, true);
+                    obstacle.radius = read.number(item, "radius", where, 0.0);
+                    if(obstacle.radius <= 0.0){
+                        read.fail(where, "a sphere needs a positive \"radius\"");
                     }
-                    else{
-                        read.fail(where, "needs a \"mesh\", \"vertices\" and \"triangles\", or a \"shape\" of box or sphere");
-                    }
+                }
+                else{
+                    read.fail(where, "needs a \"mesh\", \"vertices\" and \"triangles\", or a \"shape\" of box or sphere");
                 }
             }
-            catch(const std::runtime_error& error){
-                if(std::string(error.what()).rfind(path, 0) == 0){
-                    throw;
-                }
-                read.fail(where, error.what());
-            }
-            auto matrix = [&](const Json& value, const std::string& at){
-                std::array<double, 16> out;
-                if(value.kind != Json::ARRAY || value.items.size() != 16){
-                    read.fail(at, "should be 16 numbers: a row-major 4x4 matrix");
-                }
-                for(int i = 0; i < 16; ++i){
-                    if(value.items[i].kind != Json::NUMBER){
-                        read.fail(at, "should be 16 numbers: a row-major 4x4 matrix");
-                    }
-                    out[i] = value.items[i].number;
-                }
-                return out;
-            };
-            if(const Json* keyframes = read.array(item, "keyframes", where)){
-                for(size_t key = 0; key < keyframes->items.size(); ++key){
-                    const Json& keyframe = keyframes->items[key];
-                    std::string at = where + ".keyframes[" + std::to_string(key) + "]";
-                    const Json* transform = keyframe.kind == Json::OBJECT ? keyframe.find("transform") : nullptr;
-                    if(transform == nullptr || !keyframe.find("time")){
-                        read.fail(at, "needs a \"time\" and a \"transform\"");
-                    }
-                    double time = read.number(keyframe, "time", at, 0.0);
-                    if(!obstacle.keyTimes.empty() && time <= obstacle.keyTimes.back()){
-                        read.fail(at, "keyframes have to be in increasing time");
-                    }
-                    obstacle.keyTimes.push_back(time);
-                    obstacle.transforms.push_back(matrix(*transform, at + ".transform"));
-                }
-                if(obstacle.keyTimes.empty()){
-                    read.fail(where + ".keyframes", "is empty");
-                }
-            }
-            else if(const Json* transform = item.find("transform")){
-                obstacle.transforms.push_back(matrix(*transform, where + ".transform"));
-            }
-            else{
-                obstacle.transforms.push_back({1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1});
-            }
-            if(const Json* deforming = read.array(item, "deforming", where)){
-                auto samples = std::make_shared<std::vector<float>>();
-                for(size_t key = 0; key < deforming->items.size(); ++key){
-                    const Json& sample = deforming->items[key];
-                    std::string at = where + ".deforming[" + std::to_string(key) + "]";
-                    if(sample.kind != Json::OBJECT || !sample.find("time") || (!sample.find("mesh") && !sample.find("vertices"))){
-                        read.fail(at, "needs a \"time\", and a \"mesh\" or \"vertices\"");
-                    }
-                    read.checkKeys(sample, at, {"time", "mesh", "vertices"});
-                    double time = read.number(sample, "time", at, 0.0);
-                    if(!obstacle.sampleTimes.empty() && time <= obstacle.sampleTimes.back()){
-                        read.fail(at, "samples have to be in increasing time");
-                    }
-                    std::vector<float> vertices;
-                    std::vector<int> triangles;
-                    try{
-                        if(sample.find("mesh")){
-                            loadObj(resolve(read.text(sample, "mesh", at, "")), vertices, triangles);
-                        }
-                        else{
-                            for(double value : loadNpy(resolve(read.text(sample, "vertices", at, "")))){
-                                vertices.push_back((float)value);
-                            }
-                        }
-                    }
-                    catch(const std::runtime_error& error){
-                        if(std::string(error.what()).rfind(path, 0) == 0){
-                            throw;
-                        }
-                        read.fail(at, error.what());
-                    }
-                    if(obstacle.triangles.empty()){     //the mesh's triangles come from its first sample
-                        if(triangles.empty()){
-                            read.fail(at, "the first sample has to be a \"mesh\" to give the triangles, unless the obstacle has a \"mesh\" or \"vertices\" and \"triangles\"");
-                        }
-                        obstacle.kind = SceneObstacle::MESH;
-                        obstacle.vertices = vertices;
-                        obstacle.triangles = triangles;
-                    }
-                    else if(!triangles.empty() && triangles != obstacle.triangles){
-                        read.fail(at, "its triangles aren't the mesh's: a deforming mesh keeps its triangles, and only its vertices move");
-                    }
-                    if(vertices.size() != obstacle.vertices.size()){
-                        read.fail(at, "has " + std::to_string(vertices.size() / 3) + " vertices, but the mesh has " + std::to_string(obstacle.vertices.size() / 3));
-                    }
-                    obstacle.sampleTimes.push_back(time);
-                    samples->insert(samples->end(), vertices.begin(), vertices.end());
-                }
-                if(obstacle.sampleTimes.empty()){
-                    read.fail(where + ".deforming", "is empty");
-                }
-                obstacle.samples = samples;
-            }
+            readPlacement(item, where, obstacle);
             obstacle.friction = read.number(item, "friction", where, obstacle.friction);
             obstacle.thickness = read.number(item, "thickness", where, obstacle.thickness);
             if(obstacle.friction < 0.0 || obstacle.friction > 1.0 || obstacle.thickness < 0.0){
@@ -839,6 +929,9 @@ void seedParticles(const Scene& scene, std::vector<double>& x, std::vector<doubl
     }
     for(size_t index = 0; index < scene.fluids.size(); ++index){
         const SceneShape& shape = scene.fluids[index];
+        if(shape.kind == SceneShape::MESH){     //the GPU seeds those (Particles::emitParticles)
+            continue;
+        }
         double low[3], high[3];
         shape.bounds(low, high);
         unsigned long long first[3], last[3];   //the lattice cells whose centres can be inside it

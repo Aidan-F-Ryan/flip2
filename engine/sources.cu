@@ -201,6 +201,46 @@ __global__ void findEmissions(EmitterLattice lattice, FluidShape emitter, unsign
     }
 }
 
+//whether a lattice point seeds fluid to start with, for fluid which, a mesh: inside it, and not inside a box or sphere fluid (the host seeded those),
+//an earlier mesh fluid, or an obstacle (fluid there would only be removed or pushed out)
+__device__ inline bool fills(const EmitterLattice& lattice, const FluidShapes& fluids, int which, const Obstacles& obstacles, unsigned long long seed, unsigned long long index, double now[3]){
+    if(!emits(lattice, fluids.shapes[which], seed, index, now)){
+        return false;
+    }
+    for(int other = 0; other < fluids.count; ++other){
+        if(other != which && (fluids.shapes[other].kind != FluidShape::MESH || other < which) && fluids.shapes[other].contains(now[0], now[1], now[2])){
+            return false;
+        }
+    }
+    float distance;
+    float3 normal;
+    return !(nearestObstacle(obstacles, make_float3((float)now[0], (float)now[1], (float)now[2]), distance, normal) >= 0 && distance < 0.0f);
+}
+
+__global__ void findFills(EmitterLattice lattice, FluidShapes fluids, int which, Obstacles obstacles, unsigned long long seed, uint* emitting){
+    unsigned long long index = threadIdx.x + (unsigned long long)blockIdx.x*blockDim.x;
+    if(index < lattice.count()){
+        double now[3];
+        emitting[index] = fills(lattice, fluids, which, obstacles, seed, index, now);
+    }
+}
+
+__global__ void fillFromLattice(EmitterLattice lattice, FluidShapes fluids, int which, Obstacles obstacles, unsigned long long seed, const uint* emitting, const uint* ends, uint first,
+                                double* px, double* py, double* pz, float* vx, float* vy, float* vz){
+    unsigned long long index = threadIdx.x + (unsigned long long)blockIdx.x*blockDim.x;
+    if(index < lattice.count() && emitting[index]){
+        double now[3];
+        fills(lattice, fluids, which, obstacles, seed, index, now);
+        uint particle = first + ends[index] - 1;
+        px[particle] = now[0];
+        py[particle] = now[1];
+        pz[particle] = now[2];
+        vx[particle] = fluids.shapes[which].velocity[0];
+        vy[particle] = fluids.shapes[which].velocity[1];
+        vz[particle] = fluids.shapes[which].velocity[2];
+    }
+}
+
 //the new particles, after the first particles; ends holds each lattice point's running count of emissions
 __global__ void emitFromLattice(EmitterLattice lattice, FluidShape emitter, unsigned long long seed, const uint* emitting, const uint* ends, uint first,
                                 double* px, double* py, double* pz, float* vx, float* vy, float* vz){
@@ -219,7 +259,11 @@ __global__ void emitFromLattice(EmitterLattice lattice, FluidShape emitter, unsi
 }
 
 void Particles::emitParticles(){
-    if(sources.numEmitters == 0){
+    bool filling = false;   //the start, with fluid in meshes to seed
+    for(int fluid = 0; fluid < fluids.count && substepIndex == 0; ++fluid){
+        filling = filling || fluids.shapes[fluid].kind == FluidShape::MESH;
+    }
+    if(sources.numEmitters == 0 && !filling){
         return;
     }
     int interiorWidth = 2<<refinementLevel;
@@ -237,12 +281,8 @@ void Particles::emitParticles(){
     lattice.low[2] = origin[2] + (double)boxLo*grid.cellSize;
     lattice.high[2] = origin[2] + (double)boxHi*grid.cellSize;
     uint added = 0;
-    for(int emitter = 0; emitter < sources.numEmitters; ++emitter){
-        const FluidShape& shape = sources.emitters[emitter];
-        if(size > 0){
-            constrainEmitterVelocities<<<std::min(size / BLOCKSIZE + 1, 4096u), BLOCKSIZE, 0, stream>>>(size, px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(), shape);
-        }
-        //the lattice points that can be inside the emitter now, or have swept through it this substep
+    //of the lattice points that can be inside the shape now, or have swept through it this substep, the ones find marks become particles, made by place
+    auto emitFrom = [&](const FluidShape& shape, auto find, auto place){
         bool none = false;
         for(int axis = 0; axis < 3; ++axis){
             lattice.shift[axis] = shape.velocity[axis]*elapsedTime;
@@ -254,7 +294,7 @@ void Particles::emitParticles(){
             none = none || high <= low || lattice.extent[axis] <= 0;
         }
         if(none){
-            continue;
+            return;
         }
         unsigned long long count = lattice.count();
         if(count >= (1ull << 31)){
@@ -267,7 +307,7 @@ void Particles::emitParticles(){
         size_t scratchBytes = 0;
         gpuErrchk(cudaMallocAsync((void**)&emitting, sizeof(uint)*count, stream));
         gpuErrchk(cudaMallocAsync((void**)&ends, sizeof(uint)*count, stream));
-        findEmissions<<<(uint)(count / BLOCKSIZE + 1), BLOCKSIZE, 0, stream>>>(lattice, shape, sources.seed + emitter, emitting);
+        find(count, emitting);
         cub::DeviceScan::InclusiveSum(scratch, scratchBytes, emitting, ends, (int)count, stream);
         gpuErrchk(cudaMallocAsync(&scratch, scratchBytes, stream));
         cub::DeviceScan::InclusiveSum(scratch, scratchBytes, emitting, ends, (int)count, stream);
@@ -277,18 +317,86 @@ void Particles::emitParticles(){
         if(newParticles > 0){
             uint first = size;
             resizeParticleArrays(size + newParticles, size);
-            emitFromLattice<<<(uint)(count / BLOCKSIZE + 1), BLOCKSIZE, 0, stream>>>(lattice, shape, sources.seed + emitter, emitting, ends, first,
-                px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr());
+            place(count, emitting, ends, first);
             added += newParticles;
         }
         gpuErrchk(cudaPeekAtLastError());
         cudaFreeAsync(emitting, stream);
         cudaFreeAsync(ends, stream);
         cudaFreeAsync(scratch, stream);
+    };
+    for(int emitter = 0; emitter < sources.numEmitters; ++emitter){
+        const FluidShape& shape = sources.emitters[emitter];
+        if(size > 0){
+            constrainEmitterVelocities<<<std::min(size / BLOCKSIZE + 1, 4096u), BLOCKSIZE, 0, stream>>>(size, px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(), shape);
+        }
+        unsigned long long seed = sources.seed + emitter;
+        emitFrom(shape, [&](unsigned long long count, uint* emitting){
+            findEmissions<<<(uint)(count / BLOCKSIZE + 1), BLOCKSIZE, 0, stream>>>(lattice, shape, seed, emitting);
+        }, [&](unsigned long long count, const uint* emitting, const uint* ends, uint first){
+            emitFromLattice<<<(uint)(count / BLOCKSIZE + 1), BLOCKSIZE, 0, stream>>>(lattice, shape, seed, emitting, ends, first,
+                px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr());
+        });
+    }
+    for(int fluid = 0; fluid < fluids.count && filling; ++fluid){
+        if(fluids.shapes[fluid].kind != FluidShape::MESH){
+            continue;
+        }
+        unsigned long long seed = sources.seed + MAX_SOURCE_SHAPES + fluid;  //not an emitter's
+        emitFrom(fluids.shapes[fluid], [&](unsigned long long count, uint* emitting){
+            findFills<<<(uint)(count / BLOCKSIZE + 1), BLOCKSIZE, 0, stream>>>(lattice, fluids, fluid, obstacles.state(), seed, emitting);
+        }, [&](unsigned long long count, const uint* emitting, const uint* ends, uint first){
+            fillFromLattice<<<(uint)(count / BLOCKSIZE + 1), BLOCKSIZE, 0, stream>>>(lattice, fluids, fluid, obstacles.state(), seed, emitting, ends, first,
+                px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr());
+        });
     }
     if(added > 0){  //the new particles need their cells, and to be sorted in with the rest; rootCell leaves the others as they are
         alignParticlesToGrid();
         sortParticles();
+    }
+}
+
+void Particles::setSourceMeshes(const std::vector<SceneObstacle>& meshes, const std::vector<FluidShape>& startingFluids){
+    sourceMeshes.build(meshes, grid.cellSize / (2<<refinementLevel), stream);
+    fluids.count = 0;
+    for(const FluidShape& fluid : startingFluids){
+        if(fluids.count < MAX_SOURCE_SHAPES){
+            fluids.shapes[fluids.count++] = fluid;
+        }
+    }
+    placeSourceMeshes();
+}
+
+//every mesh emitter, sink and fluid takes its field where it is now, and the box around it; one left out of the build holds nothing
+void Particles::placeSourceMeshes(){
+    if(sourceMeshes.count() == 0){
+        return;
+    }
+    sourceMeshes.update(elapsedTime);
+    auto place = [&](FluidShape& shape){
+        if(shape.kind != FluidShape::MESH){
+            return;
+        }
+        int index = sourceMeshes.builtFrom(shape.meshIndex);
+        if(index < 0){
+            shape.kind = FluidShape::BOX;
+            for(int axis = 0; axis < 3; ++axis){
+                shape.low[axis] = INFINITY;
+                shape.high[axis] = -INFINITY;
+            }
+            return;
+        }
+        shape.mesh = sourceMeshes.state().items[index];
+        sourceMeshes.bounds(index, shape.low, shape.high);
+    };
+    for(int emitter = 0; emitter < sources.numEmitters; ++emitter){
+        place(sources.emitters[emitter]);
+    }
+    for(int sink = 0; sink < sources.numSinks; ++sink){
+        place(sources.sinks[sink]);
+    }
+    for(int fluid = 0; fluid < fluids.count; ++fluid){
+        place(fluids.shapes[fluid]);
     }
 }
 

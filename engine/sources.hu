@@ -4,18 +4,22 @@
 #define SOURCES_HU
 
 #include "typedefs.h"
+#include "obstacles.hu"     //a mesh's field, and reading it
 
 #define MAX_SOURCE_SHAPES 16
 
-//a region of space for emitting or removing fluid: a box, or a sphere. Positions are double, as the particles' are
+//a region of space for emitting or removing fluid: a box, a sphere, or a closed triangle mesh, which is only ever tested on the GPU, through its
+//distance field. Positions are double, as the particles' are
 struct FluidShape{
-    enum Kind{BOX, SPHERE};
+    enum Kind{BOX, SPHERE, MESH};
     int kind = BOX;
-    double low[3] = {0.0, 0.0, 0.0};        //the box's corners, or the sphere's bounds
+    double low[3] = {0.0, 0.0, 0.0};        //the box's corners, or the sphere's or the mesh's bounds
     double high[3] = {0.0, 0.0, 0.0};
     double centre[3] = {0.0, 0.0, 0.0};     //the sphere's
     double radius = 0.0;
     float velocity[3] = {0.0f, 0.0f, 0.0f}; //an emitter's fluid's
+    int meshIndex = -1;                     //the mesh's place among the sources' meshes (Particles::setSourceMeshes)
+    ObstacleState mesh = {};                //and its field, placed where it is now (Particles::placeSourceMeshes)
 
     __host__ __device__ bool contains(double x, double y, double z) const{
         return containsWithin(x, y, z, 0.0);
@@ -24,6 +28,25 @@ struct FluidShape{
     //whether the segment from a to b passes through the shape
     __host__ __device__ bool crossedBy(const double a[3], const double b[3]) const{
         double d[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
+        if(kind == MESH){       //along it by the distance to the surface each step, which no step can then jump past
+#ifdef __CUDA_ARCH__
+            double length = sqrt(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
+            double along = 0.0;
+            for(int step = 0; step < 256; ++step){
+                double t = length > 0.0 ? along / length : 0.0;
+                float3 normal;
+                float distance = obstacleDistance(mesh, make_float3((float)(a[0] + t*d[0]), (float)(a[1] + t*d[1]), (float)(a[2] + t*d[2])), normal);
+                if(distance < 0.0f){
+                    return true;
+                }
+                if(along >= length){
+                    return false;
+                }
+                along = fmin(length, along + fmax((double)distance, 0.05*mesh.sdf.spacing));
+            }
+#endif
+            return false;
+        }
         if(kind == SPHERE){     //the segment's closest point to the centre
             double toCentre[3] = {centre[0] - a[0], centre[1] - a[1], centre[2] - a[2]};
             double lengthSquared = d[0]*d[0] + d[1]*d[1] + d[2]*d[2];
@@ -46,14 +69,28 @@ struct FluidShape{
         return enter <= leave;
     }
 
-    //whether it's inside the shape grown by margin on every side
+    //whether it's inside the shape grown by margin on every side; for a mesh, margin can't be more than its field's band, 3 voxels
     __host__ __device__ bool containsWithin(double x, double y, double z, double margin) const{
+        if(kind == MESH){
+#ifdef __CUDA_ARCH__
+            float3 normal;
+            return obstacleDistance(mesh, make_float3((float)x, (float)y, (float)z), normal) < margin;
+#else
+            return false;
+#endif
+        }
         if(kind == SPHERE){
             double dx = x - centre[0], dy = y - centre[1], dz = z - centre[2];
             return dx*dx + dy*dy + dz*dz < (radius + margin)*(radius + margin);
         }
         return x >= low[0] - margin && x < high[0] + margin && y >= low[1] - margin && y < high[1] + margin && z >= low[2] - margin && z < high[2] + margin;
     }
+};
+
+//up to MAX_SOURCE_SHAPES of them, as one kernel argument
+struct FluidShapes{
+    int count = 0;
+    FluidShape shapes[MAX_SOURCE_SHAPES];
 };
 
 //What adds fluid to the domain and what takes it away, checked every substep:

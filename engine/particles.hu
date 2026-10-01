@@ -113,6 +113,11 @@ public:
         sources = emittersAndSinks;
     }
 
+    //the meshes the emitters, sinks and fluids use: a FluidShape of kind MESH names its place in meshes, which are voxelized at the domain's voxel
+    //size and moved as obstacles are. fluids is every fluid the scene starts with, in order: emitParticles seeds the meshes among them on the GPU,
+    //where nothing else already is (sources.cu). After setDomain and setSources
+    void setSourceMeshes(const std::vector<SceneObstacle>& meshes, const std::vector<FluidShape>& fluids);
+
     void setObstacles(const std::vector<SceneObstacle>& descriptions);  //what the fluid flows around (see obstacles.hu); after setDomain
 
     void setForceFields(const std::vector<ForceField>& fields){   //the force fields besides gravity, up to MAX_FORCE_FIELDS of them (see forces.hu)
@@ -139,10 +144,12 @@ private:
     void pinEmitterVelocities();
     bool removing() const;      //whether this initialize removes any particles: sinks, open faces, or at the start, fluid inside obstacles
     void updateObstacles();
+    void placeSourceMeshes();
     void pushOutParticles();
     void markParticlesInsideObstacles();
     void markObstacleSolids();
     void addObstacleFlux();
+    void weighCutCells(float scale);
     void obstacleGhostVelocities();
     void creditObstacleVolume();
     VoxelPlaces voxelPlaces();
@@ -260,7 +267,10 @@ private:
     Sources sources;            //emitters, sinks and open faces
     CudaVec<char> removedFlags; //per particle, while initialize runs: whether a sink or an open face takes it
     ObstacleSet obstacles;      //what the fluid flows around
-    CudaVec<char> obstacleSolids;   //per stored voxel: whether its centre is inside an obstacle
+    ObstacleSet sourceMeshes;   //the meshes of the emitters, sinks and fluids
+    FluidShapes fluids;         //the fluid to start with (setSourceMeshes)
+    CudaVec<char> obstacleSolids;   //per stored voxel: whether obstacles close every face of it
+    CudaVec<char> obstacleNear;     //per stored voxel: whether a surface passes close enough to cut its faces (cutFaces), so the other passes can skip the rest
     unsigned long long substepIndex = 0;    //substeps taken, which seeds the emitters' jitter
     double restParticlesPerVoxel = 8.0;
     double densityCorrectionTime = 0.1;

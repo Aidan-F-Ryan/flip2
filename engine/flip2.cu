@@ -69,15 +69,20 @@ static int usage(){
     return 2;
 }
 
-static FluidShape toFluidShape(const SceneShape& shape){
+//a mesh adds its description to meshes, which the shape names by its place there
+static FluidShape toFluidShape(const SceneShape& shape, std::vector<SceneObstacle>& meshes){
     FluidShape out;
-    out.kind = shape.kind == SceneShape::SPHERE ? FluidShape::SPHERE : FluidShape::BOX;
+    out.kind = shape.kind == SceneShape::SPHERE ? FluidShape::SPHERE : shape.kind == SceneShape::MESH ? FluidShape::MESH : FluidShape::BOX;
     shape.bounds(out.low, out.high);
     for(int axis = 0; axis < 3; ++axis){
         out.centre[axis] = shape.centre[axis];
         out.velocity[axis] = (float)shape.velocity[axis];
     }
     out.radius = shape.radius;
+    if(shape.kind == SceneShape::MESH){
+        out.meshIndex = (int)meshes.size();
+        meshes.push_back(shape.mesh);
+    }
     return out;
 }
 
@@ -139,7 +144,8 @@ int main(int argc, char** argv){
     std::vector<double> x, y, z;
     std::vector<float> u, v, w;
     seedParticles(scene, x, y, z, u, v, w);
-    if(x.empty() && scene.emitters.empty()){
+    bool meshFluids = std::any_of(scene.fluids.begin(), scene.fluids.end(), [](const SceneShape& fluid){ return fluid.kind == SceneShape::MESH; });
+    if(x.empty() && scene.emitters.empty() && !meshFluids){
         return failure(scenePath + ": it has no fluid: its fluids are empty or outside the domain, and it has no emitters");
     }
     std::error_code made;
@@ -202,13 +208,21 @@ int main(int argc, char** argv){
     sources.latticePerSide = scene.particlesPerVoxel == 27 ? 3 : scene.particlesPerVoxel == 8 ? 2 : 1;
     sources.seed = scene.seed;
     sources.openFaces = scene.openFaces;
+    std::vector<SceneObstacle> sourceMeshes;
     for(const SceneShape& emitter : scene.emitters){
-        sources.emitters[sources.numEmitters++] = toFluidShape(emitter);
+        sources.emitters[sources.numEmitters++] = toFluidShape(emitter, sourceMeshes);
     }
     for(const SceneShape& sink : scene.sinks){
-        sources.sinks[sources.numSinks++] = toFluidShape(sink);
+        sources.sinks[sources.numSinks++] = toFluidShape(sink, sourceMeshes);
     }
     simulation->setSources(sources);
+    std::vector<FluidShape> fluids;
+    for(const SceneShape& fluid : scene.fluids){
+        fluids.push_back(toFluidShape(fluid, sourceMeshes));
+    }
+    if(!sourceMeshes.empty()){
+        simulation->setSourceMeshes(sourceMeshes, fluids);      //after setDomain and setSources
+    }
     simulation->setObstacles(scene.obstacles);      //after setDomain: they're voxelized at its voxel size
 
     std::string directory = scene.outputDirectory + "/";

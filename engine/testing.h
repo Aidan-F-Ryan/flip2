@@ -66,6 +66,10 @@ public:
         simulation.forEachPartition([&](Particles& partition){ partition.setSources(sources); });
     }
 
+    void setSourceMeshes(const std::vector<SceneObstacle>& meshes, const std::vector<FluidShape>& fluids){
+        simulation.forEachPartition([&](Particles& partition){ partition.setSourceMeshes(meshes, fluids); });
+    }
+
     void setForceFields(const std::vector<ForceField>& fields){
         simulation.forEachPartition([&](Particles& partition){ partition.setForceFields(fields); });
     }

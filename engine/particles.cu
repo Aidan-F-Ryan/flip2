@@ -1129,8 +1129,9 @@ void Particles::pressureSolve(){
     }
     applyForces(forces, false, dt, elapsedTime, forceVoxels(), stream);
     cudaCalcDivU(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, voxelsUx, voxelsUy, voxelsUz, particleCounts, footprintDepth, restParticlesPerVoxel, correctionRate, divU, stream);
-    addObstacleFlux();      //what moving obstacles push through their walls
+    addObstacleFlux();      //what obstacles' surfaces make of the flow through the faces they cut or close
     cudaGetA(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, dt/(density*voxelSize*voxelSize), stream);
+    weighCutCells(dt/(density*voxelSize*voxelSize));      //the faces obstacles cut weigh as much as they're open
     gpuErrchk(cudaPeekAtLastError());
     uint interiorWidth = numVoxels1D - 2*(uint)std::floor(radius);
     uint3 domainVoxels = make_uint3(grid.sizeX*interiorWidth, grid.sizeY*interiorWidth, grid.sizeZ*interiorWidth);
@@ -1164,6 +1165,7 @@ void Particles::pressureSolve(){
         cudaCalcDivU(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, voxelsUx, voxelsUy, voxelsUz, particleCounts, footprintDepth, restParticlesPerVoxel, correctionRate, divU, stream);
         addObstacleFlux();
         cudaGetA(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, dt/(density*voxelSize*voxelSize), stream);
+        weighCutCells(dt/(density*voxelSize*voxelSize));
         gpuErrchk(cudaPeekAtLastError());
     }
     elapsedTime += dt;
