@@ -3,7 +3,9 @@
 #include "cudaVec.hu"
 #include "typedefs.h"
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
+#include <type_traits>
 #include "cudaDeviceManager.hu"
 
 template <typename T>
@@ -122,6 +124,16 @@ void CudaVec<T>::swapDevicePtrAsync(T* devPtr, cudaStream_t stream){
     d_vec = devPtr;
 }
 
+template<typename T>
+void CudaVec<T>::adoptAsync(T* devPtr, uint size, cudaStream_t stream){
+    if(d_vec != nullptr && d_vec != devPtr){
+        gpuErrchk( cudaFreeAsync(d_vec, stream) );
+    }
+    GPU_MEMORY_ALLOCATED += (long long)sizeof(T)*size - (long long)sizeof(T)*numElements;
+    d_vec = devPtr;
+    numElements = size;
+}
+
 template <typename T>
 void CudaVec<T>::clear(){
     if(d_vec != nullptr){
@@ -206,6 +218,73 @@ __global__ void getMaxFromArray(bool absolute, uint numElements, T* array, T* ou
 
 template <typename T>
 T CudaVec<T>::getMax(cudaStream_t stream, bool abs){
+    return getMax(stream, abs, numElements);
+}
+
+//getMax's one pass for floats' magnitudes. Non-negative floats order like their bit patterns (NaN above infinity), so each block takes an integer max of
+//|x|'s bits and one atomicMax a block combines them: exact, whatever order the blocks land in
+__global__ void largestMagnitudeBits(uint numElements, const float* values, unsigned int* largest){
+    __shared__ unsigned int warpLargest[BLOCKSIZE / 32];
+    unsigned int bits = 0;
+    for(uint i = threadIdx.x + blockIdx.x*blockDim.x; i < numElements; i += blockDim.x*gridDim.x){
+        bits = max(bits, __float_as_uint(values[i]) & 0x7fffffffu);
+    }
+    for(int offset = 16; offset > 0; offset /= 2){
+        bits = max(bits, __shfl_down_sync(0xffffffffu, bits, offset));
+    }
+    if(threadIdx.x % 32 == 0){
+        warpLargest[threadIdx.x / 32] = bits;
+    }
+    __syncthreads();
+    if(threadIdx.x < 32){
+        bits = threadIdx.x < blockDim.x / 32 ? warpLargest[threadIdx.x] : 0;
+        for(int offset = 16; offset > 0; offset /= 2){
+            bits = max(bits, __shfl_down_sync(0xffffffffu, bits, offset));
+        }
+        if(threadIdx.x == 0){
+            atomicMax(largest, bits);
+        }
+    }
+}
+
+static void addLargestMagnitude(const float* values, uint numElements, unsigned int* largest, cudaStream_t stream){
+    if(numElements > 0){
+        uint blocks = numElements / BLOCKSIZE + 1;
+        largestMagnitudeBits<<<blocks < 1024 ? blocks : 1024, BLOCKSIZE, 0, stream>>>(numElements, values, largest);
+        gpuErrchk(cudaPeekAtLastError());
+    }
+}
+
+static float readLargestMagnitude(unsigned int* largest, cudaStream_t stream){
+    unsigned int bits;
+    gpuErrchk(cudaMemcpyAsync(&bits, largest, sizeof(unsigned int), cudaMemcpyDeviceToHost, stream));  //to pageable memory: back once it's landed
+    gpuErrchk(cudaFreeAsync(largest, stream));
+    float magnitude;
+    memcpy(&magnitude, &bits, sizeof(float));
+    return magnitude;
+}
+
+float largestMagnitude(std::initializer_list<const CudaVec<float>*> arrays, cudaStream_t stream){
+    unsigned int* largest;
+    gpuErrchk(cudaMallocAsync((void**)&largest, sizeof(unsigned int), stream));
+    gpuErrchk(cudaMemsetAsync(largest, 0, sizeof(unsigned int), stream));
+    for(const CudaVec<float>* array : arrays){
+        addLargestMagnitude(array->d_vec, array->numElements, largest, stream);
+    }
+    return readLargestMagnitude(largest, stream);
+}
+
+template <typename T>
+T CudaVec<T>::getMax(cudaStream_t stream, bool abs, uint numElements){
+    if constexpr(std::is_same<T, float>::value){
+        if(abs){
+            unsigned int* largest;
+            gpuErrchk(cudaMallocAsync((void**)&largest, sizeof(unsigned int), stream));
+            gpuErrchk(cudaMemsetAsync(largest, 0, sizeof(unsigned int), stream));
+            addLargestMagnitude(d_vec, numElements, largest, stream);
+            return readLargestMagnitude(largest, stream);
+        }
+    }
     T* outArray;
     T* outArray2;
     T out;
@@ -248,4 +327,4 @@ template class CudaVec<char>;
 template class CudaVec<double>;
 
 template <typename T>
-uint CudaVec<T>::GPU_MEMORY_ALLOCATED = 0;
+std::atomic<long long> CudaVec<T>::GPU_MEMORY_ALLOCATED{0};

@@ -8,17 +8,20 @@
 #include "algorithms/voxelSolveFunctions.hu"
 #include "algorithms/conjugateGradientFunctions.hu"
 #include "algorithms/parallelPrefixSumKernels.hu"
+#include "transport.hu"
 
 #include "typedefs.h"
 #include <cmath>
 #include <iostream>
+#include <sstream>
+#include <type_traits>
 
 Particles::Particles(uint size)
 : size(size)
 , radius(2)
 , refinementLevel(1)
-, frameWriter(3*sizeof(float)*size)
 {
+    gpuErrchk(cudaGetDevice(&cudaDevice));     //everything this partition makes lives on the GPU that's current now
     setupCudaDevices();
 
     cudaStreamCreate(&stream);
@@ -44,9 +47,26 @@ Particles::Particles(uint size)
     prevDt = 0.0;
 }
 
+void Particles::setPartition(int rank, int numRanks, Transport* transport, PartitionContext* context, const std::vector<uint>& planes){
+    this->rank = rank;
+    this->numRanks = numRanks;
+    this->transport = transport;
+    this->context = context;
+    partitionPlanes = planes;
+}
+
 void Particles::setDomain(double nx, double ny, double nz, uint x, uint y, uint z, double cellSize){
     grid.setNegativeCorner(nx, ny, nz);
     grid.setSize(x, y, z, cellSize);
+    if(partitionPlanes.empty()){    //on its own, the partition is the whole domain
+        partitionPlanes = {0, z};
+    }
+    boxLo = partitionPlanes[rank];
+    boxHi = partitionPlanes[rank + 1];
+    if(numRanks > 1 && (unsigned long long)x*y*z > 1ull << 29){   //orderNodes keys each node by its group, in 3 bits above its cell
+        std::cerr<<"setDomain: "<<x<<"x"<<y<<"x"<<z<<" nodes is too many to split; up to 2^29 can be\n";
+        exit(1);
+    }
     cellToNode.resizeAsync(x*y*z, stream);
     cellToNode.zeroDeviceAsync(stream);   //holds node indices, stale or not, but never CLAIMED_NODE
     }
@@ -56,10 +76,12 @@ void Particles::alignParticlesToGrid(){
 }
 
 void Particles::sortParticles(){
+    if(size == 0){
+        return;
+    }
     uint* tempGridCell = gridCell.devPtr();
     uint* tempSortedIndices = reorderedGridIndices.devPtr();
-    cudaStreamSynchronize(stream);
-    cudaSortParticlesByGridNode(size, tempGridCell, tempSortedIndices, stream);
+    cudaSortParticlesByGridNode(size, tempGridCell, tempSortedIndices, grid.sizeX*grid.sizeY*grid.sizeZ, stream);
     // cudaStreamSynchronize(stream);
 
     //@TODO: need to create per-CudaVec stream for allocation/dealloc to get around this overlap issue when freeing on constant stream, leave compute streams in place for all else, CudaVec_stream sync on devPtr call
@@ -79,7 +101,6 @@ void Particles::sortParticles(){
         reorder(velocity);
     }
     gpuErrchk(cudaPeekAtLastError());
-    gpuErrchk(cudaStreamSynchronize(stream));
 }
 
 //a particle's position in its node's voxel block, in voxels; the block includes the apron, so the node's interior starts at apronCells
@@ -194,10 +215,11 @@ __global__ void mapCellsToNodes(uint firstNode, uint lastNode, uint numParticleN
 #define CLAIMED_NODE 0xFFFFFFFFu
 
 //particles reach into their node's 26 neighbours, and whichever node's interior holds a reached voxel has to exist to solve for it, so append the
-//neighbours without particles: the thread that swaps a neighbour's stale cellToNode entry for CLAIMED_NODE appends it, and mapCellsToNodes then registers it
-__global__ void claimEmptyNeighborNodes(uint numParticleNodes, uint* nodeCells, uint* cellToNode, uint* numNodes, Grid grid){
+//neighbours without particles: the thread that swaps a neighbour's stale cellToNode entry for CLAIMED_NODE appends it, and mapCellsToNodes then registers it.
+//Only cells in [firstClaimCell, endClaimCell) are claimed: a partition's own node planes and the ones next to them, where its ghost nodes are
+__global__ void claimEmptyNeighborNodes(uint numParticleNodes, uint* nodeCells, uint* cellToNode, uint* numNodes, Grid grid, uint firstClaimCell, uint endClaimCell){
     uint cell = neighborCell(nodeCells[blockIdx.x], threadIdx.x, grid);
-    if(threadIdx.x < 27 && cell < grid.sizeX*grid.sizeY*grid.sizeZ){
+    if(threadIdx.x < 27 && cell >= firstClaimCell && cell < endClaimCell){
         uint entry = cellToNode[cell];
         bool particleNode = entry < numParticleNodes && nodeCells[entry] == cell;
         if(!particleNode && entry != CLAIMED_NODE && atomicCAS(cellToNode + cell, entry, CLAIMED_NODE) == entry){
@@ -207,9 +229,10 @@ __global__ void claimEmptyNeighborNodes(uint numParticleNodes, uint* nodeCells, 
 }
 
 //marking pass 1, per node holding particles: every voxel of its block with a face in one of its particles' stencils. voxels1D is 8, so a block row
-//starts on a multiple of 8 and the stencil's 3 voxels of it are 3 bits of one word. Each node's masks are laid out stored, fluid, reached
+//starts on a multiple of 8 and the stencil's 3 voxels of it are 3 bits of one word. One mask per particle node, maskStride words apart: a lone partition
+//writes them straight into their slots in usedVoxelMasks; split, they're packed for the neighbours to read, and orderNodes puts them in their slots
 __global__ void markReachedVoxels(uint numParticleNodes, uint numParticles, uint numVoxels1D, const uint* gridNodeIndicesToFirstParticleIndex, const uint* gridPosition, const double* px, const double* py, const double* pz,
-                                    uint* usedVoxelMasks, double radius, Grid grid, uint refinementLevel){
+                                    uint* reachedMasks, uint maskStride, double radius, Grid grid, uint refinementLevel){
     extern __shared__ uint reached[];
     int voxels1D = numVoxels1D;
     int maskWords = (voxels1D*voxels1D*voxels1D + 31) / 32;
@@ -241,14 +264,15 @@ __global__ void markReachedVoxels(uint numParticleNodes, uint numParticles, uint
     }
     __syncthreads();
     for(int word = threadIdx.x; word < maskWords; word += blockDim.x){
-        usedVoxelMasks[(3*blockIdx.x + 2)*maskWords + word] = reached[word];
+        reachedMasks[blockIdx.x*maskStride + word] = reached[word];
     }
 }
 
 //marking pass 2, per node: its fluid is every interior voxel any particle reaches, its own or a neighbour's, so the node owning a voxel solves for it
 //wherever the particles reaching it live. It stores its fluid, the voxels above each fluid voxel in x, y and z (which hold its upper faces), the voxels
-//its own particles reach (to find their owners) and, if it has particles, its block's wall voxels. Write the stored mask, then the fluid mask, and count the stored voxels
-__global__ void markUsedVoxels(uint numUsedGridNodes, uint numParticleNodes, uint numVoxels1D, const uint* nodeCells, const uint* cellToNode, uint* usedVoxelMasks, uint* numVoxelsEachNode, double radius, Grid grid, uint refinementLevel){
+//its own particles reach (to find their owners) and, if it has particles, its block's wall voxels. Write the stored mask, then the fluid mask, and count the stored voxels.
+//Nodes hold particles here or, for ghost nodes and the nodes 2 planes out, in the partition that owns them: nodeHasParticles says which
+__global__ void markUsedVoxels(uint numUsedGridNodes, const char* nodeHasParticles, uint numVoxels1D, const uint* nodeCells, const uint* cellToNode, uint* usedVoxelMasks, uint* numVoxelsEachNode, double radius, Grid grid, uint refinementLevel){
     extern __shared__ uint mask[];
     __shared__ uint neighborNodes[27];
     int voxels1D = numVoxels1D;
@@ -258,8 +282,11 @@ __global__ void markUsedVoxels(uint numUsedGridNodes, uint numParticleNodes, uin
     int apronCells = floor(radius);
     int interiorWidth = voxels1D - 2*apronCells;
     uint cell = nodeCells[blockIdx.x];
-    bool hasParticles = blockIdx.x < numParticleNodes;
+    bool hasParticles = nodeHasParticles[blockIdx.x];
     loadNeighborNodes(neighborNodes, cell, numUsedGridNodes, nodeCells, cellToNode, grid);
+    if(threadIdx.x < 27 && neighborNodes[threadIdx.x] < numUsedGridNodes && !nodeHasParticles[neighborNodes[threadIdx.x]]){
+        neighborNodes[threadIdx.x] = numUsedGridNodes;  //only nodes holding particles have reached masks: settle which once, not per voxel
+    }
     for(int word = threadIdx.x; word < maskWords; word += blockDim.x){
         mask[word] = hasParticles ? usedVoxelMasks[(3*blockIdx.x + 2)*maskWords + word] : 0;
         fluid[word] = 0;
@@ -279,7 +306,7 @@ __global__ void markUsedVoxels(uint numUsedGridNodes, uint numParticleNodes, uin
             int neighborY = y - (neighbor / 3 % 3 - 1)*interiorWidth;
             int neighborZ = z - (neighbor / 9 - 1)*interiorWidth;
             int neighborSlot = neighborX + neighborY*voxels1D + neighborZ*voxels1D*voxels1D;
-            if(node < numParticleNodes && neighborX >= 0 && neighborY >= 0 && neighborZ >= 0 && neighborX < voxels1D && neighborY < voxels1D && neighborZ < voxels1D
+            if(node < numUsedGridNodes && neighborX >= 0 && neighborY >= 0 && neighborZ >= 0 && neighborX < voxels1D && neighborY < voxels1D && neighborZ < voxels1D
                && usedVoxelMasks[(3*node + 2)*maskWords + neighborSlot/32] >> neighborSlot%32 & 1){
                 atomicOr(fluid + slot/32, 1u << slot%32);
                 break;
@@ -331,8 +358,11 @@ __global__ void writeUsedVoxelIDs(uint numVoxels1D, const uint* usedVoxelMasks, 
 }
 
 //apron voxels mirror voxels in the 26 neighbouring nodes' interiors. Point every used voxel at the used voxel that owns its value (itself if interior, or if the owning node doesn't use it).
-//Interior fluid voxels are the pressure solve's unknowns: also record their red/black colour and the owners of their six face neighbours (NO_VOXEL for air, WALL_VOXEL outside the domain)
-__global__ void buildVoxelTopology(uint numUsedGridNodes, uint numVoxels1D, double radius, const uint* nodeCells, const uint* cellToNode, const uint* numVoxelsEachNode, const uint* voxelIDs, uint* voxelOwners,
+//Interior fluid voxels are the pressure solve's unknowns: also record their red/black colour and the owners of their six face neighbours (NO_VOXEL for air, WALL_VOXEL outside the domain).
+//An air voxel above an unknown stores the face between them, and updates it itself from the unknown's values, so each unknown also records itself as that
+//air voxel's lower neighbour in the same arrays (they're otherwise unused for voxels that aren't unknowns, and start as NO_VOXEL).
+//Ghost nodes (numOwnNodes on) get codes 3 red / 4 black: they're unknowns to the stencils, but only their owners solve for them
+__global__ void buildVoxelTopology(uint numUsedGridNodes, uint numOwnNodes, uint numVoxels1D, double radius, const uint* nodeCells, const uint* cellToNode, const uint* numVoxelsEachNode, const uint* voxelIDs, uint* voxelOwners,
                                     uint* neighborNx, uint* neighborPx, uint* neighborNy, uint* neighborPy, uint* neighborNz, uint* neighborPz, char* solveCodes, uint* coarseCells, uint* interiorVoxels,
                                     Grid grid, uint refinementLevel){
     extern __shared__ uint sharedOwners[];
@@ -379,7 +409,7 @@ __global__ void buildVoxelTopology(uint numUsedGridNodes, uint numVoxels1D, doub
         int z = slot / (voxels1D*voxels1D);
         bool unknown = solveCodes[i] && x >= apronCells && y >= apronCells && z >= apronCells && x < voxels1D - apronCells && y < voxels1D - apronCells && z < voxels1D - apronCells;  //fluid and interior
         voxelOwners[i] = sharedOwners[slot];
-        solveCodes[i] = unknown ? 1 + (x + y + z) % 2 : 0;    //1 red, 2 black
+        solveCodes[i] = unknown ? (blockIdx.x < numOwnNodes ? 1 : 3) + (x + y + z) % 2 : 0;    //1 red, 2 black; 3 and 4 for ghosts
         if(x >= apronCells && y >= apronCells && z >= apronCells && x < voxels1D - apronCells && y < voxels1D - apronCells && z < voxels1D - apronCells){
             interiorVoxels[blockIdx.x*interiorWidth*interiorWidth*interiorWidth + (x - apronCells) + (y - apronCells)*interiorWidth + (z - apronCells)*interiorWidth*interiorWidth] = i;
         }
@@ -390,6 +420,13 @@ __global__ void buildVoxelTopology(uint numUsedGridNodes, uint numVoxels1D, doub
                 int neighborSlot = slot + (face % 2 ? 1 : -1)*(face < 2 ? 1 : face < 4 ? voxels1D : voxels1D*voxels1D);
                 neighbors[face][i] = isWallVoxel(cell, neighborSlot, voxels1D, apronCells, grid, refinementLevel) ? WALL_VOXEL : sharedOwners[neighborSlot];
             }
+            #pragma unroll
+            for(int axis = 0; axis < 3; ++axis){
+                uint upper = neighbors[2*axis + 1][i];
+                if(upper < WALL_VOXEL && !solveCodes[upper]){   //only its lower neighbour writes here. solveCodes is being rewritten meanwhile, but only from fluid (1) to a colour
+                    neighbors[2*axis][upper] = i;
+                }
+            }
             uint globalX = (cell % grid.sizeX)*interiorWidth + x - apronCells;  //the 2x2x2 block of the domain's voxels holding it
             uint globalY = (cell / grid.sizeX % grid.sizeY)*interiorWidth + y - apronCells;
             uint globalZ = cell / (grid.sizeX*grid.sizeY)*interiorWidth + z - apronCells;
@@ -398,38 +435,412 @@ __global__ void buildVoxelTopology(uint numUsedGridNodes, uint numVoxels1D, doub
     }
 }
 
-void Particles::generateVoxels(){
-    numParticleNodes = cudaMarkUniqueGridCellsAndCount(size, gridCell.devPtr(), uniqueGridNodeIndices.devPtr(), stream);
+//how many of the first count sorted cells (or node order keys) come before firstCell: a binary search, in one thread
+__global__ void countCellsBefore(const uint* sortedCells, uint count, uint firstCell, uint* result){
+    uint low = 0;
+    uint high = count;
+    while(low < high){
+        uint middle = low + (high - low) / 2;
+        if(sortedCells[middle] < firstCell){
+            low = middle + 1;
+        }
+        else{
+            high = middle;
+        }
+    }
+    *result = low;
+}
 
-    //the used nodes: the ones holding particles, then their neighbours without any, which the particles reach into
+//which of the first numNodes nodes hold particles: this partition's particle nodes, the first numParticleNodes. Split, orderNodes also notes where each came from
+__global__ void markParticleNodes(uint numParticleNodes, uint numNodes, uint* nodeOrigins, char* nodeHasParticles){
+    uint node = threadIdx.x + blockIdx.x*blockDim.x;
+    if(node < numNodes){
+        nodeHasParticles[node] = node < numParticleNodes;
+        if(nodeOrigins != nullptr){
+            nodeOrigins[node] = node;
+        }
+    }
+}
+
+//orderNodes' sort key for each node after this partition's particle nodes: its group, in the 3 bits above the cellBits of its cell, then its cell. The
+//groups: 0 this partition's empty nodes (the only nodes in its own planes besides its particle nodes); then its ghost nodes, in the planes next to its
+//own: 1 below holding particles, 2 below empty, 3 above holding particles, 4 above empty, the way their owners keep them; 5 the neighbours' particle
+//nodes 2 planes out. Nodes before particleNodes hold particles
+__global__ void nodeOrderKeys(uint firstNode, uint numNodes, uint particleNodes, const uint* nodeCells, uint firstOwnCell, uint endOwnCell, uint cellsPerPlane,
+                              uint cellBits, uint* keys, uint* origins){
+    uint node = firstNode + threadIdx.x + blockIdx.x*blockDim.x;
+    if(node < numNodes){
+        uint cell = nodeCells[node];
+        uint empty = node < particleNodes ? 0 : 1;
+        uint group = cell >= firstOwnCell && cell < endOwnCell ? 0
+                   : cell + cellsPerPlane >= firstOwnCell && cell < firstOwnCell ? 1 + empty
+                   : cell >= endOwnCell && cell < endOwnCell + cellsPerPlane ? 3 + empty
+                   : 5;
+        keys[node - firstNode] = group << cellBits | cell;
+        origins[node - firstNode] = node;
+    }
+}
+
+//puts the sorted nodes in their places, noting where each came from and whether it holds particles (every node before numParticleNodes did)
+__global__ void placeOrderedNodes(uint firstNode, uint count, const uint* keys, const uint* origins, uint numParticleNodes, uint cellMask, uint* nodeCells, uint* nodeOrigins, char* nodeHasParticles){
+    uint i = threadIdx.x + blockIdx.x*blockDim.x;
+    if(i < count){
+        nodeCells[firstNode + i] = keys[i] & cellMask;
+        nodeOrigins[firstNode + i] = origins[i];
+        nodeHasParticles[firstNode + i] = origins[i] < numParticleNodes;
+    }
+}
+
+//each particle node's reached mask into its slot of usedVoxelMasks: this partition's own (numOwnParticleNodes of them came first) or a neighbour's
+__global__ void placeReachedMasks(uint maskWords, uint numOwnParticleNodes, const uint* nodeOrigins, const char* nodeHasParticles, const uint* ownMasks, const uint* foreignMasks, uint* usedVoxelMasks){
+    uint node = blockIdx.x;
+    if(nodeHasParticles[node]){
+        uint origin = nodeOrigins[node];
+        const uint* mask = origin < numOwnParticleNodes ? ownMasks + origin*maskWords : foreignMasks + (origin - numOwnParticleNodes)*maskWords;
+        for(uint word = threadIdx.x; word < maskWords; word += blockDim.x){
+            usedVoxelMasks[(3*node + 2)*maskWords + word] = mask[word];
+        }
+    }
+}
+
+//the first voxel of each listed node: the prefix sums of the nodes' voxel counts end each node, so node numNodes's is the voxel count
+struct NodeIndices{
+    uint index[18];
+    uint count;
+};
+
+__global__ void voxelStartsOf(NodeIndices nodes, const uint* voxelEnds, uint* starts){
+    uint i = threadIdx.x;
+    if(i < nodes.count){
+        starts[i] = nodes.index[i] == 0 ? 0 : voxelEnds[nodes.index[i] - 1];
+    }
+}
+
+//After the sort, the particles that left this partition's planes are a run at each end, as the cells run along z slowest: those now below it first,
+//those above it last. The first time, every partition holds all the particles and keeps just its own. After that, each takes its neighbours' leavers,
+//from below first, then its own, then from above: the order one partition would have them in, which the stable sort that follows keeps
+void Particles::exchangeParticles(){
+    if(numRanks == 1){
+        return;
+    }
+    uint cellsPerPlane = grid.sizeX*grid.sizeY;
+    uint ends[2] = {0, 0};
+    uint firstAndLast[2] = {0, 0};
+    if(size > 0){
+        uint* found;
+        gpuErrchk(cudaMallocAsync((void**)&found, 2*sizeof(uint), stream));
+        countCellsBefore<<<1, 1, 0, stream>>>(gridCell.devPtr(), size, boxLo*cellsPerPlane, found);
+        countCellsBefore<<<1, 1, 0, stream>>>(gridCell.devPtr(), size, boxHi*cellsPerPlane, found + 1);
+        cudaMemcpyAsync(ends, found, 2*sizeof(uint), cudaMemcpyDeviceToHost, stream);
+        cudaMemcpyAsync(firstAndLast, gridCell.devPtr(), sizeof(uint), cudaMemcpyDeviceToHost, stream);
+        cudaMemcpyAsync(firstAndLast + 1, gridCell.devPtr() + size - 1, sizeof(uint), cudaMemcpyDeviceToHost, stream);
+        cudaFreeAsync(found, stream);
+        gpuErrchk(cudaStreamSynchronize(stream));
+    }
+    particlesBelow = ends[0];
+    particlesAbove = size - ends[1];
+    if(distributed){    //a particle can only move into the next partition over: each is at least 2 node planes deep, and a particle moves at most one a substep
+        bool tooFarBelow = particlesBelow > 0 && (rank == 0 || firstAndLast[0] < partitionPlanes[rank - 1]*cellsPerPlane);
+        bool tooFarAbove = particlesAbove > 0 && (rank == numRanks - 1 || firstAndLast[1] >= partitionPlanes[rank + 2]*cellsPerPlane);
+        if(tooFarBelow || tooFarAbove){
+            std::cerr<<"partition "<<rank<<": a particle moved past the next partition in one substep\n";
+            exit(1);
+        }
+    }
+    uint leaving[2] = {distributed ? particlesBelow : 0u, distributed ? particlesAbove : 0u};  //the first time, nobody sends: each keeps its own
+    std::vector<uint> allLeaving(2*numRanks);
+    transport->allGatherHost(leaving, allLeaving.data(), sizeof(leaving));
+    uint fromBelow = rank > 0 ? allLeaving[2*(rank - 1) + 1] : 0;
+    uint fromAbove = rank < numRanks - 1 ? allLeaving[2*(rank + 1)] : 0;
+    uint kept = size - particlesBelow - particlesAbove;
+    uint newSize = fromBelow + kept + fromAbove;
+    std::vector<TransportSend> sends;
+    std::vector<TransportReceive> receives;
+    auto rebuild = [&](auto member){    //a per-particle array's new contents: from below, kept, from above. The same order of arrays on every partition
+        auto& mine = this->*member;
+        using T = std::remove_reference_t<decltype(*mine.devPtr())>;
+        T* fresh = nullptr;
+        if(newSize > 0){
+            gpuErrchk(cudaMallocAsync((void**)&fresh, sizeof(T)*newSize, stream));
+        }
+        if(kept > 0){
+            cudaMemcpyAsync(fresh + fromBelow, mine.devPtr() + particlesBelow, sizeof(T)*kept, cudaMemcpyDeviceToDevice, stream);
+        }
+        if(rank > 0){
+            sends.push_back({rank - 1, mine.devPtr(), sizeof(T)*leaving[0]});
+            receives.push_back({rank - 1, fresh, sizeof(T)*fromBelow});
+        }
+        if(rank < numRanks - 1){
+            sends.push_back({rank + 1, mine.devPtr() + size - leaving[1], sizeof(T)*leaving[1]});
+            receives.push_back({rank + 1, fresh + fromBelow + kept, sizeof(T)*fromAbove});
+        }
+        return fresh;
+    };
+    double* newPx = rebuild(&Particles::px);
+    double* newPy = rebuild(&Particles::py);
+    double* newPz = rebuild(&Particles::pz);
+    float* newVx = rebuild(&Particles::vx);
+    float* newVy = rebuild(&Particles::vy);
+    float* newVz = rebuild(&Particles::vz);
+    uint* newCells = rebuild(&Particles::gridCell);
+    gpuErrchk(cudaPeekAtLastError());
+    transport->exchange(sends, receives, stream);   //the old arrays are freed after it, in stream order
+    px.adoptAsync(newPx, newSize, stream);
+    py.adoptAsync(newPy, newSize, stream);
+    pz.adoptAsync(newPz, newSize, stream);
+    vx.adoptAsync(newVx, newSize, stream);
+    vy.adoptAsync(newVy, newSize, stream);
+    vz.adoptAsync(newVz, newSize, stream);
+    gridCell.adoptAsync(newCells, newSize, stream);
+    size = newSize;
+    reorderedGridIndices.resizeAsync(size, stream);
+    uniqueGridNodeIndices.resizeAsync(size, stream);
+    bool arrivals = fromBelow + fromAbove > 0;
+    distributed = true;
+    if(arrivals){
+        sortParticles();
+    }
+}
+
+//The neighbouring partitions' particle nodes within 2 planes of this partition's, with the voxels their particles reach. With them, a partition decides
+//which of its ghost nodes exist and what they store exactly as their owners do: a ghost node is next to this partition's planes, so its neighbours are
+//within 2. They go after this partition's own particle nodes, the partition below's first, so in cell order, with their masks in foreignParticleNodeMasks
+void Particles::receiveParticleNodes(uint maskWords){
+    numForeignParticleNodes = 0;
+    if(numRanks == 1){
+        return;
+    }
+    uint cellsPerPlane = grid.sizeX*grid.sizeY;
+    uint ends[2] = {0, 0};  //this partition's particle nodes before its third plane, and before its last 2: the runs its neighbours below and above take
+    if(numParticleNodes > 0){
+        uint* found;
+        gpuErrchk(cudaMallocAsync((void**)&found, 2*sizeof(uint), stream));
+        countCellsBefore<<<1, 1, 0, stream>>>(nodeCells.devPtr(), numParticleNodes, (boxLo + 2)*cellsPerPlane, found);
+        countCellsBefore<<<1, 1, 0, stream>>>(nodeCells.devPtr(), numParticleNodes, (boxHi - 2)*cellsPerPlane, found + 1);
+        cudaMemcpyAsync(ends, found, 2*sizeof(uint), cudaMemcpyDeviceToHost, stream);
+        cudaFreeAsync(found, stream);
+        gpuErrchk(cudaStreamSynchronize(stream));
+    }
+    lowerBoundaryParticleNodes = ends[0];
+    upperBoundaryParticleNodes = numParticleNodes - ends[1];
+    uint boundary[2] = {lowerBoundaryParticleNodes, upperBoundaryParticleNodes};
+    std::vector<uint> allBoundaries(2*numRanks);
+    transport->allGatherHost(boundary, allBoundaries.data(), sizeof(boundary));
+    uint fromBelow = rank > 0 ? allBoundaries[2*(rank - 1) + 1] : 0;
+    uint fromAbove = rank < numRanks - 1 ? allBoundaries[2*(rank + 1)] : 0;
+    numForeignParticleNodes = fromBelow + fromAbove;
+    foreignParticleNodeMasks.resizeAsync(numForeignParticleNodes*maskWords, stream);
+    std::vector<TransportSend> sends;
+    std::vector<TransportReceive> receives;
+    if(rank > 0){   //cells, then masks, each way
+        sends.push_back({rank - 1, nodeCells.devPtr(), sizeof(uint)*lowerBoundaryParticleNodes});
+        sends.push_back({rank - 1, particleNodeMasks.devPtr(), sizeof(uint)*lowerBoundaryParticleNodes*maskWords});
+        receives.push_back({rank - 1, nodeCells.devPtr() + numParticleNodes, sizeof(uint)*fromBelow});
+        receives.push_back({rank - 1, foreignParticleNodeMasks.devPtr(), sizeof(uint)*fromBelow*maskWords});
+    }
+    if(rank < numRanks - 1){
+        uint first = numParticleNodes - upperBoundaryParticleNodes;
+        sends.push_back({rank + 1, nodeCells.devPtr() + first, sizeof(uint)*upperBoundaryParticleNodes});
+        sends.push_back({rank + 1, particleNodeMasks.devPtr() + first*maskWords, sizeof(uint)*upperBoundaryParticleNodes*maskWords});
+        receives.push_back({rank + 1, nodeCells.devPtr() + numParticleNodes + fromBelow, sizeof(uint)*fromAbove});
+        receives.push_back({rank + 1, foreignParticleNodeMasks.devPtr() + fromBelow*maskWords, sizeof(uint)*fromAbove*maskWords});
+    }
+    transport->exchange(sends, receives, stream);
+    if(numForeignParticleNodes > 0){    //registered in cellToNode, cells already known, and no particles here
+        mapCellsToNodes<<<numForeignParticleNodes / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numParticleNodes, numParticleNodes + numForeignParticleNodes, numParticleNodes, size, gridCell.devPtr(),
+            gridNodeIndicesToFirstParticleIndex.devPtr(), nodeCells.devPtr(), cellToNode.devPtr());
+    }
+}
+
+//Puts the nodes after this partition's particle nodes in their order: its own empty nodes; its ghost nodes below, holding particles first, then above,
+//the same way (as their owners keep them); the neighbours' particle nodes 2 planes out; each group by cell. Registers them in cellToNode, notes which hold
+//particles and, split, puts each particle node's reached mask in its slot of usedVoxelMasks and finds the runs of nodes neighbours exchange
+void Particles::orderNodes(uint maskWords){
+    uint cellsPerPlane = grid.sizeX*grid.sizeY;
+    uint numCells = cellsPerPlane*grid.sizeZ;
+    uint numOthers = numUsedGridNodes - numParticleNodes;
+    nodeHasParticles.resizeAsync(numUsedGridNodes, stream);
+    usedVoxelMasks.resizeAsync(3*numUsedGridNodes*maskWords, stream);
+    if(numRanks == 1){  //alone: its particle nodes, then its empty ones in cell order, and generateVoxels writes the reached masks into their slots itself
+        cudaSortUints(numOthers, nodeCells.devPtr() + numParticleNodes, keyBits(numCells - 1), stream);
+        if(numUsedGridNodes > 0){
+            markParticleNodes<<<numUsedGridNodes / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numParticleNodes, numUsedGridNodes, nullptr, nodeHasParticles.devPtr());
+        }
+        if(numOthers > 0){
+            mapCellsToNodes<<<numOthers / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numParticleNodes, numUsedGridNodes, numParticleNodes, size, gridCell.devPtr(), gridNodeIndicesToFirstParticleIndex.devPtr(),
+                nodeCells.devPtr(), cellToNode.devPtr());
+        }
+        numOwnNodes = numUsedGridNodes;
+        numStoredNodes = numUsedGridNodes;
+        gpuErrchk(cudaPeekAtLastError());
+        return;
+    }
+    uint cellBits = keyBits(numCells - 1);      //setDomain made sure the group's 3 bits fit above them
+    uint particleNodes = numParticleNodes + numForeignParticleNodes;
+    nodeOrigins.resizeAsync(numUsedGridNodes, stream);
+    //where the runs start, found on the GPU and read back together: in the sorted keys, the starts of groups 1 to 5, and where this partition's empty
+    //nodes leave its first plane and reach its last (group 0's keys are just cells); then the same among its particle nodes
+    uint* found;
+    gpuErrchk(cudaMallocAsync((void**)&found, 9*sizeof(uint), stream));
+    gpuErrchk(cudaMemsetAsync(found, 0, 9*sizeof(uint), stream));
+    if(numParticleNodes > 0){
+        markParticleNodes<<<numParticleNodes / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numParticleNodes, numParticleNodes, nodeOrigins.devPtr(), nodeHasParticles.devPtr());
+        countCellsBefore<<<1, 1, 0, stream>>>(nodeCells.devPtr(), numParticleNodes, (boxLo + 1)*cellsPerPlane, found + 7);
+        countCellsBefore<<<1, 1, 0, stream>>>(nodeCells.devPtr(), numParticleNodes, (boxHi - 1)*cellsPerPlane, found + 8);
+    }
+    uint* keys = nullptr;
+    uint* origins = nullptr;
+    if(numOthers > 0){
+        gpuErrchk(cudaMallocAsync((void**)&keys, sizeof(uint)*numOthers, stream));
+        gpuErrchk(cudaMallocAsync((void**)&origins, sizeof(uint)*numOthers, stream));
+        nodeOrderKeys<<<numOthers / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numParticleNodes, numUsedGridNodes, particleNodes, nodeCells.devPtr(), boxLo*cellsPerPlane, boxHi*cellsPerPlane, cellsPerPlane,
+            cellBits, keys, origins);
+        cudaSortNodeOrder(numOthers, keys, origins, cellBits + 3, stream);
+        placeOrderedNodes<<<numOthers / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numParticleNodes, numOthers, keys, origins, particleNodes, (1u << cellBits) - 1, nodeCells.devPtr(), nodeOrigins.devPtr(),
+            nodeHasParticles.devPtr());
+        for(uint group = 1; group <= 5; ++group){   //the keys are sorted, so each group is a run
+            countCellsBefore<<<1, 1, 0, stream>>>(keys, numOthers, group << cellBits, found + group - 1);
+        }
+        countCellsBefore<<<1, 1, 0, stream>>>(keys, numOthers, (boxLo + 1)*cellsPerPlane, found + 5);
+        countCellsBefore<<<1, 1, 0, stream>>>(keys, numOthers, (boxHi - 1)*cellsPerPlane, found + 6);
+        mapCellsToNodes<<<numOthers / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numParticleNodes, numUsedGridNodes, numParticleNodes, size, gridCell.devPtr(), gridNodeIndicesToFirstParticleIndex.devPtr(),
+            nodeCells.devPtr(), cellToNode.devPtr());
+    }
+    uint counts[9];
+    cudaMemcpyAsync(counts, found, 9*sizeof(uint), cudaMemcpyDeviceToHost, stream);
+    cudaFreeAsync(found, stream);
+    if(numOthers > 0){
+        cudaFreeAsync(keys, stream);
+        cudaFreeAsync(origins, stream);
+    }
+    gpuErrchk(cudaStreamSynchronize(stream));
+    uint numOwnEmpty = counts[0];
+    numOwnNodes = numParticleNodes + numOwnEmpty;
+    numStoredNodes = numParticleNodes + counts[4];     //all but the neighbours' particle nodes 2 planes out
+    //the node runs at its edges and its ghosts either side, whose voxels generateVoxels finds
+    edgeParticles[0] = {0, counts[7]};
+    edgeParticles[1] = {counts[8], numParticleNodes - counts[8]};
+    edgeEmpty[0] = {numParticleNodes, counts[5]};
+    edgeEmpty[1] = {numParticleNodes + counts[6], numOwnEmpty - counts[6]};
+    ghostParticles[0] = {numParticleNodes + counts[0], counts[1] - counts[0]};
+    ghostEmpty[0] = {numParticleNodes + counts[1], counts[2] - counts[1]};
+    ghostParticles[1] = {numParticleNodes + counts[2], counts[3] - counts[2]};
+    ghostEmpty[1] = {numParticleNodes + counts[3], counts[4] - counts[3]};
+    if(numUsedGridNodes > 0){
+        placeReachedMasks<<<numUsedGridNodes, 32, 0, stream>>>(maskWords, numParticleNodes, nodeOrigins.devPtr(), nodeHasParticles.devPtr(), particleNodeMasks.devPtr(), foreignParticleNodeMasks.devPtr(),
+            usedVoxelMasks.devPtr());
+    }
+    gpuErrchk(cudaPeekAtLastError());
+}
+
+//each ghost node's voxels here and in its owner, for filling and reducing; and the check that both partitions built it alike
+//A partition's ghost runs have to be its neighbours' edge runs, node for node and voxel for voxel. Both sides build them from the same particles, so they
+//always should be; if they ever differ, filling ghosts would mix up voxels, so stop
+void Particles::checkGhostRuns(){
+    if(numRanks == 1){
+        return;
+    }
+    uint edges[8] = {edgeParticles[0].nodes, edgeParticles[0].count, edgeEmpty[0].nodes, edgeEmpty[0].count, edgeParticles[1].nodes, edgeParticles[1].count, edgeEmpty[1].nodes, edgeEmpty[1].count};
+    std::vector<uint> allEdges(8*numRanks);
+    transport->allGatherHost(edges, allEdges.data(), sizeof(edges));
+    for(int side = 0; side < 2; ++side){
+        int neighbour = side == 0 ? rank - 1 : rank + 1;
+        if(neighbour < 0 || neighbour >= numRanks){
+            continue;
+        }
+        const uint* theirs = allEdges.data() + 8*neighbour + 4*(1 - side);  //its plane facing this partition: nodes and voxels holding particles, then empty
+        const VoxelRun* mine[2] = {&ghostParticles[side], &ghostEmpty[side]};
+        for(int run = 0; run < 2; ++run){
+            if(mine[run]->nodes != theirs[2*run] || mine[run]->count != theirs[2*run + 1]){
+                std::cerr<<"partition "<<rank<<": its ghost copies of partition "<<neighbour<<"'s "<<(run == 0 ? "nodes holding particles" : "empty nodes")<<" are "
+                         <<mine[run]->nodes<<" nodes with "<<mine[run]->count<<" voxels, but the owner has "<<theirs[2*run]<<" with "<<theirs[2*run + 1]<<"\n";
+                exit(1);
+            }
+        }
+    }
+}
+
+void Particles::generateVoxels(){
+    numParticleNodes = size > 0 ? cudaMarkUniqueGridCellsAndCount(size, gridCell.devPtr(), uniqueGridNodeIndices.devPtr(), stream) : 0;
+
+    //the used nodes: the ones holding particles, then their neighbours without any, which the particles reach into. Split between partitions, the
+    //neighbours' particle nodes within 2 planes come too, and the nodes in the planes next to this partition's are its ghost nodes
+    uint cellsPerPlane = grid.sizeX*grid.sizeY;
     uint numCells = grid.sizeX*grid.sizeY*grid.sizeZ;
-    uint maxNodes = 27*numParticleNodes < numCells ? 27*numParticleNodes : numCells;
+    uint mostParticleNodes = numParticleNodes + (numRanks > 1 ? 4*cellsPerPlane : 0);  //with the neighbours' 2 planes either side
+    uint maxNodes = 27*mostParticleNodes < numCells ? 27*mostParticleNodes : numCells;
     gridNodeIndicesToFirstParticleIndex.resizeAsync(maxNodes, stream);
     nodeCells.resizeAsync(maxNodes, stream);
-    cudaMapNodeIndicesToParticles(size, uniqueGridNodeIndices.devPtr(), gridNodeIndicesToFirstParticleIndex.devPtr(), stream);
-    mapCellsToNodes<<<numParticleNodes / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(0, numParticleNodes, numParticleNodes, size, gridCell.devPtr(), gridNodeIndicesToFirstParticleIndex.devPtr(), nodeCells.devPtr(), cellToNode.devPtr());
-    cudaMemcpyAsync(nodeCount.devPtr(), &numParticleNodes, sizeof(uint), cudaMemcpyHostToDevice, stream);
-    claimEmptyNeighborNodes<<<numParticleNodes, 32, 0, stream>>>(numParticleNodes, nodeCells.devPtr(), cellToNode.devPtr(), nodeCount.devPtr(), grid);
+    uint maskWords = (numVoxelsPerNode + 31) / 32;
+    if(numParticleNodes > 0){
+        cudaMapNodeIndicesToParticles(size, uniqueGridNodeIndices.devPtr(), gridNodeIndicesToFirstParticleIndex.devPtr(), stream);
+        mapCellsToNodes<<<numParticleNodes / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(0, numParticleNodes, numParticleNodes, size, gridCell.devPtr(), gridNodeIndicesToFirstParticleIndex.devPtr(), nodeCells.devPtr(), cellToNode.devPtr());
+    }
+    if(numRanks > 1){   //split, the neighbours take the reached masks of the particle nodes near them before there's a node table to put them in
+        particleNodeMasks.resizeAsync(numParticleNodes*maskWords, stream);
+        if(numParticleNodes > 0){
+            markReachedVoxels<<<numParticleNodes, NODE_THREADS, sizeof(uint)*maskWords, stream>>>(numParticleNodes, size, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(),
+                px.devPtr(), py.devPtr(), pz.devPtr(), particleNodeMasks.devPtr(), maskWords, radius, grid, refinementLevel);
+        }
+    }
+    receiveParticleNodes(maskWords);
+    uint particleNodes = numParticleNodes + numForeignParticleNodes;
+    cudaMemcpyAsync(nodeCount.devPtr(), &particleNodes, sizeof(uint), cudaMemcpyHostToDevice, stream);
+    uint firstClaimCell = (boxLo > 0 ? boxLo - 1 : 0)*cellsPerPlane;     //empty nodes worth having: in this partition's planes, and the ghosts next to them
+    uint endClaimCell = (boxHi < grid.sizeZ ? boxHi + 1 : grid.sizeZ)*cellsPerPlane;
+    if(particleNodes > 0){
+        claimEmptyNeighborNodes<<<particleNodes, 32, 0, stream>>>(particleNodes, nodeCells.devPtr(), cellToNode.devPtr(), nodeCount.devPtr(), grid, firstClaimCell, endClaimCell);
+    }
     cudaMemcpyAsync(&numUsedGridNodes, nodeCount.devPtr(), sizeof(uint), cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream);
-    //the empty nodes were appended in whatever order their claims landed: put them in cell order, so every run numbers the nodes, and so the voxels, the same
-    cudaSortUints(numUsedGridNodes - numParticleNodes, nodeCells.devPtr() + numParticleNodes, stream);
-    mapCellsToNodes<<<(numUsedGridNodes - numParticleNodes) / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numParticleNodes, numUsedGridNodes, numParticleNodes, size, gridCell.devPtr(), gridNodeIndicesToFirstParticleIndex.devPtr(), nodeCells.devPtr(), cellToNode.devPtr());
+    //the empty nodes were appended in whatever order their claims landed: put everything after the particle nodes in a fixed order, so every run numbers the nodes, and so the voxels, the same
+    orderNodes(maskWords);
+    if(numRanks == 1 && numParticleNodes > 0){  //alone, the particle nodes come first in the node table, in the same order: each mask goes straight into its slot
+        markReachedVoxels<<<numParticleNodes, NODE_THREADS, sizeof(uint)*maskWords, stream>>>(numParticleNodes, size, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(),
+            px.devPtr(), py.devPtr(), pz.devPtr(), usedVoxelMasks.devPtr() + 2*maskWords, 3*maskWords, radius, grid, refinementLevel);
+    }
 
-    uint maskWords = (numVoxelsPerNode + 31) / 32;
     nodeIndexUsedVoxels.resizeAsync(numUsedGridNodes, stream);
-    usedVoxelMasks.resizeAsync(3*numUsedGridNodes*maskWords, stream);
-    markReachedVoxels<<<numParticleNodes, NODE_THREADS, sizeof(uint)*maskWords, stream>>>(numParticleNodes, size, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(), usedVoxelMasks.devPtr(), radius, grid, refinementLevel);
-    markUsedVoxels<<<numUsedGridNodes, 64, 2*sizeof(uint)*maskWords, stream>>>(numUsedGridNodes, numParticleNodes, numVoxels1D, nodeCells.devPtr(), cellToNode.devPtr(), usedVoxelMasks.devPtr(), nodeIndexUsedVoxels.devPtr(), radius, grid, refinementLevel);
-    cudaStreamSynchronize(stream);
-
+    nodeIndexUsedVoxels.zeroDeviceAsync(stream);    //the nodes 2 planes out store no voxels
+    if(numStoredNodes > 0){
+        markUsedVoxels<<<numStoredNodes, 64, 2*sizeof(uint)*maskWords, stream>>>(numUsedGridNodes, nodeHasParticles.devPtr(), numVoxels1D, nodeCells.devPtr(), cellToNode.devPtr(), usedVoxelMasks.devPtr(),
+            nodeIndexUsedVoxels.devPtr(), radius, grid, refinementLevel);
+    }
     cudaParallelPrefixSum(numUsedGridNodes, nodeIndexUsedVoxels.devPtr(), stream);
-    cudaStreamSynchronize(stream);
 
-    uint numUsedVoxels;
-    cudaMemcpyAsync(&numUsedVoxels, nodeIndexUsedVoxels.devPtr() + numUsedGridNodes - 1, sizeof(uint), cudaMemcpyDeviceToHost, stream);
-
-    cudaStreamSynchronize(stream);
+    uint numUsedVoxels = 0;
+    numOwnVoxels = 0;
+    if(numRanks == 1){
+        if(numUsedGridNodes > 0){
+            cudaMemcpyAsync(&numUsedVoxels, nodeIndexUsedVoxels.devPtr() + numUsedGridNodes - 1, sizeof(uint), cudaMemcpyDeviceToHost, stream);
+        }
+        cudaStreamSynchronize(stream);
+        numOwnVoxels = numUsedVoxels;
+    }
+    else{   //the edge and ghost runs' voxels too, read back with the counts
+        VoxelRun* runs[8] = {&edgeParticles[0], &edgeParticles[1], &edgeEmpty[0], &edgeEmpty[1], &ghostParticles[0], &ghostParticles[1], &ghostEmpty[0], &ghostEmpty[1]};
+        NodeIndices nodes;
+        nodes.count = 18;
+        for(int run = 0; run < 8; ++run){
+            nodes.index[2*run] = runs[run]->firstNode;
+            nodes.index[2*run + 1] = runs[run]->firstNode + runs[run]->nodes;
+        }
+        nodes.index[16] = numOwnNodes;
+        nodes.index[17] = numUsedGridNodes;
+        uint* starts;
+        uint found[18];
+        gpuErrchk(cudaMallocAsync((void**)&starts, sizeof(found), stream));
+        voxelStartsOf<<<1, 32, 0, stream>>>(nodes, nodeIndexUsedVoxels.devPtr(), starts);
+        cudaMemcpyAsync(found, starts, sizeof(found), cudaMemcpyDeviceToHost, stream);
+        cudaFreeAsync(starts, stream);
+        gpuErrchk(cudaStreamSynchronize(stream));
+        for(int run = 0; run < 8; ++run){
+            runs[run]->start = found[2*run];
+            runs[run]->count = found[2*run + 1] - found[2*run];
+        }
+        numOwnVoxels = found[16];
+        numUsedVoxels = found[17];
+    }
     voxelIDsUsed.resizeAsync(numUsedVoxels, stream);
     voxelOwners.resizeAsync(numUsedVoxels, stream);
     solids.resizeAsync(numUsedVoxels, stream);
@@ -446,14 +857,30 @@ void Particles::generateVoxels(){
     }
     p.zeroDeviceAsync(stream);
 
-    writeUsedVoxelIDs<<<numUsedGridNodes, 32, 0, stream>>>(numVoxels1D, usedVoxelMasks.devPtr(), nodeIndexUsedVoxels.devPtr(), nodeCells.devPtr(), voxelIDsUsed.devPtr(), solids.devPtr(), solveCodes.devPtr(), radius, grid, refinementLevel);
-    buildVoxelTopology<<<numUsedGridNodes, 64, sizeof(uint)*numVoxelsPerNode, stream>>>(numUsedGridNodes, numVoxels1D, radius, nodeCells.devPtr(), cellToNode.devPtr(), nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(), voxelOwners.devPtr(),
-        neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(), neighborPy.devPtr(), neighborNz.devPtr(), neighborPz.devPtr(), solveCodes.devPtr(), coarseCells.devPtr(), nodeInteriorVoxels.devPtr(),
-        grid, refinementLevel);
-    cudaStreamSynchronize(stream);
+    for(CudaVec<uint>* lower : {&neighborNx, &neighborNy, &neighborNz}){   //air voxels' lower neighbours: NO_VOXEL unless an unknown below claims them
+        cudaMemsetAsync(lower->devPtr(), 0xFF, sizeof(uint)*numUsedVoxels, stream);
+    }
+    if(numStoredNodes > 0){     //the nodes 2 planes out have no voxels to build
+        writeUsedVoxelIDs<<<numStoredNodes, 32, 0, stream>>>(numVoxels1D, usedVoxelMasks.devPtr(), nodeIndexUsedVoxels.devPtr(), nodeCells.devPtr(), voxelIDsUsed.devPtr(), solids.devPtr(), solveCodes.devPtr(), radius, grid, refinementLevel);
+        buildVoxelTopology<<<numStoredNodes, 64, sizeof(uint)*numVoxelsPerNode, stream>>>(numUsedGridNodes, numOwnNodes, numVoxels1D, radius, nodeCells.devPtr(), cellToNode.devPtr(), nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(),
+            voxelOwners.devPtr(), neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(), neighborPy.devPtr(), neighborNz.devPtr(), neighborPz.devPtr(), solveCodes.devPtr(), coarseCells.devPtr(), nodeInteriorVoxels.devPtr(),
+            grid, refinementLevel);
+    }
+    gpuErrchk(cudaPeekAtLastError());
+    checkGhostRuns();
 
-    std::cout<<"Nodes: "<<numParticleNodes<<" with particles, "<<numUsedGridNodes<<" in all, holding "<<numUsedVoxels<<" voxels\n";
-    std::cout<<"Using "<<(CudaVec<uint>::GPU_MEMORY_ALLOCATED + CudaVec<float>::GPU_MEMORY_ALLOCATED + CudaVec<double>::GPU_MEMORY_ALLOCATED + CudaVec<char>::GPU_MEMORY_ALLOCATED) / (1<<20)<<" MB on GPU\n";
+    if(numRanks == 1){
+        std::cout<<"Nodes: "<<numParticleNodes<<" with particles, "<<numUsedGridNodes<<" in all, holding "<<numUsedVoxels<<" voxels\n";
+    }
+    else{
+        std::ostringstream line;    //written whole, so the partitions' threads can't interleave their lines
+        line<<"Partition "<<rank<<": "<<size<<" particles, nodes: "<<numParticleNodes<<" with particles, "<<numOwnNodes<<" its own, "<<numStoredNodes - numOwnNodes<<" ghosts, "
+            <<numUsedGridNodes - numStoredNodes<<" beyond; "<<numOwnVoxels<<" of its "<<numUsedVoxels<<" voxels its own\n";
+        std::cout<<line.str();
+    }
+    if(verbose()){      //written whole too: the other partitions print their lines meanwhile
+        std::cout<<"Using " + std::to_string((CudaVec<uint>::GPU_MEMORY_ALLOCATED + CudaVec<float>::GPU_MEMORY_ALLOCATED + CudaVec<double>::GPU_MEMORY_ALLOCATED + CudaVec<char>::GPU_MEMORY_ALLOCATED) / (1<<20)) + " MB on GPU\n";
+    }
 }
 
 //P2G: a block per node and a thread per particle. Each particle adds its momentum and weight on the 27 faces of each component around it into the
@@ -522,7 +949,9 @@ __global__ void scatterParticleVelsToVoxels(uint numParticleNodes, uint numParti
 
 double Particles::getCourantDt(){    //every substep: the fastest particle moves at most cfl voxels. P2G finds the fastest
     double voxelSize = (grid.cellSize / (numVoxels1D - 2*std::floor(radius)));
-    std::cout<<"maxVel: "<<maxVelocity<<" voxelSize: "<<voxelSize<<"\n";
+    if(verbose()){
+        std::cout<<"maxVel: "<<maxVelocity<<" voxelSize: "<<voxelSize<<"\n";
+    }
     return cfl * (voxelSize / maxVelocity + 0.0001);
 }
 
@@ -530,20 +959,29 @@ void Particles::particleVelToVoxels(){
     for(CudaVec<float>* accumulator : {&voxelsUx, &voxelsUy, &voxelsUz, &voxelWeightsX, &voxelWeightsY, &voxelWeightsZ, &particleCounts}){
         accumulator->zeroDeviceAsync(stream);
     }
-    maxVelocity = fmax(fabs(vx.getMax(stream, true)), fmax(fabs(vy.getMax(stream, true)), fabs(vz.getMax(stream, true))));  //also sets the CFL timestep
+    maxVelocity = largestMagnitude({&vx, &vy, &vz}, stream);   //the fastest component, which also sets the CFL timestep
+    maxVelocity = context->maxOverPartitions(maxVelocity);     //every partition's fixed point and timestep have to agree
     //P2G sums in fixed point: a face's weight sum is about the particles per voxel, so budget 128 (15x rest) and keep every sum under 2^30
     float weightScale = (1 << 30) / 128.0f;
     float momentumScale = weightScale / fmax(maxVelocity, 1e-6);
-    scatterParticleVelsToVoxels<<<numParticleNodes, NODE_THREADS, 7*sizeof(int)*numVoxelsPerNode, stream>>>(numParticleNodes, size, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(),
-        nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(), voxelOwners.devPtr(), (int*)voxelsUx.devPtr(), (int*)voxelsUy.devPtr(), (int*)voxelsUz.devPtr(),
-        (int*)voxelWeightsX.devPtr(), (int*)voxelWeightsY.devPtr(), (int*)voxelWeightsZ.devPtr(), (int*)particleCounts.devPtr(), momentumScale, weightScale, radius, grid, refinementLevel);
+    if(numParticleNodes > 0){
+        scatterParticleVelsToVoxels<<<numParticleNodes, NODE_THREADS, 7*sizeof(int)*numVoxelsPerNode, stream>>>(numParticleNodes, size, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(),
+            nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(), voxelOwners.devPtr(), (int*)voxelsUx.devPtr(), (int*)voxelsUy.devPtr(), (int*)voxelsUz.devPtr(),
+            (int*)voxelWeightsX.devPtr(), (int*)voxelWeightsY.devPtr(), (int*)voxelWeightsZ.devPtr(), (int*)particleCounts.devPtr(), momentumScale, weightScale, radius, grid, refinementLevel);
+    }
+    //particles near this partition's edge reach into ghost voxels: their owners add those sums in, which in fixed point come out the same in any order
+    for(CudaVec<float>* accumulator : {&voxelsUx, &voxelsUy, &voxelsUz, &voxelWeightsX, &voxelWeightsY, &voxelWeightsZ, &particleCounts}){
+        context->reduceGhosts((int*)accumulator->devPtr(), stream);
+    }
     cudaNormalizeVoxelVelocities(solids, voxelWeightsX, voxelWeightsY, voxelWeightsZ, voxelsUx, voxelsUy, voxelsUz, particleCounts, momentumScale, weightScale, stream);
-    cudaExtrapolateUnreachedFaces(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, voxelWeightsX, voxelWeightsY, voxelWeightsZ, voxelsUx, voxelsUy, voxelsUz, stream);
-    cudaFindFootprintDepth(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, footprintDepth, freeSurface, stream);
+    for(CudaVec<float>* field : {&voxelsUx, &voxelsUy, &voxelsUz, &voxelWeightsX, &voxelWeightsY, &voxelWeightsZ, &particleCounts}){   //and the ghosts take the totals
+        context->fillGhosts(field->devPtr(), stream);
+    }
+    cudaExtrapolateUnreachedFaces(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, voxelWeightsX, voxelWeightsY, voxelWeightsZ, voxelsUx, voxelsUy, voxelsUz, *context, stream);
+    cudaFindFootprintDepth(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, footprintDepth, freeSurface, *context, stream);
     for(auto [velocity, before] : {std::pair{&voxelsUx, &voxelsUxOld}, {&voxelsUy, &voxelsUyOld}, {&voxelsUz, &voxelsUzOld}}){    //for FLIP's velocity change over the solve
         cudaMemcpyAsync(before->devPtr(), velocity->devPtr(), sizeof(float)*velocity->size(), cudaMemcpyDeviceToDevice, stream);
     }
-    cudaStreamSynchronize(stream);
 }
 
 void Particles::pressureSolve(){
@@ -556,12 +994,14 @@ void Particles::pressureSolve(){
     uint hasFreeSurface;
     cudaMemcpyAsync(&hasFreeSurface, freeSurface.devPtr(), sizeof(uint), cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream);
+    hasFreeSurface = context->anyOverPartitions(hasFreeSurface != 0);
     //divergence per unit of relative density error. Without air the fluid can't change volume, and the solve has nowhere to take a net divergence, so it's off
     double correctionRate = hasFreeSurface && densityCorrectionTime > 0.0 ? voxelSize / densityCorrectionTime : 0.0;
     //@TODO: need to use courant number for dt from max voxel u and voxel dimensions
     dt = getCourantDt();
-    std::cout<<"initial dt: "<<dt<<std::endl;
-    cudaStreamSynchronize(stream);
+    if(verbose()){
+        std::cout<<"initial dt: "<<dt<<std::endl;
+    }
     if(frameDt - elapsedTimeThisFrame < dt){
         dt = frameDt - elapsedTimeThisFrame;
     }
@@ -571,18 +1011,21 @@ void Particles::pressureSolve(){
     gpuErrchk(cudaPeekAtLastError());
     uint interiorWidth = numVoxels1D - 2*(uint)std::floor(radius);
     uint3 domainVoxels = make_uint3(grid.sizeX*interiorWidth, grid.sizeY*interiorWidth, grid.sizeZ*interiorWidth);
-    VoxelLayout layout = {nodeCells.devPtr(), nodeInteriorVoxels.devPtr(), coarseCells.devPtr(), numUsedGridNodes, interiorWidth, domainVoxels};
+    VoxelLayout layout = {nodeCells.devPtr(), nodeInteriorVoxels.devPtr(), coarseCells.devPtr(), numOwnNodes, interiorWidth, domainVoxels};   //the nodes this partition solves for
     auto solve = [&](){
         switch(pressureSolver){
             case PressureSolver::cg:
-                return cudaConjugateGradient(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, divU, p, residuals, tolerance, maxIterations, stream);
+                return cudaConjugateGradient(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, divU, p, residuals, tolerance, maxIterations,
+                                             layout, dotProductSums, numOwnVoxels, *context, stream);
             case PressureSolver::jacobi:
-                return cudaJacobiConjugateGradient(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, divU, p, residuals, tolerance, maxIterations, stream);
+                return cudaJacobiConjugateGradient(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, divU, p, residuals, tolerance, maxIterations,
+                                                   layout, dotProductSums, numOwnVoxels, *context, stream);
             case PressureSolver::multigrid:
                 return cudaMultigridConjugateGradient(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, divU, p, residuals, tolerance, maxIterations,
-                                                      layout, dt/(density*voxelSize*voxelSize), stream);
+                                                      layout, dt/(density*voxelSize*voxelSize), dotProductSums, numOwnVoxels, *context, stream);
             default:
-                return cudaGSiteration(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, divU, p, residuals, tolerance, maxIterations, stream);
+                return cudaGSiteration(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, divU, p, residuals, tolerance, maxIterations,
+                                       numOwnVoxels, *context, stream);
         }
     };
     while(previousTerminatingResidual - (terminatingResidual = solve()) > 0.0){    //while residual getting smaller
@@ -602,8 +1045,9 @@ void Particles::pressureSolve(){
     elapsedTime += dt;
     elapsedTimeThisFrame += dt;
     prevDt = dt;
-    std::cout<<"dt: "<<dt<<" ElapsedTime: "<<elapsedTime<<" elapsedTimeThisFrame: "<<elapsedTimeThisFrame<<"\nTerminating Residual: "<<terminatingResidual<<"\nTolerance: "<<tolerance<<"\n";
-    cudaStreamSynchronize(stream);
+    if(verbose()){
+        std::cout<<"dt: "<<dt<<" ElapsedTime: "<<elapsedTime<<" elapsedTimeThisFrame: "<<elapsedTimeThisFrame<<"\nTerminating Residual: "<<terminatingResidual<<"\nTolerance: "<<tolerance<<"\n";
+    }
     gpuErrchk(cudaPeekAtLastError());
 }
 
@@ -611,6 +1055,9 @@ void Particles::updateVoxelVelocities(){
     double voxelSize = grid.cellSize / (2<<refinementLevel);
     cudaVelocityUpdate(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, p, voxelsUx, voxelsUy, voxelsUz, dt/(0.014*voxelSize*voxelSize), stream);
     gpuErrchk(cudaPeekAtLastError());
+    for(CudaVec<float>* velocity : {&voxelsUx, &voxelsUy, &voxelsUz}){   //G2P and advection read ghost faces
+        context->fillGhosts(velocity->devPtr(), stream);
+    }
 }
 
 //G2P: a block per node and a thread per particle. The block copies the new and old face velocities of every voxel the node stores into shared memory,
@@ -800,6 +1247,9 @@ __global__ void advectThroughGrid(uint numParticleNodes, uint numParticles, cons
 }
 
 void Particles::voxelVelsToParticles(){
+    if(numParticleNodes == 0){  //no particles in this partition
+        return;
+    }
     gatherVoxelVelsToParticles<<<numParticleNodes, NODE_THREADS, 6*sizeof(float)*numVoxelsPerNode, stream>>>(numParticleNodes, size, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(),
         nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(), voxelOwners.devPtr(), solids.devPtr(), voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr(), voxelsUxOld.devPtr(), voxelsUyOld.devPtr(), voxelsUzOld.devPtr(), flipRatio, radius, grid, refinementLevel);
     gpuErrchk(cudaPeekAtLastError());
@@ -832,38 +1282,41 @@ void Particles::setupCudaDevices(){
     for(int i = 0; i < deviceProp.size(); ++i){
         std::cout<<"Device "<<i<<": "<<deviceProp[i].name<<" with "<<deviceProp[i].totalGlobalMem / (1<<20)<<"MB VRAM available"<<std::endl;
     }
+
+    //cudaMallocAsync's pool keeps the memory it's given. By default it hands everything free back to the driver at every sync, and each substep's
+    //allocations then map it all again: milliseconds of idle GPU a substep at 10M particles
+    int device;
+    gpuErrchk(cudaGetDevice(&device));
+    cudaMemPool_t pool;
+    gpuErrchk(cudaDeviceGetDefaultMemPool(&pool, device));
+    unsigned long long keepEverything = ~0ull;  //a 64-bit threshold
+    gpuErrchk(cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &keepEverything));
 }
 
 void Particles::solveFrame(double fps){
     frameDt = 1.0f/fps;
     dt = frameDt / 10.0f;
     elapsedTimeThisFrame = 0.0f;
-    while(elapsedTimeThisFrame < frameDt){
+    while(elapsedTimeThisFrame < frameDt){    //every step is queued on this partition's one stream, in order: the host only waits where it reads something back
         particleVelToVoxels();
-        cudaStreamSynchronize(stream);
         pressureSolve();
-        cudaStreamSynchronize(stream);
         updateVoxelVelocities();
-        cudaStreamSynchronize(stream);
         voxelVelsToParticles();   //also moves the particles; initialize re-bins them wherever they landed, reflecting any that crossed a wall
-        cudaStreamSynchronize(stream);
         initialize();
     }
 }
 
 void Particles::initialize(){
         alignParticlesToGrid();
-        cudaStreamSynchronize(stream);
         sortParticles();
-        cudaStreamSynchronize(stream);
+        exchangeParticles();    //particles that crossed into another partition's planes move there
         generateVoxels();
-        cudaStreamSynchronize(stream);
 }
 
 #include <iostream>
 #include <fstream>
 
-__global__ void packPositions(uint numParticles, const double* px, const double* py, const double* pz, float* xyz){
+__global__ void packPositionsToFloats(uint numParticles, const double* px, const double* py, const double* pz, float* xyz){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
     if(index < numParticles){
         xyz[3*index] = px[index];
@@ -872,12 +1325,41 @@ __global__ void packPositions(uint numParticles, const double* px, const double*
     }
 }
 
-//binary frame: float32 x, y, z per particle, written to disk on frameWriter's thread while the simulation carries on
-void Particles::writePositionsToFile(const std::string& fileName){
-    packPositions<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, px.devPtr(), py.devPtr(), pz.devPtr(), frameWriter.deviceFrame());
-    frameWriter.write(fileName, stream);
+//A frame's float32 x, y, z per particle, packed into framePositions on this partition's stream once the last frame's copy out of it is done
+const float* Particles::packPositions(){
+    if(frameStream == nullptr){     //on this partition's GPU, which the caller has made current
+        gpuErrchk(cudaStreamCreateWithFlags(&frameStream, cudaStreamNonBlocking));
+        gpuErrchk(cudaEventCreateWithFlags(&framePacked, cudaEventDisableTiming));
+        gpuErrchk(cudaEventCreateWithFlags(&frameCopied, cudaEventDisableTiming));
+    }
+    gpuErrchk(cudaStreamWaitEvent(stream, frameCopied, 0));    //never recorded yet: no wait
+    if(size > 0){
+        framePositions.resizeAsync(3*size, stream);
+        packPositionsToFloats<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, px.devPtr(), py.devPtr(), pz.devPtr(), framePositions.devPtr());
+        gpuErrchk(cudaPeekAtLastError());
+    }
+    return framePositions.devPtr();
 }
 
-Particles::~Particles(){
+//this partition's run of a frame, into pinned host memory at xyz: packed on its stream, then copied out on frameStream, so the simulation's next kernels
+//run alongside the copy; copied is recorded once it's in
+void Particles::copyPositionsToHost(float* xyz, cudaEvent_t copied){
+    packPositions();
+    gpuErrchk(cudaEventRecord(framePacked, stream));
+    gpuErrchk(cudaStreamWaitEvent(frameStream, framePacked, 0));
+    if(size > 0){
+        gpuErrchk(cudaMemcpyAsync(xyz, framePositions.devPtr(), sizeof(float)*3*size, cudaMemcpyDeviceToHost, frameStream));
+    }
+    gpuErrchk(cudaEventRecord(frameCopied, frameStream));
+    gpuErrchk(cudaEventRecord(copied, frameStream));
+}
+
+Particles::~Particles(){     //with its GPU the current one
+    if(frameStream != nullptr){
+        cudaStreamSynchronize(frameStream);
+        cudaStreamDestroy(frameStream);
+        cudaEventDestroy(framePacked);
+        cudaEventDestroy(frameCopied);
+    }
     gpuErrchk( cudaStreamDestroy(stream) );
 }

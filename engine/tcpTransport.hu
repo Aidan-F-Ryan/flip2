@@ -1,0 +1,48 @@
+//Copyright 2023 Aberrant Behavior LLC
+
+#ifndef TCPTRANSPORT_HU
+#define TCPTRANSPORT_HU
+
+#include "transport.hu"
+#include <string>
+#include <vector>
+
+//Ranks in separate processes, on one host or several, joined pairwise over TCP. Rank 0 listens at the rendezvous address ("host:port"); every other rank
+//connects there, which becomes its link to rank 0, and rank 0 hands out everyone's address, after which each rank connects to every rank below it. Each
+//message is its length then its bytes, and receivers check the length against what they expect. Device data is staged through pinned host memory with the
+//host waiting on the stream around each exchange: for development (several processes can share one GPU, which NCCL won't allow) and as the fallback where
+//NCCL isn't available, not for speed. POSIX sockets: Linux and macOS
+class TcpTransport : public Transport{
+public:
+    TcpTransport(int rank, int size, const std::string& rendezvous, double timeoutSeconds = 300);
+    ~TcpTransport();
+
+    int rank() const override{
+        return me;
+    }
+    int size() const override{
+        return ranks;
+    }
+    void exchange(const std::vector<TransportSend>& sends, const std::vector<TransportReceive>& receives, cudaStream_t stream) override;
+    void allGatherHost(const void* mine, void* all, size_t bytes) override;
+
+private:
+    struct Message{
+        int peer;
+        char* data;
+        unsigned long long bytes;
+        unsigned long long header;  //the length, sent first; received here and checked
+        size_t done = 0;            //bytes of header, then data, moved so far
+    };
+    void transfer(std::vector<Message>& sends, std::vector<Message>& receives);   //moves them all, in order per peer, as each socket is ready
+    char* staging(size_t bytes);
+
+    int me;
+    int ranks;
+    double timeout;
+    std::vector<int> sockets;   //per rank, the connection to it; -1 for this rank
+    char* pinned = nullptr;
+    size_t pinnedBytes = 0;
+};
+
+#endif

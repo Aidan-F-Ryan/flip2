@@ -27,12 +27,32 @@ foreach(lib ${cudaLibraries})
     target_link_libraries(${lib} radixSortKernels parallelPrefixSumKernels reductionKernels)
 endforeach()
 
+find_package(Threads REQUIRED)
+
 add_library(particles SHARED
     particles.cu
+    localTransport.cu
+    partitionExchange.cu
+    tcpTransport.cu
+    simulation.cu
 )
 
-target_link_libraries(particles ${cudaLibraries}  parallelPrefixSumKernels radixSortKernels reductionKernels particleToGridFunctions perVoxelParticleListFunctions voxelSolveFunctions conjugateGradientFunctions multigridFunctions)
+target_link_libraries(particles ${cudaLibraries}  parallelPrefixSumKernels radixSortKernels reductionKernels particleToGridFunctions perVoxelParticleListFunctions voxelSolveFunctions conjugateGradientFunctions multigridFunctions Threads::Threads)
 set_target_properties(particles PROPERTIES CUDA_ARCHITECTURES "86")
+
+# NCCL joins ranks in separate processes, one GPU each (FLIP2_TRANSPORT=nccl). Optional: found through NCCL_HOME (a CMake or environment variable: an
+# NCCL install, build directory or pip's nvidia/nccl) or the system's paths; without it, flip2 builds as before and ranks join over TCP
+find_path(NCCL_INCLUDE_DIR nccl.h HINTS ${NCCL_HOME} $ENV{NCCL_HOME} PATH_SUFFIXES include)
+find_library(NCCL_LIBRARY nccl HINTS ${NCCL_HOME} $ENV{NCCL_HOME} PATH_SUFFIXES lib lib64)
+if(NCCL_INCLUDE_DIR AND NCCL_LIBRARY)
+    message(STATUS "NCCL: ${NCCL_LIBRARY}")
+    target_sources(particles PRIVATE ncclTransport.cu)
+    target_include_directories(particles PUBLIC ${NCCL_INCLUDE_DIR})
+    target_link_libraries(particles ${NCCL_LIBRARY})
+    target_compile_definitions(particles PUBLIC FLIP2_WITH_NCCL)
+else()
+    message(STATUS "NCCL not found (set NCCL_HOME to use it): ranks can only join over TCP")
+endif()
 
 add_executable(main main.cu)
 target_link_libraries(main particles gomp)

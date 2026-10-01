@@ -1,0 +1,44 @@
+//Copyright 2023 Aberrant Behavior LLC
+
+#ifndef PARTITIONEXCHANGE_HU
+#define PARTITIONEXCHANGE_HU
+
+#include "partitionContext.hu"
+#include "transport.hu"
+
+class Particles;
+
+//A partition's side of the solver's exchanges (see PartitionContext), as sends and receives over a Transport, each rank using only its own layout:
+//ghost fills and reductions go between the partitions either side, sums and the first coarse grid between all. Sums gather every rank's values and add
+//them up in rank order, so every rank gets the same bits whatever the transport. With a single rank every call returns straight away
+class PartitionExchange : public PartitionContext{
+public:
+    PartitionExchange(Transport& transport, Particles& partition)
+    : transport(transport)
+    , me(partition)
+    {}
+    ~PartitionExchange();   //frees its buffers: make its GPU the current one first
+
+    void fillGhosts(float* values, cudaStream_t stream) override;
+    void fillGhosts(char* values, cudaStream_t stream) override;
+    void reduceGhosts(int* values, cudaStream_t stream) override;
+    double maxOverPartitions(double value) override;
+    bool anyOverPartitions(bool value) override;
+    void sumOverPartitions(long long* values, uint count, cudaStream_t stream) override;
+    void sumOverPartitions(double* value, cudaStream_t stream) override;
+    void gatherFirstLevel(void* cells, size_t bytesPerCell, cudaStream_t stream) override;
+
+private:
+    template <typename T>
+    void fill(T* values, cudaStream_t stream);
+    template <typename T>
+    void sum(T* values, uint count, cudaStream_t stream);
+    void* buffer(int which, size_t bytes, cudaStream_t stream);
+
+    Transport& transport;
+    Particles& me;
+    void* buffers[3] = {nullptr, nullptr, nullptr};     //on this partition's GPU: the ghost copies to add in from below and above, and gathered values to sum
+    size_t bufferBytes[3] = {0, 0, 0};
+};
+
+#endif

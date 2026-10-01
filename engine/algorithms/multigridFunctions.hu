@@ -5,6 +5,7 @@
 
     #include "../typedefs.h"
     #include "../cudaVec.hu"
+    #include "../partitionContext.hu"
 
     //an unknown's row of the pressure matrix A: its own coefficient and its six neighbours'. They're 0 across walls and air, so only unknowns count
     struct Stencil{
@@ -55,10 +56,12 @@
         float* residual;            //the unknowns' leftover residual, r - A*z, on its way to the first coarse grid
         CoarseLevel levels[16];     //each coarser than the last, the last small enough for one block to solve
         int numLevels;
+        PartitionContext* context;  //split between partitions: ghost unknowns take their owners' values, and the coarse grids, dense over the whole domain, are
+                                    //filled in by every partition and then solved alike in each
     };
 
     //the coarse grids for this solve, from which unknowns there are
-    Multigrid buildMultigrid(Stencil A, const char* solveCodes, uint numUsedVoxels, const VoxelLayout& layout, float scale, cudaStream_t stream);
+    Multigrid buildMultigrid(Stencil A, const char* solveCodes, uint numUsedVoxels, const VoxelLayout& layout, float scale, PartitionContext& context, cudaStream_t stream);
 
     //z = M^-1*r: one V-cycle, an approximate solve of A*z = r
     void vCycle(const Multigrid& multigrid, const float* r, float* z, cudaStream_t stream);

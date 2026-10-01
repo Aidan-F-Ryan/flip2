@@ -3,7 +3,7 @@
 #ifndef TESTING_H
 #define TESTING_H
 
-#include "particles.hu"
+#include "simulation.hu"
 #include <map>
 #include <random>
 #include <iostream>
@@ -12,35 +12,46 @@
 #include <string>
 #include <cmath>
 
+//runs a Simulation split into partitions partitions (1: the whole domain in one); the checks below look at the first partition
 class ParticleSystemTester{
 public:
 
-    ParticleSystemTester(uint size)
-    : particles(size)
+    ParticleSystemTester(uint size, int partitions = 1, int devices = 0)     //devices 0: every GPU there is
+    : simulation(size, partitions, devices)
+    , particles(simulation.partition(0))
+    {}
+
+    ParticleSystemTester(uint size, std::unique_ptr<Transport> transport, int device)     //this process is transport's rank, on GPU device
+    : simulation(size, std::move(transport), device)
+    , particles(simulation.partition(0))
     {}
 
     void setDomain(double nx, double ny, double nz, uint x, uint y, uint z, double cellSize){
-        particles.setDomain(nx, ny, nz, x, y, z, cellSize);
+        simulation.setDomain(nx, ny, nz, x, y, z, cellSize);
     }
 
     void setFlipRatio(double ratio){
-        particles.setFlipRatio(ratio);
+        simulation.forEachPartition([&](Particles& partition){ partition.setFlipRatio(ratio); });
     }
 
     void setCfl(double voxels){
-        particles.setCfl(voxels);
+        simulation.forEachPartition([&](Particles& partition){ partition.setCfl(voxels); });
     }
 
     void setRungeKutta3(bool on){
-        particles.setRungeKutta3(on);
+        simulation.forEachPartition([&](Particles& partition){ partition.setRungeKutta3(on); });
     }
 
     void setDensityCorrectionTime(double seconds){
-        particles.setDensityCorrectionTime(seconds);
+        simulation.forEachPartition([&](Particles& partition){ partition.setDensityCorrectionTime(seconds); });
     }
 
     void setPressureSolver(PressureSolver solver){
-        particles.setPressureSolver(solver);
+        simulation.forEachPartition([&](Particles& partition){ partition.setPressureSolver(solver); });
+    }
+
+    void setDotProductSums(DotProductSums sums){
+        simulation.forEachPartition([&](Particles& partition){ partition.setDotProductSums(sums); });
     }
 
     void storeGridCellMap(){
@@ -74,7 +85,8 @@ public:
     }
     
     //particles at random positions in the box lo..hi, in fractions of the domain (by default the dam break's column), and at rest, or with swirl
-    //set, in one vortex filling the domain's xy cross section, swirl m/s at its fastest and not crossing the walls
+    //set, in one vortex filling the domain's xy cross section, swirl m/s at its fastest and not crossing the walls. Every partition gets all of them, and
+    //keeps its own when it initializes
     void randomizeParticlePositions(double3 lo = make_double3(1.0/3.0, 0.0, 1.0/3.0), double3 hi = make_double3(2.0/3.0, 2.0/3.0, 2.0/3.0), double swirl = 0.0){
         std::default_random_engine e2(1);   //a fixed seed: the same run gives the same result every time
         double width = particles.grid.sizeX*particles.grid.cellSize;
@@ -93,14 +105,29 @@ public:
             particles.vy[i] = -swirl*cos(x)*sin(y);
             particles.vz[i] = 0.0;
         }
-        for(CudaVec<double>* position : {&particles.px, &particles.py, &particles.pz}){
-            position->upload(particles.stream);
-        }
-        for(CudaVec<float>* velocity : {&particles.vx, &particles.vy, &particles.vz}){
-            velocity->upload(particles.stream);
-        }
         double voxelSize = particles.grid.cellSize / (2<<particles.refinementLevel);
-        particles.setRestDensity(particles.size / ((hi.x - lo.x)*width*(hi.y - lo.y)*height*(hi.z - lo.z)*depth / (voxelSize*voxelSize*voxelSize)));   //what they start at
+        double restDensity = particles.size / ((hi.x - lo.x)*width*(hi.y - lo.y)*height*(hi.z - lo.z)*depth / (voxelSize*voxelSize*voxelSize));    //what they start at
+        simulation.forEachPartition([&](Particles& partition){
+            if(&partition != &particles){
+                for(auto [mine, theirs] : {std::pair{&partition.px, &particles.px}, {&partition.py, &particles.py}, {&partition.pz, &particles.pz}}){
+                    for(uint i = 0; i < particles.size; ++i){
+                        (*mine)[i] = (*theirs)[i];
+                    }
+                }
+                for(auto [mine, theirs] : {std::pair{&partition.vx, &particles.vx}, {&partition.vy, &particles.vy}, {&partition.vz, &particles.vz}}){
+                    for(uint i = 0; i < particles.size; ++i){
+                        (*mine)[i] = (*theirs)[i];
+                    }
+                }
+            }
+            for(CudaVec<double>* position : {&partition.px, &partition.py, &partition.pz}){
+                position->upload(partition.stream);
+            }
+            for(CudaVec<float>* velocity : {&partition.vx, &partition.vy, &partition.vz}){
+                velocity->upload(partition.stream);
+            }
+            partition.setRestDensity(restDensity);
+        });
     }
 
     void runVerify(){
@@ -132,7 +159,7 @@ public:
         }
     }
     void initialize(){
-        particles.initialize();
+        simulation.initialize();
     }
     void run(){
         particles.alignParticlesToGrid();
@@ -146,15 +173,16 @@ public:
     }
 
     void solveFrame(double fps){
-        particles.solveFrame(fps);
+        simulation.solveFrame(fps);
     }
 
     void writePositionsToFile(const std::string& fileName){
-        particles.writePositionsToFile(fileName);
+        simulation.writePositionsToFile(fileName);
     }
 
 private:
-    Particles particles;
+    Simulation simulation;
+    Particles& particles;   //the first partition, which the checks look at
     std::map<uint, uint> gridMap;
 };
 

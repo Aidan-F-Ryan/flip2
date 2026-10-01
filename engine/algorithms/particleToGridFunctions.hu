@@ -13,10 +13,23 @@
         uint* subCellsTouchedY, uint* subCellsTouchedZ, CudaVec<uint>& subCellPositionX, CudaVec<uint>& subCellPositionY,
         CudaVec<uint>& subCellPositionZ, uint numRefinementLevels, double radius, cudaStream_t stream);
 
-    void cudaSortParticlesByGridNode(uint numParticles, uint*& gridPosition, uint*& reorderedIndicesRelativeToOriginal, cudaStream_t stream);
+    //how many low bits hold every key up to maxKey: the radix sorts only look at those, a pass per 8
+    inline int keyBits(uint maxKey){
+        int bits = 1;
+        while(bits < 32 && maxKey >> bits){
+            ++bits;
+        }
+        return bits;
+    }
 
-    //sorts keys in place, ascending
-    void cudaSortUints(uint numElements, uint* keys, cudaStream_t stream);
+    //the particles' cells, all under numCells, ascending, and the order they came from; the sort is stable
+    void cudaSortParticlesByGridNode(uint numParticles, uint*& gridPosition, uint*& reorderedIndicesRelativeToOriginal, uint numCells, cudaStream_t stream);
+
+    //sorts keys in place, ascending, looking at their low endBit bits (the rest must be 0)
+    void cudaSortUints(uint numElements, uint* keys, int endBit, cudaStream_t stream);
+
+    //sorts keys in place, ascending by their low endBit bits (the rest must be 0), and values with them; stable
+    void cudaSortNodeOrder(uint numElements, uint* keys, uint* values, int endBit, cudaStream_t stream);
 
     uint cudaMarkUniqueGridCellsAndCount(uint numParticles, uint* gridPosition, uint* uniqueGridNodes, cudaStream_t stream);
 

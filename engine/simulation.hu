@@ -1,0 +1,59 @@
+//Copyright 2023 Aberrant Behavior LLC
+
+#ifndef SIMULATION_HU
+#define SIMULATION_HU
+
+#include "particles.hu"
+#include "localTransport.hu"
+#include "partitionExchange.hu"
+#include "frameWriter.hpp"
+#include <functional>
+#include <memory>
+#include <string>
+#include <vector>
+
+//A simulation split into partitions along z, each owning whole node planes and the particles in them, one rank each. Either every partition runs in this
+//process, spread over this host's GPUs (with more partitions than GPUs, neighbours share one) and joined by a LocalTransport; or this process is one rank
+//of several, on one GPU, joined to the others by a transport it's given. The partitions run the same steps in lockstep, each on its own host thread with
+//its GPU current. One partition is the whole domain, run on the calling thread, just as before the split
+class Simulation{
+public:
+    Simulation(uint numParticles, int numPartitions, int numDevices = 0);  //every partition here; numDevices 0 uses every GPU there is
+    Simulation(uint numParticles, std::unique_ptr<Transport> transport, int device);   //this process is transport's rank, on GPU device
+    ~Simulation();
+
+    //the domain, and each rank's node planes: as even a split along z as whole pairs of planes allow, at least 2 planes each
+    void setDomain(double nx, double ny, double nz, uint x, uint y, uint z, double cellSize);
+
+    int numPartitions() const{  //the partitions in this process
+        return (int)partitions.size();
+    }
+    Particles& partition(int index){
+        return *partitions[index];
+    }
+    void forEachPartition(const std::function<void(Particles&)>& setting);  //for settings, on this thread, with each partition's GPU current in turn
+
+    void initialize();      //each partition keeps its own particles and builds its grid
+    void solveFrame(double fps);
+    //every rank's particles, in rank order: the order one partition would have them in. Across processes rank 0 gathers them and writes the file; every
+    //rank has to call it
+    void writePositionsToFile(const std::string& fileName);
+
+private:
+    void inLockstep(const std::function<void(Particles&)>& step);    //every partition here runs step, each on its own thread
+    void startFrameWriter();
+
+    uint totalParticles;
+    int numRanks;       //the partitions everywhere
+    int numDevices;     //the GPUs in use here
+    std::vector<int> ranks;     //each partition here's rank
+    std::unique_ptr<LocalHub> hub;  //when every partition is here
+    std::vector<std::unique_ptr<Transport>> transports;
+    std::vector<std::unique_ptr<PartitionExchange>> contexts;
+    std::vector<std::unique_ptr<Particles>> partitions;
+    std::unique_ptr<FrameWriter> frameWriter;       //writes position frames from a background thread; across processes, only on rank 0
+    std::vector<std::vector<cudaEvent_t>> frameCopies;  //per partition here, per frame buffer: its part of the frame has landed; on its GPU
+    CudaVec<float> gatheredFrame;   //across processes, where rank 0 gathers every rank's positions
+};
+
+#endif
