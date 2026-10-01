@@ -185,6 +185,7 @@ int main(int argc, char** argv){
     simulation->setDomain(scene.domainMin[0], scene.domainMin[1], scene.domainMin[2], scene.nodes[0], scene.nodes[1], scene.nodes[2], scene.nodeSize);
     simulation->setParticles(x, y, z, u, v, w, scene.particlesPerVoxel);
     simulation->setFlipRatio(scene.flipRatio);
+    simulation->setApic(scene.transfer == "apic");
     simulation->setDensityCorrectionTime(scene.densityCorrectionTime);
     simulation->setCfl(scene.cfl);
     simulation->setPressureSolver(scene.pressureSolver == "sor" ? PressureSolver::sor : scene.pressureSolver == "cg" ? PressureSolver::cg :

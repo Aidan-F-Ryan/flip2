@@ -74,6 +74,10 @@ struct VoxelPlaces{
         return grid.cellSize / interiorWidth;
     }
 
+    __device__ bool inDomain(int3 voxel) const{
+        return voxel.x >= 0 && voxel.y >= 0 && voxel.z >= 0 && voxel.x < (int)(grid.sizeX*interiorWidth) && voxel.y < (int)(grid.sizeY*interiorWidth) && voxel.z < (int)(grid.sizeZ*interiorWidth);
+    }
+
     //a point at an offset (in voxels) from a voxel's lowest corner, in the world
     __device__ float3 point(int3 voxel, float x, float y, float z) const{
         float h = voxelSize();
@@ -107,6 +111,11 @@ public:
         return current.count;
     }
 
+    //how fast the fastest point of any obstacle's surface moves at the last update, in m/s: the timestep keeps it within cfl voxels a substep too
+    float fastest() const{
+        return fastestSurface;
+    }
+
 private:
     struct Built{
         int kind;
@@ -114,16 +123,18 @@ private:
         SolidSDF sdf = {};
         float3 low, high;
         float radius;
+        float3 objectLow, objectHigh;       //its bounds in its own space, for how fast its surface can move
         std::vector<double> keyTimes;       //empty: it doesn't move
         std::vector<double> translations;   //per key: x, y, z
         std::vector<double> rotations;      //per key: a unit quaternion, w x y z
         float friction;
     };
     void release();
-    void rigidAt(const Built& obstacle, double time, double matrix[12]) const;
+    void rigidAt(const Built& obstacle, double time, double matrix[12], int interval = -1) const;
 
     std::vector<Built> built;
     Obstacles current;
+    float fastestSurface = 0.0f;
     cudaStream_t stream = nullptr;
 };
 

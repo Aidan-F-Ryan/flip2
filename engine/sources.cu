@@ -27,10 +27,15 @@ void Particles::resizeParticleArrays(uint newSize, uint keep){
     resize(px);
     resize(py);
     resize(pz);
-    resize(vx);
-    resize(vy);
-    resize(vz);
+    for(CudaVec<float>* data : particleFloats()){
+        resize(*data);
+    }
     resize(gridCell);
+    if(apic && newSize > keep){     //new particles start with no velocity gradient
+        for(CudaVec<float>& gradient : affine){
+            gpuErrchk(cudaMemsetAsync(gradient.devPtr() + keep, 0, sizeof(float)*(newSize - keep), stream));
+        }
+    }
     if(reorderedGridIndices.size() < newSize){
         reorderedGridIndices.resizeAsync(newSize, stream);
     }

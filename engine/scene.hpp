@@ -12,7 +12,8 @@
 //    "fps": 24, "frames": 120,
 //    "domain": {"min": [-0.5, -0.5, -0.5], "max": [0.5, 0.5, 0.5], "voxelSize": 0.0078125,     //rounded up to whole nodes of 4^3 voxels
 //               "open": []},                                               //faces that delete the fluid reaching them: "-x", "+x", "-y", "+y", "-z", "+z"
-//    "solver": {"flipRatio": 0.95, "cfl": 4, "densityCorrectionTime": 0.1, "pressureSolver": "multigrid", "advection": "rk3", "dotProducts": "exact"},
+//    "solver": {"flipRatio": 0.95, "cfl": 4, "densityCorrectionTime": 0.1, "pressureSolver": "multigrid", "advection": "rk3", "dotProducts": "exact",
+//               "transfer": "flip"},                                       //or "apic": particles carry their velocity's gradient; flipRatio 0 for pure APIC
 //    "gravity": [0, -9.8, 0],
 //    "particlesPerVoxel": 8, "seed": 1,                                     //1, 8 or 27: seeded on a jittered 1^3, 2^3 or 3^3 lattice per voxel
 //    "fluids": [{"shape": "box", "min": [...], "max": [...], "velocity": [0, 0, 0]},
@@ -99,6 +100,7 @@ struct Scene{
     std::string pressureSolver = "multigrid";
     std::string advection = "rk3";
     std::string dotProducts = "exact";
+    std::string transfer = "flip";
     double gravity[3] = {0.0, -9.8, 0.0};
     int particlesPerVoxel = 8;
     unsigned long long seed = 1;

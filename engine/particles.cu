@@ -97,10 +97,33 @@ void Particles::sortParticles(){
     for(CudaVec<double>* position : {&px, &py, &pz}){
         reorder(position);
     }
-    for(CudaVec<float>* velocity : {&vx, &vy, &vz}){
-        reorder(velocity);
+    for(CudaVec<float>* data : particleFloats()){
+        reorder(data);
     }
     gpuErrchk(cudaPeekAtLastError());
+}
+
+std::vector<CudaVec<float>*> Particles::particleFloats(){
+    std::vector<CudaVec<float>*> arrays = {&vx, &vy, &vz};
+    if(apic){
+        for(CudaVec<float>& gradient : affine){
+            arrays.push_back(&gradient);
+        }
+    }
+    return arrays;
+}
+
+void Particles::setApic(bool on){
+    apic = on;
+    for(CudaVec<float>& gradient : affine){
+        if(on){
+            gradient.resizeAsync(size, stream);
+            gradient.zeroDeviceAsync(stream);   //a particle starts out with none
+        }
+        else if(gradient.size() > 0){
+            gradient.clear();
+        }
+    }
 }
 
 //a particle's position in its node's voxel block, in voxels; the block includes the apron, so the node's interior starts at apronCells
@@ -556,8 +579,7 @@ void Particles::exchangeParticles(){
     uint newSize = fromBelow + kept + fromAbove;
     std::vector<TransportSend> sends;
     std::vector<TransportReceive> receives;
-    auto rebuild = [&](auto member){    //a per-particle array's new contents: from below, kept, from above. The same order of arrays on every partition
-        auto& mine = this->*member;
+    auto rebuild = [&](auto& mine){     //a per-particle array's new contents: from below, kept, from above. The same order of arrays on every partition
         using T = std::remove_reference_t<decltype(*mine.devPtr())>;
         T* fresh = nullptr;
         if(newSize > 0){
@@ -576,21 +598,23 @@ void Particles::exchangeParticles(){
         }
         return fresh;
     };
-    double* newPx = rebuild(&Particles::px);
-    double* newPy = rebuild(&Particles::py);
-    double* newPz = rebuild(&Particles::pz);
-    float* newVx = rebuild(&Particles::vx);
-    float* newVy = rebuild(&Particles::vy);
-    float* newVz = rebuild(&Particles::vz);
-    uint* newCells = rebuild(&Particles::gridCell);
+    double* newPx = rebuild(px);
+    double* newPy = rebuild(py);
+    double* newPz = rebuild(pz);
+    std::vector<CudaVec<float>*> floats = particleFloats();
+    std::vector<float*> newFloats;
+    for(CudaVec<float>* data : floats){
+        newFloats.push_back(rebuild(*data));
+    }
+    uint* newCells = rebuild(gridCell);
     gpuErrchk(cudaPeekAtLastError());
     transport->exchange(sends, receives, stream);   //the old arrays are freed after it, in stream order
     px.adoptAsync(newPx, newSize, stream);
     py.adoptAsync(newPy, newSize, stream);
     pz.adoptAsync(newPz, newSize, stream);
-    vx.adoptAsync(newVx, newSize, stream);
-    vy.adoptAsync(newVy, newSize, stream);
-    vz.adoptAsync(newVz, newSize, stream);
+    for(size_t array = 0; array < floats.size(); ++array){
+        floats[array]->adoptAsync(newFloats[array], newSize, stream);
+    }
     gridCell.adoptAsync(newCells, newSize, stream);
     size = newSize;
     reorderedGridIndices.resizeAsync(size, stream);
@@ -884,13 +908,29 @@ void Particles::generateVoxels(){
     }
 }
 
+//APIC's per-particle velocity gradients, for the kernels: component c's along axis a at c[3*c + a], in 1/s
+struct AffineVelocities{
+    float* c[9];
+};
+
+static AffineVelocities affineVelocities(CudaVec<float> (&affine)[9]){
+    AffineVelocities out;
+    for(int i = 0; i < 9; ++i){
+        out.c[i] = affine[i].devPtr();
+    }
+    return out;
+}
+
 //P2G: a block per node and a thread per particle. Each particle adds its momentum and weight on the 27 faces of each component around it into the
 //node's voxel block in shared memory, and 1 to the count of the voxel holding it; then each voxel the node stores adds the block's sums into its owner.
 //It sums in 32-bit fixed point, as sm_86 has native shared integer atomics but not float ones. 7 ints per slot: 14 KB for an 8^3 block. The owners'
 //sums stay fixed point too, in the float arrays' storage: integers add up the same in any order, so the result doesn't depend on which node gets there
-//first. normalizeVoxelVelocities turns them into floats
+//first. normalizeVoxelVelocities turns them into floats. With APIC, each face takes the particle's velocity carried out to it along its gradient,
+//v + c.(x_face - x)
+template<bool APIC>
 __global__ void scatterParticleVelsToVoxels(uint numParticleNodes, uint numParticles, uint numVoxels1D, const uint* gridNodeIndicesToFirstParticleIndex, const uint* gridPosition,
                                             const double* px, const double* py, const double* pz, const float* vx, const float* vy, const float* vz,
+                                            AffineVelocities affine, float voxelSize,
                                             const uint* numVoxelsEachNode, const uint* voxelIDs, const uint* voxelOwners,
                                             int* ux, int* uy, int* uz, int* weightsX, int* weightsY, int* weightsZ, int* particleCounts, float momentumScale, float weightScale, double radius, Grid grid, uint refinementLevel){
     extern __shared__ int fixedSums[];    //per slot: x, y, z momentum, then x, y, z weight, then particle count
@@ -913,16 +953,33 @@ __global__ void scatterParticleVelsToVoxels(uint numParticleNodes, uint numParti
             const Spline3& y = stencil.axis(dim, 1);
             const Spline3& z = stencil.axis(dim, 2);
             float velocity = velocities[dim][index];
+            float slope[3], start[3];   //APIC: the component's change per voxel along each axis, and the stencil's first face from the particle, in voxels
+            if constexpr(APIC){
+                float q[3] = {pos.x, pos.y, pos.z};
+                #pragma unroll
+                for(int a = 0; a < 3; ++a){
+                    slope[a] = voxelSize*affine.c[3*dim + a][index];
+                    start[a] = stencil.axis(dim, a).base + (a == dim ? 0.0f : 0.5f) - q[a];
+                }
+            }
             #pragma unroll
             for(int k = 0; k < 3; ++k){
                 #pragma unroll
                 for(int j = 0; j < 3; ++j){
                     int rowStart = x.base + (y.base + j)*voxels1D + (z.base + k)*voxels1D*voxels1D;
                     float yz = y.w[j]*z.w[k];
+                    float rowVelocity = velocity;
+                    if constexpr(APIC){
+                        rowVelocity += slope[1]*(start[1] + j) + slope[2]*(start[2] + k);
+                    }
                     #pragma unroll
                     for(int i = 0; i < 3; ++i){
                         float weight = x.w[i]*yz;
-                        atomicAdd(fixedSums + dim*voxels3D + rowStart + i, __float2int_rn(weight*velocity*momentumScale));
+                        float faceVelocity = rowVelocity;
+                        if constexpr(APIC){
+                            faceVelocity += slope[0]*(start[0] + i);
+                        }
+                        atomicAdd(fixedSums + dim*voxels3D + rowStart + i, __float2int_rn(weight*faceVelocity*momentumScale));
                         atomicAdd(fixedSums + (3 + dim)*voxels3D + rowStart + i, __float2int_rn(weight*weightScale));
                     }
                 }
@@ -948,26 +1005,88 @@ __global__ void scatterParticleVelsToVoxels(uint numParticleNodes, uint numParti
 #include "algorithms/reductionKernels.hu"
 #include <cmath>
 
-double Particles::getCourantDt(){    //every substep: the fastest particle moves at most cfl voxels. P2G finds the fastest
-    double voxelSize = (grid.cellSize / (numVoxels1D - 2*std::floor(radius)));
-    if(verbose()){
-        std::cout<<"maxVel: "<<maxVelocity<<" voxelSize: "<<voxelSize<<"\n";
+//With APIC, P2G sums each particle's velocity carried out along its gradient to faces up to 1.5 voxels away on each axis. Per particle, the most that
+//comes to (largest[1]), and its largest velocity component (largest[0]), as float bits, which order like the floats for values >= 0, so atomicMax
+//takes each exactly, whatever order the blocks land in
+__global__ void largestApicVelocities(uint numParticles, const float* vx, const float* vy, const float* vz, AffineVelocities affine, float reach, unsigned int* largest){
+    __shared__ unsigned int warpLargest[2][BLOCKSIZE / 32];
+    unsigned int bits[2] = {0, 0};
+    const float* velocities[3] = {vx, vy, vz};
+    for(uint i = threadIdx.x + blockIdx.x*blockDim.x; i < numParticles; i += blockDim.x*gridDim.x){
+        #pragma unroll
+        for(int dim = 0; dim < 3; ++dim){
+            float speed = fabsf(velocities[dim][i]);
+            float carried = speed + reach*(fabsf(affine.c[3*dim][i]) + fabsf(affine.c[3*dim + 1][i]) + fabsf(affine.c[3*dim + 2][i]));
+            bits[0] = max(bits[0], __float_as_uint(speed));
+            bits[1] = max(bits[1], __float_as_uint(carried));
+        }
     }
-    return cfl * (voxelSize / maxVelocity + 0.0001);
+    #pragma unroll
+    for(int which = 0; which < 2; ++which){
+        for(int offset = 16; offset > 0; offset /= 2){
+            bits[which] = max(bits[which], __shfl_down_sync(0xffffffffu, bits[which], offset));
+        }
+        if(threadIdx.x % 32 == 0){
+            warpLargest[which][threadIdx.x / 32] = bits[which];
+        }
+    }
+    __syncthreads();
+    if(threadIdx.x < 32){
+        #pragma unroll
+        for(int which = 0; which < 2; ++which){
+            bits[which] = threadIdx.x < blockDim.x / 32 ? warpLargest[which][threadIdx.x] : 0;
+            for(int offset = 16; offset > 0; offset /= 2){
+                bits[which] = max(bits[which], __shfl_down_sync(0xffffffffu, bits[which], offset));
+            }
+            if(threadIdx.x == 0){
+                atomicMax(largest + which, bits[which]);
+            }
+        }
+    }
+}
+
+//every substep: the fastest particle moves at most cfl voxels (P2G finds it), and so does the fastest point of a moving obstacle's surface, so a wall
+//can't sweep past a voxel's worth of fluid in one substep. Every partition places the obstacles alike, so they agree on it
+double Particles::getCourantDt(){
+    double voxelSize = (grid.cellSize / (numVoxels1D - 2*std::floor(radius)));
+    double fastest = std::max(maxVelocity, (double)obstacles.fastest());
+    if(verbose()){
+        std::cout<<"maxVel: "<<maxVelocity<<" fastest obstacle: "<<obstacles.fastest()<<" voxelSize: "<<voxelSize<<"\n";
+    }
+    return cfl * (voxelSize / fastest + 0.0001);
 }
 
 void Particles::particleVelToVoxels(){
     for(CudaVec<float>* accumulator : {&voxelsUx, &voxelsUy, &voxelsUz, &voxelWeightsX, &voxelWeightsY, &voxelWeightsZ, &particleCounts}){
         accumulator->zeroDeviceAsync(stream);
     }
-    maxVelocity = largestMagnitude({&vx, &vy, &vz}, stream);   //the fastest component, which also sets the CFL timestep
-    maxVelocity = context->maxOverPartitions(maxVelocity);     //every partition's fixed point and timestep have to agree
+    float voxelSize = grid.cellSize / (2<<refinementLevel);
+    double transferred;     //the largest velocity P2G sums on a face: the largest component, or with APIC, the most a particle carries out to one
+    if(apic){
+        unsigned int* largest;
+        unsigned int bits[2];
+        gpuErrchk(cudaMallocAsync((void**)&largest, 2*sizeof(unsigned int), stream));
+        gpuErrchk(cudaMemsetAsync(largest, 0, 2*sizeof(unsigned int), stream));
+        largestApicVelocities<<<std::min(size / BLOCKSIZE + 1, 1024u), BLOCKSIZE, 0, stream>>>(size, vx.devPtr(), vy.devPtr(), vz.devPtr(), affineVelocities(affine), 1.5f*voxelSize, largest);
+        gpuErrchk(cudaMemcpyAsync(bits, largest, 2*sizeof(unsigned int), cudaMemcpyDeviceToHost, stream));   //to pageable memory: back once it's landed
+        gpuErrchk(cudaFreeAsync(largest, stream));
+        float values[2];
+        memcpy(values, bits, sizeof(values));
+        maxVelocity = context->maxOverPartitions(values[0]);
+        transferred = context->maxOverPartitions(values[1]);
+    }
+    else{
+        maxVelocity = largestMagnitude({&vx, &vy, &vz}, stream);   //the fastest component, which also sets the CFL timestep
+        maxVelocity = context->maxOverPartitions(maxVelocity);     //every partition's fixed point and timestep have to agree
+        transferred = maxVelocity;
+    }
     //P2G sums in fixed point: a face's weight sum is about the particles per voxel, so budget 128 (15x rest) and keep every sum under 2^30
     float weightScale = (1 << 30) / 128.0f;
-    float momentumScale = weightScale / fmax(maxVelocity, 1e-6);
+    float momentumScale = weightScale / fmax(transferred, 1e-6);
     if(numParticleNodes > 0){
-        scatterParticleVelsToVoxels<<<numParticleNodes, NODE_THREADS, 7*sizeof(int)*numVoxelsPerNode, stream>>>(numParticleNodes, size, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(),
-            nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(), voxelOwners.devPtr(), (int*)voxelsUx.devPtr(), (int*)voxelsUy.devPtr(), (int*)voxelsUz.devPtr(),
+        auto scatter = apic ? scatterParticleVelsToVoxels<true> : scatterParticleVelsToVoxels<false>;
+        scatter<<<numParticleNodes, NODE_THREADS, 7*sizeof(int)*numVoxelsPerNode, stream>>>(numParticleNodes, size, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(),
+            affineVelocities(affine), voxelSize, nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(), voxelOwners.devPtr(), (int*)voxelsUx.devPtr(), (int*)voxelsUy.devPtr(), (int*)voxelsUz.devPtr(),
             (int*)voxelWeightsX.devPtr(), (int*)voxelWeightsY.devPtr(), (int*)voxelWeightsZ.devPtr(), (int*)particleCounts.devPtr(), momentumScale, weightScale, radius, grid, refinementLevel);
     }
     //particles near this partition's edge reach into ghost voxels: their owners add those sums in, which in fixed point come out the same in any order
@@ -1077,9 +1196,11 @@ void Particles::updateVoxelVelocities(){
 //from their owners, and turns the faces inside walls into their mirror images (the wall's normal component reversed, so it's 0 on the wall, and the
 //tangential ones as they are, so walls don't drag). Each particle then reads its 27 faces per component from there; the weights sum to 1, so no
 //normalizing. PIC takes the new grid velocity, FLIP adds its change to the particle's own, flipRatio blends them, and the particle moves with the
-//grid's. 6 floats per slot: 12 KB for an 8^3 block
+//grid's. 6 floats per slot: 12 KB for an 8^3 block. With APIC, the particle also takes the new velocity's gradient around it: c = B D^-1, where
+//B = sum of w u (x_face - x) and D = dx^2/4 on every axis for quadratic B-splines (Jiang et al. 2015)
+template<bool APIC>
 __global__ void gatherVoxelVelsToParticles(uint numParticleNodes, uint numParticles, uint numVoxels1D, const uint* gridNodeIndicesToFirstParticleIndex, const uint* gridPosition,
-                                            double* px, double* py, double* pz, float* vx, float* vy, float* vz,
+                                            double* px, double* py, double* pz, float* vx, float* vy, float* vz, AffineVelocities affine, float voxelSize,
                                             const uint* numVoxelsEachNode, const uint* voxelIDs, const uint* voxelOwners, const char* solids,
                                             const float* ux, const float* uy, const float* uz, const float* oldUx, const float* oldUy, const float* oldUz,
                                             float flipRatio, double radius, Grid grid, uint refinementLevel){
@@ -1134,6 +1255,14 @@ __global__ void gatherVoxelVelsToParticles(uint numParticleNodes, uint numPartic
             const Spline3& z = stencil.axis(dim, 2);
             float newVelocity = 0.0f;
             float oldVelocity = 0.0f;
+            float moment[3] = {0.0f, 0.0f, 0.0f}, start[3];   //APIC: B, in voxels, and the stencil's first face from the particle
+            if constexpr(APIC){
+                float q[3] = {pos.x, pos.y, pos.z};
+                #pragma unroll
+                for(int a = 0; a < 3; ++a){
+                    start[a] = stencil.axis(dim, a).base + (a == dim ? 0.0f : 0.5f) - q[a];
+                }
+            }
             #pragma unroll
             for(int k = 0; k < 3; ++k){
                 #pragma unroll
@@ -1143,12 +1272,25 @@ __global__ void gatherVoxelVelsToParticles(uint numParticleNodes, uint numPartic
                     #pragma unroll
                     for(int i = 0; i < 3; ++i){
                         float weight = x.w[i]*yz;
-                        newVelocity += weight*blockVelocities[dim*voxels3D + rowStart + i];
+                        float face = blockVelocities[dim*voxels3D + rowStart + i];
+                        newVelocity += weight*face;
                         oldVelocity += weight*blockVelocities[(3 + dim)*voxels3D + rowStart + i];
+                        if constexpr(APIC){
+                            float share = weight*face;
+                            moment[0] += share*(start[0] + i);
+                            moment[1] += share*(start[1] + j);
+                            moment[2] += share*(start[2] + k);
+                        }
                     }
                 }
             }
             particleVelocities[dim][index] = newVelocity + flipRatio*(particleVelocities[dim][index] - oldVelocity);
+            if constexpr(APIC){
+                #pragma unroll
+                for(int a = 0; a < 3; ++a){
+                    affine.c[3*dim + a][index] = 4.0f/voxelSize*moment[a];  //B's offsets are in voxels: B D^-1 = (4/dx^2) dx moment
+                }
+            }
         }
     }
 }
@@ -1263,8 +1405,9 @@ void Particles::voxelVelsToParticles(){
     if(numParticleNodes == 0){  //no particles in this partition
         return;
     }
-    gatherVoxelVelsToParticles<<<numParticleNodes, NODE_THREADS, 6*sizeof(float)*numVoxelsPerNode, stream>>>(numParticleNodes, size, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(),
-        nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(), voxelOwners.devPtr(), solids.devPtr(), voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr(), voxelsUxOld.devPtr(), voxelsUyOld.devPtr(), voxelsUzOld.devPtr(), flipRatio, radius, grid, refinementLevel);
+    auto gather = apic ? gatherVoxelVelsToParticles<true> : gatherVoxelVelsToParticles<false>;
+    gather<<<numParticleNodes, NODE_THREADS, 6*sizeof(float)*numVoxelsPerNode, stream>>>(numParticleNodes, size, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(),
+        affineVelocities(affine), (float)(grid.cellSize / (2<<refinementLevel)), nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(), voxelOwners.devPtr(), solids.devPtr(), voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr(), voxelsUxOld.devPtr(), voxelsUyOld.devPtr(), voxelsUzOld.devPtr(), flipRatio, radius, grid, refinementLevel);
     gpuErrchk(cudaPeekAtLastError());
     uint tileWidth = 3*(numVoxels1D - 2*(uint)std::floor(radius));
     advectThroughGrid<<<numParticleNodes, NODE_THREADS, 3*sizeof(float)*tileWidth*tileWidth*tileWidth, stream>>>(numParticleNodes, size, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(),

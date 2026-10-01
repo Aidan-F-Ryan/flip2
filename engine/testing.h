@@ -34,6 +34,10 @@ public:
         simulation.forEachPartition([&](Particles& partition){ partition.setFlipRatio(ratio); });
     }
 
+    void setApic(bool on){
+        simulation.forEachPartition([&](Particles& partition){ partition.setApic(on); });
+    }
+
     void setCfl(double voxels){
         simulation.forEachPartition([&](Particles& partition){ partition.setCfl(voxels); });
     }

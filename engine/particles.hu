@@ -93,6 +93,10 @@ public:
         flipRatio = ratio;
     }
 
+    //APIC transfers (Jiang et al. 2015): each particle also carries its velocity's gradient, which P2G spreads with it and G2P measures again, so
+    //rotation and shear survive the round trip that PIC damps. flipRatio still blends FLIP's change in on top: 0 is pure APIC
+    void setApic(bool on);
+
     void setCfl(double voxels){ //how far the fastest particle may move per substep, in voxels
         cfl = voxels;
     }
@@ -127,6 +131,7 @@ private:
     void exchangeParticles();
     ForceVoxels forceVoxels();
     void resizeParticleArrays(uint newSize, uint keep);
+    std::vector<CudaVec<float>*> particleFloats();      //the per-particle float arrays: velocities, and with APIC their gradients
     void markRemovedParticles();
     void killRemovedParticles();
     void dropRemovedParticles();
@@ -150,6 +155,7 @@ private:
 
     CudaVec<double> px, py, pz;    //positions stay double: in a large domain, float would round a slow particle's step away
     CudaVec<float> vx, vy, vz;
+    CudaVec<float> affine[9];   //APIC: per particle, velocity component c's gradient along axis a, in 1/s, at [3*c + a]; empty without APIC
     CudaVec<uint> gridCell;
     CudaVec<char> solids;
     CudaVec<float> p;
@@ -244,6 +250,7 @@ private:
     uint size;
     double radius;
     double flipRatio = 0.95;
+    bool apic = false;
     double cfl = 4.0;   //RK3 advection holds up to 4: past it, its stages reach beyond advectThroughGrid's 3-node tile
     bool rungeKutta3 = true;
     PressureSolver pressureSolver = PressureSolver::multigrid;

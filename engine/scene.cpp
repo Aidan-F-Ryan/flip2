@@ -516,18 +516,22 @@ Scene loadScene(const std::string& path){
     }
 
     if(const Json* solver = read.object(root, "solver", "the scene")){
-        read.checkKeys(*solver, "solver", {"flipRatio", "cfl", "densityCorrectionTime", "pressureSolver", "advection", "dotProducts"});
+        read.checkKeys(*solver, "solver", {"flipRatio", "cfl", "densityCorrectionTime", "pressureSolver", "advection", "dotProducts", "transfer"});
         scene.flipRatio = read.number(*solver, "flipRatio", "solver", scene.flipRatio);
         scene.cfl = read.number(*solver, "cfl", "solver", scene.cfl);
         scene.densityCorrectionTime = read.number(*solver, "densityCorrectionTime", "solver", scene.densityCorrectionTime);
         scene.pressureSolver = read.text(*solver, "pressureSolver", "solver", scene.pressureSolver);
         scene.advection = read.text(*solver, "advection", "solver", scene.advection);
         scene.dotProducts = read.text(*solver, "dotProducts", "solver", scene.dotProducts);
+        scene.transfer = read.text(*solver, "transfer", "solver", scene.transfer);
         if(scene.pressureSolver != "multigrid" && scene.pressureSolver != "cg" && scene.pressureSolver != "jacobi" && scene.pressureSolver != "sor"){
             read.fail("solver.pressureSolver", "is multigrid, cg, jacobi or sor");
         }
         if(scene.advection != "rk3" && scene.advection != "euler"){
             read.fail("solver.advection", "is rk3 or euler");
+        }
+        if(scene.transfer != "flip" && scene.transfer != "apic"){
+            read.fail("solver.transfer", "is flip or apic");
         }
         if(scene.dotProducts != "exact" && scene.dotProducts != "blocks"){
             read.fail("solver.dotProducts", "is exact or blocks");

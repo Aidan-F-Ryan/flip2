@@ -24,19 +24,22 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
-SCENES = {   #main's arguments after the frame count, or a scene file for flip2 bake (engine/scene.hpp)
+SCENES = {   #main's arguments after the frame count (and any environment it runs with), or a scene file for flip2 bake (engine/scene.hpp)
     "dam16": ["0.95", "0.1", "16"],                 #the 1 m dam break on 16^3 nodes: 164K particles
     "dam": ["0.95", "0.1"],                         #the 1 m dam break on 32^3 nodes: 1.3M particles
     "tank": ["0.95", "0.1", "tank", "16"],          #a still tank, half full: nothing should move
     "swirl": ["0.95", "0.1", "tank", "32", "0.5"],  #a full tank with a 0.5 m/s vortex in its xy cross section
+    "swirl-apic": (["0", "0.1", "tank", "32", "0.5"], {"FLIP2_TRANSFER": "apic"}),        #the same with pure APIC transfers
+    "swirl-apicflip": (["0.95", "0.1", "tank", "32", "0.5"], {"FLIP2_TRANSFER": "apic"}), #and with APIC, blending FLIP in at 0.95
     "nozzle": "scenes/nozzle.json",                 #an emitter pouring into an empty box: inflow at exactly A*v
     "drain": "scenes/drain.json",                   #a tank draining through a sink and an open face
     "forces": "scenes/forces.json",                 #a drop in zero gravity, pulled, spun and stirred by force fields
     "tank-box": "scenes/tank-box.json",             #a still tank around a submerged, rotated box: it should stay still
     "paddle": "scenes/paddle.json",                 #a box keyframed to spin once a second, stirring a tank
     "tank-meshsphere": "scenes/tank-meshsphere.json",   #a still tank around an OBJ sphere, voxelized on the GPU
+    "tank-pulse": "scenes/tank-pulse.json",         #a deforming mesh sphere breathing in a tank, re-voxelized every substep (tools/deforming.py)
 }
-DEFAULT_SCENES = ["dam16", "tank", "swirl", "nozzle", "drain", "forces", "tank-box", "paddle", "tank-meshsphere"]
+DEFAULT_SCENES = ["dam16", "tank", "swirl", "swirl-apic", "nozzle", "drain", "forces", "tank-box", "paddle", "tank-meshsphere", "tank-pulse"]
 
 EXACT = ["particles", "hash", "occupiedVoxels", "perVoxel", "core", "substeps", "time", "dtMin", "dtMax", "lowest", "highest", "fastest"]
 SUMS = ["kineticEnergy", "momentum", "angularMomentum", "centroid"]
@@ -60,11 +63,12 @@ def run(binary, scene, frames, workdir, partitions, timeout, keep_frames):
     if workdir.exists():
         shutil.rmtree(workdir)
     workdir.mkdir(parents=True)
-    env = dict(os.environ, FLIP2_DIAGNOSTICS="diagnostics.jsonl", FLIP2_PARTITIONS=str(partitions))
-    if isinstance(SCENES[scene], str):  #a scene file: flip2 bake, next to main, writes its diagnostics where the scene says, in the output directory
-        command = [str(binary.parent / "flip2"), "bake", str(REPO / SCENES[scene]), "--out", ".", "--frames", str(frames)]
+    spec, extra = SCENES[scene] if isinstance(SCENES[scene], tuple) else (SCENES[scene], {})
+    env = dict(os.environ, FLIP2_DIAGNOSTICS="diagnostics.jsonl", FLIP2_PARTITIONS=str(partitions), **extra)
+    if isinstance(spec, str):   #a scene file: flip2 bake, next to main, writes its diagnostics where the scene says, in the output directory
+        command = [str(binary.parent / "flip2"), "bake", str(REPO / spec), "--out", ".", "--frames", str(frames)]
     else:
-        command = [str(binary), str(frames)] + SCENES[scene]
+        command = [str(binary), str(frames)] + spec
     start = time.time()
     with open(workdir / "log.txt", "w") as log:
         result = subprocess.run(command, cwd=workdir, env=env, stdout=log, stderr=subprocess.STDOUT, timeout=timeout)
