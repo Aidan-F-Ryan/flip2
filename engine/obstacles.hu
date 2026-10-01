@@ -45,6 +45,7 @@ struct ObstacleState{
     float worldToObject[12];    //row-major 3x4, rigid: (x, 1) to its own space
     float velocity[12];         //row-major 3x4: the solid's velocity at world point x is velocity times (x, 1)
     float friction;
+    float3 reachLow, reachHigh; //the box in the world past which nothing asks its distance: around its surface, 3 voxels wider every way
 };
 
 //every obstacle, as one kernel argument
@@ -219,11 +220,16 @@ __device__ inline float3 obstacleVelocity(const ObstacleState& obstacle, float3 
     return make_float3(v[0]*x.x + v[1]*x.y + v[2]*x.z + v[3], v[4]*x.x + v[5]*x.y + v[6]*x.z + v[7], v[8]*x.x + v[9]*x.y + v[10]*x.z + v[11]);
 }
 
-//the obstacle a point is deepest inside, or nearest to: its index and the distance and normal there
+//the obstacle a point is deepest inside, or nearest to: its index and the distance and normal there. Obstacles whose reach the point is outside are passed
+//over, as every question asked of them is about inside or within a voxel or two of them; -1, and an infinite distance, if it's outside every one's
 __device__ inline int nearestObstacle(const Obstacles& obstacles, float3 x, float& distance, float3& normal){
     int nearest = -1;
     distance = INFINITY;
     for(int index = 0; index < obstacles.count; ++index){
+        const ObstacleState& obstacle = obstacles.items[index];
+        if(x.x < obstacle.reachLow.x || x.y < obstacle.reachLow.y || x.z < obstacle.reachLow.z || x.x > obstacle.reachHigh.x || x.y > obstacle.reachHigh.y || x.z > obstacle.reachHigh.z){
+            continue;
+        }
         float3 n;
         float d = obstacleDistance(obstacles.items[index], x, n);
         if(d < distance){
@@ -294,6 +300,7 @@ private:
 
     std::vector<Built> built;
     std::vector<int> builtIndex;    //per description given to build: its place in built, or -1
+    double voxel = 0.0;             //the size build voxelized at
     Obstacles current;
     float fastestSurface = 0.0f;
     cudaStream_t stream = nullptr;

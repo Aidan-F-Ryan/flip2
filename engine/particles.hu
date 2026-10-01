@@ -270,7 +270,12 @@ private:
     ObstacleSet sourceMeshes;   //the meshes of the emitters, sinks and fluids
     FluidShapes fluids;         //the fluid to start with (setSourceMeshes)
     CudaVec<char> obstacleSolids;   //per stored voxel: whether obstacles close every face of it
-    CudaVec<char> obstacleNear;     //per stored voxel: whether a surface passes close enough to cut its faces (cutFaces), so the other passes can skip the rest
+    CudaVec<char> obstacleNear;     //per stored voxel: whether a surface passes close enough to cut its faces, so the other passes can skip the rest, and which
+                                    //of its faces are closed (bits, obstacles.cu)
+    CudaVec<uint> obstacleOpen;     //per stored voxel near a surface: its six faces' open fractions and how much of it is covered this substep, in 16-bit
+                                    //fixed point (obstacles.cu)
+    CudaVec<uint> obstacleNodes;    //the stored nodes any voxel of whose block is solid or within 1.5 voxels of a surface: how many, then them. The obstacle passes
+                                    //only visit those
     unsigned long long substepIndex = 0;    //substeps taken, which seeds the emitters' jitter
     double restParticlesPerVoxel = 8.0;
     double densityCorrectionTime = 0.1;
