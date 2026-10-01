@@ -65,18 +65,23 @@ __global__ void killRemoved(uint numParticles, const char* removed, uint deadCel
     }
 }
 
+bool Particles::removing() const{
+    return sources.removes() || (obstacles.count() > 0 && substepIndex == 0);
+}
+
 void Particles::markRemovedParticles(){
-    if(!sources.removes() || size == 0){
+    if(!removing() || size == 0){
         return;
     }
     removedFlags.resizeAsync(size, stream);
     double voxelSize = grid.cellSize / (2<<refinementLevel);
     markRemoved<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, px.devPtr(), py.devPtr(), pz.devPtr(), sources, grid, voxelSize, removedFlags.devPtr());
     gpuErrchk(cudaPeekAtLastError());
+    markParticlesInsideObstacles();
 }
 
 void Particles::killRemovedParticles(){
-    if(!sources.removes() || size == 0){
+    if(!removing() || size == 0){
         return;
     }
     killRemoved<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, removedFlags.devPtr(), grid.sizeX*grid.sizeY*grid.sizeZ, gridCell.devPtr());
@@ -99,7 +104,7 @@ __global__ void countCellsBelow(const uint* sortedCells, uint count, uint cell, 
 }
 
 void Particles::dropRemovedParticles(){
-    if(!sources.removes() || size == 0){
+    if(!removing() || size == 0){
         return;
     }
     uint* found;

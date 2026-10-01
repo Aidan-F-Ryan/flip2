@@ -1,0 +1,48 @@
+{
+ "schema": "flip2.scene/1",
+ "fps": 24,
+ "frames": 36,
+ "domain": {
+  "min": [
+   -0.5,
+   -0.5,
+   -0.5
+  ],
+  "max": [
+   0.5,
+   0.5,
+   0.5
+  ],
+  "voxelSize": 0.015625
+ },
+ "fluids": [
+  {
+   "shape": "box",
+   "min": [
+    -0.5,
+    -0.5,
+    -0.25
+   ],
+   "max": [
+    -0.1,
+    0.2,
+    0.25
+   ]
+  }
+ ],
+ "obstacles": [
+  {
+   "shape": "sphere",
+   "centre": [
+    0.2,
+    -0.35,
+    0
+   ],
+   "radius": 0.12
+  }
+ ],
+ "output": {
+  "dir": "dam-sphere",
+  "diagnostics": "diagnostics.jsonl"
+ }
+}

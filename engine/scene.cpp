@@ -294,6 +294,144 @@ public:
     std::string name;
 };
 
+void loadObj(const std::string& path, std::vector<float>& vertices, std::vector<int>& triangles){
+    std::ifstream file(path);
+    if(!file){
+        throw std::runtime_error(path + ": can't open it");
+    }
+    std::string line;
+    int lineNumber = 0;
+    while(std::getline(file, line)){
+        ++lineNumber;
+        std::istringstream words(line);
+        std::string kind;
+        words>>kind;
+        if(kind == "v"){
+            double x, y, z;
+            if(!(words>>x>>y>>z)){
+                throw std::runtime_error(path + ":" + std::to_string(lineNumber) + ": a vertex needs x, y and z");
+            }
+            vertices.push_back((float)x);
+            vertices.push_back((float)y);
+            vertices.push_back((float)z);
+        }
+        else if(kind == "f"){
+            std::vector<int> corners;
+            std::string corner;
+            while(words>>corner){   //v, v/vt, v//vn or v/vt/vn; negative counts back from the last vertex so far
+                int index = std::atoi(corner.c_str());
+                int numVertices = (int)vertices.size() / 3;
+                index = index < 0 ? numVertices + index : index - 1;
+                if(index < 0 || index >= numVertices){
+                    throw std::runtime_error(path + ":" + std::to_string(lineNumber) + ": a face names vertex " + corner + ", which isn't there");
+                }
+                corners.push_back(index);
+            }
+            for(size_t fan = 1; fan + 1 < corners.size(); ++fan){
+                triangles.push_back(corners[0]);
+                triangles.push_back(corners[fan]);
+                triangles.push_back(corners[fan + 1]);
+            }
+        }
+    }
+    if(triangles.empty()){
+        throw std::runtime_error(path + ": no faces");
+    }
+}
+
+//a .npy file's numbers, as doubles: a little-endian float32, float64, int32, int64 or uint32 array of shape (n, 3), in C order
+static std::vector<double> loadNpy(const std::string& path){
+    std::ifstream file(path, std::ios::binary);
+    if(!file){
+        throw std::runtime_error(path + ": can't open it");
+    }
+    char magic[8];
+    file.read(magic, 8);
+    if(!file || std::string(magic, 6) != "\x93NUMPY"){
+        throw std::runtime_error(path + ": not a .npy file");
+    }
+    size_t headerLength = 0;
+    if(magic[6] == 1){
+        unsigned char bytes[2];
+        file.read((char*)bytes, 2);
+        headerLength = bytes[0] | bytes[1] << 8;
+    }
+    else{
+        unsigned char bytes[4];
+        file.read((char*)bytes, 4);
+        headerLength = bytes[0] | bytes[1] << 8 | bytes[2] << 16 | (size_t)bytes[3] << 24;
+    }
+    std::string header(headerLength, ' ');
+    file.read(&header[0], headerLength);
+    auto field = [&](const std::string& key){
+        size_t at = header.find("'" + key + "'");
+        if(at == std::string::npos){
+            throw std::runtime_error(path + ": its header has no " + key);
+        }
+        return header.substr(header.find(':', at) + 1);
+    };
+    std::string descr = field("descr");
+    descr = descr.substr(descr.find('\'') + 1);
+    descr = descr.substr(0, descr.find('\''));
+    if(field("fortran_order").find("True") < field("fortran_order").find(',')){
+        throw std::runtime_error(path + ": a Fortran-order array; save it in C order");
+    }
+    std::string shape = field("shape");
+    shape = shape.substr(shape.find('(') + 1, shape.find(')') - shape.find('(') - 1);
+    size_t rows = std::strtoull(shape.c_str(), nullptr, 10);
+    size_t columns = shape.find(',') == std::string::npos ? 1 : std::strtoull(shape.c_str() + shape.find(',') + 1, nullptr, 10);
+    if(columns != 3){
+        throw std::runtime_error(path + ": should be an array of shape (n, 3), not (" + shape + ")");
+    }
+    size_t count = rows*columns;
+    std::vector<double> values(count);
+    auto read = [&](auto sample){
+        std::vector<decltype(sample)> raw(count);
+        file.read((char*)raw.data(), sizeof(sample)*count);
+        if(!file){
+            throw std::runtime_error(path + ": shorter than its header says");
+        }
+        for(size_t i = 0; i < count; ++i){
+            values[i] = (double)raw[i];
+        }
+    };
+    if(descr == "<f4"){
+        read(0.0f);
+    }
+    else if(descr == "<f8"){
+        read(0.0);
+    }
+    else if(descr == "<i4"){
+        read((int)0);
+    }
+    else if(descr == "<i8"){
+        read((long long)0);
+    }
+    else if(descr == "<u4"){
+        read((unsigned int)0);
+    }
+    else{
+        throw std::runtime_error(path + ": holds " + descr + "; flip2 reads little-endian f4, f8, i4, i8 and u4");
+    }
+    return values;
+}
+
+void loadNpyMesh(const std::string& verticesPath, const std::string& trianglesPath, std::vector<float>& vertices, std::vector<int>& triangles){
+    for(double value : loadNpy(verticesPath)){
+        vertices.push_back((float)value);
+    }
+    int numVertices = (int)vertices.size() / 3;
+    for(double value : loadNpy(trianglesPath)){
+        if(value < 0 || value >= numVertices){
+            throw std::runtime_error(trianglesPath + ": names vertex " + std::to_string((long long)value) + ", but " + verticesPath + " has " + std::to_string(numVertices));
+        }
+        triangles.push_back((int)value);
+    }
+    if(triangles.empty()){
+        throw std::runtime_error(trianglesPath + ": no triangles");
+    }
+}
+
 bool SceneShape::contains(const double point[3]) const{
     if(kind == SPHERE){
         double squared = 0.0;
@@ -330,7 +468,7 @@ Scene loadScene(const std::string& path){
     if(root.kind != Json::OBJECT){
         read.fail("the file", "should be one JSON object, {...}");
     }
-    read.checkKeys(root, "the scene", {"schema", "fps", "frames", "domain", "solver", "gravity", "particlesPerVoxel", "seed", "fluids", "emitters", "sinks", "forces", "partitions", "devices", "output"});
+    read.checkKeys(root, "the scene", {"schema", "fps", "frames", "domain", "solver", "gravity", "particlesPerVoxel", "seed", "fluids", "emitters", "sinks", "obstacles", "forces", "partitions", "devices", "output"});
     std::string schema = read.text(root, "schema", "the scene", "flip2.scene/1");
     if(schema != "flip2.scene/1"){
         read.fail("schema", "is \"" + schema + "\"; this flip2 reads \"flip2.scene/1\"");
@@ -445,6 +583,167 @@ Scene loadScene(const std::string& path){
     readShapes("sinks", scene.sinks);
     if(scene.emitters.size() > 16 || scene.sinks.size() > 16){
         read.fail("the scene", "can have up to 16 emitters and 16 sinks");
+    }
+
+    std::string directory = path.find('/') == std::string::npos ? "" : path.substr(0, path.rfind('/') + 1);    //meshes are named relative to the scene
+    if(const Json* obstacles = read.array(root, "obstacles", "the scene")){
+        for(size_t index = 0; index < obstacles->items.size(); ++index){
+            const Json& item = obstacles->items[index];
+            std::string where = "obstacles[" + std::to_string(index) + "]";
+            if(item.kind != Json::OBJECT){
+                read.fail(where, "should be an object, {...}");
+            }
+            read.checkKeys(item, where, {"mesh", "vertices", "triangles", "shape", "min", "max", "center", "centre", "radius", "transform", "keyframes", "deforming", "friction",
+                                         "thickness"});
+            SceneObstacle obstacle;
+            bool deforms = item.find("deforming") != nullptr;
+            if(deforms && (item.find("shape") || item.find("transform") || item.find("keyframes"))){
+                read.fail(where, "a deforming mesh's samples are in the world already: it can't have a \"shape\", \"transform\" or \"keyframes\" too");
+            }
+            auto resolve = [&](const std::string& file){
+                return file.empty() || file[0] == '/' ? file : directory + file;
+            };
+            try{
+                if(item.find("mesh")){
+                    obstacle.kind = SceneObstacle::MESH;
+                    loadObj(resolve(read.text(item, "mesh", where, "")), obstacle.vertices, obstacle.triangles);
+                }
+                else if(item.find("vertices") || item.find("triangles")){
+                    obstacle.kind = SceneObstacle::MESH;
+                    loadNpyMesh(resolve(read.text(item, "vertices", where, "")), resolve(read.text(item, "triangles", where, "")), obstacle.vertices, obstacle.triangles);
+                }
+                else if(!deforms){
+                    std::string shape = read.text(item, "shape", where, "");
+                    if(shape == "box"){
+                        obstacle.kind = SceneObstacle::BOX;
+                        read.vector3(item, "min", where, obstacle.min, true);
+                        read.vector3(item, "max", where, obstacle.max, true);
+                        for(int axis = 0; axis < 3; ++axis){
+                            if(obstacle.max[axis] <= obstacle.min[axis]){
+                                read.fail(where, "a box's max has to be above its min on every axis");
+                            }
+                        }
+                    }
+                    else if(shape == "sphere"){
+                        obstacle.kind = SceneObstacle::SPHERE;
+                        read.vector3(item, item.find("centre") ? "centre" : "center", where, obstacle.centre, true);
+                        obstacle.radius = read.number(item, "radius", where, 0.0);
+                        if(obstacle.radius <= 0.0){
+                            read.fail(where, "a sphere needs a positive \"radius\"");
+                        }
+                    }
+                    else{
+                        read.fail(where, "needs a \"mesh\", \"vertices\" and \"triangles\", or a \"shape\" of box or sphere");
+                    }
+                }
+            }
+            catch(const std::runtime_error& error){
+                if(std::string(error.what()).rfind(path, 0) == 0){
+                    throw;
+                }
+                read.fail(where, error.what());
+            }
+            auto matrix = [&](const Json& value, const std::string& at){
+                std::array<double, 16> out;
+                if(value.kind != Json::ARRAY || value.items.size() != 16){
+                    read.fail(at, "should be 16 numbers: a row-major 4x4 matrix");
+                }
+                for(int i = 0; i < 16; ++i){
+                    if(value.items[i].kind != Json::NUMBER){
+                        read.fail(at, "should be 16 numbers: a row-major 4x4 matrix");
+                    }
+                    out[i] = value.items[i].number;
+                }
+                return out;
+            };
+            if(const Json* keyframes = read.array(item, "keyframes", where)){
+                for(size_t key = 0; key < keyframes->items.size(); ++key){
+                    const Json& keyframe = keyframes->items[key];
+                    std::string at = where + ".keyframes[" + std::to_string(key) + "]";
+                    const Json* transform = keyframe.kind == Json::OBJECT ? keyframe.find("transform") : nullptr;
+                    if(transform == nullptr || !keyframe.find("time")){
+                        read.fail(at, "needs a \"time\" and a \"transform\"");
+                    }
+                    double time = read.number(keyframe, "time", at, 0.0);
+                    if(!obstacle.keyTimes.empty() && time <= obstacle.keyTimes.back()){
+                        read.fail(at, "keyframes have to be in increasing time");
+                    }
+                    obstacle.keyTimes.push_back(time);
+                    obstacle.transforms.push_back(matrix(*transform, at + ".transform"));
+                }
+                if(obstacle.keyTimes.empty()){
+                    read.fail(where + ".keyframes", "is empty");
+                }
+            }
+            else if(const Json* transform = item.find("transform")){
+                obstacle.transforms.push_back(matrix(*transform, where + ".transform"));
+            }
+            else{
+                obstacle.transforms.push_back({1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1});
+            }
+            if(const Json* deforming = read.array(item, "deforming", where)){
+                auto samples = std::make_shared<std::vector<float>>();
+                for(size_t key = 0; key < deforming->items.size(); ++key){
+                    const Json& sample = deforming->items[key];
+                    std::string at = where + ".deforming[" + std::to_string(key) + "]";
+                    if(sample.kind != Json::OBJECT || !sample.find("time") || (!sample.find("mesh") && !sample.find("vertices"))){
+                        read.fail(at, "needs a \"time\", and a \"mesh\" or \"vertices\"");
+                    }
+                    read.checkKeys(sample, at, {"time", "mesh", "vertices"});
+                    double time = read.number(sample, "time", at, 0.0);
+                    if(!obstacle.sampleTimes.empty() && time <= obstacle.sampleTimes.back()){
+                        read.fail(at, "samples have to be in increasing time");
+                    }
+                    std::vector<float> vertices;
+                    std::vector<int> triangles;
+                    try{
+                        if(sample.find("mesh")){
+                            loadObj(resolve(read.text(sample, "mesh", at, "")), vertices, triangles);
+                        }
+                        else{
+                            for(double value : loadNpy(resolve(read.text(sample, "vertices", at, "")))){
+                                vertices.push_back((float)value);
+                            }
+                        }
+                    }
+                    catch(const std::runtime_error& error){
+                        if(std::string(error.what()).rfind(path, 0) == 0){
+                            throw;
+                        }
+                        read.fail(at, error.what());
+                    }
+                    if(obstacle.triangles.empty()){     //the mesh's triangles come from its first sample
+                        if(triangles.empty()){
+                            read.fail(at, "the first sample has to be a \"mesh\" to give the triangles, unless the obstacle has a \"mesh\" or \"vertices\" and \"triangles\"");
+                        }
+                        obstacle.kind = SceneObstacle::MESH;
+                        obstacle.vertices = vertices;
+                        obstacle.triangles = triangles;
+                    }
+                    else if(!triangles.empty() && triangles != obstacle.triangles){
+                        read.fail(at, "its triangles aren't the mesh's: a deforming mesh keeps its triangles, and only its vertices move");
+                    }
+                    if(vertices.size() != obstacle.vertices.size()){
+                        read.fail(at, "has " + std::to_string(vertices.size() / 3) + " vertices, but the mesh has " + std::to_string(obstacle.vertices.size() / 3));
+                    }
+                    obstacle.sampleTimes.push_back(time);
+                    samples->insert(samples->end(), vertices.begin(), vertices.end());
+                }
+                if(obstacle.sampleTimes.empty()){
+                    read.fail(where + ".deforming", "is empty");
+                }
+                obstacle.samples = samples;
+            }
+            obstacle.friction = read.number(item, "friction", where, obstacle.friction);
+            obstacle.thickness = read.number(item, "thickness", where, obstacle.thickness);
+            if(obstacle.friction < 0.0 || obstacle.friction > 1.0 || obstacle.thickness < 0.0){
+                read.fail(where, "friction is between 0 and 1, and thickness can't be negative");
+            }
+            scene.obstacles.push_back(obstacle);
+        }
+        if(scene.obstacles.size() > 16){
+            read.fail("obstacles", "can have up to 16 of them");
+        }
     }
 
     if(const Json* forces = read.array(root, "forces", "the scene")){

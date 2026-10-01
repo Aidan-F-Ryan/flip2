@@ -54,6 +54,10 @@ public:
         simulation.forEachPartition([&](Particles& partition){ partition.setGravity(gravity); });
     }
 
+    void setObstacles(const std::vector<SceneObstacle>& obstacles){
+        simulation.forEachPartition([&](Particles& partition){ partition.setObstacles(obstacles); });
+    }
+
     void setSources(const Sources& sources){
         simulation.forEachPartition([&](Particles& partition){ partition.setSources(sources); });
     }

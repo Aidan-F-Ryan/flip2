@@ -208,6 +208,7 @@ int main(int argc, char** argv){
         sources.sinks[sources.numSinks++] = toFluidShape(sink);
     }
     simulation->setSources(sources);
+    simulation->setObstacles(scene.obstacles);      //after setDomain: they're voxelized at its voxel size
 
     std::string directory = scene.outputDirectory + "/";
     std::string diagnostics = scene.diagnostics.empty() ? "" : directory + scene.diagnostics;

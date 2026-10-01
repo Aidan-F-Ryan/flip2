@@ -1,0 +1,53 @@
+{
+ "schema": "flip2.scene/1",
+ "fps": 24,
+ "frames": 24,
+ "domain": {
+  "min": [
+   0,
+   0,
+   0
+  ],
+  "max": [
+   0.25,
+   0.25,
+   0.25
+  ],
+  "voxelSize": 0.0078125
+ },
+ "fluids": [
+  {
+   "shape": "box",
+   "min": [
+    0,
+    0,
+    0
+   ],
+   "max": [
+    0.25,
+    0.125,
+    0.25
+   ]
+  }
+ ],
+ "obstacles": [
+  {
+   "mesh": "geo/sphere320.obj",
+   "deforming": [
+    {
+     "time": 0,
+     "vertices": "geo/still/00.npy"
+    },
+    {
+     "time": 1,
+     "vertices": "geo/still/01.npy"
+    }
+   ]
+  }
+ ],
+ "output": {
+  "dir": "tank-still-deforming",
+  "diagnostics": "diagnostics.jsonl",
+  "positions": false
+ }
+}

@@ -9,6 +9,7 @@
 #include "partitionContext.hu"
 #include "forces.hu"
 #include "sources.hu"
+#include "obstacles.hu"
 #include "algorithms/conjugateGradientFunctions.hu"
 #include <string>
 #include <vector>
@@ -108,6 +109,8 @@ public:
         sources = emittersAndSinks;
     }
 
+    void setObstacles(const std::vector<SceneObstacle>& descriptions);  //what the fluid flows around (see obstacles.hu); after setDomain
+
     void setForceFields(const std::vector<ForceField>& fields){   //the force fields besides gravity, up to MAX_FORCE_FIELDS of them (see forces.hu)
         forces.numFields = 0;
         for(const ForceField& field : fields){
@@ -129,6 +132,15 @@ private:
     void dropRemovedParticles();
     void emitParticles();
     void pinEmitterVelocities();
+    bool removing() const;      //whether this initialize removes any particles: sinks, open faces, or at the start, fluid inside obstacles
+    void updateObstacles();
+    void pushOutParticles();
+    void markParticlesInsideObstacles();
+    void markObstacleSolids();
+    void addObstacleFlux();
+    void obstacleGhostVelocities();
+    void creditObstacleVolume();
+    VoxelPlaces voxelPlaces();
     void receiveParticleNodes(uint maskWords);
     void orderNodes(uint maskWords);
     void checkGhostRuns();
@@ -240,6 +252,8 @@ private:
     Forces forces;              //gravity and the force fields
     Sources sources;            //emitters, sinks and open faces
     CudaVec<char> removedFlags; //per particle, while initialize runs: whether a sink or an open face takes it
+    ObstacleSet obstacles;      //what the fluid flows around
+    CudaVec<char> obstacleSolids;   //per stored voxel: whether its centre is inside an obstacle
     unsigned long long substepIndex = 0;    //substeps taken, which seeds the emitters' jitter
     double restParticlesPerVoxel = 8.0;
     double densityCorrectionTime = 0.1;

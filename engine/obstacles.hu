@@ -1,0 +1,130 @@
+//Copyright 2023 Aberrant Behavior LLC
+
+#ifndef OBSTACLES_HU
+#define OBSTACLES_HU
+
+#include "typedefs.h"
+#include "grid.hpp"
+#include "scene.hpp"
+#include <memory>
+#include <vector>
+
+#define MAX_OBSTACLES 16
+#define SDF_BRICK 8             //samples along a brick's side
+#define SDF_OUTSIDE -1          //a brick table entry for a brick with no samples, all of it outside
+#define SDF_INSIDE -2           //and all of it inside
+
+//An obstacle's signed distance field in its own space, negative inside, kept sparse: a table of bricks of SDF_BRICK^3 samples over its bounds, where only
+//the bricks near its surface hold samples and the others just say inside or outside. Distances are clamped to band either way: what the simulation needs
+//is which side a point is on and, near the surface, how far and which way out. A deforming mesh's field is in the world, and also holds how fast the
+//surface moves: at each sample, the velocity of the nearest point on the mesh
+struct SolidSDF{
+    float3 origin;          //sample (0, 0, 0)
+    float spacing;          //between samples
+    int3 bricks;            //the table's size, in bricks
+    const int* table;       //per brick, x fastest: its samples' place in pool, in bricks, or SDF_OUTSIDE or SDF_INSIDE
+    const float* pool;      //per brick holding samples: SDF_BRICK^3 of them, x fastest
+    float band;
+    const float* velocities;    //deforming: per brick in pool, SDF_BRICK^3 x velocities, then y, then z; otherwise nullptr
+    float3 farVelocity;         //deforming: the mesh's mean velocity, for points in bricks without samples
+};
+
+enum ObstacleKind{
+    OBSTACLE_MESH,
+    OBSTACLE_BOX,
+    OBSTACLE_SPHERE
+};
+
+//one obstacle where it is now, for the kernels: its shape in its own space, how the world maps into that space, and how fast each point of it moves
+struct ObstacleState{
+    int kind;
+    SolidSDF sdf;               //a mesh
+    float3 low;                 //a box's corners
+    float3 high;
+    float radius;               //a sphere's, around its own origin
+    float worldToObject[12];    //row-major 3x4, rigid: (x, 1) to its own space
+    float velocity[12];         //row-major 3x4: the solid's velocity at world point x is velocity times (x, 1)
+    float friction;
+};
+
+//every obstacle, as one kernel argument
+struct Obstacles{
+    int count = 0;
+    bool moving = false;        //whether any of them moves
+    ObstacleState items[MAX_OBSTACLES];
+};
+
+//where the stored voxels are: per node, its run of voxels, its cell, and each voxel's slot in its block
+struct VoxelPlaces{
+    const uint* nodeVoxelEnds;
+    const uint* nodeCells;
+    const uint* voxelSlots;
+    Grid grid;
+    int interiorWidth;
+    int apronCells;
+
+    //the voxel's lowest corner, in the domain's voxels, for a node's slot
+    __device__ int3 voxelOf(uint cell, int slot) const{
+        int voxels1D = interiorWidth + 2*apronCells;
+        return make_int3((int)(cell % grid.sizeX)*interiorWidth - apronCells + slot % voxels1D, (int)(cell / grid.sizeX % grid.sizeY)*interiorWidth - apronCells + slot / voxels1D % voxels1D,
+                         (int)(cell / (grid.sizeX*grid.sizeY))*interiorWidth - apronCells + slot / (voxels1D*voxels1D));
+    }
+
+    __device__ float voxelSize() const{
+        return grid.cellSize / interiorWidth;
+    }
+
+    //a point at an offset (in voxels) from a voxel's lowest corner, in the world
+    __device__ float3 point(int3 voxel, float x, float y, float z) const{
+        float h = voxelSize();
+        return make_float3(grid.negX + (voxel.x + x)*h, grid.negY + (voxel.y + y)*h, grid.negZ + (voxel.z + z)*h);
+    }
+};
+
+struct MeshField;   //a mesh's field and what building it takes (obstacles.cu)
+
+//The obstacles of one partition, on its GPU: their distance fields, and where they are at any time. A mesh is voxelized at the simulation's voxel size
+//into a narrow band of 3 voxels around its surface (see MeshField in obstacles.cu), once if it's rigid, at every update if it deforms; boxes and spheres
+//are exact
+class ObstacleSet{
+public:
+    ObstacleSet() = default;
+    ObstacleSet(const ObstacleSet&) = delete;
+    ObstacleSet& operator=(const ObstacleSet&) = delete;
+    ~ObstacleSet();
+
+    //builds every obstacle's distance field on the current GPU, at voxelSize, on stream, which updates use too; replaces any there were
+    void build(const std::vector<SceneObstacle>& obstacles, double voxelSize, cudaStream_t stream);
+
+    //where they are and how they move at time; a deforming mesh's field is rebuilt there, queued on the stream without waiting for it
+    void update(double time);
+
+    const Obstacles& state() const{
+        return current;
+    }
+
+    int count() const{
+        return current.count;
+    }
+
+private:
+    struct Built{
+        int kind;
+        MeshField* field = nullptr;     //a mesh's
+        SolidSDF sdf = {};
+        float3 low, high;
+        float radius;
+        std::vector<double> keyTimes;       //empty: it doesn't move
+        std::vector<double> translations;   //per key: x, y, z
+        std::vector<double> rotations;      //per key: a unit quaternion, w x y z
+        float friction;
+    };
+    void release();
+    void rigidAt(const Built& obstacle, double time, double matrix[12]) const;
+
+    std::vector<Built> built;
+    Obstacles current;
+    cudaStream_t stream = nullptr;
+};
+
+#endif

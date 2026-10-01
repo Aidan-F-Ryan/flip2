@@ -81,7 +81,7 @@ void Particles::sortParticles(){
     }
     uint* tempGridCell = gridCell.devPtr();
     uint* tempSortedIndices = reorderedGridIndices.devPtr();
-    cudaSortParticlesByGridNode(size, tempGridCell, tempSortedIndices, grid.sizeX*grid.sizeY*grid.sizeZ + (sources.removes() ? 1 : 0), stream);  //removed particles' cell is one past the last
+    cudaSortParticlesByGridNode(size, tempGridCell, tempSortedIndices, grid.sizeX*grid.sizeY*grid.sizeZ + (removing() ? 1 : 0), stream);  //removed particles' cell is one past the last
     // cudaStreamSynchronize(stream);
 
     //@TODO: need to create per-CudaVec stream for allocation/dealloc to get around this overlap issue when freeing on constant stream, leave compute streams in place for all else, CudaVec_stream sync on devPtr call
@@ -867,6 +867,7 @@ void Particles::generateVoxels(){
             grid, refinementLevel);
     }
     gpuErrchk(cudaPeekAtLastError());
+    markObstacleSolids();   //the voxels inside obstacles stop being unknowns, and their neighbours see walls
     checkGhostRuns();
 
     if(numRanks == 1){
@@ -977,8 +978,10 @@ void Particles::particleVelToVoxels(){
     for(CudaVec<float>* field : {&voxelsUx, &voxelsUy, &voxelsUz, &voxelWeightsX, &voxelWeightsY, &voxelWeightsZ, &particleCounts}){   //and the ghosts take the totals
         context->fillGhosts(field->devPtr(), stream);
     }
+    creditObstacleVolume();     //voxels obstacles partly cover hold fewer particles at rest: the density correction mustn't read them as thin
     cudaExtrapolateUnreachedFaces(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, voxelWeightsX, voxelWeightsY, voxelWeightsZ, voxelsUx, voxelsUy, voxelsUz, *context, stream);
     cudaFindFootprintDepth(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, footprintDepth, freeSurface, *context, stream);
+    obstacleGhostVelocities();      //the faces in and beside obstacles, so FLIP's change over the solve is measured from the same kind of value there
     for(auto [velocity, before] : {std::pair{&voxelsUx, &voxelsUxOld}, {&voxelsUy, &voxelsUyOld}, {&voxelsUz, &voxelsUzOld}}){    //for FLIP's velocity change over the solve
         cudaMemcpyAsync(before->devPtr(), velocity->devPtr(), sizeof(float)*velocity->size(), cudaMemcpyDeviceToDevice, stream);
     }
@@ -1007,6 +1010,7 @@ void Particles::pressureSolve(){
     }
     applyForces(forces, false, dt, elapsedTime, forceVoxels(), stream);
     cudaCalcDivU(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, voxelsUx, voxelsUy, voxelsUz, particleCounts, footprintDepth, restParticlesPerVoxel, correctionRate, divU, stream);
+    addObstacleFlux();      //what moving obstacles push through their walls
     cudaGetA(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, dt/(density*voxelSize*voxelSize), stream);
     gpuErrchk(cudaPeekAtLastError());
     uint interiorWidth = numVoxels1D - 2*(uint)std::floor(radius);
@@ -1039,6 +1043,7 @@ void Particles::pressureSolve(){
         applyForces(forces, false, dt, elapsedTime, forceVoxels(), stream);
         previousTerminatingResidual = terminatingResidual;
         cudaCalcDivU(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, voxelsUx, voxelsUy, voxelsUz, particleCounts, footprintDepth, restParticlesPerVoxel, correctionRate, divU, stream);
+        addObstacleFlux();
         cudaGetA(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, dt/(density*voxelSize*voxelSize), stream);
         gpuErrchk(cudaPeekAtLastError());
     }
@@ -1062,6 +1067,7 @@ void Particles::updateVoxelVelocities(){
     cudaVelocityUpdate(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, p, voxelsUx, voxelsUy, voxelsUz, dt/(0.014*voxelSize*voxelSize), stream);
     gpuErrchk(cudaPeekAtLastError());
     pinEmitterVelocities();     //an emitter's fluid leaves at its velocity, whatever the solve made of it
+    obstacleGhostVelocities();  //the faces between fluid and obstacles take the obstacles' velocity across them; the faces inside continue the fluid's
     for(CudaVec<float>* velocity : {&voxelsUx, &voxelsUy, &voxelsUz}){   //G2P and advection read ghost faces
         context->fillGhosts(velocity->devPtr(), stream);
     }
@@ -1319,7 +1325,9 @@ void Particles::solveFrame(double fps){
 }
 
 void Particles::initialize(){
-        markRemovedParticles();     //sinks and open faces, before rootCell reflects anything back into the domain
+        updateObstacles();          //where the obstacles are now
+        pushOutParticles();         //particles that went into one come back out
+        markRemovedParticles();     //sinks and open faces, and at the start fluid inside obstacles, before rootCell reflects anything back into the domain
         alignParticlesToGrid();
         killRemovedParticles();     //the removed particles' cell is one past the last, so the sort puts them at the end
         sortParticles();

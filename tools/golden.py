@@ -32,8 +32,11 @@ SCENES = {   #main's arguments after the frame count, or a scene file for flip2 
     "nozzle": "scenes/nozzle.json",                 #an emitter pouring into an empty box: inflow at exactly A*v
     "drain": "scenes/drain.json",                   #a tank draining through a sink and an open face
     "forces": "scenes/forces.json",                 #a drop in zero gravity, pulled, spun and stirred by force fields
+    "tank-box": "scenes/tank-box.json",             #a still tank around a submerged, rotated box: it should stay still
+    "paddle": "scenes/paddle.json",                 #a box keyframed to spin once a second, stirring a tank
+    "tank-meshsphere": "scenes/tank-meshsphere.json",   #a still tank around an OBJ sphere, voxelized on the GPU
 }
-DEFAULT_SCENES = ["dam16", "tank", "swirl", "nozzle", "drain", "forces"]
+DEFAULT_SCENES = ["dam16", "tank", "swirl", "nozzle", "drain", "forces", "tank-box", "paddle", "tank-meshsphere"]
 
 EXACT = ["particles", "hash", "occupiedVoxels", "perVoxel", "core", "substeps", "time", "dtMin", "dtMax", "lowest", "highest", "fastest"]
 SUMS = ["kineticEnergy", "momentum", "angularMomentum", "centroid"]

@@ -1,0 +1,38 @@
+{
+ "schema": "flip2.scene/1",
+ "fps": 24,
+ "frames": 48,
+ "domain": {
+  "min": [
+   0,
+   0,
+   0
+  ],
+  "max": [
+   0.25,
+   0.25,
+   0.25
+  ],
+  "voxelSize": 0.0078125
+ },
+ "fluids": [
+  {
+   "shape": "box",
+   "min": [
+    0,
+    0,
+    0
+   ],
+   "max": [
+    0.25,
+    0.125,
+    0.25
+   ]
+  }
+ ],
+ "output": {
+  "dir": "tank-still",
+  "diagnostics": "diagnostics.jsonl",
+  "positions": false
+ }
+}

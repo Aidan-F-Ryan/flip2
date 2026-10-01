@@ -19,6 +19,10 @@
 //               {"shape": "sphere", "center": [...], "radius": 0.1, "velocity": [0, 0, 0]}],
 //    "emitters": [{"shape": "box", "min": [...], "max": [...], "velocity": [0, 0, 2]}],   //inflow: keeps its shape full of fluid moving at velocity
 //    "sinks": [{"shape": "sphere", "center": [...], "radius": 0.1}],                       //outflow: deletes the fluid inside it
+//    "obstacles": [{"mesh": "rock.obj", "friction": 0, "thickness": 0,                   //or "vertices": "v.npy", "triangles": "t.npy"; or a box or sphere
+//                   "transform": [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1],                    //its own space to the world: row-major, acting on column vectors
+//                   "keyframes": [{"time": 0, "transform": [...]}, ...],                 //instead of a transform, it moves: linearly, rotations by slerp
+//                   "deforming": [{"time": 0, "mesh": "f1.obj"}, {"time": 0.04, "vertices": "f2.npy"}, ...]}],   //or it deforms: see SceneObstacle
 //    "forces": [{"type": "point", "position": [...], "strength": 9.8, "radius": 0, "falloff": 1},       //strength in m/s^2, towards it (negative: away)
 //               {"type": "vortex", "position": [...], "axis": [0, 1, 0], "strength": 5, "radius": 0, "falloff": 1},
 //               {"type": "turbulence", "strength": 2, "scale": 0.1, "speed": 0.5, "seed": 0},
@@ -27,6 +31,8 @@
 //    "output": {"dir": ".", "positions": true, "diagnostics": ""}             //diagnostics: a file name in dir, or "" for none
 //  }
 
+#include <array>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -59,6 +65,27 @@ struct SceneForce{
     double depth = 2.0;                     //wind: how many voxels below the surface it reaches
 };
 
+//Something solid the fluid flows around: a triangle mesh, a box or a sphere, in its own space, placed in the world by a transform or moved by keyframed
+//transforms. Each transform's scale is baked into the shape at the first key, so it moves rigidly from there on, and the fluid sees its true distances.
+//Or a deforming mesh: samples of its vertices in the world over time, with the same triangles throughout, each an OBJ (whose triangles have to be the
+//mesh's) or an (n, 3) .npy of vertices. Between samples its vertices move linearly, and before the first and after the last it holds still
+struct SceneObstacle{
+    enum Kind{MESH, BOX, SPHERE};
+    Kind kind = BOX;
+    std::vector<float> vertices;    //mesh: x, y, z per vertex
+    std::vector<int> triangles;     //mesh: 3 vertex indices per triangle
+    double min[3] = {0.0, 0.0, 0.0};        //box
+    double max[3] = {0.0, 0.0, 0.0};
+    double centre[3] = {0.0, 0.0, 0.0};     //sphere
+    double radius = 0.0;
+    std::vector<double> keyTimes;                       //empty: it stays where transforms[0] puts it
+    std::vector<std::array<double, 16>> transforms;     //own space to world, row-major, acting on column vectors (translation in elements 3, 7, 11)
+    double friction = 0.0;      //0: the fluid slips past freely; 1: the fluid touching it moves with it
+    double thickness = 0.0;     //mesh: 0 for a closed surface; for an open one, like a ground plane, the shell's thickness around it
+    std::vector<double> sampleTimes;                    //deforming: when each sample is; empty: it doesn't deform
+    std::shared_ptr<const std::vector<float>> samples;  //deforming: each sample's vertices in turn, x, y, z each, in the world (shared by the scene's copies)
+};
+
 struct Scene{
     std::string path;           //where it was read from: relative output paths are relative to the working directory, not to it
     double fps = 24.0;
@@ -79,6 +106,7 @@ struct Scene{
     std::vector<SceneShape> emitters;
     std::vector<SceneShape> sinks;
     unsigned int openFaces = 0;     //bits: -x, +x, -y, +y, -z, +z
+    std::vector<SceneObstacle> obstacles;
     std::vector<SceneForce> forces;
     int partitions = 1;
     int devices = 0;            //0: every GPU there is
@@ -91,9 +119,14 @@ struct Scene{
     }
 };
 
-//reads and checks a scene file; throws std::runtime_error naming the file and what's wrong with it. Keys it doesn't know are reported on stderr, in
-//case they're typos, and otherwise ignored
+//reads and checks a scene file, and the meshes it names (relative to its own directory); throws std::runtime_error naming the file and what's wrong
+//with it. Keys it doesn't know are reported on stderr, in case they're typos, and otherwise ignored
 Scene loadScene(const std::string& path);
+
+//a triangle mesh from a Wavefront OBJ file (its v and f lines; polygons are split into fans) or from two NumPy .npy arrays, vertices (N x 3 floats) and
+//triangles (M x 3 integers); throws std::runtime_error saying what's wrong
+void loadObj(const std::string& path, std::vector<float>& vertices, std::vector<int>& triangles);
+void loadNpyMesh(const std::string& verticesPath, const std::string& trianglesPath, std::vector<float>& vertices, std::vector<int>& triangles);
 
 //the fluid the scene starts with: particlesPerVoxel per voxel, on a lattice of 1, 2 or 3 per side, each jittered within its lattice cell by a hash of
 //the seed and its place in the domain, so the same scene always seeds the same particles. Where shapes overlap, the earlier one's velocity wins

@@ -38,6 +38,7 @@ add_library(particles SHARED
     diagnostics.cu
     forces.cu
     sources.cu
+    obstacles.cu
 )
 
 target_link_libraries(particles ${cudaLibraries}  parallelPrefixSumKernels radixSortKernels reductionKernels particleToGridFunctions perVoxelParticleListFunctions voxelSolveFunctions conjugateGradientFunctions multigridFunctions Threads::Threads)
