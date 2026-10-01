@@ -7,6 +7,7 @@
 #include "localTransport.hu"
 #include "partitionExchange.hu"
 #include "frameWriter.hpp"
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <string>
@@ -31,6 +32,7 @@ public:
     Particles& partition(int index){
         return *partitions[index];
     }
+    size_t particlesHere() const;   //the particles the partitions in this process hold between them
     void forEachPartition(const std::function<void(Particles&)>& setting);  //for settings, on this thread, with each partition's GPU current in turn
 
     void initialize();      //each partition keeps its own particles and builds its grid
@@ -38,6 +40,11 @@ public:
     //every rank's particles, in rank order: the order one partition would have them in. Across processes rank 0 gathers them and writes the file; every
     //rank has to call it
     void writePositionsToFile(const std::string& fileName);
+
+    //appends a line of JSON for this frame to path (and on the first call, starts the file with a line about the run): what the particles hold, how they
+    //fill the voxels, and a hash of every particle's state (see diagnostics.hu), the same however the domain is split. Across processes every rank has to
+    //call it, and rank 0 writes
+    void writeDiagnostics(const std::string& path, int frame);
 
 private:
     void inLockstep(const std::function<void(Particles&)>& step);    //every partition here runs step, each on its own thread
@@ -54,6 +61,8 @@ private:
     std::unique_ptr<FrameWriter> frameWriter;       //writes position frames from a background thread; across processes, only on rank 0
     std::vector<std::vector<cudaEvent_t>> frameCopies;  //per partition here, per frame buffer: its part of the frame has landed; on its GPU
     CudaVec<float> gatheredFrame;   //across processes, where rank 0 gathers every rank's positions
+    double lastFrameSeconds = 0.0;  //wall time of the last solveFrame, for diagnostics
+    std::ofstream diagnostics;      //on rank 0, once writeDiagnostics has started it
 };
 
 #endif
