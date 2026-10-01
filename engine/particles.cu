@@ -140,6 +140,7 @@ __device__ inline float3 positionInNodeBlock(uint index, const uint* gridPositio
 
 //threads per node block in the particle kernels, which give each thread a particle: about 2 each in a full node
 static constexpr uint NODE_THREADS = 256;
+static constexpr int MIRRORED_PER_THREAD = 4;   //G2P's wall voxels per thread at most: a node can store NODE_THREADS times as many voxels (voxelVelsToParticles)
 
 //the quadratic B-spline's three nonzero weights for a point at q, with nodes at the integers; base is the first node
 struct Spline3{
@@ -1100,10 +1101,14 @@ void Particles::particleVelToVoxels(){
     creditObstacleVolume();     //voxels obstacles partly cover hold fewer particles at rest: the density correction mustn't read them as thin
     cudaExtrapolateUnreachedFaces(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, voxelWeightsX, voxelWeightsY, voxelWeightsZ, voxelsUx, voxelsUy, voxelsUz, *context, stream);
     cudaFindFootprintDepth(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, footprintDepth, freeSurface, *context, stream);
-    obstacleGhostVelocities();      //the faces in and beside obstacles, so FLIP's change over the solve is measured from the same kind of value there
+    obstacleGhostVelocities(voxelsUx, voxelsUy, voxelsUz);      //the faces in and beside obstacles, so FLIP's change over the solve is measured from the same kind of value there
     for(auto [velocity, before] : {std::pair{&voxelsUx, &voxelsUxOld}, {&voxelsUy, &voxelsUyOld}, {&voxelsUz, &voxelsUzOld}}){    //for FLIP's velocity change over the solve
         cudaMemcpyAsync(before->devPtr(), velocity->devPtr(), sizeof(float)*velocity->size(), cudaMemcpyDeviceToDevice, stream);
     }
+    //and FLIP's old faces that obstacles cut as what crosses them all told, as the new ones will be, with the faces inside them from those. The solve's own
+    //take the open part alone, as it needs
+    mixObstacleFaces(voxelsUxOld, voxelsUyOld, voxelsUzOld);
+    obstacleGhostVelocities(voxelsUxOld, voxelsUyOld, voxelsUzOld);
 }
 
 void Particles::pressureSolve(){
@@ -1114,9 +1119,11 @@ void Particles::pressureSolve(){
     double terminatingResidual;
     double voxelSize = grid.cellSize / (2<<refinementLevel);
     uint hasFreeSurface;
+    findSealedPockets();    //queued ahead of the wait for the free surface, which brings back whether any fluid can't see air
     cudaMemcpyAsync(&hasFreeSurface, freeSurface.devPtr(), sizeof(uint), cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream);
     hasFreeSurface = context->anyOverPartitions(hasFreeSurface != 0);
+    settleSealedPockets();
     //divergence per unit of relative density error. Without air the fluid can't change volume, and the solve has nowhere to take a net divergence, so it's off
     double correctionRate = hasFreeSurface && densityCorrectionTime > 0.0 ? voxelSize / densityCorrectionTime : 0.0;
     //@TODO: need to use courant number for dt from max voxel u and voxel dimensions
@@ -1130,6 +1137,7 @@ void Particles::pressureSolve(){
     applyForces(forces, false, dt, elapsedTime, forceVoxels(), stream);
     cudaCalcDivU(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, voxelsUx, voxelsUy, voxelsUz, particleCounts, footprintDepth, restParticlesPerVoxel, correctionRate, divU, stream);
     addObstacleFlux();      //what obstacles' surfaces make of the flow through the faces they cut or close
+    balanceSealedPockets(); //and fluid no air reaches can't change its volume
     cudaGetA(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, dt/(density*voxelSize*voxelSize), stream);
     weighCutCells(dt/(density*voxelSize*voxelSize));      //the faces obstacles cut weigh as much as they're open
     gpuErrchk(cudaPeekAtLastError());
@@ -1164,6 +1172,7 @@ void Particles::pressureSolve(){
         previousTerminatingResidual = terminatingResidual;
         cudaCalcDivU(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, voxelsUx, voxelsUy, voxelsUz, particleCounts, footprintDepth, restParticlesPerVoxel, correctionRate, divU, stream);
         addObstacleFlux();
+        balanceSealedPockets();
         cudaGetA(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, dt/(density*voxelSize*voxelSize), stream);
         weighCutCells(dt/(density*voxelSize*voxelSize));
         gpuErrchk(cudaPeekAtLastError());
@@ -1188,7 +1197,8 @@ void Particles::updateVoxelVelocities(){
     cudaVelocityUpdate(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, p, voxelsUx, voxelsUy, voxelsUz, dt/(0.014*voxelSize*voxelSize), stream);
     gpuErrchk(cudaPeekAtLastError());
     pinEmitterVelocities();     //an emitter's fluid leaves at its velocity, whatever the solve made of it
-    obstacleGhostVelocities();  //the faces between fluid and obstacles take the obstacles' velocity across them; the faces inside continue the fluid's
+    mixObstacleFaces(voxelsUx, voxelsUy, voxelsUz);         //the faces obstacles cut carry what crosses them all told, not the open part's alone
+    obstacleGhostVelocities(voxelsUx, voxelsUy, voxelsUz);  //the faces between fluid and obstacles take the obstacles' velocity across them; the faces inside continue the fluid's
     for(CudaVec<float>* velocity : {&voxelsUx, &voxelsUy, &voxelsUz}){   //G2P and advection read ghost faces
         context->fillGhosts(velocity->devPtr(), stream);
     }
@@ -1232,16 +1242,35 @@ __global__ void gatherVoxelVelsToParticles(uint numParticleNodes, uint numPartic
     int interiorWidth = voxels1D - 2*apronCells;
     int3 origin = make_int3((int)(cell % grid.sizeX)*interiorWidth - apronCells, (int)(cell / grid.sizeX % grid.sizeY)*interiorWidth - apronCells, (int)(cell / (grid.sizeX*grid.sizeY))*interiorWidth - apronCells);
     int3 domainVoxels = make_int3(grid.sizeX*interiorWidth, grid.sizeY*interiorWidth, grid.sizeZ*interiorWidth);
-    for(uint i = startVoxel + threadIdx.x; i < endVoxel; i += blockDim.x){  //a wall face's mirror image is always inside the domain, so never another wall face
-        if(solids[i]){
+    //Every wall face's mirror image is read before any is written: a face in a wall's upper plane is its own mirror image, and a corner voxel's mirror
+    //image can be one of those, which another thread may be writing meanwhile. (P2G leaves walls' faces at rest, so that face is 0 either way, but
+    //read as it goes it would come out +0 or -0 by timing, and the frames' bits with it)
+    float images[MIRRORED_PER_THREAD][6];
+    #pragma unroll
+    for(int k = 0; k < MIRRORED_PER_THREAD; ++k){
+        uint i = startVoxel + threadIdx.x + k*blockDim.x;
+        if(i < endVoxel && solids[i]){
             int slot = voxelIDs[i];
             int3 voxel = make_int3(slot % voxels1D, slot / voxels1D % voxels1D, slot / (voxels1D*voxels1D));
             #pragma unroll
             for(int dim = 0; dim < 3; ++dim){
                 float sign = 1.0f;
                 int source = mirroredSlot(voxel, dim, origin, domainVoxels, voxels1D, sign);
-                blockVelocities[dim*voxels3D + slot] = sign*blockVelocities[dim*voxels3D + source];
-                blockVelocities[(3 + dim)*voxels3D + slot] = sign*blockVelocities[(3 + dim)*voxels3D + source];
+                images[k][dim] = sign*blockVelocities[dim*voxels3D + source];
+                images[k][3 + dim] = sign*blockVelocities[(3 + dim)*voxels3D + source];
+            }
+        }
+    }
+    __syncthreads();
+    #pragma unroll
+    for(int k = 0; k < MIRRORED_PER_THREAD; ++k){
+        uint i = startVoxel + threadIdx.x + k*blockDim.x;
+        if(i < endVoxel && solids[i]){
+            int slot = voxelIDs[i];
+            #pragma unroll
+            for(int dim = 0; dim < 3; ++dim){
+                blockVelocities[dim*voxels3D + slot] = images[k][dim];
+                blockVelocities[(3 + dim)*voxels3D + slot] = images[k][3 + dim];
             }
         }
     }
@@ -1406,6 +1435,10 @@ __global__ void advectThroughGrid(uint numParticleNodes, uint numParticles, cons
 void Particles::voxelVelsToParticles(){
     if(numParticleNodes == 0){  //no particles in this partition
         return;
+    }
+    if(numVoxelsPerNode > NODE_THREADS*MIRRORED_PER_THREAD){
+        std::cerr<<"Particles: a node of "<<numVoxelsPerNode<<" voxels is more than G2P mirrors walls for ("<<NODE_THREADS*MIRRORED_PER_THREAD<<"): raise MIRRORED_PER_THREAD\n";
+        exit(1);
     }
     auto gather = apic ? gatherVoxelVelsToParticles<true> : gatherVoxelVelsToParticles<false>;
     gather<<<numParticleNodes, NODE_THREADS, 6*sizeof(float)*numVoxelsPerNode, stream>>>(numParticleNodes, size, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(),
@@ -1601,6 +1634,9 @@ Particles::~Particles(){     //with its GPU the current one
         cudaEventDestroy(framePacked);
         cudaEventDestroy(frameCopied);
         cudaEventDestroy(columnsCopied);
+    }
+    if(pocketSeen != nullptr){
+        cudaFreeHost(pocketSeen);
     }
     gpuErrchk( cudaStreamDestroy(stream) );
 }

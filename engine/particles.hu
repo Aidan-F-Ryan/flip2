@@ -157,8 +157,13 @@ private:
     void markObstacleSolids();
     void addObstacleFlux();
     void weighCutCells(float scale);
-    void obstacleGhostVelocities();
+    void obstacleGhostVelocities(CudaVec<float>& ux, CudaVec<float>& uy, CudaVec<float>& uz);   //of these face velocities: the new ones, or FLIP's old
+    void mixObstacleFaces(CudaVec<float>& ux, CudaVec<float>& uy, CudaVec<float>& uz);          //the faces obstacles cut carry what crosses them all told
     void creditObstacleVolume();
+    void findSealedPockets();       //fluid no air reaches (pockets.cu): labelled once a substep, settled across partitions, its divergence balanced before each solve
+    void settleSealedPockets();
+    void balanceSealedPockets();
+    void pocketRound(long long* summed);
     VoxelPlaces voxelPlaces();
     void receiveParticleNodes(uint maskWords);
     void orderNodes(uint maskWords);
@@ -281,8 +286,15 @@ private:
                                     //of its faces are closed (bits, obstacles.cu)
     CudaVec<uint> obstacleOpen;     //per stored voxel near a surface: its six faces' open fractions and how much of it is covered this substep, in 16-bit
                                     //fixed point (obstacles.cu)
+    CudaVec<float> ghostBefore[3];  //the face velocities before a layer of obstacleGhostVelocities, which it reads while it writes the faces it sets
     CudaVec<uint> obstacleNodes;    //the stored nodes any voxel of whose block is solid or within 1.5 voxels of a surface: how many, then them. The obstacle passes
                                     //only visit those
+    CudaVec<uint> pocketParents;    //sealed pockets (pockets.cu), per stored voxel: its piece of fluid's root, its label (0 if air reaches it), and scratch, each
+    CudaVec<uint> pocketLabels;     //root's smallest label and then its pocket's place in the table
+    CudaVec<uint> pocketMinima;
+    CudaVec<double> pocketWords;    //the pockets' bookkeeping, in 64-bit words
+    long long* pocketSeen = nullptr;    //pinned: the counts the host reads back
+    long long pocketUnknowns = 0;   //unknowns no air reaches this substep
     unsigned long long substepIndex = 0;    //substeps taken, which seeds the emitters' jitter
     double restParticlesPerVoxel = 8.0;
     double densityCorrectionTime = 0.1;

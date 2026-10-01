@@ -5,6 +5,7 @@
 //  flip2 bake scene.json [--frames N] [--out DIR] [--overwrite]
 //  flip2 resume DIR [--frames N] [--force]
 //  flip2 verify DIR
+//  flip2 info
 //
 //bake runs the scene (see scene.hpp) and writes into the output directory its cache (cacheWriter.hu: cache.json, frames/NNNN/, which a DCC can read
 //while the bake runs, and checkpoints/NNNN/), and if the scene asks, N.bin (float32 x, y, z per particle) and the diagnostics file. It won't bake over a
@@ -13,8 +14,9 @@
 //stopped, on as many ranks as it's run with (so on more or fewer GPUs too): the frames after the checkpoint move to frames.discarded/ and are worked out
 //again. It reads the scene the cache names, which has to be unchanged unless --force, and goes on to the frame the bake was going to; --frames takes it
 //further. verify checks every
-//committed frame of the cache in DIR: each shard there, whole, with the size and XXH64 its commit record gives. Standard output carries only events, one
-//JSON object per line, for a DCC or a farm to follow:
+//committed frame of the cache in DIR: each shard there, whole, with the size and XXH64 its commit record gives. info says what this build is and runs a
+//kernel on every GPU it finds, to tell whether it runs there (exiting 1 if there's none it does). Standard output carries only events, one JSON object per
+//line, for a DCC or a farm to follow:
 //
 //  {"event":"start","particles":1240000,"frames":120,"nodes":[32,32,32],"voxelSize":0.0078125,"ranks":1}     with "resumedFrom":40 when resuming
 //  {"event":"frame","frame":1,"seconds":0.041}                 a frame simulated
@@ -23,6 +25,7 @@
 //  {"event":"cancelled","frame":57,"seconds":3.1}              stopped by a signal after frame 57, which is committed and checkpointed
 //  {"event":"done","frames":120,"seconds":5.2}                 every frame committed
 //  {"event":"verified","frames":121,"unfinished":0,"shards":121,"particles":150040000,"bytes":1712345678,"problems":0}
+//  {"event":"info","build":"7dc95a4","architectures":"86","cudaRuntime":13040,"driver":13040,"gpus":[{"index":0,"name":"...","sm":86,"memoryMB":24135,"runs":true}],...}
 //  {"event":"error","message":"scene.json: domain: needs a positive \"voxelSize\""}
 //
 //Everything else the engine says goes to standard error. As with main, FLIP2_PARTITIONS splits the domain between partitions in this process, and
@@ -89,8 +92,65 @@ static int failure(const std::string& message){
 static int usage(){
     std::cerr<<"usage: flip2 bake scene.json [--frames N] [--out DIR] [--overwrite]\n"
                "       flip2 resume DIR [--frames N] [--force]\n"
-               "       flip2 verify DIR\n";
+               "       flip2 verify DIR\n"
+               "       flip2 info\n";
     return 2;
+}
+
+#ifndef FLIP2_ARCHITECTURES
+#define FLIP2_ARCHITECTURES "unknown"
+#endif
+
+__global__ void probe(int* landed){
+    *landed = 1;
+}
+
+//flip2 info: the build, and every GPU there is, with whether this build's kernels run on it: tried by launching one, as no table of architectures is
+//as sure. 0 if they run on at least one
+static int info(){
+    int runtime = 0, driver = 0, devices = 0;
+    cudaRuntimeGetVersion(&runtime);
+    cudaDriverGetVersion(&driver);
+    cudaError_t counted = cudaGetDeviceCount(&devices);
+    std::string gpus;
+    int running = 0;
+    for(int device = 0; counted == cudaSuccess && device < devices; ++device){
+        cudaDeviceProp properties;
+        cudaGetDeviceProperties(&properties, device);
+        cudaSetDevice(device);
+        int* landed = nullptr;
+        int found = 0;
+        cudaError_t tried = cudaMalloc((void**)&landed, sizeof(int));
+        if(tried == cudaSuccess){
+            probe<<<1, 1>>>(landed);
+            tried = cudaGetLastError();
+        }
+        if(tried == cudaSuccess){
+            tried = cudaMemcpy(&found, landed, sizeof(int), cudaMemcpyDeviceToHost);
+        }
+        cudaFree(landed);
+        bool runs = tried == cudaSuccess && found == 1;
+        running += runs;
+        char entry[512];
+        std::snprintf(entry, sizeof(entry), "%s{\"index\":%d,\"name\":%s,\"sm\":%d,\"memoryMB\":%zu,\"runs\":%s%s%s}", device ? "," : "", device, quoted(properties.name).c_str(),
+                      properties.major*10 + properties.minor, properties.totalGlobalMem >> 20, runs ? "true" : "false", runs ? "" : ",\"error\":",
+                      runs ? "" : quoted(cudaGetErrorString(tried)).c_str());
+        gpus += entry;
+    }
+    bool openvdb = false;
+#ifdef FLIP2_WITH_OPENVDB
+    openvdb = true;
+#endif
+    bool nccl = false;
+#ifdef FLIP2_WITH_NCCL
+    nccl = true;
+#endif
+    std::string line = "{\"event\":\"info\",\"build\":" + quoted(FLIP2_BUILD_ID) + ",\"architectures\":" + quoted(FLIP2_ARCHITECTURES) + ",\"cudaRuntime\":" +
+                       std::to_string(runtime) + ",\"driver\":" + std::to_string(driver) + ",\"gpus\":[" + gpus + "],\"compression\":" + (cacheCompresses() ? "true" : "false") +
+                       ",\"openvdb\":" + (openvdb ? "true" : "false") + ",\"nccl\":" + (nccl ? "true" : "false") +
+                       (counted == cudaSuccess ? std::string() : ",\"error\":" + quoted(cudaGetErrorString(counted))) + "}";
+    event(line);
+    return running > 0 ? 0 : 1;
 }
 
 static bool readFile(const std::string& path, std::string& contents){
@@ -110,6 +170,12 @@ static std::string hex(uint64_t value){
     return text;
 }
 
+//whether a cache record (cache.json, commit.json, ckpt.json) has a version newer than this flip2 reads, which it then mustn't (docs/cache-format.md)
+static bool newerThanKnown(const Json& record){
+    const Json* version = record.find("version");
+    return version != nullptr && version->number > 1;
+}
+
 //flip2 verify: every committed frame's shards, each the size its record gives, hashing to its XXH64, with a shard's header and the right particle count
 static int verify(const std::string& directory){
     std::string text;
@@ -119,6 +185,9 @@ static int verify(const std::string& directory){
     int committed = -1;
     try{
         Json cache = JsonReader(text, directory + "/cache.json").document();
+        if(newerThanKnown(cache)){
+            return failure(directory + "/cache.json: version " + std::to_string((int)cache.find("version")->number) + ", newer than this flip2 reads (1)");
+        }
         if(const Json* last = cache.find("committed")){
             committed = (int)last->number;
         }
@@ -152,6 +221,10 @@ static int verify(const std::string& directory){
         ++done;
         try{
             Json commit = JsonReader(record, (frame / "commit.json").string()).document();
+            if(newerThanKnown(commit)){
+                problem((frame / "commit.json").string() + ": a version newer than this flip2 reads");
+                continue;
+            }
             const Json* list = commit.find("shards");
             if(list == nullptr){
                 problem((frame / "commit.json").string() + ": no shards");
@@ -307,6 +380,9 @@ static bool newestCheckpoint(const std::string& directory, Checkpoint& out, std:
     }
     try{
         Json record = JsonReader(text, path).document();
+        if(newerThanKnown(record)){
+            throw std::runtime_error(path + ": a version newer than this flip2 reads");
+        }
         auto need = [&](const char* key){
             const Json* value = record.find(key);
             if(value == nullptr){
@@ -422,6 +498,9 @@ int main(int argc, char** argv){
     if(argc == 3 && std::string(argv[1]) == "verify"){
         return verify(argv[2]);
     }
+    if(argc == 2 && std::string(argv[1]) == "info"){
+        return info();
+    }
     if(argc < 3 || (std::string(argv[1]) != "bake" && std::string(argv[1]) != "resume")){
         return usage();
     }
@@ -459,6 +538,9 @@ int main(int argc, char** argv){
         }
         try{
             Json cache = JsonReader(text, outputDirectory + "/cache.json").document();
+            if(newerThanKnown(cache)){
+                return failure(outputDirectory + "/cache.json: a version newer than this flip2 reads");
+            }
             const Json* scene = cache.find("scene");
             const Json* path = scene ? scene->find("path") : nullptr;
             const Json* hash = scene ? scene->find("xxh64") : nullptr;

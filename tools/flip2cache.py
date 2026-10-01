@@ -24,9 +24,16 @@ except ImportError:
     numpy = None
 
 
+def _known(record, path):
+    if record.get("version", 1) > 1:
+        raise ValueError("%s: version %s, newer than this reader knows (1)" % (path, record["version"]))
+    return record
+
+
 def load_cache(directory):
-    with open(os.path.join(directory, "cache.json")) as file:
-        return json.load(file)
+    path = os.path.join(directory, "cache.json")
+    with open(path) as file:
+        return _known(json.load(file), path)
 
 
 def frame_directory(directory, frame):
@@ -44,8 +51,9 @@ def committed_frames(directory):
 
 
 def read_commit(directory, frame):
-    with open(os.path.join(frame_directory(directory, frame), "commit.json")) as file:
-        return json.load(file)
+    path = os.path.join(frame_directory(directory, frame), "commit.json")
+    with open(path) as file:
+        return _known(json.load(file), path)
 
 
 def _decompress(data):
@@ -67,8 +75,8 @@ def read_shard(path):
     for index in range(attributes):
         name, kind, components, codec, _, offset, stored, raw, _ = ATTRIBUTE.unpack_from(data, HEADER.size + index*ATTRIBUTE.size)
         name = name.rstrip(b"\0").decode()
-        if kind not in (1, 2):
-            raise ValueError("%s: attribute %s isn't float32 or float64" % (path, name))
+        if kind not in (1, 2):      #a type a later version added: skipped (docs/cache-format.md)
+            continue
         shard["types"][name] = "f" if kind == 1 else "d"
         sizes = struct.unpack_from("<%dQ" % components, data, offset)
         at = offset + 8*components

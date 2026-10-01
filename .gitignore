@@ -7,3 +7,6 @@ engine/Makefile
 engine/devManagerTestDriver.cu
 engine/deviceManagerTest
 **/__pycache__/
+build-release/
+build-release.configure.log
+dist/

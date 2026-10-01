@@ -84,6 +84,7 @@ struct ShardData{
 };
 //reads path into out, checking it hashes to xxh64 (hex) if that's given; or says why not
 bool readShard(const std::string& path, const std::string& xxh64, ShardData& out, std::string& why);
+bool cacheCompresses();     //whether this build has blosc, to compress the cache's shards (and read compressed ones)
 
 //Writes the cache's frames and checkpoints on a background thread, like FrameWriter: the caller takes a free pinned buffer with acquire(), has each of its
 //partitions copy its planes in, recording an event when they land, and submits it. The thread writes each shard (compressed, hashed, flushed to the disk),

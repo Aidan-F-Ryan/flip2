@@ -1,0 +1,56 @@
+{
+ "schema": "flip2.scene/1",
+ "fps": 24,
+ "frames": 24,
+ "domain": {
+  "min": [
+   0,
+   0,
+   0
+  ],
+  "max": [
+   0.25,
+   0.25,
+   0.25
+  ],
+  "voxelSize": 0.0078125
+ },
+ "fluids": [
+  {
+   "shape": "box",
+   "min": [
+    0.07,
+    0.07,
+    0.07
+   ],
+   "max": [
+    0.18,
+    0.18,
+    0.18
+   ]
+  },
+  {
+   "shape": "box",
+   "min": [
+    0,
+    0,
+    0
+   ],
+   "max": [
+    0.25,
+    0.04,
+    0.25
+   ]
+  }
+ ],
+ "obstacles": [
+  {
+   "mesh": "geo/hollow.obj"
+  }
+ ],
+ "output": {
+  "dir": "sealed-box",
+  "diagnostics": "diagnostics.jsonl",
+  "positions": false
+ }
+}

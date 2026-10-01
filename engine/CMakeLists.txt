@@ -23,13 +23,14 @@ add_subdirectory(algorithms)
 
 foreach(lib ${cudaLibraries})
     add_library(${lib} ${lib}.cu)
-    set_target_properties(${lib} PROPERTIES CUDA_ARCHITECTURES "86")
+    set_target_properties(${lib} PROPERTIES CUDA_ARCHITECTURES "${flip2Architectures}")
     target_link_libraries(${lib} radixSortKernels parallelPrefixSumKernels reductionKernels)
 endforeach()
 
 find_package(Threads REQUIRED)
 
-add_library(particles SHARED
+# the engine, as a static library: flip2 is one self-contained program (with its third-party libraries beside it in a release, tools/package-linux.sh)
+add_library(particles STATIC
     particles.cu
     localTransport.cu
     partitionExchange.cu
@@ -39,11 +40,12 @@ add_library(particles SHARED
     forces.cu
     sources.cu
     obstacles.cu
+    pockets.cu
     cacheWriter.cu
 )
 
 target_link_libraries(particles ${cudaLibraries}  parallelPrefixSumKernels radixSortKernels reductionKernels particleToGridFunctions perVoxelParticleListFunctions voxelSolveFunctions conjugateGradientFunctions multigridFunctions Threads::Threads)
-set_target_properties(particles PROPERTIES CUDA_ARCHITECTURES "86")
+set_target_properties(particles PROPERTIES CUDA_ARCHITECTURES "${flip2Architectures}")
 
 # blosc compresses the cache's shards (cacheWriter.cu). Optional: without it they're written raw
 find_path(BLOSC_INCLUDE_DIR blosc.h)
@@ -66,7 +68,7 @@ endif()
 if(NOT buildId)
     set(buildId "unknown")
 endif()
-target_compile_definitions(particles PRIVATE FLIP2_BUILD_ID="${buildId}")
+target_compile_definitions(particles PUBLIC FLIP2_BUILD_ID="${buildId}")
 
 # NCCL joins ranks in separate processes, one GPU each (FLIP2_TRANSPORT=nccl). Optional: found through NCCL_HOME (a CMake or environment variable: an
 # NCCL install, build directory or pip's nvidia/nccl) or the system's paths; without it, flip2 builds as before and ranks join over TCP
@@ -84,12 +86,18 @@ endif()
 
 add_executable(main main.cu)
 target_link_libraries(main particles gomp)
-set_target_properties(main PROPERTIES CUDA_ARCHITECTURES "86")
+set_target_properties(main PROPERTIES CUDA_ARCHITECTURES "${flip2Architectures}")
 
 # flip2: the command line, which runs a scene file (scene.hpp)
 add_executable(flip2 flip2.cu scene.cpp volumes.cpp)
 target_link_libraries(flip2 particles gomp)
-set_target_properties(flip2 PROPERTIES CUDA_ARCHITECTURES "86")
+set_target_properties(flip2 PROPERTIES CUDA_ARCHITECTURES "${flip2Architectures}")
+string(REPLACE ";" "," architectureNames "${flip2Architectures}")     #a CMake list would split the definition
+target_compile_definitions(flip2 PRIVATE FLIP2_ARCHITECTURES="${architectureNames}")
+# installed (tools/package-linux.sh), flip2 finds the libraries it was built with in ../lib beside it, whatever the machine has
+set_target_properties(flip2 PROPERTIES INSTALL_RPATH "$ORIGIN/../lib")
+target_link_options(flip2 PRIVATE "LINKER:--disable-new-dtags")    #an RPATH, not a RUNPATH, so the libraries those libraries load are found there too
+install(TARGETS flip2 RUNTIME DESTINATION bin)
 
 # OpenVDB lets scenes name VDB level sets (volumes.cpp). Optional: without it, flip2 builds as before, and a scene naming one fails, saying why. Found
 # directly rather than through OpenVDB's own find module, which also wants Boost's iostreams library, which linking to its shared library doesn't need;

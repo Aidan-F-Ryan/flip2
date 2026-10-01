@@ -38,6 +38,8 @@ SCENES = {   #main's arguments after the frame count (and any environment it run
     "paddle": "scenes/paddle.json",                 #a box keyframed to spin once a second, stirring a tank
     "tank-meshsphere": "scenes/tank-meshsphere.json",   #a still tank around an OBJ sphere, voxelized on the GPU
     "tank-pulse": "scenes/tank-pulse.json",         #a deforming mesh sphere breathing in a tank, re-voxelized every substep (tools/deforming.py)
+    "sealed-pulse": "scenes/sealed-pulse.json",     #the breathing sphere in a box full of water: no air anywhere, so its growth has to be balanced (engine/pockets.cu)
+    "sealed-box": "scenes/sealed-box.json",         #water sealed in a hollow box (geo/hollow.obj) above a pool: a pocket with air elsewhere
     "mesh-sources": "scenes/mesh-sources.json",     #a mesh fluid half inside a box fluid, a mesh emitter and a keyframed mesh sink, seeded and tested on the GPU
     "drop-meshsphere": "scenes/drop-meshsphere.json",   #a ball of water from a mesh, dropped into a tank: against drop-sphere's analytic one
     "nozzle-mesh": "scenes/nozzle-mesh.json",       #the nozzle with a cube mesh for its emitter: the same flow, particle for particle
@@ -47,7 +49,7 @@ SCENES = {   #main's arguments after the frame count (and any environment it run
     "drop-vdbsphere": "scenes/drop-vdbsphere.json", #a ball of water from a VDB level set: against drop-sphere
     "tank-meshspin": "scenes/tank-meshspin.json",   #tank-vdbspin's spin as keyframes of the rigid mesh sphere
 }
-DEFAULT_SCENES = ["dam16", "tank", "swirl", "swirl-apic", "nozzle", "drain", "forces", "tank-box", "paddle", "tank-meshsphere", "tank-pulse", "mesh-sources", "tank-vdbspin"]
+DEFAULT_SCENES = ["dam16", "tank", "swirl", "swirl-apic", "nozzle", "drain", "forces", "tank-box", "paddle", "tank-meshsphere", "tank-pulse", "mesh-sources", "tank-vdbspin", "sealed-pulse", "sealed-box"]
 
 EXACT = ["particles", "hash", "occupiedVoxels", "perVoxel", "core", "substeps", "time", "dtMin", "dtMax", "lowest", "highest", "fastest"]
 SUMS = ["kineticEnergy", "momentum", "angularMomentum", "centroid"]

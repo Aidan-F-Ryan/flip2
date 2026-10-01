@@ -10,7 +10,8 @@
 
 template <typename T>
 CudaVec<T>::CudaVec()
-: d_vec(nullptr){
+: d_vec(nullptr)
+, numElements(0){   //size() is 0 until it's resized
 
 }
 

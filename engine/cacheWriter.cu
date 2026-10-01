@@ -164,6 +164,14 @@ bool replaceFile(const std::string& path, const std::string& text, std::string& 
 
 }
 
+bool cacheCompresses(){
+#ifdef FLIP2_WITH_BLOSC
+    return true;
+#else
+    return false;
+#endif
+}
+
 const ShardData::Attribute* ShardData::find(const std::string& name) const{
     for(const Attribute& attribute : attributes){
         if(attribute.name == name){
@@ -210,9 +218,12 @@ bool readShard(const std::string& path, const std::string& xxh64, ShardData& out
         attribute.name = std::string(entry.name, strnlen(entry.name, sizeof(entry.name)));
         attribute.type = entry.type;
         attribute.components = entry.components;
+        if(entry.type != TYPE_FLOAT32 && entry.type != TYPE_FLOAT64){   //a type a later version added: skipped, as docs/cache-format.md says readers do
+            continue;
+        }
         size_t valueBytes = entry.type == TYPE_FLOAT64 ? 8 : 4;
         size_t planeBytes = valueBytes*header.particles;
-        if((entry.type != TYPE_FLOAT32 && entry.type != TYPE_FLOAT64) || entry.offset + entry.storedBytes > data.size() || entry.rawBytes != planeBytes*entry.components){
+        if(entry.offset + entry.storedBytes > data.size() || entry.rawBytes != planeBytes*entry.components){
             why = path + ": attribute " + attribute.name + " doesn't fit the file";
             return false;
         }

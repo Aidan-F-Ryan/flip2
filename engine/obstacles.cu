@@ -209,10 +209,74 @@ __device__ inline int crossings(float3 p, int axis, const ColumnBins& columns, c
     return hits;
 }
 
+//The winding number along a ray. Each triangle the ray from p along +axis crosses past p counts +1 or -1 by which way it faces along the ray (the sign of
+//its area seen down the axis), and for a closed mesh whose triangles all wind the same way the sum is how many times the mesh wraps p: 0 outside, 1
+//inside, 2 where it overlaps or folds through itself (a skinned joint bent hard), -1 where it's turned inside out. Parity counts a fold as outside, and so
+//can pseudonormals, which see only the nearest sheet. Each edge's side test takes the same bits in both triangles that share it (no fused multiply-adds,
+//which would round them two ways), and a ray that meets an edge or vertex exactly goes through just one of the triangles there, by which way the edge
+//runs (as if p were moved a hair along -u, and a hair less along -v), so it neither slips between two triangles nor counts one twice
+__device__ inline float edgeSide(float fromU, float fromV, float toU, float toV){
+    return __fsub_rn(__fmul_rn(fromU, toV), __fmul_rn(fromV, toU));
+}
+
+//whether the ray along axis through (pu, pv) crosses triangle abc: 1 or -1 by which way the triangle faces along it, and where along it, or 0
+__device__ inline int windingCrossing(float3 a, float3 b, float3 c, float pu, float pv, int axis, int u, int v, float& hit){
+    float au = __fsub_rn(component(a, u), pu), av = __fsub_rn(component(a, v), pv);
+    float bu = __fsub_rn(component(b, u), pu), bv = __fsub_rn(component(b, v), pv);
+    float cu = __fsub_rn(component(c, u), pu), cv = __fsub_rn(component(c, v), pv);
+    float ab = edgeSide(au, av, bu, bv), bc = edgeSide(bu, bv, cu, cv), ca = edgeSide(cu, cv, au, av);
+    float area = ab + bc + ca;
+    if(area == 0.0f){   //edge on, seen down the axis
+        return 0;
+    }
+    float s = area > 0.0f ? 1.0f : -1.0f;
+    auto takes = [s](float side, float du, float dv){   //inside this edge, or on it and the edge runs the one way, which its twin in the next triangle doesn't
+        return s*side > 0.0f || (side == 0.0f && (s*dv > 0.0f || (dv == 0.0f && s*du < 0.0f)));
+    };
+    if(!takes(ab, __fsub_rn(bu, au), __fsub_rn(bv, av)) || !takes(bc, __fsub_rn(cu, bu), __fsub_rn(cv, bv)) || !takes(ca, __fsub_rn(au, cu), __fsub_rn(av, cv))){
+        return 0;
+    }
+    hit = (bc*component(a, axis) + ca*component(b, axis) + ab*component(c, axis)) / area;
+    return (int)s;
+}
+
+//the run of triangles in the column of bricks along axis that holds p
+__device__ inline int2 columnRun(float3 p, int axis, const ColumnBins& columns, float3 origin, float brickSize, int3 bricks){
+    int u = (axis + 1) % 3, v = (axis + 2) % 3;
+    int size[3] = {bricks.x, bricks.y, bricks.z};
+    int column[3] = {0, 0, 0};
+    column[u] = min(max((int)floorf((component(p, u) - component(origin, u)) / brickSize), 0), size[u] - 1);
+    column[v] = min(max((int)floorf((component(p, v) - component(origin, v)) / brickSize), 0), size[v] - 1);
+    return columns.runs[axis][column[0] + bricks.x*(column[1] + bricks.y*column[2])];
+}
+
+//the winding number along +axis from p, over the triangles of p's column; with first and stride, of every stride-th of them from first on, a lane's share
+__device__ inline int windingAlong(float3 p, int axis, const ColumnBins& columns, const float3* vertices, const int3* triangles, float3 origin, float brickSize, int3 bricks,
+                                   int first = 0, int stride = 1){
+    int u = (axis + 1) % 3, v = (axis + 2) % 3;
+    int2 run = columnRun(p, axis, columns, origin, brickSize, bricks);
+    float pu = component(p, u), pv = component(p, v), pa = component(p, axis);
+    int sum = 0;
+    for(int k = run.x + first; k < run.y; k += stride){
+        int3 triangle = triangles[columns.triangleOfPair[axis][k]];
+        float hit;
+        int facing = windingCrossing(vertices[triangle.x], vertices[triangle.y], vertices[triangle.z], pu, pv, axis, u, v, hit);
+        if(facing != 0 && hit > pa){
+            sum += facing;
+        }
+    }
+    return sum;
+}
+
+//points are nudged off the lattice before rays are cast from them, so the rays don't run exactly along the mesh's own axis-aligned edges
+__device__ inline float3 offLattice(float3 p, float spacing){
+    return p + spacing*make_float3(1.234567e-4f, 2.345678e-4f, 3.456789e-4f);
+}
+
 //whether p is inside the mesh: the parity of the crossings of a ray along each axis, the majority of the three, which survives a ray through a crack or
-//along an edge. p is nudged off the lattice first, so rays don't run exactly along the mesh's own axis-aligned edges
+//along an edge
 __device__ inline bool insideMesh(float3 p, const ColumnBins& columns, const float3* vertices, const int3* triangles, float3 origin, float brickSize, int3 bricks, float spacing){
-    p = p + spacing*make_float3(1.234567e-4f, 2.345678e-4f, 3.456789e-4f);
+    p = offLattice(p, spacing);
     int votes = 0;
     for(int axis = 0; axis < 3; ++axis){
         votes += crossings(p, axis, columns, vertices, triangles, origin, brickSize, bricks) & 1;
@@ -220,75 +284,62 @@ __device__ inline bool insideMesh(float3 p, const ColumnBins& columns, const flo
     return votes >= 2;
 }
 
-//insideMesh by a whole warp, each lane taking every 32nd of the triangles; every lane gets the answer
-__device__ inline bool insideMeshByWarp(float3 p, const ColumnBins& columns, const float3* vertices, const int3* triangles, float3 origin, float brickSize, int3 bricks, float spacing){
-    p = p + spacing*make_float3(1.234567e-4f, 2.345678e-4f, 3.456789e-4f);
+//insideMesh by a whole warp, each lane taking every 32nd of the triangles; every lane gets the answer. A mesh that winds consistently counts p inside
+//where it wraps p any number of times (its winding number isn't 0), by the majority of the three rays again
+__device__ inline bool insideMeshByWarp(float3 p, const ColumnBins& columns, const float3* vertices, const int3* triangles, float3 origin, float brickSize, int3 bricks, float spacing,
+                                        bool wound){
+    p = offLattice(p, spacing);
     int lane = threadIdx.x % 32;
     int votes = 0;
     for(int axis = 0; axis < 3; ++axis){
-        int hits = crossings(p, axis, columns, vertices, triangles, origin, brickSize, bricks, lane, 32);
+        int count = wound ? windingAlong(p, axis, columns, vertices, triangles, origin, brickSize, bricks, lane, 32)
+                          : crossings(p, axis, columns, vertices, triangles, origin, brickSize, bricks, lane, 32);
         for(int offset = 16; offset > 0; offset /= 2){
-            hits += __shfl_xor_sync(0xFFFFFFFFu, hits, offset);
+            count += __shfl_xor_sync(0xFFFFFFFFu, count, offset);
         }
-        votes += hits & 1;
+        votes += wound ? count != 0 : count & 1;
     }
     return votes >= 2;
 }
 
-//The signs of a deforming closed mesh, without casting rays through it: its angle-weighted pseudonormals (Baerentzen and Aanaes, Signed distance
-//computation using the angle weighted pseudonormal, 2005). Per triangle, its unit normal, outwards; per vertex, the sum of its triangles' weighted by
-//their angles there; per edge, the sum of its two triangles'. A point is inside the mesh exactly when it's behind the pseudonormal of the part of the
-//mesh nearest it
-struct Pseudonormals{
-    const float3* faces;            //nullptr: the mesh is signed by rays instead
-    const float3* vertices;
-    const int3* across;             //per triangle, the triangle across each edge: ab, bc, ca
-};
-
-__global__ void faceNormals(uint numTriangles, const float3* vertices, const int3* triangles, float orientation, float3* normals){
-    uint index = threadIdx.x + blockIdx.x*blockDim.x;
-    if(index < numTriangles){
-        int3 triangle = triangles[index];
-        float3 a = vertices[triangle.x], ab = vertices[triangle.y] - a, ac = vertices[triangle.z] - a;
-        float3 normal = make_float3(ab.y*ac.z - ab.z*ac.y, ab.z*ac.x - ab.x*ac.z, ab.x*ac.y - ab.y*ac.x);
-        float length = sqrtf(dot(normal, normal));
-        normals[index] = length > 0.0f ? (orientation / length)*normal : make_float3(0.0f, 0.0f, 0.0f);
+//the winding numbers of a row of a brick's samples, those along axis from at (whose own coordinate along it is 0), for a mesh that winds consistently:
+//one ray from the first, whose crossings count for each sample before them. With first and stride, of every stride-th of the column's triangles from
+//first on, a lane's share. One axis is enough: the edge tests leave no cracks, so the count is exact up to rounding where a ray all but grazes the surface
+__device__ inline void windingRow(int axis, int3 at, int3 brickCell, const ColumnBins& columns, const float3* vertices, const int3* triangles, float3 origin, float spacing,
+                                  int3 bricks, int first, int stride, int windings[SDF_BRICK]){
+    int u = (axis + 1) % 3, v = (axis + 2) % 3;
+    float3 p = offLattice(origin + spacing*make_float3(brickCell.x*SDF_BRICK + at.x, brickCell.y*SDF_BRICK + at.y, brickCell.z*SDF_BRICK + at.z), spacing);
+    float firstAlong = component(p, axis);
+    float pu = component(p, u), pv = component(p, v);
+    int2 run = columnRun(p, axis, columns, origin, spacing*SDF_BRICK, bricks);
+    #pragma unroll
+    for(int j = 0; j < SDF_BRICK; ++j){
+        windings[j] = 0;
     }
-}
-
-//each vertex's triangles in a fixed order (incident: triangle*3 + corner), so the sums don't depend on the GPU's
-__global__ void vertexNormals(uint numVertices, const float3* vertices, const int3* triangles, const uint* incidentStarts, const uint* incident, const float3* faceNormals,
-                              float3* normals){
-    uint index = threadIdx.x + blockIdx.x*blockDim.x;
-    if(index < numVertices){
-        float3 sum = make_float3(0.0f, 0.0f, 0.0f);
-        for(uint k = incidentStarts[index]; k < incidentStarts[index + 1]; ++k){
-            uint which = incident[k] / 3, corner = incident[k] % 3;
-            int3 triangle = triangles[which];
-            int at[3] = {triangle.x, triangle.y, triangle.z};
-            float3 here = vertices[at[corner]];
-            float3 one = vertices[at[(corner + 1) % 3]] - here, other = vertices[at[(corner + 2) % 3]] - here;
-            float3 cross = make_float3(one.y*other.z - one.z*other.y, one.z*other.x - one.x*other.z, one.x*other.y - one.y*other.x);
-            sum = sum + atan2f(sqrtf(dot(cross, cross)), dot(one, other))*faceNormals[which];
+    for(int k = run.x + first; k < run.y; k += stride){
+        int3 triangle = triangles[columns.triangleOfPair[axis][k]];
+        float hit;
+        int facing = windingCrossing(vertices[triangle.x], vertices[triangle.y], vertices[triangle.z], pu, pv, axis, u, v, hit);
+        if(facing != 0){
+            #pragma unroll
+            for(int j = 0; j < SDF_BRICK; ++j){
+                windings[j] += hit > firstAlong + j*spacing ? facing : 0;
+            }
         }
-        normals[index] = sum;
     }
 }
 
 //per brick near the surface, a block, and a thread per sample: the distance to the nearest of the triangles near the brick. Those are every triangle within
 //band of it, so the distance is exact up to band, and past it just more than band. A deforming mesh's sample also takes the velocity of that nearest
 //point, blended from its triangle's vertices'. Blocks past the bricks in use, or past the pool, have nothing to do.
-//With pseudonormals, the samples are signed here too, and clamped to the band: those within band by the pseudonormal at their nearest point, which is
-//the nearest on the whole mesh. Those past it might not be, but they can't be across the surface from any sample next to them, which would make the two
-//distances add up to no more than the spacing; so they take their neighbours' sign, out from the ones within band. A brick with none within band is all
-//on one side, which one ray test at its centre finds
+//A closed mesh that winds consistently is signed here too, by its winding numbers, and clamped to the band: a ray along each row of samples (windingRow),
+//along whichever axis the brick's column of triangles is shortest, each row's triangles shared between SDF_BRICK lanes
 __global__ void brickDistances(const uint* activeBricks, const uint* numActive, const int2* runs, const uint* triangleOfPair, const float3* vertices, const int3* triangles,
-                               const float3* vertexVelocities, float3 origin, float spacing, int3 bricks, float* pool, float* velocities, Pseudonormals normals, float band,
+                               const float3* vertexVelocities, float3 origin, float spacing, int3 bricks, float* pool, float* velocities, bool signs, float band,
                                ColumnBins columns){
     __shared__ float3 corners[64*3];
     __shared__ uint chunkTriangles[64];
-    __shared__ signed char side[SDF_BRICK*SDF_BRICK*SDF_BRICK];     //-1 inside, 1 outside, 0 not known yet
-    __shared__ bool brickInside;
+    __shared__ bool wraps[SDF_BRICK*SDF_BRICK*SDF_BRICK];           //whether the mesh wraps each sample
     if(blockIdx.x >= *numActive){
         return;
     }
@@ -327,53 +378,35 @@ __global__ void brickDistances(const uint* activeBricks, const uint* numActive, 
     }
     const int samples = SDF_BRICK*SDF_BRICK*SDF_BRICK;
     float distance = sqrtf(best);
-    if(normals.faces != nullptr){
-        signed char known = 0;
-        if(best <= band*band){
-            int3 triangle = triangles[nearest];
-            float wb, wc;
-            int feature;
-            float3 closest = closestOnTriangle(p, vertices[triangle.x], vertices[triangle.y], vertices[triangle.z], wb, wc, &feature);
-            int3 across = normals.across[nearest];
-            float3 face = normals.faces[nearest];
-            float3 normal = feature == AT_A ? normals.vertices[triangle.x] : feature == AT_B ? normals.vertices[triangle.y] : feature == AT_C ? normals.vertices[triangle.z]
-                          : feature == ON_AB ? face + normals.faces[across.x] : feature == ON_BC ? face + normals.faces[across.y] : feature == ON_CA ? face + normals.faces[across.z] : face;
-            known = dot(p - closest, normal) < 0.0f ? -1 : 1;
-        }
-        side[threadIdx.x] = known;
-        bool unknown = __syncthreads_or(known == 0);
-        while(unknown){
-            signed char taken = 0;
-            if(side[threadIdx.x] == 0){
-                int at[3] = {sample.x, sample.y, sample.z};
-                for(int face = 0; face < 6 && taken == 0; ++face){
-                    int step = face % 2 ? 1 : -1;
-                    int moved = at[face/2] + step;
-                    if(moved >= 0 && moved < SDF_BRICK){
-                        taken = side[threadIdx.x + step*(face/2 == 0 ? 1 : face/2 == 1 ? SDF_BRICK : SDF_BRICK*SDF_BRICK)];
-                    }
-                }
-            }
-            bool changed = __syncthreads_or(taken != 0);
-            if(taken != 0){
-                side[threadIdx.x] = taken;
-            }
-            unknown = __syncthreads_or(side[threadIdx.x] == 0);
-            if(unknown && !changed){    //none within band: the brick is on one side
-                if(threadIdx.x < 32){
-                    float half = 0.5f*SDF_BRICK;
-                    float3 centre = origin + spacing*make_float3(brickCell.x*SDF_BRICK + half, brickCell.y*SDF_BRICK + half, brickCell.z*SDF_BRICK + half);
-                    bool inside = insideMeshByWarp(centre, columns, vertices, triangles, origin, spacing*SDF_BRICK, bricks, spacing);
-                    if(threadIdx.x == 0){
-                        brickInside = inside;
-                    }
-                }
-                __syncthreads();
-                side[threadIdx.x] = brickInside ? -1 : 1;
-                unknown = false;
+    if(signs){
+        static_assert(SDF_BRICK*SDF_BRICK*SDF_BRICK == 512 && 32 % SDF_BRICK == 0, "a row's lanes share a warp, and the block has a lane for each of a row's samples");
+        int axis = 0, fewest = 0;
+        for(int along = 0; along < 3; ++along){
+            int3 column = along == 0 ? make_int3(0, brickCell.y, brickCell.z) : along == 1 ? make_int3(brickCell.x, 0, brickCell.z) : make_int3(brickCell.x, brickCell.y, 0);
+            int2 run = columns.runs[along][column.x + bricks.x*(column.y + bricks.y*column.z)];
+            if(along == 0 || run.y - run.x < fewest){
+                fewest = run.y - run.x;
+                axis = along;
             }
         }
-        distance = fminf(fmaxf(side[threadIdx.x]*distance, -band), band);
+        int row = threadIdx.x / SDF_BRICK, lane = threadIdx.x % SDF_BRICK;
+        int across = row % SDF_BRICK, beyond = row / SDF_BRICK;     //the row's place along the next axis round and the one after
+        int3 at = axis == 0 ? make_int3(0, across, beyond) : axis == 1 ? make_int3(beyond, 0, across) : make_int3(across, beyond, 0);
+        int windings[SDF_BRICK];
+        windingRow(axis, at, brickCell, columns, vertices, triangles, origin, spacing, bricks, lane, SDF_BRICK, windings);
+        bool mine = false;
+        #pragma unroll
+        for(int j = 0; j < SDF_BRICK; ++j){
+            for(int offset = SDF_BRICK/2; offset > 0; offset /= 2){
+                windings[j] += __shfl_xor_sync(0xFFFFFFFFu, windings[j], offset);
+            }
+            mine = lane == j ? windings[j] != 0 : mine;
+        }
+        int stride = axis == 0 ? 1 : axis == 1 ? SDF_BRICK : SDF_BRICK*SDF_BRICK;
+        wraps[at.x + SDF_BRICK*(at.y + SDF_BRICK*at.z) + lane*stride] = mine;    //each lane the sample its own number along the row
+        __syncthreads();
+        bool inside = wraps[threadIdx.x];
+        distance = fminf(fmaxf(inside ? -distance : distance, -band), band);
     }
     pool[(size_t)blockIdx.x*samples + threadIdx.x] = distance;
     if(velocities != nullptr){
@@ -405,14 +438,14 @@ __global__ void signBrickSamples(const uint* activeBricks, const uint* numActive
 }
 
 //the bricks far from the surface: inside or out, by their centres, a warp per brick
-__global__ void signFarBricks(uint numBricks, ColumnBins columns, const float3* vertices, const int3* triangles, float3 origin, float spacing, int3 bricks, int* table){
+__global__ void signFarBricks(uint numBricks, ColumnBins columns, const float3* vertices, const int3* triangles, float3 origin, float spacing, int3 bricks, bool wound, int* table){
     uint brick = (threadIdx.x + blockIdx.x*blockDim.x) / 32;
     if(brick >= numBricks || table[brick] != SDF_OUTSIDE){     //the same for the whole warp
         return;
     }
     float half = 0.5f*SDF_BRICK;
     float3 p = origin + spacing*make_float3((brick % bricks.x)*SDF_BRICK + half, (brick / bricks.x % bricks.y)*SDF_BRICK + half, (brick / (bricks.x*bricks.y))*SDF_BRICK + half);
-    if(insideMeshByWarp(p, columns, vertices, triangles, origin, spacing*SDF_BRICK, bricks, spacing) && threadIdx.x % 32 == 0){
+    if(insideMeshByWarp(p, columns, vertices, triangles, origin, spacing*SDF_BRICK, bricks, spacing, wound) && threadIdx.x % 32 == 0){
         table[brick] = SDF_INSIDE;
     }
 }
@@ -564,7 +597,7 @@ struct MeshField{
     float3 origin;
     float spacing = 0.0f;
     float band = 0.0f;
-    float shell = 0.0f;                     //an open mesh's half thickness; 0: it's closed, and signed by ray parity
+    float shell = 0.0f;                     //an open mesh's half thickness; 0: it's closed, and signed by rays
     int3 bricks;
     uint numBricks = 0;
     int* table = nullptr;
@@ -579,13 +612,7 @@ struct MeshField{
     void* scanScratch = nullptr;
     size_t scanBytes = 0;
     TriangleBins bins[4];                   //into bricks; for a closed mesh's signs, also into columns of bricks along x, y and z
-    //a deforming closed mesh's pseudonormals, if it's a manifold whose triangles all wind the same way (see Pseudonormals); otherwise it's signed by rays
-    int3* across = nullptr;
-    uint* incidentStarts = nullptr;
-    uint* incident = nullptr;
-    float3* faceNormalBuffer = nullptr;
-    float3* vertexNormalBuffer = nullptr;
-    float orientation = 1.0f;               //-1: its triangles wind inwards
+    bool wound = false;                     //closed, and a manifold whose triangles all wind the same way: signed by winding numbers, otherwise by parity
     //deforming
     std::shared_ptr<const std::vector<float>> samples;
     std::vector<double> sampleTimes;
@@ -624,81 +651,37 @@ struct MeshField{
         return shell <= 0.0f;
     }
 
-    Pseudonormals pseudonormals() const{
-        return {faceNormalBuffer, vertexNormalBuffer, across};
-    }
-
-    //whether a closed mesh's triangles make a manifold that winds consistently, which pseudonormals sign: every edge in exactly two triangles, running
-    //along it in opposite directions in each. If so, puts them and each vertex's triangles on the GPU, and how they wind from the first sample's volume
-    bool findPseudonormals(const std::vector<float3>& first, const std::vector<int3>& meshTriangles, cudaStream_t stream){
-        std::vector<int3> neighbours(numTriangles, make_int3(-1, -1, -1));
-        std::unordered_map<unsigned long long, int> open;      //per edge seen once, its triangle*3 + edge
-        open.reserve(2*(size_t)numTriangles);
-        auto corner = [&](uint triangle, int which){
-            const int3& t = meshTriangles[triangle];
-            return which == 0 ? t.x : which == 1 ? t.y : t.z;
-        };
-        auto setAcross = [&](uint triangle, int edge, int other){
-            int3& n = neighbours[triangle];
-            (edge == 0 ? n.x : edge == 1 ? n.y : n.z) = other;
-        };
-        for(uint triangle = 0; triangle < numTriangles; ++triangle){
+    //whether a closed mesh's triangles make a manifold that winds consistently, which its winding numbers need: every edge in exactly two triangles,
+    //running along it in opposite directions in each. Which way they wind doesn't matter: wrapped either way round is inside
+    static bool windsConsistently(const std::vector<int3>& meshTriangles){
+        std::unordered_map<unsigned long long, int> open;      //per edge seen once, which way it ran: 1 from its lower vertex, -1 from its higher; 0 seen twice
+        open.reserve(2*meshTriangles.size());
+        for(const int3& t : meshTriangles){
+            int corners[3] = {t.x, t.y, t.z};
             for(int edge = 0; edge < 3; ++edge){
-                int from = corner(triangle, edge), to = corner(triangle, (edge + 1) % 3);
+                int from = corners[edge], to = corners[(edge + 1) % 3];
                 if(from == to){
                     return false;
                 }
                 unsigned long long key = (unsigned long long)std::min(from, to) << 32 | (unsigned)std::max(from, to);
+                int way = from < to ? 1 : -1;
                 auto found = open.find(key);
                 if(found == open.end()){
-                    open.emplace(key, (int)(3*triangle + edge));
-                    continue;
+                    open.emplace(key, way);
                 }
-                int other = found->second;
-                if(other < 0 || corner(other/3, other % 3) != to || corner(other/3, (other % 3 + 1) % 3) != from){
+                else if(found->second != -way){
                     return false;   //a third triangle on the edge, or two running along it the same way
                 }
-                setAcross(triangle, edge, other/3);
-                setAcross(other/3, other % 3, (int)triangle);
-                found->second = -1;
+                else{
+                    found->second = 0;
+                }
             }
         }
         for(const auto& edge : open){
-            if(edge.second >= 0){
+            if(edge.second != 0){
                 return false;       //an edge with one triangle: the mesh has a hole
             }
         }
-        double volume = 0.0;
-        for(const int3& t : meshTriangles){
-            float3 a = first[t.x], b = first[t.y], c = first[t.z];
-            volume += (double)a.x*((double)b.y*c.z - (double)b.z*c.y) + (double)a.y*((double)b.z*c.x - (double)b.x*c.z) + (double)a.z*((double)b.x*c.y - (double)b.y*c.x);
-        }
-        orientation = volume < 0.0 ? -1.0f : 1.0f;
-        std::vector<uint> starts(numVertices + 1, 0);
-        for(const int3& t : meshTriangles){
-            ++starts[t.x + 1];
-            ++starts[t.y + 1];
-            ++starts[t.z + 1];
-        }
-        for(uint vertex = 0; vertex < numVertices; ++vertex){
-            starts[vertex + 1] += starts[vertex];
-        }
-        std::vector<uint> list(3*(size_t)numTriangles);
-        std::vector<uint> filled(starts.begin(), starts.end() - 1);
-        for(uint triangle = 0; triangle < numTriangles; ++triangle){
-            for(int which = 0; which < 3; ++which){
-                list[filled[corner(triangle, which)]++] = 3*triangle + which;
-            }
-        }
-        gpuErrchk(cudaMallocAsync((void**)&across, sizeof(int3)*numTriangles, stream));
-        gpuErrchk(cudaMallocAsync((void**)&incidentStarts, sizeof(uint)*(numVertices + 1), stream));
-        gpuErrchk(cudaMallocAsync((void**)&incident, sizeof(uint)*list.size(), stream));
-        gpuErrchk(cudaMallocAsync((void**)&faceNormalBuffer, sizeof(float3)*numTriangles, stream));
-        gpuErrchk(cudaMallocAsync((void**)&vertexNormalBuffer, sizeof(float3)*numVertices, stream));
-        gpuErrchk(cudaMemcpyAsync(across, neighbours.data(), sizeof(int3)*numTriangles, cudaMemcpyHostToDevice, stream));
-        gpuErrchk(cudaMemcpyAsync(incidentStarts, starts.data(), sizeof(uint)*(numVertices + 1), cudaMemcpyHostToDevice, stream));
-        gpuErrchk(cudaMemcpyAsync(incident, list.data(), sizeof(uint)*list.size(), cudaMemcpyHostToDevice, stream));
-        gpuErrchk(cudaStreamSynchronize(stream));      //before the vectors go
         return true;
     }
 
@@ -740,15 +723,13 @@ struct MeshField{
             freeBins(binning);
         }
         for(void* buffer : {(void*)triangles, (void*)vertices, (void*)vertexVelocities, (void*)flags, (void*)slots, (void*)activeBricks, (void*)numActive, scanScratch,
-                            (void*)fromSample, (void*)toSample, (void*)across, (void*)incidentStarts, (void*)incident, (void*)faceNormalBuffer, (void*)vertexNormalBuffer}){
+                            (void*)fromSample, (void*)toSample}){
             if(buffer != nullptr){
                 cudaFree(buffer);
             }
         }
         triangles = nullptr;
-        across = nullptr;
-        incidentStarts = incident = nullptr;
-        vertices = vertexVelocities = fromSample = toSample = faceNormalBuffer = vertexNormalBuffer = nullptr;
+        vertices = vertexVelocities = fromSample = toSample = nullptr;
         flags = slots = activeBricks = numActive = nullptr;
         scanScratch = nullptr;
         if(staging != nullptr){
@@ -847,14 +828,10 @@ struct MeshField{
         cub::DeviceScan::ExclusiveSum(nullptr, scanBytes, flags, slots, (int)numBricks, stream);
         gpuErrchk(cudaMallocAsync(&scanScratch, scanBytes, stream));
         gpuErrchk(cudaMallocHost((void**)&usedSeen, sizeof(uint)));
-        if(deforms() && closed()){
-            std::vector<float3> first(numVertices);
-            for(uint vertex = 0; vertex < numVertices; ++vertex){
-                first[vertex] = make_float3((*samples)[3*vertex], (*samples)[3*vertex + 1], (*samples)[3*vertex + 2]);
-            }
-            if(!findPseudonormals(first, meshTriangles, stream)){
-                std::cerr<<"A deforming obstacle isn't a closed manifold whose triangles all wind the same way, so it's signed by casting rays, which is much slower\n";
-            }
+        wound = closed() && windsConsistently(meshTriangles);
+        if(closed() && !wound){
+            std::cerr<<"A mesh isn't a closed manifold whose triangles all wind the same way, so it's signed by the parity of rays through it: where it overlaps "
+                       "itself reads as outside"<<(deforms() ? ", and rebuilding it is much slower" : "")<<"\n";
         }
     }
 
@@ -878,10 +855,6 @@ struct MeshField{
         float brickSize = spacing*SDF_BRICK;
         for(int which = 0; which < (closed() ? 4 : 1); ++which){
             sortIntoBins(bins[which], numTriangles, vertices, triangles, origin, brickSize, bricks, stream);
-        }
-        if(faceNormalBuffer != nullptr){
-            faceNormals<<<numTriangles / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numTriangles, vertices, triangles, orientation, faceNormalBuffer);
-            vertexNormals<<<numVertices / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numVertices, vertices, triangles, incidentStarts, incident, faceNormalBuffer, vertexNormalBuffer);
         }
         flagBricksInUse<<<numBricks / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numBricks, bins[0].runs, flags);
         size_t bytes = scanBytes;
@@ -913,12 +886,12 @@ struct MeshField{
             }
         }
         brickDistances<<<poolBricks, SDF_BRICK*SDF_BRICK*SDF_BRICK, 0, stream>>>(activeBricks, numActive, bins[0].runs, bins[0].triangleOfPair, vertices, triangles, vertexVelocities,
-            origin, spacing, bricks, pool, velocities, pseudonormals(), band, columns);
-        if(faceNormalBuffer == nullptr){
+            origin, spacing, bricks, pool, velocities, wound, band, columns);
+        if(!wound){
             signBrickSamples<<<poolBricks, SDF_BRICK*SDF_BRICK*SDF_BRICK, 0, stream>>>(activeBricks, numActive, columns, vertices, triangles, origin, spacing, bricks, band, shell, pool);
         }
         if(closed()){
-            signFarBricks<<<numBricks / 4 + 1, 128, 0, stream>>>(numBricks, columns, vertices, triangles, origin, spacing, bricks, table);
+            signFarBricks<<<numBricks / 4 + 1, 128, 0, stream>>>(numBricks, columns, vertices, triangles, origin, spacing, bricks, wound, table);
         }
         if(deforms()){
             gpuErrchk(cudaMemcpyAsync(usedSeen, numActive, sizeof(uint), cudaMemcpyDeviceToHost, stream));
@@ -1856,13 +1829,14 @@ void Particles::addObstacleFlux(){
 //- a face between fluid and obstacle: the obstacle's velocity across it, the flow the pressure solve gave it (addObstacleFlux)
 //- a face inside the obstacle: the fluid's velocity along the surface from the faces of the same component next to it, blended towards the obstacle's
 //  by its friction; across the surface, the obstacle's. Layer 1 fills the faces next to fluid faces, layer 2 the faces next to those
-__global__ void obstacleGhostFaces(int layer, Obstacles obstacles, VoxelPlaces places, const uint* nodes, uint numOwnNodes, const uint* voxelOwners, const char* solid, const char* near, float* ux,
-                                   float* uy, float* uz){
-    extern __shared__ float blockVelocities[];  //per component, a value per slot; then per slot, whether it's stored and whether it's solid
+__global__ void obstacleGhostFaces(int layer, Obstacles obstacles, VoxelPlaces places, const uint* nodes, uint numOwnNodes, const uint* voxelOwners, const char* solid, const char* near,
+                                   const float* beforeX, const float* beforeY, const float* beforeZ, float* ux, float* uy, float* uz){
+    extern __shared__ float blockVelocities[];  //per component, a value per slot; then per slot, whether it's stored, whether it's solid, its near bits
     int voxels1D = places.interiorWidth + 2*places.apronCells;
     int voxels3D = voxels1D*voxels1D*voxels1D;
     char* stored = (char*)(blockVelocities + 3*voxels3D);
     char* inside = stored + voxels3D;
+    char* bits = inside + voxels3D;
     for(uint listed = blockIdx.x; listed < nodes[0]; listed += gridDim.x){    //the nodes near obstacles (findSolidVoxels), a block each in turn
         uint node = nodes[1 + listed];
         if(node >= numOwnNodes){    //another partition's, which it fills itself
@@ -1875,16 +1849,19 @@ __global__ void obstacleGhostFaces(int layer, Obstacles obstacles, VoxelPlaces p
         for(int slot = threadIdx.x; slot < voxels3D; slot += blockDim.x){
             stored[slot] = 0;
             inside[slot] = 0;
+            bits[slot] = 0;
         }
         __syncthreads();
+        const float* before[3] = {beforeX, beforeY, beforeZ};
         for(uint index = first + threadIdx.x; index < last; index += blockDim.x){
             int slot = places.voxelSlots[index];
             uint owner = voxelOwners[index];
             for(int dim = 0; dim < 3; ++dim){
-                blockVelocities[dim*voxels3D + slot] = velocities[dim][owner];
+                blockVelocities[dim*voxels3D + slot] = before[dim][owner];
             }
             stored[slot] = 1;
             inside[slot] = solid[owner];
+            bits[slot] = near[owner];
         }
         __syncthreads();
         for(int slot = threadIdx.x; slot < voxels3D; slot += blockDim.x){
@@ -1905,10 +1882,11 @@ __global__ void obstacleGhostFaces(int layer, Obstacles obstacles, VoxelPlaces p
             int moved = along(slot, axis) + by;
             return moved >= 0 && moved < voxels1D ? slot + by*strides[axis] : -1;
         };
-        //a dim face is a fluid face if it's stored and neither voxel either side of it is in an obstacle; an inside face if both are
+        //a dim face is a fluid face if it's stored, neither voxel either side of it is in an obstacle, and obstacles don't close it (a wall thinner than a
+        //voxel, whose velocity this pass writes, so another block may be writing it as this one reads); an inside face if both voxels are in obstacles
         auto fluidFace = [&](int slot, int dim){
             int below = step(slot, dim, -1);
-            return below >= 0 && stored[slot] && !inside[slot] && !inside[below];
+            return below >= 0 && stored[slot] && !inside[slot] && !inside[below] && !(bits[slot] & CLOSED_FACE << 2*dim);
         };
         auto insideFace = [&](int slot, int dim){
             int below = step(slot, dim, -1);
@@ -1995,17 +1973,100 @@ __global__ void obstacleGhostFaces(int layer, Obstacles obstacles, VoxelPlaces p
     }
 }
 
-void Particles::obstacleGhostVelocities(){
+//What crosses a face an obstacle cuts is the fluid's velocity over its open part w and the obstacle's over the rest: w u + (1 - w) u_obstacle, as the
+//divergence counts it (obstacleFaceFlux). That's what G2P and advection take there, FLIP's old velocity before the solve and the new one after it, rather
+//than the open part's alone: the solve holds only w u, and where a surface closes in on fluid, u at a face open a sliver runs to many times the obstacle's
+//speed (water a foot squeezes against the floor leaves through a corner of a face at tens of metres a second), which particles would carry off. Mixed, it
+//goes smoothly to the obstacle's velocity as w goes to 0, where the face closes and the ghost velocities give it just that. A face is the lower face of
+//the voxel above it, a block per node of this partition's own; the ghost pass after it rewrites the faces it owns (closed ones, ones into solids), and the
+//domain's walls stay walls
+__global__ void mixCutFaces(Obstacles obstacles, VoxelPlaces places, const uint* nodes, uint numOwnNodes, const char* near, const uint* opens, float* ux, float* uy,
+                            float* uz){
+    int voxels1D = places.interiorWidth + 2*places.apronCells;
+    float* velocities[3] = {ux, uy, uz};
+    for(uint listed = blockIdx.x; listed < nodes[0]; listed += gridDim.x){    //the nodes near obstacles (findSolidVoxels), a block each in turn
+        uint node = nodes[1 + listed];
+        if(node >= numOwnNodes){    //another partition's, which it mixes itself
+            continue;
+        }
+        uint first = node == 0 ? 0 : places.nodeVoxelEnds[node - 1];
+        uint last = places.nodeVoxelEnds[node];
+        uint cell = places.nodeCells[node];
+        for(uint index = first + threadIdx.x; index < last; index += blockDim.x){
+            if(!(near[index] & NEAR_SURFACE)){
+                continue;
+            }
+            int slot = places.voxelSlots[index];
+            int x = slot % voxels1D, y = slot / voxels1D % voxels1D, z = slot / (voxels1D*voxels1D);
+            if(x < places.apronCells || y < places.apronCells || z < places.apronCells || x >= voxels1D - places.apronCells || y >= voxels1D - places.apronCells ||
+               z >= voxels1D - places.apronCells){
+                continue;   //only the node's own voxels: their neighbours own the apron's
+            }
+            int3 voxel = places.voxelOf(cell, slot);
+            CutFaces cut = cachedCut(opens, index);
+            float3 points[3];
+            int nearest[3];
+            bool mixes[3];
+            for(int dim = 0; dim < 3; ++dim){
+                int3 below = make_int3(voxel.x - (dim == 0), voxel.y - (dim == 1), voxel.z - (dim == 2));
+                float open = cut.open[2*dim];
+                mixes[dim] = open > 0.0f && open < 1.0f && places.inDomain(below) && !(near[index] & CLOSED_FACE << 2*dim);
+                float offset[3] = {0.5f, 0.5f, 0.5f};
+                offset[dim] = 0.0f;
+                points[dim] = places.point(voxel, offset[0], offset[1], offset[2]);
+            }
+            for(int dim = 0; dim < 3; ++dim){   //looked up together, so their latencies overlap
+                float distance;
+                float3 normal;
+                nearest[dim] = mixes[dim] ? nearestObstacle(obstacles, points[dim], distance, normal) : -1;
+            }
+            for(int dim = 0; dim < 3; ++dim){
+                if(nearest[dim] < 0){
+                    continue;
+                }
+                float open = cut.open[2*dim];
+                float solid = component(obstacleVelocity(obstacles.items[nearest[dim]], points[dim]), dim);
+                velocities[dim][index] = open*velocities[dim][index] + (1.0f - open)*solid;
+            }
+        }
+    }
+}
+
+void Particles::mixObstacleFaces(CudaVec<float>& ux, CudaVec<float>& uy, CudaVec<float>& uz){
+    if(obstacles.count() == 0 || numOwnNodes == 0){
+        return;
+    }
+    mixCutFaces<<<obstacleBlocks(), OBSTACLE_THREADS, 0, stream>>>(obstacles.state(), voxelPlaces(), obstacleNodes.devPtr(), numOwnNodes, obstacleNear.devPtr(),
+        obstacleOpen.devPtr(), ux.devPtr(), uy.devPtr(), uz.devPtr());
+    gpuErrchk(cudaPeekAtLastError());
+    for(CudaVec<float>* velocity : {&ux, &uy, &uz}){   //the ghost pass next reads the ghosts' faces, as their owners mixed them
+        context->fillGhosts(velocity->devPtr(), stream);
+    }
+}
+
+void Particles::obstacleGhostVelocities(CudaVec<float>& ux, CudaVec<float>& uy, CudaVec<float>& uz){
     if(obstacles.count() == 0 || numOwnNodes == 0){
         return;
     }
     int voxels1D = numVoxels1D;
-    size_t shared = (3*sizeof(float) + 2)*voxels1D*voxels1D*voxels1D;
+    size_t shared = (3*sizeof(float) + 3)*voxels1D*voxels1D*voxels1D;
+    //Each layer reads the faces as they were before it and writes the faces it sets. Nodes store their own sparse voxels, so where one node's block lacks a
+    //voxel another stores, the two can see a face differently (inside by its centre, or fluid by its solid flag): one block would read as fluid a face
+    //another is setting, and get either value, by timing
+    for(CudaVec<float>& before : ghostBefore){
+        if(before.size() < ux.size()){
+            before.resizeAsync(ux.size(), stream);
+        }
+    }
     for(int layer = 1; layer <= 2; ++layer){
+        CudaVec<float>* velocity[3] = {&ux, &uy, &uz};
+        for(int dim = 0; dim < 3; ++dim){
+            gpuErrchk(cudaMemcpyAsync(ghostBefore[dim].devPtr(), velocity[dim]->devPtr(), sizeof(float)*ux.size(), cudaMemcpyDeviceToDevice, stream));
+        }
         obstacleGhostFaces<<<obstacleBlocks(), OBSTACLE_THREADS, shared, stream>>>(layer, obstacles.state(), voxelPlaces(), obstacleNodes.devPtr(), numOwnNodes, voxelOwners.devPtr(), obstacleSolids.devPtr(), obstacleNear.devPtr(),
-            voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr());
+            ghostBefore[0].devPtr(), ghostBefore[1].devPtr(), ghostBefore[2].devPtr(), ux.devPtr(), uy.devPtr(), uz.devPtr());
         gpuErrchk(cudaPeekAtLastError());
-        for(CudaVec<float>* velocity : {&voxelsUx, &voxelsUy, &voxelsUz}){   //the next layer, and the ghosts, read what this one wrote
+        for(CudaVec<float>* velocity : {&ux, &uy, &uz}){   //the next layer, and the ghosts, read what this one wrote
             context->fillGhosts(velocity->devPtr(), stream);
         }
     }
