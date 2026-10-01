@@ -235,6 +235,22 @@ public:
         simulation.writeDiagnostics(path, frame);
     }
 
+    void startCache(const std::string& directory, const CacheDescription& description, std::function<void(int)> committed){
+        simulation.startCache(directory, description, std::move(committed));
+    }
+
+    void writeCacheFrame(int frame){
+        simulation.writeCacheFrame(frame);
+    }
+
+    std::string cacheError(){
+        return simulation.cacheError();
+    }
+
+    std::string finishCache(){
+        return simulation.finishCache();
+    }
+
 private:
     Simulation simulation;
     Particles& particles;   //the first partition, which the checks look at

@@ -39,10 +39,34 @@ add_library(particles SHARED
     forces.cu
     sources.cu
     obstacles.cu
+    cacheWriter.cu
 )
 
 target_link_libraries(particles ${cudaLibraries}  parallelPrefixSumKernels radixSortKernels reductionKernels particleToGridFunctions perVoxelParticleListFunctions voxelSolveFunctions conjugateGradientFunctions multigridFunctions Threads::Threads)
 set_target_properties(particles PROPERTIES CUDA_ARCHITECTURES "86")
+
+# blosc compresses the cache's shards (cacheWriter.cu). Optional: without it they're written raw
+find_path(BLOSC_INCLUDE_DIR blosc.h)
+find_library(BLOSC_LIBRARY blosc)
+if(BLOSC_INCLUDE_DIR AND BLOSC_LIBRARY)
+    message(STATUS "blosc: ${BLOSC_LIBRARY}")
+    target_include_directories(particles PRIVATE ${BLOSC_INCLUDE_DIR})
+    target_link_libraries(particles ${BLOSC_LIBRARY})
+    target_compile_definitions(particles PRIVATE FLIP2_WITH_BLOSC)
+else()
+    message(STATUS "blosc not found (install libblosc-dev): the cache's shards are written uncompressed")
+endif()
+
+# what cache.json names the build: FLIP2_BUILD_ID if it's given, or git describe of the source tree when configured, or "unknown"
+set(FLIP2_BUILD_ID "" CACHE STRING "the build's name in the caches it writes")
+set(buildId "${FLIP2_BUILD_ID}")
+if(NOT buildId)
+    execute_process(COMMAND git describe --always --dirty WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} OUTPUT_VARIABLE buildId OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+endif()
+if(NOT buildId)
+    set(buildId "unknown")
+endif()
+target_compile_definitions(particles PRIVATE FLIP2_BUILD_ID="${buildId}")
 
 # NCCL joins ranks in separate processes, one GPU each (FLIP2_TRANSPORT=nccl). Optional: found through NCCL_HOME (a CMake or environment variable: an
 # NCCL install, build directory or pip's nvidia/nccl) or the system's paths; without it, flip2 builds as before and ranks join over TCP

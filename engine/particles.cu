@@ -1494,13 +1494,18 @@ __global__ void packPositionsToFloats(uint numParticles, const double* px, const
     }
 }
 
-//A frame's float32 x, y, z per particle, packed into framePositions on this partition's stream once the last frame's copy out of it is done
-const float* Particles::packPositions(){
+void Particles::makeFrameStream(){
     if(frameStream == nullptr){     //on this partition's GPU, which the caller has made current
         gpuErrchk(cudaStreamCreateWithFlags(&frameStream, cudaStreamNonBlocking));
         gpuErrchk(cudaEventCreateWithFlags(&framePacked, cudaEventDisableTiming));
         gpuErrchk(cudaEventCreateWithFlags(&frameCopied, cudaEventDisableTiming));
+        gpuErrchk(cudaEventCreateWithFlags(&columnsCopied, cudaEventDisableTiming));
     }
+}
+
+//A frame's float32 x, y, z per particle, packed into framePositions on this partition's stream once the last frame's copy out of it is done
+const float* Particles::packPositions(){
+    makeFrameStream();
     gpuErrchk(cudaStreamWaitEvent(stream, frameCopied, 0));    //never recorded yet: no wait
     if(size > 0){
         framePositions.resizeAsync(3*size, stream);
@@ -1523,12 +1528,45 @@ void Particles::copyPositionsToHost(float* xyz, cudaEvent_t copied){
     gpuErrchk(cudaEventRecord(copied, frameStream));
 }
 
+__global__ void packFrameColumns(uint numParticles, const double* px, const double* py, const double* pz, const float* vx, const float* vy, const float* vz, float* planes){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(index < numParticles){
+        size_t n = numParticles;
+        planes[index] = px[index];
+        planes[n + index] = py[index];
+        planes[2*n + index] = pz[index];
+        planes[3*n + index] = vx[index];
+        planes[4*n + index] = vy[index];
+        planes[5*n + index] = vz[index];
+    }
+}
+
+//this partition's part of a cache frame, into pinned host memory: packed on its stream (once the last frame's copy out of frameColumns is done), then
+//copied out on frameStream, so the simulation's next kernels run alongside the copy; copied is recorded once it's in
+void Particles::copyFrameColumnsToHost(float* planes, cudaEvent_t copied){
+    makeFrameStream();
+    gpuErrchk(cudaStreamWaitEvent(stream, columnsCopied, 0));
+    if(size > 0){
+        frameColumns.resizeAsync(6*size, stream);
+        packFrameColumns<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(), frameColumns.devPtr());
+        gpuErrchk(cudaPeekAtLastError());
+    }
+    gpuErrchk(cudaEventRecord(framePacked, stream));
+    gpuErrchk(cudaStreamWaitEvent(frameStream, framePacked, 0));
+    if(size > 0){
+        gpuErrchk(cudaMemcpyAsync(planes, frameColumns.devPtr(), sizeof(float)*6*(size_t)size, cudaMemcpyDeviceToHost, frameStream));
+    }
+    gpuErrchk(cudaEventRecord(columnsCopied, frameStream));
+    gpuErrchk(cudaEventRecord(copied, frameStream));
+}
+
 Particles::~Particles(){     //with its GPU the current one
     if(frameStream != nullptr){
         cudaStreamSynchronize(frameStream);
         cudaStreamDestroy(frameStream);
         cudaEventDestroy(framePacked);
         cudaEventDestroy(frameCopied);
+        cudaEventDestroy(columnsCopied);
     }
     gpuErrchk( cudaStreamDestroy(stream) );
 }

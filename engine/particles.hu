@@ -60,6 +60,9 @@ public:
 
     const float* packPositions();   //float32 x, y, z per particle, for a frame, on this partition's GPU; valid for the work queued on its stream after this
     void copyPositionsToHost(float* xyz, cudaEvent_t copied);   //the same, into pinned xyz, recording copied once it's there
+    //a frame for the cache (cacheWriter.hu), into pinned planes: float32 P x, y, z, then v x, y, z, each a plane of every particle's value, recording
+    //copied once they're there
+    void copyFrameColumnsToHost(float* planes, cudaEvent_t copied);
 
     uint numParticles() const{
         return size;
@@ -295,9 +298,12 @@ private:
     std::vector<cudaDeviceProp> deviceProp;
 
     CudaVec<float> framePositions;          //a frame's x, y, z, packed for the copy to the host
+    CudaVec<float> frameColumns;            //a frame's P and v planes, packed for the cache's copy to the host
     cudaStream_t frameStream = nullptr;     //copies frames to the host alongside the simulation
     cudaEvent_t framePacked = nullptr;
     cudaEvent_t frameCopied = nullptr;      //framePositions has been copied out, so it can take the next frame
+    cudaEvent_t columnsCopied = nullptr;    //and frameColumns
+    void makeFrameStream();
     std::vector<uint> selectedDevices;
 
     //the partition: this is rank of numRanks, owning node planes [boxLo, boxHi). Partitions exchange through the transport, and the solver's exchanges go

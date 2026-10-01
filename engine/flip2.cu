@@ -2,14 +2,19 @@
 
 //flip2's command line:
 //
-//  flip2 bake scene.json [--frames N] [--out DIR]
+//  flip2 bake scene.json [--frames N] [--out DIR] [--overwrite]
+//  flip2 verify DIR
 //
-//runs the scene (see scene.hpp) and writes its frames into the output directory: N.bin, float32 x, y, z per particle, and the diagnostics file if the
-//scene asks for one. Standard output carries only events, one JSON object per line, for a DCC or a farm to follow:
+//bake runs the scene (see scene.hpp) and writes into the output directory its cache (cacheWriter.hu: cache.json and frames/NNNN/, which a DCC can read
+//while the bake runs), and if the scene asks, N.bin (float32 x, y, z per particle) and the diagnostics file. It won't bake over a cache already there
+//unless told to with --overwrite, which deletes it first. verify checks every committed frame of the cache in DIR: each shard there, whole, with the size
+//and XXH64 its commit record gives. Standard output carries only events, one JSON object per line, for a DCC or a farm to follow:
 //
 //  {"event":"start","particles":1240000,"frames":120,"nodes":[32,32,32],"voxelSize":0.0078125,"ranks":1}
-//  {"event":"frame","frame":1,"seconds":0.041}
-//  {"event":"done","frames":120,"seconds":5.2}
+//  {"event":"frame","frame":1,"seconds":0.041}                 a frame simulated
+//  {"event":"committed","frame":1}                             and its cache frame on the disk, whole; from the cache's thread, so it can come later
+//  {"event":"done","frames":120,"seconds":5.2}                 every frame committed
+//  {"event":"verified","frames":121,"unfinished":0,"shards":121,"particles":150040000,"bytes":1712345678,"problems":0}
 //  {"event":"error","message":"scene.json: domain: needs a positive \"voxelSize\""}
 //
 //Everything else the engine says goes to standard error. As with main, FLIP2_PARTITIONS splits the domain between partitions in this process, and
@@ -17,6 +22,8 @@
 
 #include "testing.h"
 #include "scene.hpp"
+#include "json.hpp"
+#include "xxhash64.hpp"
 #include "tcpTransport.hu"
 #ifdef FLIP2_WITH_NCCL
 #include "ncclTransport.hu"
@@ -26,14 +33,20 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <memory>
+#include <mutex>
+#include <sstream>
 #include <string>
 
 static bool printsEvents = true;    //only rank 0 does, across processes
+static std::mutex eventLock;        //the cache's thread says when frames are committed
 
 static void event(const std::string& json){
     if(printsEvents){
+        std::lock_guard<std::mutex> lock(eventLock);
         std::fputs((json + "\n").c_str(), stdout);
         std::fflush(stdout);
     }
@@ -65,8 +78,134 @@ static int failure(const std::string& message){
 }
 
 static int usage(){
-    std::cerr<<"usage: flip2 bake scene.json [--frames N] [--out DIR]\n";
+    std::cerr<<"usage: flip2 bake scene.json [--frames N] [--out DIR] [--overwrite]\n"
+               "       flip2 verify DIR\n";
     return 2;
+}
+
+static bool readFile(const std::string& path, std::string& contents){
+    std::ifstream file(path, std::ios::binary);
+    if(!file){
+        return false;
+    }
+    std::stringstream text;
+    text<<file.rdbuf();
+    contents = text.str();
+    return true;
+}
+
+static std::string hex(uint64_t value){
+    char text[17];
+    std::snprintf(text, sizeof(text), "%016llx", (unsigned long long)value);
+    return text;
+}
+
+//flip2 verify: every committed frame's shards, each the size its record gives, hashing to its XXH64, with a shard's header and the right particle count
+static int verify(const std::string& directory){
+    std::string text;
+    if(!readFile(directory + "/cache.json", text)){
+        return failure(directory + ": no cache.json, so no cache here");
+    }
+    int committed = -1;
+    try{
+        Json cache = JsonReader(text, directory + "/cache.json").document();
+        if(const Json* last = cache.find("committed")){
+            committed = (int)last->number;
+        }
+    }
+    catch(const std::exception& error){
+        return failure(error.what());
+    }
+    std::vector<std::filesystem::path> frames;
+    std::error_code listed;
+    for(const auto& entry : std::filesystem::directory_iterator(directory + "/frames", listed)){
+        if(entry.is_directory()){
+            frames.push_back(entry.path());
+        }
+    }
+    std::sort(frames.begin(), frames.end());
+    size_t done = 0, unfinished = 0, shards = 0, problems = 0;
+    unsigned long long particles = 0, bytes = 0;
+    auto problem = [&](const std::string& what){
+        if(problems++ < 20){
+            event("{\"event\":\"error\",\"message\":" + quoted(what) + "}");
+        }
+        std::cerr<<what<<"\n";
+    };
+    std::vector<char> chunk(4 << 20);
+    for(const auto& frame : frames){
+        std::string record;
+        if(!readFile((frame / "commit.json").string(), record)){
+            ++unfinished;
+            continue;
+        }
+        ++done;
+        try{
+            Json commit = JsonReader(record, (frame / "commit.json").string()).document();
+            const Json* list = commit.find("shards");
+            if(list == nullptr){
+                problem((frame / "commit.json").string() + ": no shards");
+                continue;
+            }
+            for(const Json& shard : list->items){
+                const Json* file = shard.find("file");
+                const Json* size = shard.find("bytes");
+                const Json* hash = shard.find("xxh64");
+                const Json* count = shard.find("particles");
+                if(file == nullptr || size == nullptr || hash == nullptr || count == nullptr){
+                    problem((frame / "commit.json").string() + ": a shard without its file, bytes, particles and xxh64");
+                    continue;
+                }
+                ++shards;
+                std::string path = (frame / file->text).string();
+                std::ifstream in(path, std::ios::binary);
+                if(!in){
+                    problem(path + ": missing");
+                    continue;
+                }
+                Xxh64 digest;
+                unsigned long long length = 0;
+                char header[24] = {};
+                while(in){
+                    in.read(chunk.data(), chunk.size());
+                    size_t got = (size_t)in.gcount();
+                    if(length < sizeof(header)){
+                        std::memcpy(header + length, chunk.data(), std::min(got, (size_t)(sizeof(header) - length)));
+                    }
+                    digest.update(chunk.data(), got);
+                    length += got;
+                }
+                unsigned long long headerCount;
+                std::memcpy(&headerCount, header + 16, 8);
+                if(length != (unsigned long long)size->number){
+                    problem(path + ": " + std::to_string(length) + " bytes, but its commit record says " + std::to_string((unsigned long long)size->number));
+                }
+                else if(hex(digest.digest()) != hash->text){
+                    problem(path + ": its XXH64 is " + hex(digest.digest()) + ", but its commit record says " + hash->text);
+                }
+                else if(std::memcmp(header, "FLIP2SHD", 8) != 0 || headerCount != (unsigned long long)count->number){
+                    problem(path + ": not a shard of " + std::to_string((unsigned long long)count->number) + " particles");
+                }
+                particles += (unsigned long long)count->number;
+                bytes += length;
+            }
+        }
+        catch(const std::exception& error){
+            problem(error.what());
+        }
+    }
+    for(int frame = 0; frame <= committed; ++frame){     //cache.json's committed frame and every one before it
+        char name[16];
+        std::snprintf(name, sizeof(name), "%04d", frame);
+        if(!std::filesystem::exists(directory + "/frames/" + name + "/commit.json")){
+            problem(directory + "/frames/" + name + ": cache.json says it's committed, but it has no commit record");
+        }
+    }
+    char line[512];
+    std::snprintf(line, sizeof(line), "{\"event\":\"verified\",\"frames\":%zu,\"unfinished\":%zu,\"shards\":%zu,\"particles\":%llu,\"bytes\":%llu,\"problems\":%zu}",
+                  done, unfinished, shards, particles, bytes, problems);
+    event(line);
+    return problems > 0 ? 1 : 0;
 }
 
 //a mesh adds its description to meshes, which the shape names by its place there
@@ -106,12 +245,16 @@ static ForceField toForceField(const SceneForce& force){
 
 int main(int argc, char** argv){
     std::cout.rdbuf(std::cerr.rdbuf());     //the engine's own messages go to standard error, so standard output carries only the events
+    if(argc == 3 && std::string(argv[1]) == "verify"){
+        return verify(argv[2]);
+    }
     if(argc < 3 || std::string(argv[1]) != "bake"){
         return usage();
     }
     std::string scenePath = argv[2];
     int frames = -1;
     std::string outputDirectory;
+    bool overwrite = false;
     for(int arg = 3; arg < argc; ++arg){
         std::string option = argv[arg];
         if(option == "--frames" && arg + 1 < argc){
@@ -119,6 +262,9 @@ int main(int argc, char** argv){
         }
         else if(option == "--out" && arg + 1 < argc){
             outputDirectory = argv[++arg];
+        }
+        else if(option == "--overwrite"){
+            overwrite = true;
         }
         else{
             return usage();
@@ -157,9 +303,29 @@ int main(int argc, char** argv){
     //the ranks, as main sets them up: this process is one rank of FLIP2_WORLD_SIZE, or every partition is here
     int worldSize = std::getenv("FLIP2_WORLD_SIZE") ? std::atoi(std::getenv("FLIP2_WORLD_SIZE")) : 1;
     std::string transport = std::getenv("FLIP2_TRANSPORT") ? std::getenv("FLIP2_TRANSPORT") : "";
+    bool alone = worldSize <= 1 && transport.empty();
+    bool rankZero = alone || (std::getenv("FLIP2_RANK") && std::atoi(std::getenv("FLIP2_RANK")) == 0);
+    std::string sceneText;
+    if(scene.writeCache && !readFile(scenePath, sceneText)){
+        return failure(scenePath + ": can't read it again to hash it for the cache");
+    }
+    //a cache already here is only replaced when asked; rank 0 deletes it before it joins the others, who wait for it to before they write anything
+    if(scene.writeCache && rankZero && std::filesystem::exists(scene.outputDirectory + "/cache.json")){
+        if(!overwrite){
+            return failure(scene.outputDirectory + " holds a cache already: bake with --overwrite to replace it, or give another --out");
+        }
+        std::error_code removed;
+        std::filesystem::remove_all(scene.outputDirectory + "/frames", removed);
+        if(!removed){
+            std::filesystem::remove(scene.outputDirectory + "/cache.json", removed);
+        }
+        if(removed){
+            return failure(scene.outputDirectory + ": can't delete the cache there: " + removed.message());
+        }
+    }
     std::unique_ptr<ParticleSystemTester> simulation;
     int ranks = scene.partitions;
-    if(worldSize > 1 || !transport.empty()){
+    if(!alone){
         const char* rank = std::getenv("FLIP2_RANK");
         const char* rendezvous = std::getenv("FLIP2_RENDEZVOUS");
         if(rank == nullptr || rendezvous == nullptr){
@@ -224,6 +390,19 @@ int main(int argc, char** argv){
         simulation->setSourceMeshes(sourceMeshes, fluids);      //after setDomain and setSources
     }
     simulation->setObstacles(scene.obstacles);      //after setDomain: they're voxelized at its voxel size
+    if(scene.writeCache){
+        CacheDescription description;
+        std::error_code resolved;
+        std::filesystem::path absolute = std::filesystem::absolute(scenePath, resolved);
+        description.scenePath = resolved ? scenePath : absolute.lexically_normal().string();
+        Xxh64 hash;
+        hash.update(sceneText.data(), sceneText.size());
+        description.sceneHash = hex(hash.digest());
+        description.fps = scene.fps;
+        description.frames = scene.frames;
+        description.compression = scene.compression;
+        simulation->startCache(scene.outputDirectory, description, [](int frame){ event("{\"event\":\"committed\",\"frame\":" + std::to_string(frame) + "}"); });
+    }
 
     std::string directory = scene.outputDirectory + "/";
     std::string diagnostics = scene.diagnostics.empty() ? "" : directory + scene.diagnostics;
@@ -239,6 +418,9 @@ int main(int argc, char** argv){
     if(scene.writePositions){
         simulation->writePositionsToFile(directory + "0.bin");
     }
+    if(scene.writeCache){
+        simulation->writeCacheFrame(0);
+    }
     for(int frame = 1; frame <= scene.frames; ++frame){
         auto frameStart = std::chrono::steady_clock::now();
         simulation->solveFrame(scene.fps);
@@ -248,9 +430,20 @@ int main(int argc, char** argv){
         if(scene.writePositions){
             simulation->writePositionsToFile(directory + std::to_string(frame) + ".bin");
         }
+        if(scene.writeCache){
+            simulation->writeCacheFrame(frame);
+            std::string error = simulation->cacheError();
+            if(!error.empty()){
+                return failure(error);
+            }
+        }
         std::snprintf(line, sizeof(line), "{\"event\":\"frame\",\"frame\":%d,\"seconds\":%.4f,\"particles\":%zu}", frame,
                       std::chrono::duration<double>(std::chrono::steady_clock::now() - frameStart).count(), simulation->particlesHere());
         event(line);
+    }
+    std::string error = simulation->finishCache();  //every frame committed
+    if(!error.empty()){
+        return failure(error);
     }
     simulation.reset();     //finishes writing the frames
     std::snprintf(line, sizeof(line), "{\"event\":\"done\",\"frames\":%d,\"seconds\":%.3f}", scene.frames, std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());

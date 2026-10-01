@@ -7,6 +7,7 @@
 #include "localTransport.hu"
 #include "partitionExchange.hu"
 #include "frameWriter.hpp"
+#include "cacheWriter.hu"
 #include <fstream>
 #include <functional>
 #include <memory>
@@ -46,6 +47,15 @@ public:
     //call it, and rank 0 writes
     void writeDiagnostics(const std::string& path, int frame);
 
+    //starts the cache (cacheWriter.hu) in directory, after setDomain; description says what made it, and this fills in the rest. committed(frame) is
+    //called on the cache's thread as each frame is committed, in the process with rank 0. Every rank has to call it
+    void startCache(const std::string& directory, CacheDescription description, std::function<void(int)> committed);
+    //each rank here's particles into its own shard of frame, on the cache's thread; every rank has to call it. Each rank writes its own, so nothing is
+    //gathered anywhere
+    void writeCacheFrame(int frame);
+    std::string cacheError();   //what went wrong writing the cache, if anything
+    std::string finishCache();  //waits until every frame given to the cache is committed (or has failed), then says what went wrong, if anything
+
 private:
     void inLockstep(const std::function<void(Particles&)>& step);    //every partition here runs step, each on its own thread
     void startFrameWriter();
@@ -60,6 +70,9 @@ private:
     std::vector<std::unique_ptr<Particles>> partitions;
     std::unique_ptr<FrameWriter> frameWriter;       //writes position frames from a background thread; across processes, only on rank 0
     std::vector<std::vector<cudaEvent_t>> frameCopies;  //per partition here, per frame buffer: its part of the frame has landed; on its GPU
+    std::unique_ptr<CacheWriter> cacheWriter;       //writes the cache from a background thread, in every process
+    std::vector<std::vector<cudaEvent_t>> cacheCopies;  //per partition here, per cache buffer, as frameCopies
+    std::vector<uint> planes;   //each rank's first node plane along z, and the last one's end (setDomain)
     CudaVec<float> gatheredFrame;   //across processes, where rank 0 gathers every rank's positions
     double lastFrameSeconds = 0.0;  //wall time of the last solveFrame, for diagnostics
     std::ofstream diagnostics;      //on rank 0, once writeDiagnostics has started it

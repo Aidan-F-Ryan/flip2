@@ -24,6 +24,14 @@ class BinaryReader:     #<frame>.bin: float32 x, y, z per particle
     def np(self):
         return self.data.astype(np.float64)
 
+class CacheReader:      #a committed frame of a flip2 bake's cache (engine/cacheWriter.hu), through tools/flip2cache.py
+    def __init__(self, directory, frame):
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools"))
+        import flip2cache
+        self.data = flip2cache.read_frame(directory, frame, attributes=("P",))[0]["P"]
+    def np(self):
+        return self.data.astype(np.float64)
+
 
 def loadObj(path):  #its vertices, and its faces split into fans of triangles, as the engine reads it (scene.cpp)
     vertices, triangles = [], []
@@ -140,6 +148,7 @@ class Obstacle:     #one of a scene's obstacles (engine/scene.hpp), as a triangl
 
 def usage():
     print("usage: python3 visualizeSavedPoints.py <dir> <numFrames> [--scene scene.json]")
+    print("<dir> holds a bake's cache (cache.json and frames/; compressed ones need pip install blosc) or its N.bin frames")
     print("plays the frames in realtime (at the scene's fps, or 24, skipping frames if drawing can't keep up) on a loop; space pauses, closing the window quits")
     print("with the scene the frames came from, it also draws its obstacles where they were at each frame, and its domain")
 
@@ -160,9 +169,14 @@ def main():
         return
     pointData = []
     numFrames = int(args[1])
+    directory = os.path.join(os.getcwd(), args[0])
+    cached = os.path.exists(os.path.join(directory, "cache.json"))
     for i in range(numFrames):
-        path = os.path.join(os.path.join(os.getcwd(), args[0]), str(i))
-        pointData.append(BinaryReader(path + ".bin") if os.path.exists(path + ".bin") else CSVReader(path))
+        path = os.path.join(directory, str(i))
+        if cached:
+            pointData.append(CacheReader(directory, i))
+        else:
+            pointData.append(BinaryReader(path + ".bin") if os.path.exists(path + ".bin") else CSVReader(path))
     fps = scene.get("fps", 24) if scene else 24
     obstacles = [Obstacle(description, sceneDirectory) for description in scene.get("obstacles", [])] if scene else []
 

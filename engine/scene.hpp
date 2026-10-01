@@ -31,7 +31,8 @@
 //               {"type": "turbulence", "strength": 2, "scale": 0.1, "speed": 0.5, "seed": 0},
 //               {"type": "wind", "velocity": [2, 0, 0], "drag": 1, "depth": 2}],               //drag per second, on the voxels within depth of the surface
 //    "partitions": 1, "devices": 0,
-//    "output": {"dir": ".", "positions": true, "diagnostics": ""}             //diagnostics: a file name in dir, or "" for none
+//    "output": {"dir": ".", "cache": true, "compression": "zstd",           //the cache DCCs read (cacheWriter.hu), in dir; "zstd", "lz4" or "none"
+//               "positions": false, "diagnostics": ""}                     //N.bin, float32 x, y, z per particle; diagnostics: a file name in dir, or ""
 //  }
 
 #include <array>
@@ -135,7 +136,9 @@ struct Scene{
     int partitions = 1;
     int devices = 0;            //0: every GPU there is
     std::string outputDirectory = ".";
-    bool writePositions = true;
+    bool writeCache = true;     //frames/NNNN/ and cache.json in the output directory (cacheWriter.hu)
+    std::string compression = "zstd";   //of the cache's shards: "zstd" or "lz4" (blosc), or "none"
+    bool writePositions = false;    //N.bin, float32 x, y, z per particle, gathered into one file per frame: for quick looks
     std::string diagnostics;    //a file name in the output directory, or empty for none
 
     double voxelSize() const{

@@ -1,0 +1,133 @@
+//Copyright 2023 Aberrant Behavior LLC
+
+#ifndef CACHEWRITER_HU
+#define CACHEWRITER_HU
+
+#include "typedefs.h"
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <functional>
+#include <mutex>
+#include <queue>
+#include <string>
+#include <thread>
+#include <vector>
+
+//A bake's cache, written while it runs and readable while it does. In the output directory:
+//
+//  cache.json                          what made it: the scene and its hash, the domain, the ranks and how the domain is split between them, the GPU and
+//                                      build, the shards' format, and "committed": the last frame whose commit record is down (every one before it is too),
+//                                      brought up to date at least every second, and whenever the writer has caught up; the commit records have the last word
+//  frames/0042/particles.r003.f2p      rank 3's particles at frame 42: a shard (below), written by rank 3 itself
+//  frames/0042/commit.json             written last, by rank 0, once every rank's shard is on the disk: each shard's size and XXH64. A frame without one
+//                                      is unfinished, and a reader skips it
+//
+//A shard (.f2p, version 1) is little-endian: a 64-byte header, a 64-byte entry per attribute, then each attribute's data. Header: "FLIP2SHD", version,
+//attribute count, particle count (uint64), frame, rank, world size, flags, then the particles' bounds, float32 low x, y, z and high x, y, z. Attribute:
+//name (16 bytes, zero padded), type (1: float32), components, codec (0: raw, 1: blosc), 4 reserved bytes, then as uint64 the offset of its data from the
+//start of the file, the data's stored size, its raw size and 8 reserved bytes. The data: each component's stored size (uint64), then the components,
+//each a plane of every particle's value in the shard's order; with blosc, each plane is one blosc buffer (zstd with bit shuffle, or lz4 with byte
+//shuffle: blosc's own header says which, so any blosc reader takes either). Attributes: "P" (position) and "v" (velocity), float32 x, y, z each.
+//Particles carry no ids yet, and their order changes from frame to frame. Floats from a simulation are noisy: losslessly they come to about 17 bytes a
+//particle (1.4x) with zstd and 18.5 with lz4, measured on the dam break
+struct CacheDescription{
+    std::string scenePath;      //as given
+    std::string sceneHash;      //XXH64 of the scene file, hex
+    double fps = 24.0;
+    int frames = 0;             //asked for, after frame 0
+    int worldSize = 1;
+    std::vector<uint> partitionPlanes;  //each rank's first node plane along z, and the last one's end
+    uint nodes[3] = {0, 0, 0};
+    double nodeSize = 0.0;
+    double voxelSize = 0.0;
+    double domainMin[3] = {0.0, 0.0, 0.0};
+    std::string gpu;
+    int sm = 0;
+    int cudaRuntime = 0;
+    std::string compression = "zstd";   //the shards' planes: "zstd" or "lz4" (blosc), or "none"
+};
+
+//one rank's part of a frame in a host buffer: P x, y, z, then v x, y, z, each a plane of particles floats
+struct CacheShard{
+    int rank;
+    size_t particles;
+    size_t offset;      //in floats, from the start of the buffer
+};
+
+//Writes the cache's frames on a background thread, like FrameWriter: the caller takes a free pinned buffer with acquire(), has each of its partitions
+//copy its planes in, recording an event when they land, and submits it. The thread writes each shard (compressed, hashed, flushed to the disk), then
+//commits the frame: in the process with rank 0, once every other rank's record of its shard is there too (each process writes its own ranks' shards,
+//and the others leave a record beside theirs for rank 0, which reads no shard but its own); then committed(frame) is called, from the thread
+class CacheWriter{
+public:
+    CacheWriter(const std::string& directory, const CacheDescription& description, const std::vector<int>& localRanks, std::function<void(int)> committed,
+                int numBuffers = 3);
+    ~CacheWriter();     //finishes every frame submitted
+
+    int numBuffers() const{
+        return (int)hostBuffers.size();
+    }
+    int acquire(size_t floats);     //a free buffer's index, once one is free, holding at least floats
+    float* hostBuffer(int buffer){
+        return hostBuffers[buffer];
+    }
+    //writes and commits frame (at time seconds in) once every event in copies has completed; the events mustn't be recorded again until the buffer is free
+    void submit(int buffer, int frame, double time, const std::vector<CacheShard>& shards, const std::vector<cudaEvent_t>& copies);
+    void flush();           //waits until every frame submitted is written and committed, or has failed
+    std::string error();    //what went wrong, if anything: no frame from then on is committed
+
+private:
+    struct Job{
+        int buffer;
+        int frame;
+        double time;
+        std::vector<CacheShard> shards;
+        std::vector<cudaEvent_t> copies;
+    };
+    struct ShardRecord{
+        int rank = 0;
+        uint64_t particles = 0;
+        uint64_t bytes = 0;
+        uint64_t hash = 0;
+        float low[3] = {0.0f, 0.0f, 0.0f};
+        float high[3] = {0.0f, 0.0f, 0.0f};
+    };
+
+    void run();
+    void process(const Job& job);
+    bool writeShard(const std::string& frameDirectory, int frame, const CacheShard& shard, const float* planes, ShardRecord& record);
+    bool readRecord(const std::string& path, int rank, ShardRecord& record);
+    bool commit(const std::string& frameDirectory, int frame, double time, const std::vector<ShardRecord>& records);
+    bool describe();    //cache.json, as things are now
+    std::string cacheJson() const;
+    void fail(const std::string& why);
+
+    std::string directory;
+    CacheDescription description;
+    std::vector<int> localRanks;
+    bool commits;       //whether this process has rank 0
+    std::function<void(int)> committed;
+    int lastCommitted = -1;
+    int lastDescribed = -2;     //the committed frame cache.json last said
+    std::chrono::steady_clock::time_point described;    //when
+    std::vector<char> scratch;  //compressed planes
+    struct Timing{      //where the thread's time goes, and how long the simulation waited for a buffer; said on stderr at the end
+        int frames = 0;
+        double compress = 0.0, write = 0.0, flush = 0.0, commit = 0.0, waited = 0.0;
+        int waits = 0;
+    } timing;
+
+    std::vector<float*> hostBuffers;
+    std::vector<size_t> capacities;     //in floats
+    std::vector<int> freeBuffers;
+    std::queue<Job> jobs;
+    std::string failure;
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool stopping = false;
+    bool busy = false;  //on a job taken off the queue
+    std::thread thread;
+};
+
+#endif

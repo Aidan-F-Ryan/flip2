@@ -82,9 +82,11 @@ def run(binary, scene, frames, workdir, partitions, timeout, keep_frames):
         result = subprocess.run(command, cwd=workdir, env=env, stdout=log, stderr=subprocess.STDOUT, timeout=timeout)
     if result.returncode != 0:
         sys.exit(f"{scene}: {' '.join(command)} exited with {result.returncode}; see {workdir / 'log.txt'}")
-    if not keep_frames:
+    if not keep_frames:     #N.bin frames, and the cache flip2 bake writes
         for frame in workdir.glob("*.bin"):
             frame.unlink()
+        if (workdir / "frames").exists():
+            shutil.rmtree(workdir / "frames")
     print(f"  {scene} ({partitions} partition{'s' if partitions > 1 else ''}): {frames} frames in {time.time() - start:.1f} s")
     return load(workdir / "diagnostics.jsonl")
 
@@ -154,7 +156,7 @@ def main():
     parser.add_argument("--out", default="golden-runs", help="where the runs go (default ./golden-runs)")
     parser.add_argument("--golden", default=str(REPO / "tests" / "golden"), help="the golden diagnostics (default tests/golden)")
     parser.add_argument("--timeout", type=int, default=1800, help="seconds per run")
-    parser.add_argument("--keep-frames", action="store_true", help="keep the runs' .bin frames")
+    parser.add_argument("--keep-frames", action="store_true", help="keep the runs' frames: .bin files and caches")
     args = parser.parse_args()
 
     if args.command == "diff":
