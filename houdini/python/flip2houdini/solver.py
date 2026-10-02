@@ -29,6 +29,8 @@ import shlex
 import shutil
 import signal
 import subprocess
+import threading
+import time
 
 import hou
 
@@ -180,11 +182,13 @@ def _connected(node, index):
     return index < len(inputs) and inputs[index] is not None
 
 
-def _sample(node, role, frames):
-    """an input's objects over frames: per object its name, triangles (into its own vertices) and vertex positions per frame"""
+def _sample(node, role, frames, progress=None):
+    """an input's objects over frames: per object its name, triangles (into its own vertices) and vertex positions per frame; progress() after each"""
     import numpy
     source = node.node(role.upper())
     first, positions = _objects(source.geometryAtFrame(frames[0]))
+    if progress is not None:
+        progress()
     samples = []
     for name, triangles in first:
         used, local = numpy.unique(triangles, return_inverse=True)
@@ -199,6 +203,8 @@ def _sample(node, role, frames):
                                 % (LABELS[ROLES.index(role)], frame))
         for sample in samples:
             sample["frames"].append(positions[sample["points"]].copy())
+        if progress is not None:
+            progress()
     return samples
 
 
@@ -251,10 +257,16 @@ def write_scene(node):
         "output": {"dir": "bake", "compression": ("zstd", "lz4", "none")[node.evalParm("compression")],
                    "checkpoints": {"every": node.evalParm("checkpoints"), "keep": 2}},
     }
-    for role in ROLES:
-        if not _connected(node, ROLES.index(role)):
-            continue
-        for index, samples in enumerate(_sample(node, role, frames[:1] if role == "fluid" else frames)):
+    roles = [role for role in ROLES if _connected(node, ROLES.index(role))]
+    total = sum(1 if role == "fluid" else len(frames) for role in roles)
+    sampled = [0]
+    with hou.InterruptableOperation("flip2: sampling the inputs", long_operation_name="Writing the flip2 scene", open_interrupt_dialog=True) as operation:
+        def progress():     #a progress bar, which Esc interrupts
+            sampled[0] += 1
+            operation.updateLongProgress(sampled[0] / max(total, 1), "sampled %d of %d frames of the inputs" % (sampled[0], total))
+        sampled_roles = [(role, _sample(node, role, frames[:1] if role == "fluid" else frames, progress)) for role in roles]
+    for role, objects in sampled_roles:
+        for index, samples in enumerate(objects):
             entry = _write_object(samples, "%s%d" % (role, index), geo_dir, frames[:len(samples["frames"])], fps)
             if role == "fluid":
                 entry = {key: entry[key] for key in ("vertices", "triangles")}
@@ -308,6 +320,12 @@ def fit_domain(node):
 
 
 # ---- baking ----
+#
+#Nothing here makes Houdini's own thread, the one that draws its interface, wait on a bake. Only writing the scene runs there, as it reads Houdini's
+#geometry, with a progress bar. A remote bake's checks, uploads and start run on a thread of their own, which touches no hou objects (they aren't
+#thread-safe), and the bake itself runs in processes of its own. Its progress is looked at twice a second, from the end of its event log, and shown under
+#the node and in the status bar, which cook nothing: Status only changes when a bake starts and ends, and the frame on show is reloaded only when its
+#file arrives or changes.
 
 def _program(node):
     program = node.evalParm("program") or os.environ.get("FLIP2") or shutil.which("flip2")
@@ -331,102 +349,152 @@ def _remote(node):
 
 
 def _ssh(host, command):
+    """runs command on host; RuntimeError, not a hou one, as it runs on a launching thread"""
     result = subprocess.run(["ssh"] + SSH_OPTIONS + [host, command], capture_output=True, text=True, timeout=120)
     if result.returncode != 0:
-        raise hou.NodeError("ssh %s: %s" % (host, (result.stderr or result.stdout).strip() or "exit status %d" % result.returncode))
+        raise RuntimeError("ssh %s: %s" % (host, (result.stderr or result.stdout).strip() or "exit status %d" % result.returncode))
     return result.stdout
 
 
 def _rsync(arguments):
     result = subprocess.run(["rsync", "-a", "-e", " ".join(["ssh"] + SSH_OPTIONS)] + arguments, capture_output=True, text=True, timeout=600)
     if result.returncode != 0:
-        raise hou.NodeError("rsync: %s" % (result.stderr.strip() or "exit status %d" % result.returncode))
+        raise RuntimeError("rsync: %s" % (result.stderr.strip() or "exit status %d" % result.returncode))
 
 
-def _run_remote(node, arguments, upload):
-    """runs flip2 with arguments on the remote host (sending the scene first if upload), mirrored back here by remote/mirror.sh"""
-    host, job, program = _remote(node)
-    local = _output_directory(node)
+def _launch_remote(job, host, directory, program, arguments, upload, local, logs):
+    """on a thread: checks there's a flip2 on host, sends the scene if upload, starts the bake there detached (remote/job.sh), and the mirror bringing
+    it back here (remote/mirror.sh). Says how far it's got in job["state"], and why it stopped in job["failure"]"""
     scripts = os.path.join(os.path.dirname(os.path.abspath(__file__)), "remote")
+    try:
+        job["state"] = "connecting to %s" % host
+        _ssh(host, 'program=%s; program="${program/#\\~/$HOME}"; '     #a path names an executable file; a bare name is looked up on the PATH
+                   'case "$program" in */*) [ -f "$program" ] && [ -x "$program" ];; *) command -v "$program" > /dev/null;; esac || '
+                   '{ echo "no flip2 program at $program on this machine: set flip2 Program" >&2; exit 1; }' % shlex.quote(program))
+        _ssh(host, "mkdir -p %s/geo %s/logs && rm -f %s/logs/finished" % (directory, directory, directory))
+        if upload:
+            job["state"] = "sending the scene to %s" % host
+            _rsync(["--delete", os.path.join(local, "geo") + "/", "%s:%s/geo/" % (host, directory)])
+            _rsync([os.path.join(local, "scene.json"), "%s:%s/" % (host, directory)])
+        _rsync([os.path.join(scripts, "job.sh"), "%s:%s/" % (host, directory)])
+        job["state"] = "starting on %s" % host
+        _ssh(host, "cd %s && nohup bash job.sh %s > /dev/null 2>&1 < /dev/null &" % (directory, " ".join(shlex.quote(word) for word in [program] + arguments)))
+        environment = dict(os.environ, FLIP2_RSH=" ".join(["ssh"] + SSH_OPTIONS))
+        job["process"] = subprocess.Popen(["bash", os.path.join(scripts, "mirror.sh"), host, directory, local], env=environment,
+                                          stdout=subprocess.DEVNULL, stderr=open(os.path.join(logs, "mirror.log"), "a"))
+        job["state"] = "baking on %s" % host
+    except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+        job["failure"] = str(error)
+
+
+def _start(node, kind, upload=True):
+    """starts a bake ("bake", or "resume" from the newest checkpoint) and returns at once; _watch follows it"""
+    if node.path() in _jobs:
+        raise hou.NodeError("a bake is running already")
+    local = _output_directory(node)
     logs = os.path.join(local, "logs")
     os.makedirs(logs, exist_ok=True)
-    for stale in ("finished", "bake.events.jsonl", "bake.pid"):     #from an earlier bake: the mirror replaces them
+    for stale in ("finished", "bake.events.jsonl", "bake.pid"):     #an earlier bake's
         if os.path.exists(os.path.join(logs, stale)):
             os.remove(os.path.join(logs, stale))
-    _ssh(host, 'program=%s; program="${program/#\\~/$HOME}"; '      #a path names an executable file; a bare name is looked up on the PATH
-               'case "$program" in */*) [ -f "$program" ] && [ -x "$program" ];; *) command -v "$program" > /dev/null;; esac || '
-               '{ echo "no flip2 program at $program on this machine: set flip2 Program" >&2; exit 1; }' % shlex.quote(program))
-    _ssh(host, "mkdir -p %s/geo %s/logs && rm -f %s/logs/finished" % (job, job, job))
-    if upload:
-        _rsync(["--delete", os.path.join(local, "geo") + "/", "%s:%s/geo/" % (host, job)])
-        _rsync([os.path.join(local, "scene.json"), "%s:%s/" % (host, job)])
-    _rsync([os.path.join(scripts, "job.sh"), "%s:%s/" % (host, job)])
-    _ssh(host, "cd %s && nohup bash job.sh %s > /dev/null 2>&1 < /dev/null &" % (job, " ".join(shlex.quote(word) for word in [program] + arguments)))
-    environment = dict(os.environ, FLIP2_RSH=" ".join(["ssh"] + SSH_OPTIONS))
-    mirror = subprocess.Popen(["bash", os.path.join(scripts, "mirror.sh"), host, job, local], env=environment, stdout=subprocess.DEVNULL,
-                              stderr=open(os.path.join(logs, "mirror.log"), "a"))
-    _jobs[node.path()] = {"bake": mirror, "export": None, "events": os.path.join(logs, "bake.events.jsonl"), "remote": (host, job)}
-    node.parm("status").set("baking on %s" % host)
-    if hou.isUIAvailable() and _watch not in hou.ui.eventLoopCallbacks():
-        hou.ui.addEventLoopCallback(_watch)
-    return mirror
-
-
-def _run(node, arguments, upload=True):
-    """starts flip2 with arguments, and flip2 export following the bake beside it; their events and messages go to logs/. On a remote machine if the
-    node says so"""
-    if node.path() in _jobs and _jobs[node.path()]["bake"].poll() is None:
-        raise hou.NodeError("a bake is running already")
+    job = {"process": None, "export": None, "events": os.path.join(logs, "bake.events.jsonl"), "state": "starting", "failure": None, "said": None,
+           "shown": None}
     if node.evalParm("bakeon") == 1:
-        remote = {"bake": ["bake", "scene.json", "--out", "bake", "--overwrite"], "resume": ["resume", "bake"]}[arguments[0]]
-        return _run_remote(node, remote, upload)
-    program = _program(node)
-    directory = _output_directory(node)
-    logs = os.path.join(directory, "logs")
-    os.makedirs(logs, exist_ok=True)
-    events = os.path.join(logs, "bake.events.jsonl")
-    bake = subprocess.Popen([program] + arguments, stdout=open(events, "w"), stderr=open(os.path.join(logs, "bake.log"), "w"), cwd=directory)
-    exporter = subprocess.Popen([program, "export", os.path.join(directory, "bake"), "--follow"], stdout=open(os.path.join(logs, "export.events.jsonl"), "w"),
-                                stderr=open(os.path.join(logs, "export.log"), "w"), cwd=directory)
-    _jobs[node.path()] = {"bake": bake, "export": exporter, "events": events}
+        host, directory, program = _remote(node)
+        job["remote"] = (host, directory)
+        arguments = {"bake": ["bake", "scene.json", "--out", "bake", "--overwrite"], "resume": ["resume", "bake"]}[kind]
+        threading.Thread(target=_launch_remote, args=(job, host, directory, program, arguments, upload, local, logs), daemon=True).start()
+    else:
+        program = _program(node)
+        bake = os.path.join(local, "bake")
+        arguments = {"bake": ["bake", os.path.join(local, "scene.json"), "--out", bake, "--overwrite"], "resume": ["resume", bake]}[kind]
+        job["process"] = subprocess.Popen([program] + arguments, stdout=open(job["events"], "w"), stderr=open(os.path.join(logs, "bake.log"), "w"), cwd=local)
+        job["export"] = subprocess.Popen([program, "export", bake, "--follow"], stdout=open(os.path.join(logs, "export.events.jsonl"), "w"),
+                                         stderr=open(os.path.join(logs, "export.log"), "w"), cwd=local)
+        job["program"] = program
+        job["state"] = "baking"
+    _jobs[node.path()] = job
     node.parm("status").set("baking")
+    _show(node, job["state"])
     if hou.isUIAvailable() and _watch not in hou.ui.eventLoopCallbacks():
         hou.ui.addEventLoopCallback(_watch)
-    return bake
 
 
 def bake(node):
     """writes the scene and bakes it from the start, over any bake already in the output directory"""
-    scene = write_scene(node)
-    return _run(node, ["bake", scene, "--out", os.path.join(_output_directory(node), "bake"), "--overwrite"])
+    write_scene(node)
+    _start(node, "bake")
 
 
 def resume(node):
     """carries the bake on from its newest checkpoint"""
-    return _run(node, ["resume", os.path.join(_output_directory(node), "bake")], upload=False)
+    _start(node, "resume", upload=False)
 
 
 def cancel(node):
     """asks the bake to stop after the frame it's on, with a checkpoint to resume from"""
     job = _jobs.get(node.path())
-    if job is None or job["bake"].poll() is not None:
+    if job is None or job["process"] is None or job["process"].poll() is not None:
         node.parm("status").set("no bake running")
         return
     if "remote" in job:
         host, directory = job["remote"]
-        _ssh(host, "kill -TERM $(cat %s/logs/bake.pid)" % directory)
+        def signal_remote():
+            try:
+                _ssh(host, "kill -TERM $(cat %s/logs/bake.pid)" % directory)
+            except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+                job["state"] = "couldn't cancel: %s" % error
+        threading.Thread(target=signal_remote, daemon=True).start()
     else:
-        job["bake"].send_signal(signal.SIGTERM)
-    node.parm("status").set("cancelling after this frame")
+        job["process"].send_signal(signal.SIGTERM)
+    job["state"] = "cancelling after this frame"
+    _show(node, job["state"])
 
 
 def _last_event(path):
+    """the last event in a bake's log, read from its end"""
     try:
-        with open(path) as events:
-            lines = [line for line in events.read().splitlines() if line.strip()]
+        with open(path, "rb") as events:
+            events.seek(0, os.SEEK_END)
+            events.seek(max(0, events.tell() - 4096))
+            lines = [line for line in events.read().decode("utf-8", "replace").splitlines() if line.strip()]
         return json.loads(lines[-1]) if lines else None
     except (OSError, ValueError):
         return None
+
+
+def _describe(event):
+    if event is None:
+        return None
+    kind = event.get("event")
+    return {"start": "started: %s particles" % event.get("particles"), "frame": "frame %s" % event.get("frame"),
+            "committed": "frame %s on disk" % event.get("frame"), "checkpoint": "checkpoint at frame %s" % event.get("frame"),
+            "cancelled": "cancelled after frame %s" % event.get("frame"), "done": "done: %s frames in %.0f s" % (event.get("frames"), event.get("seconds", 0)),
+            "error": "error: %s" % event.get("message")}.get(kind, kind)
+
+
+def _show(node, text):
+    """a bake's progress where showing it cooks nothing: under the node in the network editor, and in the status bar"""
+    node.setComment(text)
+    node.setGenericFlag(hou.nodeFlag.DisplayComment, True)
+    if hou.isUIAvailable():
+        hou.ui.setStatusMessage("%s: %s" % (node.name(), text))
+
+
+def _refresh(node, job):
+    """reloads the frame on show if its file has arrived or changed since it was loaded"""
+    particles = node.node("particles")
+    if particles is None or not node.evalParm("load"):
+        return
+    path = particles.evalParm("file")
+    try:
+        stamp = os.stat(path)
+        key = (path, stamp.st_mtime_ns, stamp.st_size)
+    except OSError:
+        key = (path, None, None)
+    if key != job["shown"]:
+        job["shown"] = key
+        particles.parm("reload").pressButton()
 
 
 def _ending(job):
@@ -439,7 +507,7 @@ def _ending(job):
         except (OSError, ValueError):
             return "lost touch with %s: see %s" % (job["remote"][0], os.path.join(logs, "mirror.log"))
     else:
-        status = job["bake"].returncode
+        status = job["process"].returncode
     if status in (0, 3):    #done, or cancelled after a checkpoint
         return None
     try:
@@ -450,34 +518,48 @@ def _ending(job):
     return "failed (exit status %d): %s" % (status, lines[-1] if lines else "see " + os.path.join(logs, "bake.log"))
 
 
+_next_look = [0.0]
+
+
 def _watch():
-    """from Houdini's event loop: each bake's progress into its node's status; when one ends, its exporter catches up and stops"""
+    """from Houdini's event loop, which calls it whenever it's idle: twice a second, each bake's progress, the frame on show if it's arrived, and when
+    a bake ends, its result in Status (and a local one's exporter catching up and stopping)"""
+    now = time.monotonic()
+    if now < _next_look[0]:
+        return
+    _next_look[0] = now + 0.5
     for path, job in list(_jobs.items()):
         node = hou.node(path)
-        event = _last_event(job["events"])
-        ended = job["bake"].poll()
-        if node is not None and event is not None:
-            kind = event.get("event")
-            text = {"start": "started: %s particles" % event.get("particles"), "frame": "frame %s" % event.get("frame"),
-                    "committed": "frame %s on disk" % event.get("frame"), "checkpoint": "checkpoint at frame %s" % event.get("frame"),
-                    "cancelled": "cancelled after frame %s" % event.get("frame"), "done": "done: %s frames in %.0f s" % (event.get("frames"), event.get("seconds", 0)),
-                    "error": "error: %s" % event.get("message")}.get(kind, kind)
-            if node.evalParm("status") != text:
-                node.parm("status").set(text)
-                particles = node.node("particles")
-                if kind == "committed" and particles is not None:
-                    particles.parm("reload").pressButton()
-        if ended is not None:
-            failure = _ending(job)
-            if node is not None and failure is not None and (event is None or event.get("event") not in ("done", "cancelled", "error")):
-                node.parm("status").set(failure)
-            if job["export"] is not None and job["export"].poll() is None:
-                job["export"].terminate()
-                subprocess.Popen([_program(node) if node else "flip2", "export", os.path.join(os.path.dirname(os.path.dirname(job["events"])), "bake")],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)     #the frames it committed last
-            if node is not None and node.node("particles") is not None:
-                node.node("particles").parm("reload").pressButton()
+        if node is None:    #deleted: its bake carries on, unwatched
             del _jobs[path]
+            continue
+        if job["failure"] is not None:
+            node.parm("status").set("failed: %s" % job["failure"])
+            _show(node, "failed")
+            del _jobs[path]
+            continue
+        process = job["process"]
+        event = _last_event(job["events"]) if process is not None else None
+        text = _describe(event) or job["state"]
+        if text != job["said"]:
+            job["said"] = text
+            _show(node, text)
+        if process is None:     #still being launched
+            continue
+        _refresh(node, job)
+        if process.poll() is None:
+            continue
+        failure = _ending(job)
+        final = failure if failure is not None and (event is None or event.get("event") not in ("done", "cancelled", "error")) else text
+        if job["export"] is not None and job["export"].poll() is None:
+            job["export"].terminate()
+            subprocess.Popen([job["program"], "export", os.path.join(os.path.dirname(os.path.dirname(job["events"])), "bake")],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)     #the frames it committed last
+        node.parm("status").set(final)
+        _show(node, final)
+        job["shown"] = None
+        _refresh(node, job)
+        del _jobs[path]
     if not _jobs and hou.isUIAvailable() and _watch in hou.ui.eventLoopCallbacks():
         hou.ui.removeEventLoopCallback(_watch)
 
