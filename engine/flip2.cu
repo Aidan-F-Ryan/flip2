@@ -5,6 +5,7 @@
 //  flip2 bake scene.json [--frames N] [--out DIR] [--overwrite]
 //  flip2 resume DIR [--frames N] [--force]
 //  flip2 verify DIR
+//  flip2 export DIR [--frames A-B] [--out DIR] [--overwrite] [--follow]
 //  flip2 info
 //
 //bake runs the scene (see scene.hpp) and writes into the output directory its cache (cacheWriter.hu: cache.json, frames/NNNN/, which a DCC can read
@@ -14,7 +15,8 @@
 //stopped, on as many ranks as it's run with (so on more or fewer GPUs too): the frames after the checkpoint move to frames.discarded/ and are worked out
 //again. It reads the scene the cache names, which has to be unchanged unless --force, and goes on to the frame the bake was going to; --frames takes it
 //further. verify checks every
-//committed frame of the cache in DIR: each shard there, whole, with the size and XXH64 its commit record gives. info says what this build is and runs a
+//committed frame of the cache in DIR: each shard there, whole, with the size and XXH64 its commit record gives. export writes the committed frames as files
+//DCCs load natively (see exportCache). info says what this build is and runs a
 //kernel on every GPU it finds, to tell whether it runs there (exiting 1 if there's none it does). Standard output carries only events, one JSON object per
 //line, for a DCC or a farm to follow:
 //
@@ -25,6 +27,8 @@
 //  {"event":"cancelled","frame":57,"seconds":3.1}              stopped by a signal after frame 57, which is committed and checkpointed
 //  {"event":"done","frames":120,"seconds":5.2}                 every frame committed
 //  {"event":"verified","frames":121,"unfinished":0,"shards":121,"particles":150040000,"bytes":1712345678,"problems":0}
+//  {"event":"exported","frame":42,"particles":1240000,"file":"/shots/a/export/houdini/particles.0042.bgeo"}
+//  {"event":"exportDone","frames":121,"exported":121,"seconds":9.8}
 //  {"event":"info","build":"7dc95a4","architectures":"86","cudaRuntime":13040,"driver":13040,"gpus":[{"index":0,"name":"...","sm":86,"memoryMB":24135,"runs":true}],...}
 //  {"event":"error","message":"scene.json: domain: needs a positive \"voxelSize\""}
 //
@@ -35,6 +39,7 @@
 #include "scene.hpp"
 #include "json.hpp"
 #include "xxhash64.hpp"
+#include "bgeo.hpp"
 #include "tcpTransport.hu"
 #ifdef FLIP2_WITH_NCCL
 #include "ncclTransport.hu"
@@ -52,6 +57,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 
 static bool printsEvents = true;    //only rank 0 does, across processes
 static std::mutex eventLock;        //the cache's thread says when frames are committed
@@ -93,6 +99,7 @@ static int usage(){
     std::cerr<<"usage: flip2 bake scene.json [--frames N] [--out DIR] [--overwrite]\n"
                "       flip2 resume DIR [--frames N] [--force]\n"
                "       flip2 verify DIR\n"
+               "       flip2 export DIR [--frames A-B] [--out DIR] [--overwrite] [--follow]\n"
                "       flip2 info\n";
     return 2;
 }
@@ -289,6 +296,121 @@ static int verify(const std::string& directory){
                   done, unfinished, shards, particles, bytes, problems);
     event(line);
     return problems > 0 ? 1 : 0;
+}
+
+//flip2 export: the cache's committed frames, as files DCCs load natively. For now Houdini's: OUT/particles.NNNN.bgeo (OUT is DIR/export/houdini unless
+//--out says), each a frame's every shard in one point cloud, in rank order (the order one partition would have held them), with P and v (bgeo.cu).
+//Frame NNNN is the cache's: frame 0 is the start, at time 0. Each shard is checked against its commit record's XXH64 as it's read. A frame already
+//exported is left alone unless its commit record is newer (a resume worked it out again) or --overwrite. --frames A-B, or just A, picks the frames;
+//otherwise every frame the bake makes. --follow waits for frames still to come, so a DCC can show a bake's frames as it commits them; it stops when
+//they've all been exported
+static int exportCache(const std::string& directory, int first, int last, std::string out, bool overwrite, bool follow){
+    if(out.empty()){
+        out = directory + "/export/houdini";
+    }
+    std::error_code made;
+    std::filesystem::create_directories(out, made);
+    if(made){
+        return failure(out + ": " + made.message());
+    }
+    auto start = std::chrono::steady_clock::now();
+    size_t exported = 0, problems = 0;
+    std::vector<bool> finished;     //per frame in range: exported, or found already exported
+    for(;;){
+        std::string text;
+        if(!readFile(directory + "/cache.json", text)){
+            return failure(directory + ": no cache.json, so no cache here");
+        }
+        int bakeFrames = -1;
+        try{
+            Json cache = JsonReader(text, directory + "/cache.json").document();
+            if(newerThanKnown(cache)){
+                return failure(directory + "/cache.json: a version newer than this flip2 reads");
+            }
+            if(const Json* frames = cache.find("frames")){
+                bakeFrames = (int)frames->number;
+            }
+        }
+        catch(const std::exception& error){
+            return failure(error.what());
+        }
+        int end = last >= 0 ? last : bakeFrames;
+        if(end < first){
+            return failure(directory + ": no frames from " + std::to_string(first) + (last >= 0 ? " to " + std::to_string(last) : ""));
+        }
+        finished.resize(end - first + 1, false);
+        size_t waiting = 0;
+        for(int frame = first; frame <= end; ++frame){
+            if(finished[frame - first]){
+                continue;
+            }
+            char name[16];
+            std::snprintf(name, sizeof(name), "%04d", frame);
+            std::string record = directory + "/frames/" + name + "/commit.json";
+            std::string target = out + "/particles." + name + ".bgeo";
+            std::error_code missing;
+            auto committedAt = std::filesystem::last_write_time(record, missing);
+            if(missing){
+                ++waiting;      //not committed yet
+                continue;
+            }
+            std::error_code absent;
+            auto exportedAt = std::filesystem::last_write_time(target, absent);
+            if(!absent && !overwrite && exportedAt >= committedAt){
+                finished[frame - first] = true;
+                continue;
+            }
+            std::string why;
+            std::vector<ShardData> shards;
+            unsigned long long particles = 0;
+            try{
+                std::string contents;
+                if(!readFile(record, contents)){
+                    why = record + ": unreadable";
+                }
+                Json commit = why.empty() ? JsonReader(contents, record).document() : Json();
+                const Json* list = commit.find("shards");
+                if(why.empty() && (newerThanKnown(commit) || list == nullptr)){
+                    why = record + (list == nullptr ? ": no shards" : ": a version newer than this flip2 reads");
+                }
+                for(size_t index = 0; why.empty() && list != nullptr && index < list->items.size(); ++index){
+                    const Json* file = list->items[index].find("file");
+                    const Json* hash = list->items[index].find("xxh64");
+                    shards.emplace_back();
+                    if(file == nullptr || hash == nullptr || !readShard(directory + "/frames/" + name + "/" + file->text, hash->text, shards.back(), why)){
+                        why = why.empty() ? record + ": a shard without its file and xxh64" : why;
+                    }
+                    particles += shards.back().particles;
+                }
+            }
+            catch(const std::exception& error){
+                why = error.what();
+            }
+            std::vector<const ShardData*> pieces;
+            for(const ShardData& shard : shards){
+                pieces.push_back(&shard);
+            }
+            if(why.empty() && writeParticlesBgeo(target, pieces, std::string("flip2 ") + FLIP2_BUILD_ID, why)){
+                ++exported;
+                finished[frame - first] = true;
+                event("{\"event\":\"exported\",\"frame\":" + std::to_string(frame) + ",\"particles\":" + std::to_string(particles) + ",\"file\":" + ::quoted(target) + "}");
+            }
+            else{
+                ++problems;
+                finished[frame - first] = true;     //not tried again
+                event("{\"event\":\"error\",\"message\":" + quoted("frame " + std::to_string(frame) + ": " + why) + "}");
+                std::cerr<<"frame "<<frame<<": "<<why<<"\n";
+            }
+        }
+        if(!follow || waiting == 0){
+            char line[256];
+            std::snprintf(line, sizeof(line), "{\"event\":\"exportDone\",\"frames\":%zu,\"exported\":%zu,\"unfinished\":%zu,\"problems\":%zu,\"seconds\":%.3f}",
+                          finished.size(), exported, waiting, problems, std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+            event(line);
+            return problems > 0 ? 1 : 0;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
 }
 
 //a mesh adds its description to meshes, which the shape names by its place there
@@ -500,6 +622,33 @@ int main(int argc, char** argv){
     }
     if(argc == 2 && std::string(argv[1]) == "info"){
         return info();
+    }
+    if(argc >= 3 && std::string(argv[1]) == "export"){
+        int first = 0, last = -1;
+        std::string out;
+        bool overwrite = false, follow = false;
+        for(int arg = 3; arg < argc; ++arg){
+            std::string option = argv[arg];
+            if(option == "--frames" && arg + 1 < argc){
+                std::string range = argv[++arg];
+                size_t dash = range.find('-', 1);
+                first = std::atoi(range.substr(0, dash).c_str());
+                last = dash == std::string::npos ? first : std::atoi(range.substr(dash + 1).c_str());
+            }
+            else if(option == "--out" && arg + 1 < argc){
+                out = argv[++arg];
+            }
+            else if(option == "--overwrite"){
+                overwrite = true;
+            }
+            else if(option == "--follow"){
+                follow = true;
+            }
+            else{
+                return usage();
+            }
+        }
+        return exportCache(argv[2], first, last, out, overwrite, follow);
     }
     if(argc < 3 || (std::string(argv[1]) != "bake" && std::string(argv[1]) != "resume")){
         return usage();
