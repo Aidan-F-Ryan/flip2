@@ -89,7 +89,7 @@ target_link_libraries(main particles gomp)
 set_target_properties(main PROPERTIES CUDA_ARCHITECTURES "${flip2Architectures}")
 
 # flip2: the command line, which runs a scene file (scene.hpp)
-add_executable(flip2 flip2.cu scene.cpp volumes.cpp bgeo.cu)
+add_executable(flip2 flip2.cu scene.cpp volumes.cpp bgeo.cu surface.cu)
 target_link_libraries(flip2 particles gomp)
 set_target_properties(flip2 PROPERTIES CUDA_ARCHITECTURES "${flip2Architectures}")
 string(REPLACE ";" "," architectureNames "${flip2Architectures}")     #a CMake list would split the definition

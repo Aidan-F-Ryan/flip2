@@ -6,6 +6,8 @@
 //  flip2 resume DIR [--frames N] [--force]
 //  flip2 verify DIR
 //  flip2 export DIR [--frames A-B] [--out DIR] [--overwrite] [--follow]
+//  flip2 mesh DIR [--frames A-B] [--out DIR] [--overwrite] [--follow] [--separation S] [--voxel-scale S] [--influence-scale S] [--radius-scale S]
+//             [--smoothing N]
 //  flip2 info
 //
 //bake runs the scene (see scene.hpp) and writes into the output directory its cache (cacheWriter.hu: cache.json, frames/NNNN/, which a DCC can read
@@ -16,7 +18,7 @@
 //again. It reads the scene the cache names, which has to be unchanged unless --force, and goes on to the frame the bake was going to; --frames takes it
 //further. verify checks every
 //committed frame of the cache in DIR: each shard there, whole, with the size and XXH64 its commit record gives. export writes the committed frames as files
-//DCCs load natively (see exportCache). info says what this build is and runs a
+//DCCs load natively (see exportCache), and mesh the liquid's surface in each (meshCache). info says what this build is and runs a
 //kernel on every GPU it finds, to tell whether it runs there (exiting 1 if there's none it does). Standard output carries only events, one JSON object per
 //line, for a DCC or a farm to follow:
 //
@@ -29,6 +31,8 @@
 //  {"event":"verified","frames":121,"unfinished":0,"shards":121,"particles":150040000,"bytes":1712345678,"problems":0}
 //  {"event":"exported","frame":42,"particles":1240000,"file":"/shots/a/export/houdini/particles.0042.bgeo"}
 //  {"event":"exportDone","frames":121,"exported":121,"seconds":9.8}
+//  {"event":"meshed","frame":42,"particles":1240000,"points":310000,"faces":309000,"bandCells":52000,"rounds":2,"seconds":0.05,"file":"/shots/a/export/houdini/surface.0042.bgeo"}
+//  {"event":"meshDone","frames":121,"meshed":121,"seconds":12.1}
 //  {"event":"info","build":"7dc95a4","architectures":"86","cudaRuntime":13040,"driver":13040,"gpus":[{"index":0,"name":"...","sm":86,"memoryMB":24135,"runs":true}],...}
 //  {"event":"error","message":"scene.json: domain: needs a positive \"voxelSize\""}
 //
@@ -40,6 +44,7 @@
 #include "json.hpp"
 #include "xxhash64.hpp"
 #include "bgeo.hpp"
+#include "surface.hu"
 #include "tcpTransport.hu"
 #ifdef FLIP2_WITH_NCCL
 #include "ncclTransport.hu"
@@ -53,6 +58,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -100,6 +106,8 @@ static int usage(){
                "       flip2 resume DIR [--frames N] [--force]\n"
                "       flip2 verify DIR\n"
                "       flip2 export DIR [--frames A-B] [--out DIR] [--overwrite] [--follow]\n"
+               "       flip2 mesh DIR [--frames A-B] [--out DIR] [--overwrite] [--follow] [--separation S] [--voxel-scale S] [--influence-scale S]\n"
+               "                  [--radius-scale S] [--smoothing N]\n"
                "       flip2 info\n";
     return 2;
 }
@@ -298,24 +306,23 @@ static int verify(const std::string& directory){
     return problems > 0 ? 1 : 0;
 }
 
-//flip2 export: the cache's committed frames, as files DCCs load natively. For now Houdini's: OUT/particles.NNNN.bgeo (OUT is DIR/export/houdini unless
-//--out says), each a frame's every shard in one point cloud, in rank order (the order one partition would have held them), with P and v (bgeo.cu).
-//Frame NNNN is the cache's: frame 0 is the start, at time 0. Each shard is checked against its commit record's XXH64 as it's read. A frame already
-//exported is left alone unless its commit record is newer (a resume worked it out again) or --overwrite. --frames A-B, or just A, picks the frames;
-//otherwise every frame the bake makes. --follow waits for frames still to come, and for the cache itself if the bake hasn't started it, so a DCC can
-//show a bake's frames as it commits them; it stops when they've all been exported
-static int exportCache(const std::string& directory, int first, int last, std::string out, bool overwrite, bool follow){
-    if(out.empty()){
-        out = directory + "/export/houdini";
-    }
-    std::error_code made;
-    std::filesystem::create_directories(out, made);
-    if(made){
-        return failure(out + ": " + made.message());
-    }
+static std::string frameName(int frame){    //as the cache's folders and the exports name it
+    char name[16];
+    std::snprintf(name, sizeof(name), "%04d", frame);
+    return name;
+}
+
+//makes a file of each of the cache's committed frames, for export and mesh: for every frame from first to last (or the bake's last, if last is -1) whose
+//file, target(frame), is missing or older than the frame's commit record (a resume worked it out again), or every one with overwrite, reads its shards,
+//each checked against its commit record's XXH64, and has make(frame, shards, target, why) write the file (saying so as an event) or say why not. follow
+//waits for frames still to come, and for the cache itself if the bake hasn't started it, so a DCC can show a bake's frames as it commits them; it stops
+//when they've all been made. Ends with the event finished, counting the files written as written
+static int eachCommittedFrame(const std::string& directory, int first, int last, bool overwrite, bool follow, const char* finished, const char* written,
+                              const std::function<std::string(int)>& target,
+                              const std::function<bool(int, const std::vector<ShardData>&, const std::string&, std::string&)>& make){
     auto start = std::chrono::steady_clock::now();
-    size_t exported = 0, problems = 0;
-    std::vector<bool> finished;     //per frame in range: exported, or found already exported
+    size_t made = 0, problems = 0;
+    std::vector<bool> done;     //per frame in range: made, or found already made
     for(;;){
         std::string text;
         if(!readFile(directory + "/cache.json", text)){
@@ -342,16 +349,15 @@ static int exportCache(const std::string& directory, int first, int last, std::s
         if(end < first){
             return failure(directory + ": no frames from " + std::to_string(first) + (last >= 0 ? " to " + std::to_string(last) : ""));
         }
-        finished.resize(end - first + 1, false);
+        done.resize(end - first + 1, false);
         size_t waiting = 0;
         for(int frame = first; frame <= end; ++frame){
-            if(finished[frame - first]){
+            if(done[frame - first]){
                 continue;
             }
-            char name[16];
-            std::snprintf(name, sizeof(name), "%04d", frame);
+            std::string name = frameName(frame);
             std::string record = directory + "/frames/" + name + "/commit.json";
-            std::string target = out + "/particles." + name + ".bgeo";
+            std::string file = target(frame);
             std::error_code missing;
             auto committedAt = std::filesystem::last_write_time(record, missing);
             if(missing){
@@ -359,14 +365,13 @@ static int exportCache(const std::string& directory, int first, int last, std::s
                 continue;
             }
             std::error_code absent;
-            auto exportedAt = std::filesystem::last_write_time(target, absent);
-            if(!absent && !overwrite && exportedAt >= committedAt){
-                finished[frame - first] = true;
+            auto madeAt = std::filesystem::last_write_time(file, absent);
+            if(!absent && !overwrite && madeAt >= committedAt){
+                done[frame - first] = true;
                 continue;
             }
             std::string why;
             std::vector<ShardData> shards;
-            unsigned long long particles = 0;
             try{
                 std::string contents;
                 if(!readFile(record, contents)){
@@ -378,43 +383,171 @@ static int exportCache(const std::string& directory, int first, int last, std::s
                     why = record + (list == nullptr ? ": no shards" : ": a version newer than this flip2 reads");
                 }
                 for(size_t index = 0; why.empty() && list != nullptr && index < list->items.size(); ++index){
-                    const Json* file = list->items[index].find("file");
+                    const Json* shardFile = list->items[index].find("file");
                     const Json* hash = list->items[index].find("xxh64");
                     shards.emplace_back();
-                    if(file == nullptr || hash == nullptr || !readShard(directory + "/frames/" + name + "/" + file->text, hash->text, shards.back(), why)){
+                    if(shardFile == nullptr || hash == nullptr || !readShard(directory + "/frames/" + name + "/" + shardFile->text, hash->text, shards.back(), why)){
                         why = why.empty() ? record + ": a shard without its file and xxh64" : why;
                     }
-                    particles += shards.back().particles;
                 }
             }
             catch(const std::exception& error){
                 why = error.what();
             }
-            std::vector<const ShardData*> pieces;
-            for(const ShardData& shard : shards){
-                pieces.push_back(&shard);
-            }
-            if(why.empty() && writeParticlesBgeo(target, pieces, std::string("flip2 ") + FLIP2_BUILD_ID, why)){
-                ++exported;
-                finished[frame - first] = true;
-                event("{\"event\":\"exported\",\"frame\":" + std::to_string(frame) + ",\"particles\":" + std::to_string(particles) + ",\"file\":" + ::quoted(target) + "}");
+            if(why.empty() && make(frame, shards, file, why)){
+                ++made;
+                done[frame - first] = true;
             }
             else{
                 ++problems;
-                finished[frame - first] = true;     //not tried again
+                done[frame - first] = true;     //not tried again
                 event("{\"event\":\"error\",\"message\":" + quoted("frame " + std::to_string(frame) + ": " + why) + "}");
                 std::cerr<<"frame "<<frame<<": "<<why<<"\n";
             }
         }
         if(!follow || waiting == 0){
             char line[256];
-            std::snprintf(line, sizeof(line), "{\"event\":\"exportDone\",\"frames\":%zu,\"exported\":%zu,\"unfinished\":%zu,\"problems\":%zu,\"seconds\":%.3f}",
-                          finished.size(), exported, waiting, problems, std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+            std::snprintf(line, sizeof(line), "{\"event\":\"%s\",\"frames\":%zu,\"%s\":%zu,\"unfinished\":%zu,\"problems\":%zu,\"seconds\":%.3f}", finished,
+                          done.size(), written, made, waiting, problems, std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
             event(line);
             return problems > 0 ? 1 : 0;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }
+}
+
+static bool makeDirectory(const std::string& path){
+    std::error_code made;
+    std::filesystem::create_directories(path, made);
+    if(made){
+        failure(path + ": " + made.message());
+        return false;
+    }
+    return true;
+}
+
+//flip2 export: the cache's committed frames, as files DCCs load natively. For now Houdini's: OUT/particles.NNNN.bgeo (OUT is DIR/export/houdini unless
+//--out says), each a frame's every shard in one point cloud, in rank order (the order one partition would have held them), with P and v (bgeo.cu).
+//Frame NNNN is the cache's: frame 0 is the start, at time 0. Frames are picked, redone and followed as eachCommittedFrame says
+static int exportCache(const std::string& directory, int first, int last, std::string out, bool overwrite, bool follow){
+    if(out.empty()){
+        out = directory + "/export/houdini";
+    }
+    if(!makeDirectory(out)){
+        return 1;
+    }
+    return eachCommittedFrame(directory, first, last, overwrite, follow, "exportDone", "exported", [&](int frame){
+        return out + "/particles." + frameName(frame) + ".bgeo";
+    }, [&](int frame, const std::vector<ShardData>& shards, const std::string& target, std::string& why){
+        std::vector<const ShardData*> pieces;
+        unsigned long long particles = 0;
+        for(const ShardData& shard : shards){
+            pieces.push_back(&shard);
+            particles += shard.particles;
+        }
+        if(!writeParticlesBgeo(target, pieces, std::string("flip2 ") + FLIP2_BUILD_ID, why)){
+            return false;
+        }
+        event("{\"event\":\"exported\",\"frame\":" + std::to_string(frame) + ",\"particles\":" + std::to_string(particles) + ",\"file\":" + ::quoted(target) + "}");
+        return true;
+    });
+}
+
+//flip2 mesh: the liquid's surface in each of the cache's committed frames, worked out on the GPU (surface.cu), as OUT/surface.NNNN.bgeo (OUT as for
+//export): closed quads facing outwards, their points carrying the liquid's velocity v for motion blur. The particle separation is the bake's (half its
+//voxel size) unless settings give one. Frames are picked, redone and followed as eachCommittedFrame says
+static int meshCache(const std::string& directory, int first, int last, std::string out, bool overwrite, bool follow, SurfaceSettings settings){
+    SurfaceSettings checked = settings;
+    if(checked.separation <= 0.0f){
+        checked.separation = 1.0f;      //the bake's, which can only be checked once there's a cache
+    }
+    std::string problem = checked.problem();
+    if(!problem.empty()){
+        return failure("mesh: " + problem);
+    }
+    if(out.empty()){
+        out = directory + "/export/houdini";
+    }
+    if(!makeDirectory(out)){
+        return 1;
+    }
+    if(const char* device = std::getenv("FLIP2_DEVICE")){
+        cudaSetDevice(std::atoi(device));
+    }
+    std::unique_ptr<SurfaceMesher> mesher;      //made at the first frame, on the GPU: so not at all, if there's nothing to mesh
+    std::vector<float> positions, velocities;
+    SurfaceMesh mesh;
+    return eachCommittedFrame(directory, first, last, overwrite, follow, "meshDone", "meshed", [&](int frame){
+        return out + "/surface." + frameName(frame) + ".bgeo";
+    }, [&](int frame, const std::vector<ShardData>& shards, const std::string& target, std::string& why){
+        if(settings.separation <= 0.0f){
+            std::string text;
+            const Json* voxelSize = nullptr;
+            Json cache;
+            try{
+                if(readFile(directory + "/cache.json", text)){
+                    cache = JsonReader(text, directory + "/cache.json").document();
+                    voxelSize = cache.find("voxelSize");
+                }
+            }
+            catch(const std::exception& error){
+                why = error.what();
+                return false;
+            }
+            if(voxelSize == nullptr || !(voxelSize->number > 0.0)){
+                why = directory + "/cache.json: no voxelSize, so no particle separation to mesh with";
+                return false;
+            }
+            settings.separation = (float)(voxelSize->number/2.0);
+        }
+        unsigned long long particles = 0;
+        for(const ShardData& shard : shards){
+            const ShardData::Attribute* p = shard.find("P");
+            const ShardData::Attribute* v = shard.find("v");
+            for(const ShardData::Attribute* attribute : {p, v}){
+                if(attribute == nullptr || attribute->type != 1 || attribute->components != 3 || attribute->planes.size() != 3*sizeof(float)*shard.particles){
+                    why = "a shard without float32 P and v";
+                    return false;
+                }
+            }
+            particles += shard.particles;
+        }
+        positions.resize(3*particles);
+        velocities.resize(3*particles);
+        float low[3] = {INFINITY, INFINITY, INFINITY}, high[3] = {-INFINITY, -INFINITY, -INFINITY};
+        unsigned long long offset = 0;
+        for(const ShardData& shard : shards){   //every shard's planes into one x, y and z plane each
+            const float* p = (const float*)shard.find("P")->planes.data();
+            const float* v = (const float*)shard.find("v")->planes.data();
+            for(int axis = 0; axis < 3; ++axis){
+                std::copy(p + axis*shard.particles, p + (axis + 1)*shard.particles, positions.begin() + axis*particles + offset);
+                std::copy(v + axis*shard.particles, v + (axis + 1)*shard.particles, velocities.begin() + axis*particles + offset);
+                for(uint64_t particle = 0; particle < shard.particles; ++particle){
+                    low[axis] = std::min(low[axis], p[axis*shard.particles + particle]);
+                    high[axis] = std::max(high[axis], p[axis*shard.particles + particle]);
+                }
+            }
+            offset += shard.particles;
+        }
+        try{
+            if(!mesher){
+                mesher.reset(new SurfaceMesher);
+            }
+            mesher->mesh(positions.data(), velocities.data(), particles, low, high, settings, mesh);
+        }
+        catch(const std::exception& error){
+            why = error.what();
+            return false;
+        }
+        if(!writeSurfaceBgeo(target, mesh, std::string("flip2 ") + FLIP2_BUILD_ID, why)){
+            return false;
+        }
+        char numbers[200];
+        std::snprintf(numbers, sizeof(numbers), ",\"particles\":%llu,\"points\":%zu,\"faces\":%zu,\"bandCells\":%zu,\"rounds\":%d,\"seconds\":%.4f,\"file\":",
+                      particles, mesh.points.size()/3, mesh.quads.size()/4, mesher->bandCells, mesher->rounds, mesher->seconds);
+        event("{\"event\":\"meshed\",\"frame\":" + std::to_string(frame) + numbers + ::quoted(target) + "}");
+        return true;
+    });
 }
 
 //a mesh adds its description to meshes, which the shape names by its place there
@@ -627,13 +760,45 @@ int main(int argc, char** argv){
     if(argc == 2 && std::string(argv[1]) == "info"){
         return info();
     }
-    if(argc >= 3 && std::string(argv[1]) == "export"){
+    if(argc >= 3 && (std::string(argv[1]) == "export" || std::string(argv[1]) == "mesh")){
+        bool meshing = std::string(argv[1]) == "mesh";
         int first = 0, last = -1;
         std::string out;
         bool overwrite = false, follow = false;
+        SurfaceSettings surface;
         for(int arg = 3; arg < argc; ++arg){
             std::string option = argv[arg];
-            if(option == "--frames" && arg + 1 < argc){
+            if(meshing && arg + 1 < argc && (option == "--separation" || option == "--voxel-scale" || option == "--influence-scale" || option == "--radius-scale" ||
+                                             option == "--smoothing")){
+                char* end = nullptr;
+                std::string given = argv[++arg];
+                double value = std::strtod(given.c_str(), &end);
+                if(end == given.c_str() || *end != '\0'){
+                    return usage();
+                }
+                if(option == "--separation"){
+                    surface.separation = (float)value;
+                    if(!(surface.separation > 0.0f)){
+                        return failure("mesh: the particle separation has to be positive");
+                    }
+                }
+                else if(option == "--voxel-scale"){
+                    surface.voxelScale = (float)value;
+                }
+                else if(option == "--influence-scale"){
+                    surface.influenceScale = (float)value;
+                }
+                else if(option == "--radius-scale"){
+                    surface.radiusScale = (float)value;
+                }
+                else{
+                    surface.smoothing = (int)value;
+                    if(surface.smoothing != value){
+                        return usage();
+                    }
+                }
+            }
+            else if(option == "--frames" && arg + 1 < argc){
                 std::string range = argv[++arg];
                 size_t dash = range.find('-', 1);
                 first = std::atoi(range.substr(0, dash).c_str());
@@ -652,7 +817,7 @@ int main(int argc, char** argv){
                 return usage();
             }
         }
-        return exportCache(argv[2], first, last, out, overwrite, follow);
+        return meshing ? meshCache(argv[2], first, last, out, overwrite, follow, surface) : exportCache(argv[2], first, last, out, overwrite, follow);
     }
     if(argc < 3 || (std::string(argv[1]) != "bake" && std::string(argv[1]) != "resume")){
         return usage();

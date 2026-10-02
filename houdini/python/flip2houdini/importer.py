@@ -1,14 +1,18 @@
-"""flip2 Import: a bake's particles, at the current time, from the .bgeo files `flip2 export` writes (BAKE/export/houdini/particles.NNNN.bgeo).
+"""flip2 Import: a bake's surface and particles, at the current time, from the .bgeo files `flip2 mesh` and `flip2 export` write
+(BAKE/export/houdini/surface.NNNN.bgeo and particles.NNNN.bgeo).
 
 A flip2 frame is a time: frame N is N/fps seconds after the bake's start. Houdini's frame 1 is time 0, so loading by time puts the bake's frame 0 on
 Houdini's frame 1, and keeps it there whatever frame rate either uses. A frame the bake hasn't made (yet) loads as no geometry.
 """
+import glob
 import json
 import os
 
 import hou
 
 PARTICLES = "particles"
+SURFACE = "surface"
+SHOW = (("surface", "Surface"), ("particles", "Particles"), ("both", "Surface and Particles"))
 
 
 def read_bake(directory):
@@ -18,6 +22,45 @@ def read_bake(directory):
             return json.load(record)
     except (OSError, ValueError):
         return None
+
+
+def show_parm(**kwargs):
+    """the Show menu: what of each frame to load"""
+    return hou.MenuParmTemplate("show", "Show", [item for item, _ in SHOW], [label for _, label in SHOW], default_value=0,
+                                help="What of each frame to load: the liquid's surface (flip2 mesh), its particles, or both", **kwargs)
+
+
+def build_loaders(node, folder, frame):
+    """inside node, File nodes loading a frame's surface and particles from folder (the bake's export/houdini directory) at frame (the bake's frame
+    number), both expressions, and a switch between them by the node's Show menu, which it returns. Makes only what's missing, so an older node, which
+    loaded only particles, gains the rest, and whatever took its particles takes the switch"""
+    loaders = {}
+    for name in (SURFACE, PARTICLES):
+        loader = node.node(name)
+        if loader is None:
+            loader = node.createNode("file", name)
+            loader.parm("missingframe").set("empty")
+        loader.parm("file").set('%s/%s.`padzero(4, %s)`.bgeo' % (folder, name, frame))
+        loaders[name] = loader
+    switch = node.node("show")
+    if switch is None:
+        takers = [(taker, taker.inputs().index(loaders[PARTICLES])) for taker in loaders[PARTICLES].outputs()]
+        both = node.createNode("merge", "both")
+        both.setInput(0, loaders[SURFACE])
+        both.setInput(1, loaders[PARTICLES])
+        switch = node.createNode("switch", "show")
+        for index, source in enumerate((loaders[SURFACE], loaders[PARTICLES], both)):     #in the Show menu's order
+            switch.setInput(index, source)
+        switch.parm("input").setExpression('ch("../show")')
+        for taker, index in takers:
+            taker.setInput(index, switch)
+        node.layoutChildren()
+    return switch
+
+
+def has_surface(folder):
+    """whether a bake's export/houdini directory holds any surface frames"""
+    return bool(glob.glob(os.path.join(hou.text.expandString(folder), SURFACE + ".[0-9]*.bgeo")))
 
 
 def _interface(node):
@@ -31,6 +74,7 @@ def _interface(node):
                                        help="Frames per second of the bake, read from its cache.json"))
     group.append(hou.FloatParmTemplate("timeoffset", "Time Offset", 1, default_value=(0.0,),
                                        help="Seconds to delay the bake by: its start shows at this time"))
+    group.append(show_parm())
     group.append(hou.ButtonParmTemplate("reload", "Reload", script_callback="__import__('flip2houdini').importer.reload(kwargs['node'])",
                                         script_callback_language=hou.scriptLanguage.Python,
                                         help="Read the bake's cache.json again, and the frame on show from disk"))
@@ -40,21 +84,24 @@ def _interface(node):
     node.setParmTemplateGroup(group)
 
 
+def _network(node):
+    """the node's network: its loaders, by the frame showing at this time (a bake's frame N is at N/fps)"""
+    return build_loaders(node, '`chs("../bakedir")`/export/houdini', 'round(($T - ch("../timeoffset"))*ch("../fps"))')
+
+
 def create_import(parent, bake_dir="", name="flip2_import"):
-    """a flip2 Import node in the SOP network parent, loading bake_dir's particles"""
+    """a flip2 Import node in the SOP network parent, loading bake_dir's frames: its surface if it has one, otherwise its particles"""
     node = parent.createNode("subnet", name)
     node.setUserData("flip2", "import")
     _interface(node)
-    particles = node.createNode("file", PARTICLES)
-    #the frame showing at this time: a bake's frame N is at N/fps
-    particles.parm("file").set('`chs("../bakedir")`/export/houdini/particles.`padzero(4, round(($T - ch("../timeoffset"))*ch("../fps")))`.bgeo')
-    particles.parm("missingframe").set("empty")
     output = node.createNode("output", "output0")
-    output.setInput(0, particles)
+    output.setInput(0, _network(node))
     output.setDisplayFlag(True)
     output.setRenderFlag(True)
     node.layoutChildren()
     node.parm("bakedir").set(bake_dir)
+    if bake_dir and not has_surface(os.path.join(bake_dir, "export", "houdini")):
+        node.parm("show").set(PARTICLES)
     reload(node)
     return node
 
@@ -69,9 +116,10 @@ def reload(node):
         committed, frames = bake.get("committed", -1), bake.get("frames", -1)
         node.parm("status").set("%d of frames 0-%d committed, at %g fps" % (committed + 1, frames, bake.get("fps", 24.0)) if committed < frames
                                 else "frames 0-%d, at %g fps" % (frames, bake.get("fps", 24.0)))
-    particles = node.node(PARTICLES)
-    if particles is not None:
-        particles.parm("reload").pressButton()
+    for name in (SURFACE, PARTICLES):
+        loader = node.node(name)
+        if loader is not None:
+            loader.parm("reload").pressButton()
 
 
 def shelf_tool(kwargs):

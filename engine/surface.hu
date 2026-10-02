@@ -1,0 +1,44 @@
+//Copyright 2023 Aberrant Behavior LLC
+#ifndef SURFACE_HU
+#define SURFACE_HU
+#include <string>
+#include <vector>
+
+//A liquid's surface from its particles, on the GPU (surface.cu): a smooth field around them, Houdini's Average Position method (Zhu and Bridson,
+//Animating sand as a fluid, 2005), worked out only in a narrow band around the edge of the space they fill, and a mesh of its zero level by surface nets,
+//closed and welded, its points carrying the liquid's velocity
+
+struct SurfaceSettings{
+    float separation = 0.0f;        //the bake's particle separation (half its voxel size)
+    float voxelScale = 0.5f;        //the field's sample spacing, in particle separations: smaller is finer
+    float influenceScale = 2.0f;    //how far each particle reaches into the field, in particle separations
+    float radiusScale = 0.6f;       //each particle's radius, in particle separations: sets where the surface sits
+    int smoothing = 2;              //passes of a mean filter over the field before it's meshed
+    std::string problem() const;    //what's wrong with these, if anything
+};
+
+struct SurfaceMesh{
+    std::vector<float> points;      //x, y, z per point
+    std::vector<float> velocities;  //x, y, z per point, metres per second
+    std::vector<int> quads;         //4 point indices per face, counter-clockwise seen from outside
+};
+
+//keeps its GPU buffers between frames, growing them as needed; one per thread, on the device that's current when it's made
+class SurfaceMesher{
+public:
+    SurfaceMesher();
+    ~SurfaceMesher();
+    SurfaceMesher(const SurfaceMesher&) = delete;
+    SurfaceMesher& operator=(const SurfaceMesher&) = delete;
+    //meshes count particles: positions and velocities as x, y and z planes (each count floats, one after another), within bounds low and high
+    void mesh(const float* positions, const float* velocities, unsigned long long count, const float low[3], const float high[3], const SurfaceSettings& settings,
+              SurfaceMesh& out);
+    double seconds = 0.0;           //the last mesh's time on the GPU, copies included
+    int rounds = 0;                 //how many times the last mesh's field was worked out: once, and again each time its band grew
+    size_t bandCells = 0;           //the cells of the last mesh's band, each holding a cube of samples
+private:
+    struct Buffers;
+    Buffers* buffers;
+};
+
+#endif
