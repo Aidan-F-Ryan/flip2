@@ -4,6 +4,7 @@
   <toolshelf name="flip2" label="flip2">
     <memberTool name="flip2_solver"/>
     <memberTool name="flip2_import"/>
+    <memberTool name="flip2_update"/>
   </toolshelf>
 
   <tool name="flip2_solver" label="flip2 Solver" icon="DOP_flipsolver">
@@ -26,5 +27,16 @@ flip2houdini.solver.shelf_tool(kwargs)]]></script>
     <toolSubmenu>flip2</toolSubmenu>
     <script scriptType="python"><![CDATA[import flip2houdini.importer
 flip2houdini.importer.shelf_tool(kwargs)]]></script>
+  </tool>
+
+  <tool name="flip2_update" label="Update flip2 Nodes" icon="BUTTONS_reload">
+    <helpText><![CDATA[Gives every flip2 node in the scene the parameters of the flip2 version installed, keeping their values.]]></helpText>
+    <toolMenuContext name="network">
+      <contextNetType>OBJ</contextNetType>
+      <contextNetType>SOP</contextNetType>
+    </toolMenuContext>
+    <toolSubmenu>flip2</toolSubmenu>
+    <script scriptType="python"><![CDATA[import flip2houdini.solver
+flip2houdini.solver.update_tool(kwargs)]]></script>
   </tool>
 </shelfDocument>

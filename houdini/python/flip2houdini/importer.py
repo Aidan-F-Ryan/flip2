@@ -21,7 +21,8 @@ def read_bake(directory):
 
 
 def _interface(node):
-    group = node.parmTemplateGroup()
+    """the node's parameters, from the subnet's own on, so applying them again (an update) keeps its values"""
+    group = node.type().parmTemplateGroup()
     group.append(hou.StringParmTemplate("bakedir", "Bake", 1, string_type=hou.stringParmType.FileReference, file_type=hou.fileType.Directory,
                                         help="The bake's directory: the one with cache.json in it",
                                         script_callback="__import__('flip2houdini').importer.reload(kwargs['node'])",
@@ -42,6 +43,7 @@ def _interface(node):
 def create_import(parent, bake_dir="", name="flip2_import"):
     """a flip2 Import node in the SOP network parent, loading bake_dir's particles"""
     node = parent.createNode("subnet", name)
+    node.setUserData("flip2", "import")
     _interface(node)
     particles = node.createNode("file", PARTICLES)
     #the frame showing at this time: a bake's frame N is at N/fps

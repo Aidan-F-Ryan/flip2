@@ -52,7 +52,8 @@ def _callback(function):
 
 
 def _interface(node):
-    group = node.parmTemplateGroup()
+    """the node's parameters, from the subnet's own on: applied again to an existing node (update), it keeps the values of the parameters it still has"""
+    group = node.type().parmTemplateGroup()
     simulation = hou.FolderParmTemplate("simulation", "Simulation", folder_type=hou.folderType.Tabs)
     simulation.addParmTemplate(hou.FloatParmTemplate("particlesep", "Particle Separation", 1, default_value=(0.02,), min=0.0001,
                                                      help="The distance between particles at rest. flip2's voxels are twice this"))
@@ -109,6 +110,9 @@ def _interface(node):
     bake.addParmTemplate(hou.ButtonParmTemplate("resume", "Resume", join_with_next=True, help="Carry a cancelled bake on from its newest checkpoint",
                                                 **_callback("resume")))
     bake.addParmTemplate(hou.ButtonParmTemplate("cancel", "Cancel", help="Stop the bake after the frame it's on, checkpointed", **_callback("cancel")))
+    bake.addParmTemplate(hou.ButtonParmTemplate("deleteremote", "Delete Remote Copy", disable_when="{ bakeon == 0 }",
+                                                help="Delete this node's bake on the remote machine. The frames already here stay, but it can't be resumed after",
+                                                **_callback("delete_remote")))
     status = hou.StringParmTemplate("status", "Status", 1)
     status.setDisableWhen("{ cfl >= 0 }")       #always: it's only to read
     bake.addParmTemplate(status)
@@ -120,6 +124,7 @@ def _interface(node):
 def create_solver(parent, name="flip2_solver"):
     """a flip2 Solver node in the SOP network parent"""
     node = parent.createNode("subnet", name)
+    node.setUserData("flip2", "solver")
     _interface(node)
     for index, role in enumerate(ROLES):     #each input as triangles, with each triangle's points
         unpack = node.createNode("unpack", role + "_unpack")
@@ -334,6 +339,8 @@ def _program(node):
     return program
 
 
+REMOTE_DIRECTORY = re.compile(r"^[A-Za-z0-9_./~-]+$")
+JOB_FOLDER = re.compile(r"^[A-Za-z0-9_.-]+-[0-9a-f]{8}$")     #<node>-<hash of its output directory>: the only folders delete_remote deletes
 SSH_OPTIONS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ControlMaster=auto", "-o", "ControlPath=~/.ssh/flip2-%r@%h:%p",
                "-o", "ControlPersist=120"]   #one connection, kept open between the mirror's syncs
 
@@ -344,6 +351,8 @@ def _remote(node):
     if not host:
         raise hou.NodeError("no remote host")
     base = node.evalParm("remotedir").strip().rstrip("/") or "~/flip2-bakes"
+    if not REMOTE_DIRECTORY.match(base):
+        raise hou.NodeError("Remote Directory can only hold letters, digits and ~ . _ - /: %r" % base)
     job = "%s-%s" % (node.name(), hashlib.sha1(os.path.abspath(_output_directory(node)).encode()).hexdigest()[:8])
     return host, base + "/" + job, node.parm("program").unexpandedString().strip() or "flip2"     #unexpanded: ~ is the remote machine's home
 
@@ -451,6 +460,36 @@ def cancel(node):
     _show(node, job["state"])
 
 
+def delete_remote(node, confirm=True):
+    """deletes this node's bake on the remote machine, after asking: the frames already here stay, but it can't be resumed or extended after"""
+    if node.path() in _jobs:
+        raise hou.NodeError("a bake is running: cancel it first")
+    host, directory, _ = _remote(node)
+    if not JOB_FOLDER.match(directory.rsplit("/", 1)[-1]):
+        raise hou.NodeError("not deleting %s: it isn't a flip2 job folder" % directory)
+    if confirm and hou.isUIAvailable():
+        choice = hou.ui.displayMessage("Delete %s:%s?" % (host, directory), buttons=("Delete", "Cancel"), default_choice=1, close_choice=1,
+                                       severity=hou.severityType.Warning,
+                                       details="The frames already here stay, but the bake can't be resumed or extended once its remote copy is gone.")
+        if choice != 0:
+            return
+    path = node.path()
+
+    def remove():
+        try:
+            missing = "missing" in _ssh(host, "test -d %s || echo missing; rm -rf -- %s" % (directory, directory))
+            _notices.append((path, "no remote copy at %s:%s" % (host, directory) if missing else "deleted the remote copy, %s:%s" % (host, directory)))
+        except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+            _notices.append((path, "couldn't delete the remote copy: %s" % error))
+        finally:
+            _working[0] -= 1
+    _working[0] += 1
+    threading.Thread(target=remove, daemon=True).start()
+    _show(node, "deleting the remote copy")
+    if hou.isUIAvailable() and _watch not in hou.ui.eventLoopCallbacks():
+        hou.ui.addEventLoopCallback(_watch)
+
+
 def _last_event(path):
     """the last event in a bake's log, read from its end"""
     try:
@@ -519,6 +558,8 @@ def _ending(job):
 
 
 _next_look = [0.0]
+_notices = []       #(node path, text) from threads, which mustn't touch hou objects: _watch shows them
+_working = [0]      #threads still at work for nodes (deleting remote copies)
 
 
 def _watch():
@@ -528,6 +569,12 @@ def _watch():
     if now < _next_look[0]:
         return
     _next_look[0] = now + 0.5
+    while _notices:
+        path, text = _notices.pop(0)
+        node = hou.node(path)
+        if node is not None:
+            node.parm("status").set(text)
+            _show(node, text)
     for path, job in list(_jobs.items()):
         node = hou.node(path)
         if node is None:    #deleted: its bake carries on, unwatched
@@ -560,7 +607,7 @@ def _watch():
         job["shown"] = None
         _refresh(node, job)
         del _jobs[path]
-    if not _jobs and hou.isUIAvailable() and _watch in hou.ui.eventLoopCallbacks():
+    if not _jobs and not _notices and _working[0] == 0 and hou.isUIAvailable() and _watch in hou.ui.eventLoopCallbacks():
         hou.ui.removeEventLoopCallback(_watch)
 
 
@@ -589,3 +636,30 @@ def shelf_tool(kwargs):
     node.setRenderFlag(True)
     node.setSelected(True, clear_all_selected=True)
     return node
+
+
+def update_all(root=None):
+    """gives every flip2 Solver and flip2 Import node under root (the whole scene by default) the latest parameters, keeping their values. Returns them"""
+    from . import importer
+    updated = []
+    for node in (root or hou.node("/")).allSubChildren():
+        if node.type().name() != "subnet":
+            continue
+        kind = node.userData("flip2") or ("solver" if node.parm("particlesep") is not None and node.parm("remotehost") is not None
+                                          else "import" if node.parm("bakedir") is not None else None)
+        if kind == "solver":
+            _interface(node)
+        elif kind == "import":
+            importer._interface(node)
+        else:
+            continue
+        node.setUserData("flip2", kind)
+        updated.append(node)
+    return updated
+
+
+def update_tool(kwargs):
+    """the Update flip2 Nodes tool"""
+    updated = update_all()
+    hou.ui.displayMessage("Updated %d flip2 node%s to this version's parameters." % (len(updated), "" if len(updated) == 1 else "s"),
+                          details="\n".join(node.path() for node in updated) or None)
