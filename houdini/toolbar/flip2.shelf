@@ -5,6 +5,7 @@
     <memberTool name="flip2_solver"/>
     <memberTool name="flip2_import"/>
     <memberTool name="flip2_whitewater"/>
+    <memberTool name="flip2_karma"/>
     <memberTool name="flip2_update"/>
   </toolshelf>
 
@@ -38,6 +39,16 @@ flip2houdini.importer.shelf_tool(kwargs)]]></script>
     <toolSubmenu>flip2</toolSubmenu>
     <script scriptType="python"><![CDATA[import flip2houdini.whitewater
 flip2houdini.whitewater.shelf_tool(kwargs)]]></script>
+  </tool>
+
+  <tool name="flip2_karma" label="flip2 Karma Setup" icon="ROP_karma">
+    <helpText><![CDATA[A Karma setup in /stage for the selected flip2 Solver or flip2 Import node's bake: its surface as water, its collisions, its whitewater if flip2 Whitewater set it up, a ground, a sky and a camera, with Velocity Blur on so the surface's motion blurs.]]></helpText>
+    <toolMenuContext name="network">
+      <contextNetType>SOP</contextNetType>
+    </toolMenuContext>
+    <toolSubmenu>flip2</toolSubmenu>
+    <script scriptType="python"><![CDATA[import flip2houdini.render
+flip2houdini.render.shelf_tool(kwargs)]]></script>
   </tool>
 
   <tool name="flip2_update" label="Update flip2 Nodes" icon="BUTTONS_reload">

@@ -110,7 +110,7 @@ def build_container(node, collision, wired):
         collide = node.createNode("flipcollide", "collision_stream")
         for index in range(3):
             collide.setInput(index, container, index)
-        collide.setInput(3, collision)
+    collide.setInput(3, collision)
     collisions = node.node("collisions")
     if collisions is None:
         collisions = node.createNode("switch", "collisions")

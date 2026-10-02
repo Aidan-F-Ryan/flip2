@@ -7,9 +7,14 @@ Its inputs are geometry, as Houdini's own FLIP Solver takes it:
     3 Sources      closed surfaces kept full of fluid moving at the emission velocity (or their v attribute's mean)
     4 Sinks        closed surfaces that remove the fluid inside them
 
-Each input is one object, or with a "name" primitive attribute, one per name (flip2 takes up to 16 collisions). Packed geometry is unpacked, every
-primitive turned into polygons and the polygons into triangles. An object that moves or deforms over the frame range is sampled every frame, which
-flip2 re-voxelizes between, so its point count and triangles mustn't change.
+Each input is one object, or with a "name" primitive attribute, one per name. Packed geometry is unpacked, every primitive turned into polygons and the
+polygons into triangles. An object is sampled every frame of the range, and goes to flip2 as what it does: still, its vertices once; moving rigidly (no
+vertex further than a hundredth of a voxel from where a turn and a shift put it), its vertices once and a transform per frame, which flip2 turns it
+through exactly; or deforming, its vertices every frame, which flip2 re-voxelizes between, so its points and triangles mustn't change. flip2 takes 16
+collisions: with more names than that, the still ones go as one object, and if need be the moving ones as another.
+
+VDBs in the Collisions input stay volumes: a level set that's still (with a velocity VDB beside it, if there is one: named after it with "vel" on the
+end, or "vel" or "v") or moved rigidly goes to flip2 as it is. One that changes shape over time flip2 can't take yet.
 
 Everything goes in the output directory ($HIP/geo/<scene>.<node> by default, beside File Cache's caches): scene.json and geo/ (what the node writes), bake/ (flip2's cache, which a
 running bake commits frames to, and export/houdini/ beside it) and logs/. The bake's frame 0 is the start frame, and the node shows it there: its
@@ -53,8 +58,14 @@ i@flip2_a = corners == 3 ? primpoint(0, @primnum, 0) : -1;
 i@flip2_b = corners == 3 ? primpoint(0, @primnum, 1) : -1;
 i@flip2_c = corners == 3 ? primpoint(0, @primnum, 2) : -1;
 """
+SOLIDS = 'if(primintrinsic(0, "typename", @primnum) == "VDB") removeprim(0, @primnum, 1);'      #the Collisions input without its VDBs, and only them
+VOLUMES = 'if(primintrinsic(0, "typename", @primnum) != "VDB") removeprim(0, @primnum, 1);'
+VOLUME_FILE = "collision_volumes.vdb"
+LIMIT = 16      #the obstacles flip2 takes, and the meshes among its fluids, emitters and sinks
+SURFACE_DEFAULTS = {"influencescale": (3.0,), "radiusscale": (0.8,), "smoothing": (4,)}     #flip2 mesh's own
+OLD_SURFACE_DEFAULTS = {"influencescale": 2.0, "radiusscale": 0.6, "smoothing": 2}         #what they were, which left the surface dimpled
 _jobs = {}      #per node path, its bake's processes, while this session runs them
-GEO_FILE = re.compile(r"^(%s)\d+_(triangles|vertices|f-?\d+)\.npy$" % "|".join(ROLES))     #the files write_scene writes into geo/
+GEO_FILE = re.compile(r"^((%s)\d+_(triangles|vertices|f-?\d+)\.npy|collision_volumes\.vdb)$" % "|".join(ROLES))    #the files write_scene writes into geo/
 
 
 def _callback(function):
@@ -103,13 +114,14 @@ def _interface(node):
                                                         "outwards, with v for motion blur"))
     surface.addParmTemplate(hou.FloatParmTemplate("voxelscale", "Voxel Scale", 1, default_value=(0.5,), min=0.1, max=2.0,
                                                   help="The surface's sample spacing, in particle separations: smaller is finer, slower and larger on disk"))
-    surface.addParmTemplate(hou.FloatParmTemplate("influencescale", "Influence Scale", 1, default_value=(2.0,), min=0.5, max=4.0,
+    surface.addParmTemplate(hou.FloatParmTemplate("influencescale", "Influence Scale", 1, default_value=SURFACE_DEFAULTS["influencescale"], min=0.5, max=4.0,
                                                   help="How far each particle reaches into the surface, in particle separations: larger is smoother, and "
-                                                       "fills gaps between particles further apart. At most 8 times the voxel scale"))
-    surface.addParmTemplate(hou.FloatParmTemplate("radiusscale", "Radius Scale", 1, default_value=(0.6,), min=0.1, max=2.0,
-                                                  help="Each particle's radius, in particle separations: where the surface sits around them. 0.6 keeps "
-                                                       "the liquid's volume. Less than the influence scale"))
-    surface.addParmTemplate(hou.IntParmTemplate("smoothing", "Smoothing", 1, default_value=(2,), min=0, max=10,
+                                                       "fills gaps between particles further apart; at 2 the surface dimples over each particle. At "
+                                                       "most 8 times the voxel scale"))
+    surface.addParmTemplate(hou.FloatParmTemplate("radiusscale", "Radius Scale", 1, default_value=SURFACE_DEFAULTS["radiusscale"], min=0.1, max=2.0,
+                                                  help="Each particle's radius, in particle separations: where the surface sits around them. 0.8 keeps "
+                                                       "the liquid's volume at an influence scale of 3 (0.6 at 2). Less than the influence scale"))
+    surface.addParmTemplate(hou.IntParmTemplate("smoothing", "Smoothing", 1, default_value=SURFACE_DEFAULTS["smoothing"], min=0, max=10,
                                                 help="Passes of a smoothing filter over the surface before it's meshed"))
     surface.addParmTemplate(hou.ToggleParmTemplate("outputfields", "Output Fluid Fields", default_value=False,
                                                    help="Write the liquid's surface level set and velocity field each frame too (surface and vel, as Houdini's FLIP "
@@ -163,7 +175,8 @@ def _network(node):
     folder, frame = '`chs("../outputdir")`/bake/export/houdini', 'round(($T - (ch("../startframe") - 1)/$FPS)*$FPS)'
     shown = importer.build_loaders(node, folder, frame)
     importer.build_fields(node, folder, frame)
-    box = importer.build_container(node, node.node("COLLISION"), ROLES.index("collision"))
+    _split_volumes(node)
+    box = importer.build_container(node, node.node("collision_unpack"), ROLES.index("collision"))
     for axis in "xyz":
         box.parm("size" + axis).setExpression('ch("../domainsize%s")' % axis)
         box.parm("t" + axis).setExpression('ch("../domaincenter%s")' % axis)
@@ -171,6 +184,25 @@ def _network(node):
         if node.parm("label%d" % (index + 1)) is not None:
             node.parm("label%d" % (index + 1)).set(label)
     return shown
+
+
+def _split_volumes(node):
+    """the Collisions input's VDBs apart from the rest of it: the rest goes on to be triangles (COLLISION), and the VDBs stay as they are
+    (COLLISION_VOLUMES). Makes only what's missing, so an older node gains it"""
+    unpack = node.node("collision_unpack")
+    if node.node("collision_solids") is None:
+        solids = node.createNode("attribwrangle", "collision_solids")
+        solids.parm("class").set(1)
+        solids.parm("snippet").set(SOLIDS)
+        solids.setInput(0, unpack)
+        node.node("collision_polygons").setInput(0, solids)
+    if node.node("COLLISION_VOLUMES") is None:
+        only = node.createNode("attribwrangle", "collision_volumes")
+        only.parm("class").set(1)
+        only.parm("snippet").set(VOLUMES)
+        only.setInput(0, unpack)
+        node.createNode("null", "COLLISION_VOLUMES").setInput(0, only)
+        node.layoutChildren()
 
 
 def create_solver(parent, name="flip2_solver"):
@@ -262,20 +294,137 @@ def _sample(node, role, frames, progress=None):
     return samples
 
 
-def _write_object(samples, prefix, geo_dir, frames, fps):
-    """an object's files, and its scene entry: still, or deforming with a sample every frame"""
+def _rigid(first, later, tolerance):
+    """the turn and shift that take first's points to later's, as flip2 has a transform (16 numbers: a 4x4 matrix by rows, acting on column vectors), or
+    None if none does to within tolerance. The best fit there is: Kabsch's"""
     import numpy
+    centre, moved = first.mean(axis=0), later.mean(axis=0)
+    u, _, vt = numpy.linalg.svd((first - centre).T @ (later - moved))
+    turn = vt.T @ numpy.diag([1.0, 1.0, numpy.sign(numpy.linalg.det(vt.T @ u.T))]) @ u.T
+    shift = moved - turn @ centre
+    if numpy.abs(first @ turn.T + shift - later).max() > tolerance:
+        return None
+    return [float(value) for row in range(3) for value in (*turn[row], shift[row])] + [0.0, 0.0, 0.0, 1.0]
+
+
+def _motion(samples, tolerance):
+    """how a sampled object moves: still; rigid, with a transform per frame from where it is at the first; or deforming"""
+    import numpy
+    first = samples["frames"][0]
+    if all(numpy.array_equal(positions, first) for positions in samples["frames"][1:]):
+        return "still", None
+    transforms = []
+    for positions in samples["frames"]:
+        transform = _rigid(first.astype(numpy.float64), positions.astype(numpy.float64), tolerance)
+        if transform is None:
+            return "deforming", None
+        transforms.append(transform)
+    return "rigid", transforms
+
+
+def _merge(objects):
+    """several sampled objects as one: at every frame their vertices one after another, and their triangles"""
+    import numpy
+    triangles, offset = [], 0
+    for samples in objects:
+        triangles.append(samples["triangles"] + offset)
+        offset += len(samples["frames"][0])
+    return {"name": "", "triangles": numpy.concatenate(triangles), "points": numpy.concatenate([samples["points"] for samples in objects]),
+            "frames": [numpy.concatenate([samples["frames"][frame] for samples in objects]) for frame in range(len(objects[0]["frames"]))]}
+
+
+def _within(objects, limit, tolerance):
+    """objects with how each moves, no more than limit of them: as they are if they fit; otherwise the still ones as one object, and if that's still too
+    many, the moving ones as another (together they deform)"""
+    moving = [(samples, _motion(samples, tolerance)) for samples in objects]
+    if len(moving) <= limit:
+        return moving
+    still = [samples for samples, (kind, _) in moving if kind == "still"]
+    rest = [(samples, motion) for samples, motion in moving if motion[0] != "still"]
+    if len(rest) + min(len(still), 1) > limit:
+        merged = _merge([samples for samples, _ in rest])
+        rest = [(merged, _motion(merged, tolerance))]
+    return ([(_merge(still), ("still", None))] if still else []) + rest
+
+
+def _write_object(samples, motion, prefix, geo_dir, frames, fps):
+    """an object's files, and its scene entry: still, moving rigidly with a transform every frame, or deforming with its vertices every frame"""
+    import numpy
+    kind, transforms = motion
     numpy.save(os.path.join(geo_dir, prefix + "_triangles.npy"), samples["triangles"])
-    still = all(numpy.array_equal(positions, samples["frames"][0]) for positions in samples["frames"][1:])
-    if still:
+    entry = {"vertices": "geo/%s_vertices.npy" % prefix, "triangles": "geo/%s_triangles.npy" % prefix}
+    if kind != "deforming":
         numpy.save(os.path.join(geo_dir, prefix + "_vertices.npy"), samples["frames"][0])
-        return {"vertices": "geo/%s_vertices.npy" % prefix, "triangles": "geo/%s_triangles.npy" % prefix}
+        if kind == "rigid":
+            entry["keyframes"] = [{"time": (frame - frames[0]) / fps, "transform": transform} for frame, transform in zip(frames, transforms)]
+        return entry
     deforming = []
     for frame, positions in zip(frames, samples["frames"]):
         name = "%s_f%d.npy" % (prefix, frame)
         numpy.save(os.path.join(geo_dir, name), positions)
         deforming.append({"time": (frame - frames[0]) / fps, "vertices": "geo/" + name})
-    return {"vertices": deforming[0]["vertices"], "triangles": "geo/%s_triangles.npy" % prefix, "deforming": deforming}
+    return {"vertices": deforming[0]["vertices"], "triangles": entry["triangles"], "deforming": deforming}
+
+
+def _volume_state(volume):
+    """a VDB's voxels as far as it's cheap to tell them from another frame's (how many, over what extent, their least, greatest and mean values); where
+    it is: its transform from voxels to the world, as Houdini has one (4x4, on row vectors); and its middle"""
+    import numpy
+    voxels = (volume.intrinsicValue("activevoxelcount"), tuple(volume.intrinsicValue("activevoxeldimensions")), volume.intrinsicValue("vdb_value_type"))
+    if "volumeminvalue" in volume.intrinsicNames() and voxels[2] in ("float", "double"):
+        voxels += tuple(round(volume.intrinsicValue(name), 6) for name in ("volumeminvalue", "volumemaxvalue", "volumeavgvalue"))
+    return voxels, numpy.array(volume.intrinsicValue("transform"), dtype=numpy.float64).reshape(4, 4), numpy.array(volume.boundingBox().center())
+
+
+def _sample_volumes(node, frames, progress=None):
+    """the Collisions input's VDB level sets over frames: per level set its name, its velocity VDB's name (or None), and a transform per frame from where
+    it is at the first if it moves (rigidly), or None if it keeps still. One that changes shape is an error: flip2 hasn't those yet. Houdini's own
+    transform of a VDB it has turned a few degrees is a little off a turn (its scale along the axis is the angle's cosine), so the nearest turn is taken,
+    about the volume's middle, when the scales are within a hundredth of 1"""
+    import numpy
+    volumes, first = [], {}
+    for frame in frames:
+        geometry = node.node("COLLISION_VOLUMES").geometryAtFrame(frame)
+        states = {}
+        for volume in geometry.prims():
+            name = volume.attribValue("name") if geometry.findPrimAttrib("name") is not None else ""
+            if name in states:
+                raise hou.NodeError("Collisions: two volumes are both named %r; flip2 tells them apart by name, so give each its own" % name)
+            states[name] = _volume_state(volume)
+        if frame == frames[0]:
+            first = states
+            vectors = [name for name, state in states.items() if state[0][2].startswith("vec3")]
+            for name, state in states.items():
+                if state[0][2] in ("float", "double"):
+                    velocity = next((candidate for candidate in (name + "vel", "vel", "v") if candidate in vectors), None)
+                    volumes.append({"name": name, "velocity": velocity, "transforms": [], "still": True})
+        elif set(states) != set(first):
+            raise hou.NodeError("Collisions: its volumes change at frame %d; flip2 takes volumes that are there throughout" % frame)
+        for volume in volumes:
+            for name in [volume["name"]] + ([volume["velocity"]] if volume["velocity"] else []):
+                if states[name][0] != first[name][0]:
+                    raise hou.NodeError("Collisions: the volume %r changes shape at frame %d. flip2 takes a level set that keeps still or moves rigidly, but "
+                                        "not yet one that changes over time: give it the geometry the volume is made from instead" % (name, frame))
+            moved = numpy.linalg.inv(first[volume["name"]][1]) @ states[volume["name"]][1]      #from where it was at the first frame, on row vectors
+            u, scales, vt = numpy.linalg.svd(moved[:3, :3].T)       #on column vectors: the nearest turn is u vt
+            if numpy.abs(scales - 1.0).max() > 0.01:
+                raise hou.NodeError("Collisions: the volume %r is scaled or sheared at frame %d, which makes its distances wrong; flip2 takes "
+                                    "one that keeps still or moves rigidly" % (volume["name"], frame))
+            turn = u @ numpy.diag([1.0, 1.0, numpy.sign(numpy.linalg.det(u @ vt))]) @ vt
+            middle = first[volume["name"]][2]
+            shift = moved[:3, :3].T @ middle + moved[3, :3] - turn @ middle     #so its middle goes where Houdini puts it
+            volume["still"] = volume["still"] and numpy.allclose(moved, numpy.eye(4), atol=1e-6)
+            volume["transforms"].append([float(value) for row in range(3) for value in (*turn[row], shift[row])] + [0.0, 0.0, 0.0, 1.0])
+            if volume["velocity"] and not numpy.allclose(states[volume["velocity"]][1], first[volume["velocity"]][1], atol=1e-6):
+                volume["still"] = False
+        if progress is not None:
+            progress()
+    for volume in volumes:
+        if volume["still"]:
+            volume["transforms"] = None
+        elif volume["velocity"]:    #its velocities are the world's, so they can't turn with it
+            volume["velocity"] = None
+    return volumes
 
 
 def _output_directory(node):
@@ -312,16 +461,27 @@ def write_scene(node):
                    "checkpoints": {"every": node.evalParm("checkpoints"), "keep": 2}},
     }
     roles = [role for role in ROLES if _connected(node, ROLES.index(role))]
-    total = sum(1 if role == "fluid" else len(frames) for role in roles)
+    total = sum(1 if role == "fluid" else len(frames) for role in roles) + (len(frames) if "collision" in roles else 0)
     sampled = [0]
     with hou.InterruptableOperation("flip2: sampling the inputs", long_operation_name="Writing the flip2 scene", open_interrupt_dialog=True) as operation:
         def progress():     #a progress bar, which Esc interrupts
             sampled[0] += 1
             operation.updateLongProgress(sampled[0] / max(total, 1), "sampled %d of %d frames of the inputs" % (sampled[0], total))
-        sampled_roles = [(role, _sample(node, role, frames[:1] if role == "fluid" else frames, progress)) for role in roles]
-    for role, objects in sampled_roles:
-        for index, samples in enumerate(objects):
-            entry = _write_object(samples, "%s%d" % (role, index), geo_dir, frames[:len(samples["frames"])], fps)
+        sampled_roles = {role: _sample(node, role, frames[:1] if role == "fluid" else frames, progress) for role in roles}
+        volumes = _sample_volumes(node, frames, progress) if "collision" in roles else []
+    if len(volumes) > LIMIT:
+        raise hou.NodeError("flip2 takes up to %d collision objects; this has %d volumes" % (LIMIT, len(volumes)))
+    tolerance = 0.01*2*separation      #a hundredth of a voxel: less than the fluid can feel
+    crowded = sum(len(sampled_roles.get(role, ())) for role in ("fluid", "source", "sink")) > LIMIT    #flip2's limit is on the three together
+    limits = {"collision": LIMIT - len(volumes), "fluid": 1 if crowded else LIMIT, "source": 2 if crowded else LIMIT, "sink": 2 if crowded else LIMIT}
+    made = []
+    for role in roles:
+        objects = _within(sampled_roles[role], limits[role], tolerance)
+        kinds = [kind for _, (kind, _) in objects] + (["volume"]*len(volumes) if role == "collision" else [])
+        made.append("%s: %s" % (LABELS[ROLES.index(role)].lower(), ", ".join("%d %s" % (kinds.count(kind), kind) for kind in ("still", "rigid", "deforming", "volume")
+                                                                               if kind in kinds) or "nothing"))
+        for index, (samples, motion) in enumerate(objects):
+            entry = _write_object(samples, motion, "%s%d" % (role, index), geo_dir, frames[:len(samples["frames"])], fps)
             if role == "fluid":
                 entry = {key: entry[key] for key in ("vertices", "triangles")}
                 scene["fluids"].append(entry)
@@ -334,12 +494,19 @@ def write_scene(node):
                 scene["emitters"].append(entry)
             else:
                 scene["sinks"].append(entry)
-    if len(scene["obstacles"]) > 16:
-        raise hou.NodeError("flip2 takes up to 16 collision objects; this has %d (one per name)" % len(scene["obstacles"]))
+    if volumes:     #the level sets as they are at the start, in one file, each named
+        node.node("COLLISION_VOLUMES").geometryAtFrame(frames[0]).saveToFile(os.path.join(geo_dir, VOLUME_FILE))
+    for volume in volumes:
+        entry = {"vdb": "geo/" + VOLUME_FILE, "grid": volume["name"], "friction": node.evalParm("friction")}
+        if volume["velocity"]:
+            entry["velocityGrid"] = volume["velocity"]
+        if volume["transforms"]:
+            entry["keyframes"] = [{"time": (frame - frames[0]) / fps, "transform": transform} for frame, transform in zip(frames, volume["transforms"])]
+        scene["obstacles"].append(entry)
     path = os.path.join(directory, "scene.json")
     with open(path, "w") as out:
         json.dump(scene, out, indent=1)
-    node.parm("status").set("wrote %s" % path)
+    node.parm("status").set("wrote %s (%s)" % (path, "; ".join(made)))
     return path
 
 
@@ -358,8 +525,8 @@ def fit_domain(node):
     """sets the domain to the box around every input's geometry over the frame range, a little larger"""
     start, end = _frames(node)
     low, high = [float("inf")]*3, [float("-inf")]*3
-    for role in ROLES:
-        source = node.node(role.upper())
+    for source in [node.node(role.upper()) for role in ROLES] + [node.node("COLLISION_VOLUMES")]:
+        role = source.name().lower()
         for frame in ([start] if role == "fluid" else range(start, end + 1)):
             geometry = source.geometryAtFrame(frame)
             box = geometry.boundingBox() if geometry is not None else None
@@ -763,8 +930,12 @@ def update_all(root=None):
                                           else "import" if node.parm("bakedir") is not None else None)
         if kind == "solver":
             had = node.parm("exportformat") is not None
+            dimpled = all(node.parm(name) is not None and abs(node.evalParm(name) - value) < 1e-6 for name, value in OLD_SURFACE_DEFAULTS.items())
             _interface(node)
             _network(node)
+            if dimpled:     #still at the surface settings it was made with: it follows them to today's
+                for name, value in SURFACE_DEFAULTS.items():
+                    node.parm(name).set(value[0])
             folder = node.evalParm("outputdir").rstrip("/")
             found = importer.detect_format(os.path.join(folder, "bake", "export", "houdini")) if folder else None
             if not had and found is not None:      #older than Export Format: its frames are whatever it wrote
