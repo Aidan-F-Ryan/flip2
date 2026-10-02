@@ -302,8 +302,8 @@ static int verify(const std::string& directory){
 //--out says), each a frame's every shard in one point cloud, in rank order (the order one partition would have held them), with P and v (bgeo.cu).
 //Frame NNNN is the cache's: frame 0 is the start, at time 0. Each shard is checked against its commit record's XXH64 as it's read. A frame already
 //exported is left alone unless its commit record is newer (a resume worked it out again) or --overwrite. --frames A-B, or just A, picks the frames;
-//otherwise every frame the bake makes. --follow waits for frames still to come, so a DCC can show a bake's frames as it commits them; it stops when
-//they've all been exported
+//otherwise every frame the bake makes. --follow waits for frames still to come, and for the cache itself if the bake hasn't started it, so a DCC can
+//show a bake's frames as it commits them; it stops when they've all been exported
 static int exportCache(const std::string& directory, int first, int last, std::string out, bool overwrite, bool follow){
     if(out.empty()){
         out = directory + "/export/houdini";
@@ -319,6 +319,10 @@ static int exportCache(const std::string& directory, int first, int last, std::s
     for(;;){
         std::string text;
         if(!readFile(directory + "/cache.json", text)){
+            if(follow){     //the bake hasn't started writing its cache yet
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                continue;
+            }
             return failure(directory + ": no cache.json, so no cache here");
         }
         int bakeFrames = -1;

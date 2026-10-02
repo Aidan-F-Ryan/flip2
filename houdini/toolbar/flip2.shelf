@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- flip2's tools: on the flip2 shelf, and in the Tab menu under flip2 -->
+<shelfDocument>
+  <toolshelf name="flip2" label="flip2">
+    <memberTool name="flip2_solver"/>
+    <memberTool name="flip2_import"/>
+  </toolshelf>
+
+  <tool name="flip2_solver" label="flip2 Solver" icon="DOP_flipsolver">
+    <helpText><![CDATA[A flip2 simulation: fluid, collisions, sources and sinks as inputs; bakes with the flip2 program and loads the result.]]></helpText>
+    <toolMenuContext name="network">
+      <contextNetType>OBJ</contextNetType>
+      <contextNetType>SOP</contextNetType>
+    </toolMenuContext>
+    <toolSubmenu>flip2</toolSubmenu>
+    <script scriptType="python"><![CDATA[import flip2houdini.solver
+flip2houdini.solver.shelf_tool(kwargs)]]></script>
+  </tool>
+
+  <tool name="flip2_import" label="flip2 Import" icon="SOP_file">
+    <helpText><![CDATA[Loads a flip2 bake's particles at the current time, from the .bgeo files flip2 export writes.]]></helpText>
+    <toolMenuContext name="network">
+      <contextNetType>OBJ</contextNetType>
+      <contextNetType>SOP</contextNetType>
+    </toolMenuContext>
+    <toolSubmenu>flip2</toolSubmenu>
+    <script scriptType="python"><![CDATA[import flip2houdini.importer
+flip2houdini.importer.shelf_tool(kwargs)]]></script>
+  </tool>
+</shelfDocument>
