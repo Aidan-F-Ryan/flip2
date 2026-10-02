@@ -4,6 +4,7 @@
 #define VOLUMES_HPP
 
 #include "scene.hpp"
+#include "surface.hu"
 #include <memory>
 #include <string>
 
@@ -12,5 +13,9 @@
 //that vector grid's velocities are sampled at the same points (staggered grids too). Throws std::runtime_error saying what's wrong, and in a build without
 //OpenVDB, always
 std::shared_ptr<const SceneField> loadLevelSet(const std::string& path, const std::string& grid, const std::string& velocityGrid, double voxelSize);
+
+//writes path, a VDB file of the liquid's fields as Houdini's FLIP has them, for its whitewater: "surface", a level set (inside its narrow band, inside), and
+//"vel", the velocity. Says why not if it can't, and in a build without OpenVDB, always can't
+bool writeFluidFields(const std::string& path, const FluidFields& fields, std::string& why);
 
 #endif

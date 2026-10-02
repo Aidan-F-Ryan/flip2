@@ -18,6 +18,9 @@ surface, its particles or both (Show).
 The surface is meshed on the GPU as each frame is committed (flip2 mesh, beside flip2 export), with the Surface tab's settings: closed quads facing
 outwards, their points carrying v for motion blur. Mesh Bake meshes a bake's frames again, with other settings or after a bake made without them.
 
+Its outputs: 1, the bake's surface, particles or both (Show); 2, its fluid fields, with Output Fluid Fields (surface, a level set, and vel, as Houdini's
+FLIP outputs them); 3, the domain. Outputs 2 and 3 are what Whitewater Source takes as its Liquid Simulation and Container.
+
 Bake On picks where flip2 runs: this machine, or another over ssh (a GPU box, for a Mac). A remote bake sends scene.json and geo/ to the remote
 directory, runs there detached (remote/job.sh), and is mirrored back every couple of seconds (remote/mirror.sh): its logs, its cache.json and its
 exported and meshed frames, so it shows here as a local one does. It needs ssh to reach the host without a password (a key), and rsync at both ends.
@@ -107,6 +110,12 @@ def _interface(node):
                                                        "the liquid's volume. Less than the influence scale"))
     surface.addParmTemplate(hou.IntParmTemplate("smoothing", "Smoothing", 1, default_value=(2,), min=0, max=10,
                                                 help="Passes of a smoothing filter over the surface before it's meshed"))
+    surface.addParmTemplate(hou.ToggleParmTemplate("outputfields", "Output Fluid Fields", default_value=False,
+                                                   help="Write the liquid's surface level set and velocity field each frame too (surface and vel, as Houdini's FLIP "
+                                                        "outputs them): the node's second output, for Whitewater Source"))
+    surface.addParmTemplate(hou.FloatParmTemplate("fieldvoxelscale", "Field Voxel Scale", 1, default_value=(2.0,), min=0.5, max=8.0,
+                                                  disable_when="{ outputfields == 0 }",
+                                                  help="The fields' voxel size, in particle separations: 2 is the simulation's own, as Houdini's FLIP has them"))
     surface.addParmTemplate(hou.ButtonParmTemplate("meshbake", "Mesh Bake", help="Mesh the bake's frames again with these settings, replacing their "
                                                    "surfaces: after a bake made without them, or to try others", **_callback("mesh_bake")))
     group.append(surface)
@@ -127,7 +136,9 @@ def _interface(node):
                                              help="How many pieces to split the domain into, across the GPUs"))
     bake.addParmTemplate(hou.IntParmTemplate("checkpoints", "Checkpoint Every", 1, default_value=(10,), min=0,
                                              help="Frames between checkpoints, which a cancelled bake resumes from; 0 for one only on cancel and at the end"))
-    bake.addParmTemplate(hou.MenuParmTemplate("compression", "Compression", ("zstd", "lz4", "none"), ("Zstd", "LZ4", "None"), default_value=0))
+    bake.addParmTemplate(hou.MenuParmTemplate("compression", "Compression", ("zstd", "lz4", "none"), ("Zstd", "LZ4", "None"), default_value=0,
+                                              help="How flip2's own cache of the bake is compressed"))
+    bake.addParmTemplate(importer.format_parm())
     bake.addParmTemplate(hou.ButtonParmTemplate("writescene", "Write Scene", help="Write scene.json and geo/ without baking", **_callback("write_scene")))
     bake.addParmTemplate(hou.ButtonParmTemplate("bake", "Bake", join_with_next=True, help="Write the scene and bake it from the start", **_callback("bake")))
     bake.addParmTemplate(hou.ButtonParmTemplate("resume", "Resume", join_with_next=True, help="Carry a cancelled bake on from its newest checkpoint",
@@ -146,8 +157,19 @@ def _interface(node):
 
 
 def _network(node):
-    """the node's loaders: the bake's frame showing at this time, its frame 0 on the start frame"""
-    return importer.build_loaders(node, '`chs("../outputdir")`/bake/export/houdini', 'round(($T - (ch("../startframe") - 1)/$FPS)*$FPS)')
+    """the node's loaders: the bake's frame showing at this time, its frame 0 on the start frame; and its domain, and its inputs' labels. Returns what
+    its first output shows"""
+    folder, frame = '`chs("../outputdir")`/bake/export/houdini', 'round(($T - (ch("../startframe") - 1)/$FPS)*$FPS)'
+    shown = importer.build_loaders(node, folder, frame)
+    importer.build_fields(node, folder, frame)
+    box = importer.build_container(node)
+    for axis in "xyz":
+        box.parm("size" + axis).setExpression('ch("../domainsize%s")' % axis)
+        box.parm("t" + axis).setExpression('ch("../domaincenter%s")' % axis)
+    for index, label in enumerate(LABELS):
+        if node.parm("label%d" % (index + 1)) is not None:
+            node.parm("label%d" % (index + 1)).set(label)
+    return shown
 
 
 def create_solver(parent, name="flip2_solver"):
@@ -415,8 +437,9 @@ def _launch_remote(job, host, directory, program, arguments, upload, local, logs
         job["state"] = "starting on %s" % host
         _ssh(host, "cd %s && nohup bash job.sh %s > /dev/null 2>&1 < /dev/null &" % (directory, " ".join(shlex.quote(word) for word in [program] + arguments)))
         environment = dict(os.environ, FLIP2_RSH=" ".join(["ssh"] + SSH_OPTIONS))
-        job["process"] = subprocess.Popen(["bash", os.path.join(scripts, "mirror.sh"), host, directory, local], env=environment,
-                                          stdout=subprocess.DEVNULL, stderr=open(os.path.join(logs, "mirror.log"), "a"))
+        #a bake from the start replaces the frames here; one resumed or meshed again only adds to them, as its remote copy may have been deleted since
+        mirror = ["bash", os.path.join(scripts, "mirror.sh"), host, directory, local] + (["replace"] if upload else [])
+        job["process"] = subprocess.Popen(mirror, env=environment, stdout=subprocess.DEVNULL, stderr=open(os.path.join(logs, "mirror.log"), "a"))
         job["state"] = "baking on %s" % host
     except (RuntimeError, OSError, subprocess.SubprocessError) as error:
         job["failure"] = str(error)
@@ -424,6 +447,7 @@ def _launch_remote(job, host, directory, program, arguments, upload, local, logs
 
 def _mesh_options(node):
     """flip2 mesh's options, from the Surface tab, checked as flip2 mesh would check them"""
+    fields = node.evalParm("outputfields")
     voxel, influence, radius = node.evalParm("voxelscale"), node.evalParm("influencescale"), node.evalParm("radiusscale")
     smoothing = node.evalParm("smoothing")
     if min(voxel, influence, radius) <= 0 or smoothing < 0:
@@ -432,7 +456,17 @@ def _mesh_options(node):
         raise hou.NodeError("the surface's radius scale has to be less than its influence scale")
     if influence > 8*voxel:
         raise hou.NodeError("the surface's influence scale can be at most 8 times its voxel scale")
-    return ["--voxel-scale", repr(voxel), "--influence-scale", repr(influence), "--radius-scale", repr(radius), "--smoothing", str(smoothing)]
+    options = ["--format", node.parm("exportformat").evalAsString(), "--voxel-scale", repr(voxel), "--influence-scale", repr(influence),
+               "--radius-scale", repr(radius), "--smoothing", str(smoothing)]
+    if fields:
+        if node.evalParm("fieldvoxelscale") <= 0:
+            raise hou.NodeError("the fields' voxel scale has to be positive")
+        options += ["--fields", "--field-voxel-scale", repr(node.evalParm("fieldvoxelscale"))]
+    if not node.evalParm("meshsurface"):
+        if not fields:
+            raise hou.NodeError("nothing to mesh: turn on Mesh the Surface or Output Fluid Fields")
+        options.append("--no-surface")
+    return options
 
 
 def _start(node, kind, upload=True):
@@ -440,7 +474,7 @@ def _start(node, kind, upload=True):
     the bake's frames again ("mesh"); returns at once, and _watch follows it"""
     if node.path() in _jobs:
         raise hou.NodeError("a bake is running already")
-    meshing = _mesh_options(node) if kind == "mesh" or node.evalParm("meshsurface") else None
+    meshing = _mesh_options(node) if kind == "mesh" or node.evalParm("meshsurface") or node.evalParm("outputfields") else None
     local = _output_directory(node)
     logs = os.path.join(local, "logs")
     os.makedirs(logs, exist_ok=True)
@@ -448,12 +482,14 @@ def _start(node, kind, upload=True):
     for stale in ("finished", name + ".events.jsonl", "bake.pid"):     #an earlier one's
         if os.path.exists(os.path.join(logs, stale)):
             os.remove(os.path.join(logs, stale))
+    exporting = ["--format", node.parm("exportformat").evalAsString()]
     job = {"process": None, "export": None, "mesh": None, "events": os.path.join(logs, name + ".events.jsonl"), "log": os.path.join(logs, name + ".log"),
-           "kind": kind, "meshing": meshing, "state": "starting", "failure": None, "said": None, "shown": {}}
+           "kind": kind, "meshing": meshing, "exporting": exporting, "state": "starting", "failure": None, "said": None, "shown": {}}
     if node.evalParm("bakeon") == 1:
         host, directory, program = _remote(node)
         job["remote"] = (host, directory)
         arguments = {"bake": ["bake", "scene.json", "--out", "bake", "--overwrite"], "resume": ["resume", "bake"], "mesh": ["mesh"]}[kind]
+        arguments = ["--export", " ".join(exporting)] + arguments
         if meshing is not None:
             arguments = ["--mesh", " ".join(meshing)] + arguments
         threading.Thread(target=_launch_remote, args=(job, host, directory, program, arguments, upload, local, logs), daemon=True).start()
@@ -465,9 +501,14 @@ def _start(node, kind, upload=True):
             job["process"] = subprocess.Popen([program, "mesh", bake, "--overwrite"] + meshing, stdout=open(job["events"], "w"),
                                               stderr=open(job["log"], "w"), cwd=local)
         else:
+            if kind == "bake":      #from the start: an earlier bake's cache and what was made of it go first, or the exporter and mesher following this
+                for part in ("frames", "frames.discarded", "checkpoints", "export"):    #one would take them for its own, and stop
+                    shutil.rmtree(os.path.join(bake, part), ignore_errors=True)
+                if os.path.exists(os.path.join(bake, "cache.json")):
+                    os.remove(os.path.join(bake, "cache.json"))
             arguments = {"bake": ["bake", os.path.join(local, "scene.json"), "--out", bake, "--overwrite"], "resume": ["resume", bake]}[kind]
             job["process"] = subprocess.Popen([program] + arguments, stdout=open(job["events"], "w"), stderr=open(job["log"], "w"), cwd=local)
-            job["export"] = subprocess.Popen([program, "export", bake, "--follow"], stdout=open(os.path.join(logs, "export.events.jsonl"), "w"),
+            job["export"] = subprocess.Popen([program, "export", bake, "--follow"] + exporting, stdout=open(os.path.join(logs, "export.events.jsonl"), "w"),
                                              stderr=open(os.path.join(logs, "export.log"), "w"), cwd=local)
             if meshing is not None:
                 job["mesh"] = subprocess.Popen([program, "mesh", bake, "--follow"] + meshing, stdout=open(os.path.join(logs, "mesh.events.jsonl"), "w"),
@@ -586,7 +627,7 @@ def _refresh(node, job):
     """reloads the frame on show, surface and particles, where its file has arrived or changed since it was loaded"""
     if not node.evalParm("load"):
         return
-    for name in (importer.SURFACE, importer.PARTICLES):
+    for name in (importer.SURFACE, importer.PARTICLES, importer.FIELDS):
         loader = node.node(name)
         if loader is None:
             continue
@@ -670,7 +711,7 @@ def _watch():
         if job.get("cancelled") and job["kind"] == "mesh":
             final = "cancelled: %s" % text
         bake = os.path.join(os.path.dirname(os.path.dirname(job["events"])), "bake")
-        for follower, command in (("export", ["export", bake]), ("mesh", ["mesh", bake] + (job["meshing"] or []))):
+        for follower, command in (("export", ["export", bake] + job["exporting"]), ("mesh", ["mesh", bake] + (job["meshing"] or []))):
             if job[follower] is not None and job[follower].poll() is None:     #following frames that won't come now: the last ones, once more
                 job[follower].terminate()
                 subprocess.Popen([job["program"]] + command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -720,11 +761,17 @@ def update_all(root=None):
         kind = node.userData("flip2") or ("solver" if node.parm("particlesep") is not None and node.parm("remotehost") is not None
                                           else "import" if node.parm("bakedir") is not None else None)
         if kind == "solver":
+            had = node.parm("exportformat") is not None
             _interface(node)
             _network(node)
+            folder = node.evalParm("outputdir").rstrip("/")
+            found = importer.detect_format(os.path.join(folder, "bake", "export", "houdini")) if folder else None
+            if not had and found is not None:      #older than Export Format: its frames are whatever it wrote
+                node.parm("exportformat").set(found)
         elif kind == "import":
             importer._interface(node)
             importer._network(node)
+            importer._match_format(node)
         else:
             continue
         node.setUserData("flip2", kind)

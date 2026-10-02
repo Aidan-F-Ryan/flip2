@@ -92,6 +92,11 @@ set_target_properties(main PROPERTIES CUDA_ARCHITECTURES "${flip2Architectures}"
 add_executable(flip2 flip2.cu scene.cpp volumes.cpp bgeo.cu surface.cu)
 target_link_libraries(flip2 particles gomp)
 set_target_properties(flip2 PROPERTIES CUDA_ARCHITECTURES "${flip2Architectures}")
+if(BLOSC_INCLUDE_DIR AND BLOSC_LIBRARY)     # and Houdini's compressed .bgeo.sc exports (bgeo.cu)
+    target_include_directories(flip2 PRIVATE ${BLOSC_INCLUDE_DIR})
+    target_link_libraries(flip2 ${BLOSC_LIBRARY})
+    target_compile_definitions(flip2 PRIVATE FLIP2_WITH_BLOSC)
+endif()
 string(REPLACE ";" "," architectureNames "${flip2Architectures}")     #a CMake list would split the definition
 target_compile_definitions(flip2 PRIVATE FLIP2_ARCHITECTURES="${architectureNames}")
 # installed (tools/package-linux.sh), flip2 finds the libraries it was built with in ../lib beside it, whatever the machine has

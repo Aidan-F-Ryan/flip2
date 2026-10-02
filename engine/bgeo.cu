@@ -16,7 +16,12 @@
 //
 //  "primitives", [[["type", "p_r"], ["s_v", 0, "n_p", quads, "r_v", [4, quads]]]]
 //
-//which is how Houdini 22 writes a run of polygons with 4 vertices each in binary: its first vertex, how many there are, and their vertex counts' runs
+//which is how Houdini 22 writes a run of polygons with 4 vertices each in binary: its first vertex, how many there are, and their vertex counts' runs.
+//
+//A path ending .sc is written compressed, as Houdini's .bgeo.sc (Blosc-compressed geometry): "scf1" and 8 bytes of 0; then the file as it would be
+//uncompressed, in chunks of 1 MiB (the last one shorter), each a Blosc chunk; then an index of big-endian 64-bit numbers: where each chunk after the
+//first starts, counted from the end of those 12 bytes, the chunk size, the last chunk's size and the index's own size so far; and last, "1fcs". That's
+//how Houdini 22 writes one, its chunks LZ4 with a byte shuffle of 4, as these are: zstd makes them a few percent smaller, but Houdini twice as slow to read
 #include "bgeo.hpp"
 #include <algorithm>
 #include <cerrno>
@@ -24,7 +29,11 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <unordered_map>
+#ifdef FLIP2_WITH_BLOSC
+#include <blosc.h>
+#endif
 
 namespace{
 
@@ -36,10 +45,126 @@ enum : unsigned char{       //binary_json.py's JID_ values
 const uint32_t BINARY_MAGIC = 0x624a534e;   //"NSJb" in a little-endian file
 const int PAGE_SIZE = 1024;
 
-//writes binary JSON to a file, little-endian
+//where a file's bytes go: straight to it, or through Houdini's .sc compression
+class Sink{
+public:
+    virtual ~Sink() = default;
+    virtual void write(const void* data, size_t bytes) = 0;
+    virtual bool finish() = 0;      //writes whatever it holds back; whether everything got written
+};
+
+class PlainSink : public Sink{
+public:
+    explicit PlainSink(std::FILE* file) : file(file), buffer(1 << 22){
+        std::setvbuf(file, buffer.data(), _IOFBF, buffer.size());
+    }
+    void write(const void* data, size_t bytes) override{
+        ok = ok && std::fwrite(data, 1, bytes, file) == bytes;
+    }
+    bool finish() override{
+        return ok && std::fflush(file) == 0;
+    }
+private:
+    std::FILE* file;
+    std::vector<char> buffer;
+    bool ok = true;
+};
+
+#ifdef FLIP2_WITH_BLOSC
+
+//the .sc framing (above): the bytes held back until there's a batch of chunks, which are compressed at once, a thread each
+class CompressingSink : public Sink{
+public:
+    static const size_t CHUNK = 1 << 20;
+    static const size_t BATCH = 32;     //chunks compressed together
+
+    explicit CompressingSink(std::FILE* file) : file(file){
+        static const char magic[12] = {'s', 'c', 'f', '1', 0, 0, 0, 0, 0, 0, 0, 0};
+        put(magic, sizeof(magic));
+        pending.reserve(BATCH*CHUNK);
+    }
+
+    void write(const void* data, size_t bytes) override{
+        const char* from = (const char*)data;
+        while(bytes > 0){
+            size_t taken = std::min(bytes, BATCH*CHUNK - pending.size());
+            pending.insert(pending.end(), from, from + taken);
+            from += taken;
+            bytes -= taken;
+            if(pending.size() == BATCH*CHUNK){
+                compress();
+            }
+        }
+    }
+
+    bool finish() override{
+        compress();
+        for(uint64_t start : starts){
+            putBigEndian(start);
+        }
+        putBigEndian(CHUNK);
+        putBigEndian(lastChunk);
+        putBigEndian(8*starts.size() + 16);
+        put("1fcs", 4);
+        return ok && std::fflush(file) == 0;
+    }
+
+private:
+    //compresses and writes every byte held back, in chunks
+    void compress(){
+        size_t chunks = (pending.size() + CHUNK - 1) / CHUNK;
+        std::vector<std::vector<char>> compressed(chunks);
+        std::vector<int> sizes(chunks);
+        #pragma omp parallel for schedule(dynamic, 1)
+        for(long chunk = 0; chunk < (long)chunks; ++chunk){
+            size_t bytes = std::min(CHUNK, pending.size() - chunk*CHUNK);
+            compressed[chunk].resize(bytes + BLOSC_MAX_OVERHEAD);
+            sizes[chunk] = blosc_compress_ctx(5, BLOSC_SHUFFLE, 4, bytes, pending.data() + chunk*CHUNK, compressed[chunk].data(), compressed[chunk].size(), "lz4",
+                                              0, 1);
+        }
+        for(size_t chunk = 0; chunk < chunks; ++chunk){
+            if(sizes[chunk] <= 0){
+                ok = false;
+                return;
+            }
+            if(chunkCount > 0){
+                starts.push_back(written);
+            }
+            put(compressed[chunk].data(), sizes[chunk]);
+            written += sizes[chunk];
+            lastChunk = std::min(CHUNK, pending.size() - chunk*CHUNK);
+            ++chunkCount;
+        }
+        pending.clear();
+    }
+
+    void put(const void* data, size_t bytes){
+        ok = ok && std::fwrite(data, 1, bytes, file) == bytes;
+    }
+
+    void putBigEndian(uint64_t value){
+        unsigned char bytes[8];
+        for(int byte = 0; byte < 8; ++byte){
+            bytes[byte] = (unsigned char)(value >> (56 - 8*byte));
+        }
+        put(bytes, 8);
+    }
+
+    std::FILE* file;
+    std::vector<char> pending;
+    std::vector<uint64_t> starts;   //each chunk's after the first, from the end of the magic number
+    uint64_t written = 0;           //bytes of chunks written
+    uint64_t lastChunk = 0;         //the last chunk's size, uncompressed
+    size_t chunkCount = 0;
+    bool ok = true;
+};
+
+#endif
+
+//writes binary JSON, little-endian
 class BinaryJson{
 public:
-    explicit BinaryJson(std::FILE* file) : file(file){
+    explicit BinaryJson(Sink& sink) : sink(sink){
         id(ID_MAGIC);
         raw(&BINARY_MAGIC, sizeof(BINARY_MAGIC));
     }
@@ -111,13 +236,9 @@ public:
     }
 
     void raw(const void* data, size_t bytes){
-        if(ok && bytes > 0){
-            ok = std::fwrite(data, 1, bytes, file) == bytes;
+        if(bytes > 0){
+            sink.write(data, bytes);
         }
-    }
-
-    bool good() const{
-        return ok;
     }
 
 private:
@@ -147,9 +268,8 @@ private:
         }
     }
 
-    std::FILE* file;
+    Sink& sink;
     std::unordered_map<std::string, uint64_t> tokens;
-    bool ok = true;
 };
 
 //an attribute's three float32 planes from a shard, or nullptr if it hasn't them
@@ -161,7 +281,8 @@ const float* planesOf(const ShardData& shard, const char* name){
     return (const float*)attribute->planes.data();
 }
 
-//writes path through write(json): to path.tmp, moved into place once it's whole, so nothing reading it ever sees half of one. Says why not if it can't
+//writes path through write(json), compressed if it ends .sc: to path.tmp, moved into place once it's whole, so nothing reading it ever sees half of one.
+//Says why not if it can't
 template<typename Write>
 bool writeFile(const std::string& path, std::string& why, Write write){
     std::string temporary = path + ".tmp";
@@ -170,11 +291,25 @@ bool writeFile(const std::string& path, std::string& why, Write write){
         why = "can't write " + temporary + ": " + std::strerror(errno);
         return false;
     }
-    std::vector<char> buffer(1 << 22);
-    std::setvbuf(file, buffer.data(), _IOFBF, buffer.size());
-    BinaryJson json(file);
+    bool compressed = path.size() > 3 && path.compare(path.size() - 3, 3, ".sc") == 0;
+    std::unique_ptr<Sink> sink;
+    if(!compressed){
+        sink.reset(new PlainSink(file));
+    }
+    else{
+#ifdef FLIP2_WITH_BLOSC
+        sink.reset(new CompressingSink(file));
+#else
+        std::fclose(file);
+        std::remove(temporary.c_str());
+        why = "this build of flip2 has no blosc, so it can't write .sc files";
+        return false;
+#endif
+    }
+    BinaryJson json(*sink);
     write(json);
-    bool written = json.good() && std::fflush(file) == 0;
+    bool written = sink->finish();
+    sink.reset();
     written = std::fclose(file) == 0 && written;
     if(!written){
         why = "couldn't write " + temporary;

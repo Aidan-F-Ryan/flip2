@@ -1,8 +1,11 @@
 //Copyright 2023 Aberrant Behavior LLC
 
-//VDB level sets, resampled into the engine's sparse bricks (see volumes.hpp). Only this file sees OpenVDB, so the CUDA sources never include it
+//VDB level sets, resampled into the engine's sparse bricks, and the liquid's fields written as VDBs (see volumes.hpp). Only this file sees OpenVDB, so
+//the CUDA sources never include it
 
 #include "volumes.hpp"
+#include <cstdio>
+#include <filesystem>
 #include <stdexcept>
 
 #ifdef FLIP2_WITH_OPENVDB
@@ -10,6 +13,7 @@
 #include <openvdb/openvdb.h>
 #include <openvdb/tools/Interpolation.h>
 #include <openvdb/tools/LevelSetRebuild.h>
+#include <openvdb/tools/SignedFloodFill.h>
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_for.h>
 #include <algorithm>
@@ -223,10 +227,62 @@ std::shared_ptr<const SceneField> loadLevelSet(const std::string& path, const st
     return field;
 }
 
+bool writeFluidFields(const std::string& path, const FluidFields& fields, std::string& why){
+    try{
+        openvdb::initialize();
+        openvdb::math::Transform::Ptr transform = openvdb::math::Transform::createLinearTransform(fields.voxelSize);
+        openvdb::FloatGrid::Ptr surface = openvdb::FloatGrid::create(fields.halfWidth*fields.voxelSize);
+        surface->setTransform(transform);
+        surface->setName("surface");
+        surface->setGridClass(openvdb::GRID_LEVEL_SET);
+        {
+            openvdb::FloatGrid::Accessor voxels = surface->getAccessor();
+            for(size_t voxel = 0; voxel < fields.distances.size(); ++voxel){
+                const int* at = &fields.surfaceVoxels[3*voxel];
+                voxels.setValueOn(openvdb::Coord(at[0], at[1], at[2]), fields.distances[voxel]);
+            }
+        }
+        openvdb::tools::signedFloodFill(surface->tree());     //everything the band encloses is inside
+        openvdb::Vec3SGrid::Ptr vel = openvdb::Vec3SGrid::create(openvdb::Vec3s(0.0f));
+        vel->setTransform(transform->copy());
+        vel->setName("vel");
+        vel->setVectorType(openvdb::VEC_CONTRAVARIANT_RELATIVE);    //a velocity: transforms turn it, but don't move it
+        {
+            openvdb::Vec3SGrid::Accessor voxels = vel->getAccessor();
+            for(size_t voxel = 0; voxel < fields.velocities.size()/3; ++voxel){
+                const int* at = &fields.velocityVoxels[3*voxel];
+                const float* v = &fields.velocities[3*voxel];
+                voxels.setValueOn(openvdb::Coord(at[0], at[1], at[2]), openvdb::Vec3s(v[0], v[1], v[2]));
+            }
+        }
+        std::string temporary = path + ".tmp";
+        openvdb::io::File file(temporary);
+        file.write(openvdb::GridCPtrVec{surface, vel});     //Blosc-compressed, as OpenVDB writes by default
+        file.close();
+        std::error_code renamed;
+        std::filesystem::rename(temporary, path, renamed);
+        if(renamed){
+            std::remove(temporary.c_str());
+            why = "couldn't move " + temporary + " into place: " + renamed.message();
+            return false;
+        }
+        return true;
+    }
+    catch(const std::exception& error){
+        why = path + ": " + error.what();
+        return false;
+    }
+}
+
 #else
 
 std::shared_ptr<const SceneField> loadLevelSet(const std::string& path, const std::string&, const std::string&, double){
     throw std::runtime_error(path + ": this build of flip2 has no OpenVDB, so it can't read VDB files; build it where OpenVDB is installed (libopenvdb-dev)");
+}
+
+bool writeFluidFields(const std::string& path, const FluidFields&, std::string& why){
+    why = path + ": this build of flip2 has no OpenVDB, so it can't write VDB files; build it where OpenVDB is installed (libopenvdb-dev)";
+    return false;
 }
 
 #endif

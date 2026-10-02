@@ -5,15 +5,15 @@
 //  flip2 bake scene.json [--frames N] [--out DIR] [--overwrite]
 //  flip2 resume DIR [--frames N] [--force]
 //  flip2 verify DIR
-//  flip2 export DIR [--frames A-B] [--out DIR] [--overwrite] [--follow]
-//  flip2 mesh DIR [--frames A-B] [--out DIR] [--overwrite] [--follow] [--separation S] [--voxel-scale S] [--influence-scale S] [--radius-scale S]
-//             [--smoothing N]
+//  flip2 export DIR [--frames A-B] [--out DIR] [--overwrite] [--follow] [--format bgeo.sc|bgeo]
+//  flip2 mesh DIR [--frames A-B] [--out DIR] [--overwrite] [--follow] [--format bgeo.sc|bgeo] [--separation S] [--voxel-scale S] [--influence-scale S]
+//             [--radius-scale S] [--smoothing N] [--fields] [--field-voxel-scale S] [--no-surface]
 //  flip2 info
 //
 //bake runs the scene (see scene.hpp) and writes into the output directory its cache (cacheWriter.hu: cache.json, frames/NNNN/, which a DCC can read
 //while the bake runs, and checkpoints/NNNN/), and if the scene asks, N.bin (float32 x, y, z per particle) and the diagnostics file. It won't bake over a
-//cache already there unless told to with --overwrite, which deletes it first. The first SIGINT or SIGTERM lets the frame being simulated finish,
-//checkpoints it and exits with status 3; a second exits at once. resume carries the bake in DIR on from its newest checkpoint, exactly as if it had never
+//cache already there unless told to with --overwrite, which deletes it first, with what was exported and meshed from it (DIR/export). The first SIGINT
+//or SIGTERM lets the frame being simulated finish, checkpoints it and exits with status 3; a second exits at once. resume carries the bake in DIR on from its newest checkpoint, exactly as if it had never
 //stopped, on as many ranks as it's run with (so on more or fewer GPUs too): the frames after the checkpoint move to frames.discarded/ and are worked out
 //again. It reads the scene the cache names, which has to be unchanged unless --force, and goes on to the frame the bake was going to; --frames takes it
 //further. verify checks every
@@ -29,9 +29,10 @@
 //  {"event":"cancelled","frame":57,"seconds":3.1}              stopped by a signal after frame 57, which is committed and checkpointed
 //  {"event":"done","frames":120,"seconds":5.2}                 every frame committed
 //  {"event":"verified","frames":121,"unfinished":0,"shards":121,"particles":150040000,"bytes":1712345678,"problems":0}
-//  {"event":"exported","frame":42,"particles":1240000,"file":"/shots/a/export/houdini/particles.0042.bgeo"}
+//  {"event":"exported","frame":42,"particles":1240000,"file":"/shots/a/export/houdini/particles.0042.bgeo.sc"}
 //  {"event":"exportDone","frames":121,"exported":121,"seconds":9.8}
-//  {"event":"meshed","frame":42,"particles":1240000,"points":310000,"faces":309000,"bandCells":52000,"rounds":2,"seconds":0.05,"file":"/shots/a/export/houdini/surface.0042.bgeo"}
+//  {"event":"meshed","frame":42,"particles":1240000,"points":310000,"faces":309000,"bandCells":52000,"rounds":2,"seconds":0.05,"file":"/shots/a/export/houdini/surface.0042.bgeo.sc"}
+//      with --fields, and ...,"surfaceVoxels":90000,"velocityVoxels":180000,"fieldSeconds":0.01,"writeSeconds":0.05,"fields":"/shots/a/export/houdini/fields.0042.vdb"}
 //  {"event":"meshDone","frames":121,"meshed":121,"seconds":12.1}
 //  {"event":"info","build":"7dc95a4","architectures":"86","cudaRuntime":13040,"driver":13040,"gpus":[{"index":0,"name":"...","sm":86,"memoryMB":24135,"runs":true}],...}
 //  {"event":"error","message":"scene.json: domain: needs a positive \"voxelSize\""}
@@ -45,6 +46,7 @@
 #include "xxhash64.hpp"
 #include "bgeo.hpp"
 #include "surface.hu"
+#include "volumes.hpp"
 #include "tcpTransport.hu"
 #ifdef FLIP2_WITH_NCCL
 #include "ncclTransport.hu"
@@ -105,9 +107,9 @@ static int usage(){
     std::cerr<<"usage: flip2 bake scene.json [--frames N] [--out DIR] [--overwrite]\n"
                "       flip2 resume DIR [--frames N] [--force]\n"
                "       flip2 verify DIR\n"
-               "       flip2 export DIR [--frames A-B] [--out DIR] [--overwrite] [--follow]\n"
-               "       flip2 mesh DIR [--frames A-B] [--out DIR] [--overwrite] [--follow] [--separation S] [--voxel-scale S] [--influence-scale S]\n"
-               "                  [--radius-scale S] [--smoothing N]\n"
+               "       flip2 export DIR [--frames A-B] [--out DIR] [--overwrite] [--follow] [--format bgeo.sc|bgeo]\n"
+               "       flip2 mesh DIR [--frames A-B] [--out DIR] [--overwrite] [--follow] [--format bgeo.sc|bgeo] [--separation S] [--voxel-scale S]\n"
+               "                  [--influence-scale S] [--radius-scale S] [--smoothing N] [--fields] [--field-voxel-scale S] [--no-surface]\n"
                "       flip2 info\n";
     return 2;
 }
@@ -312,14 +314,14 @@ static std::string frameName(int frame){    //as the cache's folders and the exp
     return name;
 }
 
-//makes a file of each of the cache's committed frames, for export and mesh: for every frame from first to last (or the bake's last, if last is -1) whose
-//file, target(frame), is missing or older than the frame's commit record (a resume worked it out again), or every one with overwrite, reads its shards,
-//each checked against its commit record's XXH64, and has make(frame, shards, target, why) write the file (saying so as an event) or say why not. follow
+//makes files of each of the cache's committed frames, for export and mesh: for every frame from first to last (or the bake's last, if last is -1) one of
+//whose files, targets(frame), is missing or older than the frame's commit record (a resume worked it out again), or every one with overwrite, reads its
+//shards, each checked against its commit record's XXH64, and has make(frame, shards, targets, why) write them (saying so as an event) or say why not. follow
 //waits for frames still to come, and for the cache itself if the bake hasn't started it, so a DCC can show a bake's frames as it commits them; it stops
 //when they've all been made. Ends with the event finished, counting the files written as written
 static int eachCommittedFrame(const std::string& directory, int first, int last, bool overwrite, bool follow, const char* finished, const char* written,
-                              const std::function<std::string(int)>& target,
-                              const std::function<bool(int, const std::vector<ShardData>&, const std::string&, std::string&)>& make){
+                              const std::function<std::vector<std::string>(int)>& targets,
+                              const std::function<bool(int, const std::vector<ShardData>&, const std::vector<std::string>&, std::string&)>& make){
     auto start = std::chrono::steady_clock::now();
     size_t made = 0, problems = 0;
     std::vector<bool> done;     //per frame in range: made, or found already made
@@ -357,16 +359,20 @@ static int eachCommittedFrame(const std::string& directory, int first, int last,
             }
             std::string name = frameName(frame);
             std::string record = directory + "/frames/" + name + "/commit.json";
-            std::string file = target(frame);
+            std::vector<std::string> files = targets(frame);
             std::error_code missing;
             auto committedAt = std::filesystem::last_write_time(record, missing);
             if(missing){
                 ++waiting;      //not committed yet
                 continue;
             }
-            std::error_code absent;
-            auto madeAt = std::filesystem::last_write_time(file, absent);
-            if(!absent && !overwrite && madeAt >= committedAt){
+            bool current = !overwrite;
+            for(const std::string& file : files){
+                std::error_code absent;
+                auto madeAt = std::filesystem::last_write_time(file, absent);
+                current = current && !absent && madeAt >= committedAt;
+            }
+            if(current){
                 done[frame - first] = true;
                 continue;
             }
@@ -394,7 +400,11 @@ static int eachCommittedFrame(const std::string& directory, int first, int last,
             catch(const std::exception& error){
                 why = error.what();
             }
-            if(why.empty() && make(frame, shards, file, why)){
+            for(const std::string& file : files){     //there again, if a bake starting over has cleared its exports away since
+                std::error_code ignored;
+                std::filesystem::create_directories(std::filesystem::path(file).parent_path(), ignored);
+            }
+            if(why.empty() && make(frame, shards, files, why)){
                 ++made;
                 done[frame - first] = true;
             }
@@ -426,10 +436,11 @@ static bool makeDirectory(const std::string& path){
     return true;
 }
 
-//flip2 export: the cache's committed frames, as files DCCs load natively. For now Houdini's: OUT/particles.NNNN.bgeo (OUT is DIR/export/houdini unless
-//--out says), each a frame's every shard in one point cloud, in rank order (the order one partition would have held them), with P and v (bgeo.cu).
-//Frame NNNN is the cache's: frame 0 is the start, at time 0. Frames are picked, redone and followed as eachCommittedFrame says
-static int exportCache(const std::string& directory, int first, int last, std::string out, bool overwrite, bool follow){
+//flip2 export: the cache's committed frames, as files DCCs load natively. For now Houdini's: OUT/particles.NNNN.bgeo.sc (OUT is DIR/export/houdini
+//unless --out says; .bgeo, uncompressed, with format "bgeo"), each a frame's every shard in one point cloud, in rank order (the order one partition would
+//have held them), with P and v (bgeo.cu). Frame NNNN is the cache's: frame 0 is the start, at time 0. Frames are picked, redone and followed as
+//eachCommittedFrame says
+static int exportCache(const std::string& directory, int first, int last, std::string out, bool overwrite, bool follow, const std::string& format){
     if(out.empty()){
         out = directory + "/export/houdini";
     }
@@ -437,8 +448,9 @@ static int exportCache(const std::string& directory, int first, int last, std::s
         return 1;
     }
     return eachCommittedFrame(directory, first, last, overwrite, follow, "exportDone", "exported", [&](int frame){
-        return out + "/particles." + frameName(frame) + ".bgeo";
-    }, [&](int frame, const std::vector<ShardData>& shards, const std::string& target, std::string& why){
+        return std::vector<std::string>{out + "/particles." + frameName(frame) + "." + format};
+    }, [&](int frame, const std::vector<ShardData>& shards, const std::vector<std::string>& targets, std::string& why){
+        const std::string& target = targets[0];
         std::vector<const ShardData*> pieces;
         unsigned long long particles = 0;
         for(const ShardData& shard : shards){
@@ -453,17 +465,26 @@ static int exportCache(const std::string& directory, int first, int last, std::s
     });
 }
 
-//flip2 mesh: the liquid's surface in each of the cache's committed frames, worked out on the GPU (surface.cu), as OUT/surface.NNNN.bgeo (OUT as for
-//export): closed quads facing outwards, their points carrying the liquid's velocity v for motion blur. The particle separation is the bake's (half its
-//voxel size) unless settings give one. Frames are picked, redone and followed as eachCommittedFrame says
-static int meshCache(const std::string& directory, int first, int last, std::string out, bool overwrite, bool follow, SurfaceSettings settings){
+//flip2 mesh: the liquid's surface in each of the cache's committed frames, worked out on the GPU (surface.cu), as OUT/surface.NNNN.bgeo.sc (OUT and
+//format as for export): closed quads facing outwards, their points carrying the liquid's velocity v for motion blur. With fields, also OUT/fields.NNNN.vdb, the
+//liquid's fields as Houdini's FLIP outputs them for its whitewater: "surface", a level set, and "vel", its velocity (surface.hu, volumes.hpp); with
+//surface false, only them. The particle separation is the bake's (half its voxel size) unless settings give one. Frames are picked, redone and
+//followed as eachCommittedFrame says
+static int meshCache(const std::string& directory, int first, int last, std::string out, bool overwrite, bool follow, const std::string& format,
+                     SurfaceSettings settings, bool surface, bool fields, const FieldSettings& fieldSettings){
     SurfaceSettings checked = settings;
     if(checked.separation <= 0.0f){
         checked.separation = 1.0f;      //the bake's, which can only be checked once there's a cache
     }
     std::string problem = checked.problem();
+    if(problem.empty() && fields){
+        problem = fieldSettings.problem();
+    }
     if(!problem.empty()){
         return failure("mesh: " + problem);
+    }
+    if(!surface && !fields){
+        return failure("mesh: neither the surface nor the fields asked for");
     }
     if(out.empty()){
         out = directory + "/export/houdini";
@@ -477,9 +498,17 @@ static int meshCache(const std::string& directory, int first, int last, std::str
     std::unique_ptr<SurfaceMesher> mesher;      //made at the first frame, on the GPU: so not at all, if there's nothing to mesh
     std::vector<float> positions, velocities;
     SurfaceMesh mesh;
+    FluidFields fluidFields;
     return eachCommittedFrame(directory, first, last, overwrite, follow, "meshDone", "meshed", [&](int frame){
-        return out + "/surface." + frameName(frame) + ".bgeo";
-    }, [&](int frame, const std::vector<ShardData>& shards, const std::string& target, std::string& why){
+        std::vector<std::string> files;
+        if(surface){
+            files.push_back(out + "/surface." + frameName(frame) + "." + format);
+        }
+        if(fields){
+            files.push_back(out + "/fields." + frameName(frame) + ".vdb");
+        }
+        return files;
+    }, [&](int frame, const std::vector<ShardData>& shards, const std::vector<std::string>& targets, std::string& why){
         if(settings.separation <= 0.0f){
             std::string text;
             const Json* voxelSize = nullptr;
@@ -534,18 +563,35 @@ static int meshCache(const std::string& directory, int first, int last, std::str
                 mesher.reset(new SurfaceMesher);
             }
             mesher->mesh(positions.data(), velocities.data(), particles, low, high, settings, mesh);
+            if(fields){
+                mesher->fields(fieldSettings, fluidFields);
+            }
         }
         catch(const std::exception& error){
             why = error.what();
             return false;
         }
-        if(!writeSurfaceBgeo(target, mesh, std::string("flip2 ") + FLIP2_BUILD_ID, why)){
-            return false;
-        }
         char numbers[200];
-        std::snprintf(numbers, sizeof(numbers), ",\"particles\":%llu,\"points\":%zu,\"faces\":%zu,\"bandCells\":%zu,\"rounds\":%d,\"seconds\":%.4f,\"file\":",
+        std::snprintf(numbers, sizeof(numbers), ",\"particles\":%llu,\"points\":%zu,\"faces\":%zu,\"bandCells\":%zu,\"rounds\":%d,\"seconds\":%.4f",
                       particles, mesh.points.size()/3, mesh.quads.size()/4, mesher->bandCells, mesher->rounds, mesher->seconds);
-        event("{\"event\":\"meshed\",\"frame\":" + std::to_string(frame) + numbers + ::quoted(target) + "}");
+        std::string said = "{\"event\":\"meshed\",\"frame\":" + std::to_string(frame) + numbers;
+        if(surface){
+            if(!writeSurfaceBgeo(targets[0], mesh, std::string("flip2 ") + FLIP2_BUILD_ID, why)){
+                return false;
+            }
+            said += ",\"file\":" + ::quoted(targets[0]);
+        }
+        if(fields){
+            auto writing = std::chrono::steady_clock::now();
+            if(!writeFluidFields(targets.back(), fluidFields, why)){
+                return false;
+            }
+            std::snprintf(numbers, sizeof(numbers), ",\"surfaceVoxels\":%zu,\"velocityVoxels\":%zu,\"fieldSeconds\":%.4f,\"writeSeconds\":%.4f,\"fields\":",
+                          fluidFields.distances.size(), fluidFields.velocities.size()/3, mesher->fieldSeconds,
+                          std::chrono::duration<double>(std::chrono::steady_clock::now() - writing).count());
+            said += numbers + ::quoted(targets.back());
+        }
+        event(said + "}");
         return true;
     });
 }
@@ -766,10 +812,25 @@ int main(int argc, char** argv){
         std::string out;
         bool overwrite = false, follow = false;
         SurfaceSettings surface;
+        FieldSettings fieldSettings;
+        bool meshSurface = true, fields = false;
+        std::string format = "bgeo.sc";
         for(int arg = 3; arg < argc; ++arg){
             std::string option = argv[arg];
-            if(meshing && arg + 1 < argc && (option == "--separation" || option == "--voxel-scale" || option == "--influence-scale" || option == "--radius-scale" ||
-                                             option == "--smoothing")){
+            if(option == "--format" && arg + 1 < argc){
+                format = argv[++arg];
+                if(format != "bgeo" && format != "bgeo.sc"){
+                    return usage();
+                }
+            }
+            else if(meshing && option == "--fields"){
+                fields = true;
+            }
+            else if(meshing && option == "--no-surface"){
+                meshSurface = false;
+            }
+            else if(meshing && arg + 1 < argc && (option == "--separation" || option == "--voxel-scale" || option == "--influence-scale" || option == "--radius-scale" ||
+                                                  option == "--smoothing" || option == "--field-voxel-scale")){
                 char* end = nullptr;
                 std::string given = argv[++arg];
                 double value = std::strtod(given.c_str(), &end);
@@ -790,6 +851,9 @@ int main(int argc, char** argv){
                 }
                 else if(option == "--radius-scale"){
                     surface.radiusScale = (float)value;
+                }
+                else if(option == "--field-voxel-scale"){
+                    fieldSettings.voxelScale = (float)value;
                 }
                 else{
                     surface.smoothing = (int)value;
@@ -817,7 +881,8 @@ int main(int argc, char** argv){
                 return usage();
             }
         }
-        return meshing ? meshCache(argv[2], first, last, out, overwrite, follow, surface) : exportCache(argv[2], first, last, out, overwrite, follow);
+        return meshing ? meshCache(argv[2], first, last, out, overwrite, follow, format, surface, meshSurface, fields, fieldSettings)
+                       : exportCache(argv[2], first, last, out, overwrite, follow, format);
     }
     if(argc < 3 || (std::string(argv[1]) != "bake" && std::string(argv[1]) != "resume")){
         return usage();
@@ -945,7 +1010,7 @@ int main(int argc, char** argv){
             return failure(scene.outputDirectory + " holds a cache already: bake with --overwrite to replace it, give another --out, or flip2 resume it");
         }
         std::error_code removed;
-        for(const char* part : {"frames", "checkpoints", "frames.discarded"}){
+        for(const char* part : {"frames", "checkpoints", "frames.discarded", "export"}){    //and what was exported and meshed from it
             if(!removed){
                 std::filesystem::remove_all(scene.outputDirectory + "/" + part, removed);
             }

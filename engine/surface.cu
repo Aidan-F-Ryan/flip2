@@ -14,6 +14,12 @@
 //5. surface nets: a point in each cube of 8 samples the surface cuts, at the mean of where it cuts the cube's edges, and a quad joining the 4 cubes around
 //   each edge it cuts, facing outwards. Neighbouring cubes share their points, so the mesh is closed and welded
 //
+//The fields (fields()) are on a lattice of their own, at their voxel size, over every cell within reach of a particle and a few cells beyond. Their
+//velocity is the particles' velocities averaged as the field averages their positions, then carried on past where they reach, a voxel a pass, each voxel
+//without one taking its neighbours' mean. Their surface is the field's zero level as a signed distance field: at each voxel beside the surface, the
+//distance to where it crosses the edges between them, and from there out to the half width, Godunov's upwind solution of |grad d| = 1, relaxed a pass at
+//a time.
+//
 //Each pass over samples is a block per band cell, whose threads read the cell's 27 neighbours' places in the band (found once, in findNeighbours), so a
 //sample's neighbour in any direction is a direct lookup. There are no atomics: every sum runs in a fixed order and every list is compacted by prefix sums,
 //so a frame always meshes to the same mesh
@@ -251,6 +257,24 @@ __global__ void checkBand(const Key* band, const int* neighbours, Lattice lattic
     }
 }
 
+//the cells within rings of each occupied one, which make the velocity field's lattice: (2 rings + 1)^3 per occupied cell, NO_CELL beyond the lattice
+__global__ void dilateCells(int occupiedCount, const Key* occupied, Lattice lattice, int rings, Key* candidates){
+    int i = threadIdx.x + blockIdx.x*blockDim.x;
+    if(i >= occupiedCount){
+        return;
+    }
+    int3 c = lattice.cell(occupied[i]);
+    int width = 2*rings + 1;
+    size_t at = (size_t)i*width*width*width;
+    for(int z = -rings; z <= rings; ++z){
+        for(int y = -rings; y <= rings; ++y){
+            for(int x = -rings; x <= rings; ++x){
+                candidates[at++] = lattice.contains(c.x + x, c.y + y, c.z + z) ? lattice.key(c.x + x, c.y + y, c.z + z) : NO_CELL;
+            }
+        }
+    }
+}
+
 // ---- 4: smoothing ----
 
 __global__ void smoothField(const int* neighbours, Lattice lattice, const float* from, float* to){
@@ -261,6 +285,155 @@ __global__ void smoothField(const int* neighbours, Lattice lattice, const float*
               + fieldAt(around, from, lattice, local, 0, -1, 0) + fieldAt(around, from, lattice, local, 0, 1, 0) + fieldAt(around, from, lattice, local, 0, 0, -1)
               + fieldAt(around, from, lattice, local, 0, 0, 1);
     to[(size_t)blockIdx.x*blockDim.x + threadIdx.x] = sum / 7.0f;
+}
+
+// ---- the velocity field ----
+
+//one pass carrying the velocity on past where particles reach: each sample without one takes the mean of its six neighbours' that have one
+__global__ void extendVelocity(const int* neighbours, Lattice lattice, const float4* from, float4* to){
+    __shared__ int around[27];
+    loadNeighbours(neighbours, around);
+    int3 local = localSample(lattice.side);
+    size_t at = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
+    float4 own = from[at];
+    if(own.w == 0.0f){
+        float3 sum = make_float3(0.0f, 0.0f, 0.0f);
+        int found = 0;
+        for(int d = 0; d < 6; ++d){
+            int step = d & 1 ? 1 : -1;
+            float4 v = velocityAt(around, from, lattice, local, d >> 1 == 0 ? step : 0, d >> 1 == 1 ? step : 0, d >> 1 == 2 ? step : 0);
+            if(v.w > 0.0f){
+                sum.x += v.x; sum.y += v.y; sum.z += v.z;
+                ++found;
+            }
+        }
+        if(found > 0){
+            own = make_float4(sum.x/found, sum.y/found, sum.z/found, 1.0f);
+        }
+    }
+    to[at] = own;
+}
+
+//the samples with a velocity, each at its place among them (places: their flags summed before each): its voxel, counted from first, and velocity
+__global__ void listVelocities(const Key* cells, Lattice lattice, int3 first, const float4* velocities, const unsigned int* places, int* voxels, float* values){
+    size_t sample = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
+    if(places[sample + 1] == places[sample]){
+        return;
+    }
+    int3 c = lattice.cell(cells[blockIdx.x]);
+    int3 local = localSample(lattice.side);
+    size_t at = 3*(size_t)places[sample];
+    voxels[at] = first.x + c.x*lattice.side + local.x;
+    voxels[at + 1] = first.y + c.y*lattice.side + local.y;
+    voxels[at + 2] = first.z + c.z*lattice.side + local.z;
+    float4 v = velocities[sample];
+    values[at] = v.x;
+    values[at + 1] = v.y;
+    values[at + 2] = v.z;
+}
+
+__global__ void flagVelocities(const float4* velocities, unsigned int* flags){
+    size_t sample = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
+    flags[sample] = velocities[sample].w > 0.0f ? 1u : 0u;
+}
+
+constexpr float FAR = 1e20f;    //a distance not yet known
+
+//the signed distance at the sample offset from this thread's: FAR beyond the lattice's cells, which are all outside
+__device__ inline float distanceAt(const int* around, const float* distances, const Lattice& lattice, int3 local, int dx, int dy, int dz){
+    int neighbour, index;
+    locate(local, dx, dy, dz, lattice.side, neighbour, index);
+    int place = around[neighbour];
+    if(place >= 0){
+        return distances[(size_t)place*lattice.samples() + index];
+    }
+    return place == DEEP ? -FAR : FAR;
+}
+
+//the distances beside the surface: at each sample with a neighbour on the other side of it, the distance to the plane through where it crosses the edges
+//to them, from the field interpolated along each; FAR, signed as the field is, everywhere else
+__global__ void startDistances(const int* neighbours, Lattice lattice, const float* field, float* distances){
+    __shared__ int around[27];
+    loadNeighbours(neighbours, around);
+    int3 local = localSample(lattice.side);
+    size_t at = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
+    float here = field[at];
+    bool inside = here < 0.0f;
+    float inverse = 0.0f;       //the sum over the axes the surface crosses of 1/d^2, d the distance to it along each
+    for(int axis = 0; axis < 3; ++axis){
+        float nearest = FAR;
+        for(int step = -1; step <= 1; step += 2){
+            float there = fieldAt(around, field, lattice, local, axis == 0 ? step : 0, axis == 1 ? step : 0, axis == 2 ? step : 0);
+            if((there < 0.0f) != inside){
+                nearest = fminf(nearest, here / (here - there) * lattice.h);
+            }
+        }
+        if(nearest < FAR){
+            nearest = fmaxf(nearest, 1e-4f*lattice.h);
+            inverse += 1.0f / (nearest*nearest);
+        }
+    }
+    float distance = inverse > 0.0f ? rsqrtf(inverse) : FAR;
+    distances[at] = inside ? -distance : distance;
+}
+
+//one pass of the distances out from the surface: each sample not beside it (fixed holds FAR there) takes the upwind solution of |grad d| = 1 from its
+//nearest neighbours along each axis on its own side, if that's nearer than it had
+__global__ void relaxDistances(const int* neighbours, Lattice lattice, const float* fixed, const float* from, float* to){
+    __shared__ int around[27];
+    loadNeighbours(neighbours, around);
+    size_t at = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
+    float own = from[at];
+    if(fabsf(fixed[at]) < FAR){
+        to[at] = own;
+        return;
+    }
+    int3 local = localSample(lattice.side);
+    bool inside = own < 0.0f;
+    float nearest[3];
+    for(int axis = 0; axis < 3; ++axis){
+        nearest[axis] = FAR;
+        for(int step = -1; step <= 1; step += 2){
+            float there = distanceAt(around, from, lattice, local, axis == 0 ? step : 0, axis == 1 ? step : 0, axis == 2 ? step : 0);
+            if((there < 0.0f) == inside){
+                nearest[axis] = fminf(nearest[axis], fabsf(there));
+            }
+        }
+    }
+    float a = fminf(fminf(nearest[0], nearest[1]), nearest[2]);     //sorted: a, b, c
+    float b = fmaxf(fminf(nearest[0], nearest[1]), fminf(fmaxf(nearest[0], nearest[1]), nearest[2]));
+    float c = fmaxf(fmaxf(nearest[0], nearest[1]), nearest[2]);
+    float h = lattice.h;
+    float t = a + h;
+    if(b < FAR && t > b){
+        t = 0.5f*(a + b + sqrtf(fmaxf(2.0f*h*h - (a - b)*(a - b), 0.0f)));
+        if(c < FAR && t > c){
+            float sum = a + b + c;
+            t = (sum + sqrtf(fmaxf(sum*sum - 3.0f*(a*a + b*b + c*c - h*h), 0.0f))) / 3.0f;
+        }
+    }
+    float distance = fminf(fabsf(own), t);
+    to[at] = inside ? -distance : distance;
+}
+
+__global__ void flagDistances(const float* distances, float limit, unsigned int* flags){
+    size_t sample = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
+    flags[sample] = fabsf(distances[sample]) < limit ? 1u : 0u;
+}
+
+//the samples in the narrow band, each at its place among them (places: their flags summed before each): its voxel, counted from first, and distance
+__global__ void listDistances(const Key* cells, Lattice lattice, int3 first, const float* distances, const unsigned int* places, int* voxels, float* values){
+    size_t sample = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
+    if(places[sample + 1] == places[sample]){
+        return;
+    }
+    int3 c = lattice.cell(cells[blockIdx.x]);
+    int3 local = localSample(lattice.side);
+    size_t at = places[sample];
+    voxels[3*at] = first.x + c.x*lattice.side + local.x;
+    voxels[3*at + 1] = first.y + c.y*lattice.side + local.y;
+    voxels[3*at + 2] = first.z + c.z*lattice.side + local.z;
+    values[at] = distances[sample];
 }
 
 // ---- 5: surface nets ----
@@ -437,7 +610,8 @@ struct SurfaceMesher::Buffers{
     Buffer<Key> candidates, sortedCandidates, band, merged;
     Buffer<int> neighbours;
     Buffer<float> field, smoothed;
-    Buffer<float4> velocities;
+    Buffer<float4> velocities, spareVelocities;
+    Buffer<float> distances, spareDistances, fixedDistances;
     Buffer<unsigned int> cubePlaces, quadPlaces;
     Buffer<float> points, pointVelocities;
     Buffer<int> quads;
@@ -451,12 +625,62 @@ struct SurfaceMesher::Buffers{
         check(pass(nullptr, bytes), "sizing a library pass");
         check(pass(scratch.hold(bytes), bytes), "a library pass");
     }
+
+    //the count particles in planes (positions, then velocities) sorted into lattice's cells: positions and particleVelocities in cell order, occupied
+    //the cells that hold any, each one's first particle in starts and how many in counts. Returns how many cells are occupied
+    int sortIntoCells(const Lattice& lattice, int count, int keyBits){
+        const int threads = 256;
+        int blocks = (count + threads - 1) / threads;
+        float* from = planes.data;
+        cellKeys<<<blocks, threads>>>(count, from, from + count, from + 2*(size_t)count, lattice, keys.hold(count), order.hold(count));
+        sortedKeys.hold(count);
+        sortedOrder.hold(count);
+        run([&](void* space, size_t& bytes){
+            return cub::DeviceRadixSort::SortPairs(space, bytes, keys.data, sortedKeys.data, order.data, sortedOrder.data, count, 0, keyBits);
+        });
+        gatherParticles<<<blocks, threads>>>(count, sortedOrder.data, from, from + count, from + 2*(size_t)count, from + 3*(size_t)count, from + 4*(size_t)count,
+                                             from + 5*(size_t)count, positions.hold(count), particleVelocities.hold(count));
+        occupied.hold(count);
+        counts.hold(count);
+        starts.hold(count);
+        run([&](void* space, size_t& bytes){
+            return cub::DeviceRunLengthEncode::Encode(space, bytes, sortedKeys.data, occupied.data, counts.data, numbers.hold(1), count);
+        });
+        int occupiedCount = 0;
+        check(cudaMemcpy(&occupiedCount, numbers.data, sizeof(int), cudaMemcpyDeviceToHost), "counting cells");
+        run([&](void* space, size_t& bytes){
+            return cub::DeviceScan::ExclusiveSum(space, bytes, counts.data, starts.data, occupiedCount);
+        });
+        return occupiedCount;
+    }
+
+    //the number of distinct keys a library pass just sorted and made unique into list, less the NO_CELL at its end if there is one
+    int distinct(const Key* list){
+        int found = 0;
+        check(cudaMemcpy(&found, numbers.data, sizeof(int), cudaMemcpyDeviceToHost), "counting cells");
+        if(found > 0){
+            Key last = 0;
+            check(cudaMemcpy(&last, list + found - 1, sizeof(Key), cudaMemcpyDeviceToHost), "the last cell");
+            found -= last == NO_CELL;
+        }
+        return found;
+    }
 };
 
 SurfaceMesher::SurfaceMesher() : buffers(new Buffers){}
 
 SurfaceMesher::~SurfaceMesher(){
     delete buffers;
+}
+
+std::string FieldSettings::problem() const{
+    if(!(voxelScale > 0.0f)){
+        return "the fields' voxel scale has to be positive";
+    }
+    if(!(halfWidth >= 1.0f && halfWidth <= 64.0f)){
+        return "the fields' half width has to be from 1 to 64 voxels";
+    }
+    return "";
 }
 
 std::string SurfaceSettings::problem() const{
@@ -487,6 +711,7 @@ void SurfaceMesher::mesh(const float* positionPlanes, const float* velocityPlane
     seconds = 0.0;
     rounds = 0;
     bandCells = 0;
+    this->count = 0;
     std::string problem = settings.problem();
     if(!problem.empty()){
         throw std::runtime_error(problem);
@@ -523,36 +748,24 @@ void SurfaceMesher::mesh(const float* positionPlanes, const float* velocityPlane
     int keyBits = std::max(1, (int)std::ceil(std::log2(cellCount + 1.0)));
     const int threads = 256;
     int n = (int)count;
-    int particleBlocks = (n + threads - 1) / threads;
 
     // 1: cells
     float* planes = b.planes.hold(6*count);
     check(cudaMemcpy(planes, positionPlanes, sizeof(float)*3*count, cudaMemcpyHostToDevice), "copying positions");
     check(cudaMemcpy(planes + 3*count, velocityPlanes, sizeof(float)*3*count, cudaMemcpyHostToDevice), "copying velocities");
-    Key* keys = b.keys.hold(count);
-    Key* sortedKeys = b.sortedKeys.hold(count);
-    unsigned int* order = b.order.hold(count);
-    unsigned int* sortedOrder = b.sortedOrder.hold(count);
-    float4* positions = b.positions.hold(count);
-    float4* particleVelocities = b.particleVelocities.hold(count);
-    int* numbers = b.numbers.hold(1);
-    cellKeys<<<particleBlocks, threads>>>(n, planes, planes + count, planes + 2*count, lattice, keys, order);
-    b.run([&](void* scratch, size_t& bytes){
-        return cub::DeviceRadixSort::SortPairs(scratch, bytes, keys, sortedKeys, order, sortedOrder, n, 0, keyBits);
-    });
-    gatherParticles<<<particleBlocks, threads>>>(n, sortedOrder, planes, planes + count, planes + 2*count, planes + 3*count, planes + 4*count, planes + 5*count,
-                                                 positions, particleVelocities);
-    Key* occupied = b.occupied.hold(count);
-    int* counts = b.counts.hold(count);
-    int* starts = b.starts.hold(count);
-    b.run([&](void* scratch, size_t& bytes){
-        return cub::DeviceRunLengthEncode::Encode(scratch, bytes, sortedKeys, occupied, counts, numbers, n);
-    });
-    int occupiedCount = 0;
-    check(cudaMemcpy(&occupiedCount, numbers, sizeof(int), cudaMemcpyDeviceToHost), "counting cells");
-    b.run([&](void* scratch, size_t& bytes){
-        return cub::DeviceScan::ExclusiveSum(scratch, bytes, counts, starts, occupiedCount);
-    });
+    this->count = count;
+    surface = settings;
+    for(int axis = 0; axis < 3; ++axis){
+        this->low[axis] = low[axis];
+        this->high[axis] = high[axis];
+    }
+    int occupiedCount = b.sortIntoCells(lattice, n, keyBits);
+    Key* occupied = b.occupied.data;
+    int* counts = b.counts.data;
+    int* starts = b.starts.data;
+    float4* positions = b.positions.data;
+    float4* particleVelocities = b.particleVelocities.data;
+    int* numbers = b.numbers.data;
 
     // 2: the band
     size_t candidateCount = 27*(size_t)occupiedCount;
@@ -570,18 +783,7 @@ void SurfaceMesher::mesh(const float* positionPlanes, const float* velocityPlane
     b.run([&](void* scratch, size_t& bytes){
         return cub::DeviceSelect::Unique(scratch, bytes, sortedCandidates, band, numbers, candidateItems);
     });
-    //the number of distinct keys sorted and made unique into list, less the NO_CELL at its end if there is one
-    auto distinct = [&](const Key* list){
-        int found = 0;
-        check(cudaMemcpy(&found, numbers, sizeof(int), cudaMemcpyDeviceToHost), "counting cells");
-        if(found > 0){
-            Key last = 0;
-            check(cudaMemcpy(&last, list + found - 1, sizeof(Key), cudaMemcpyDeviceToHost), "the last cell");
-            found -= last == NO_CELL;
-        }
-        return found;
-    };
-    int bandCount = distinct(band);
+    int bandCount = b.distinct(band);
     if(bandCount == 0){
         seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
         return;
@@ -622,7 +824,7 @@ void SurfaceMesher::mesh(const float* positionPlanes, const float* velocityPlane
         b.run([&](void* scratch, size_t& bytes){
             return cub::DeviceSelect::Unique(scratch, bytes, sortedCandidates, candidates, numbers, checked);
         });
-        int added = distinct(candidates);
+        int added = b.distinct(candidates);
         if(added == 0){
             break;
         }
@@ -668,4 +870,134 @@ void SurfaceMesher::mesh(const float* positionPlanes, const float* velocityPlane
     check(cudaMemcpy(out.velocities.data(), pointVelocities, sizeof(float)*out.velocities.size(), cudaMemcpyDeviceToHost), "copying velocities");
     check(cudaMemcpy(out.quads.data(), quads, sizeof(int)*out.quads.size(), cudaMemcpyDeviceToHost), "copying quads");
     seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
+}
+
+void SurfaceMesher::fields(const FieldSettings& settings, FluidFields& out){
+    auto began = std::chrono::steady_clock::now();
+    out.surfaceVoxels.clear();
+    out.distances.clear();
+    out.velocityVoxels.clear();
+    out.velocities.clear();
+    fieldSeconds = 0.0;
+    fieldCells = 0;
+    std::string problem = settings.problem();
+    if(!problem.empty()){
+        throw std::runtime_error(problem);
+    }
+    out.voxelSize = settings.voxelScale*surface.separation;
+    out.halfWidth = settings.halfWidth;
+    if(count == 0){
+        return;
+    }
+    Buffers& b = *buffers;
+    Lattice lattice;
+    lattice.h = out.voxelSize;
+    lattice.reach = surface.influenceScale*surface.separation;     //the mesh's field, at these voxels
+    lattice.radius = surface.radiusScale*surface.separation;
+    lattice.side = std::min(std::max((int)std::ceil(lattice.reach/lattice.h - 1e-4f), 2), MAX_SIDE);
+    lattice.cellSize = lattice.side*lattice.h;
+    lattice.reach = std::min(lattice.reach, lattice.cellSize);
+    lattice.outside = lattice.reach - lattice.radius;
+    lattice.deep = -lattice.radius;
+    int passes = (int)std::ceil(settings.halfWidth);
+    int rings = (int)std::ceil((lattice.reach + passes*lattice.h) / lattice.cellSize);   //cells past the occupied ones: room for the velocity carried on
+    int first[3], extent[3];
+    float origin[3];
+    double cellCount = 1.0;
+    for(int axis = 0; axis < 3; ++axis){    //a whole number of voxels from the origin, so each sample is a voxel; and room for the rings and their neighbours
+        first[axis] = (int)std::floor(low[axis]/lattice.h) - (rings + 2)*lattice.side;
+        origin[axis] = first[axis]*lattice.h;
+        extent[axis] = (int)std::ceil((high[axis] - origin[axis]) / lattice.cellSize) + rings + 2;
+        cellCount *= extent[axis];
+    }
+    if(!(cellCount < 4.0e18)){
+        throw std::runtime_error("the particles spread too far for the fields");
+    }
+    lattice.origin = make_float3(origin[0], origin[1], origin[2]);
+    lattice.cells = make_int3(extent[0], extent[1], extent[2]);
+    int keyBits = std::max(1, (int)std::ceil(std::log2(cellCount + 1.0)));
+    const int threads = 256;
+    int occupiedCount = b.sortIntoCells(lattice, (int)count, keyBits);
+
+    //the cells within rings of an occupied one, each a cube of voxels
+    int width = 2*rings + 1;
+    size_t candidateCount = (size_t)occupiedCount*width*width*width;
+    if(candidateCount > (size_t)INT_MAX){
+        throw std::runtime_error("too large fields to work out in one piece");
+    }
+    int candidateItems = (int)candidateCount;
+    Key* candidates = b.candidates.hold(candidateCount);
+    Key* sortedCandidates = b.sortedCandidates.hold(candidateCount);
+    Key* cells = b.band.hold(candidateCount);
+    dilateCells<<<(occupiedCount + threads - 1) / threads, threads>>>(occupiedCount, b.occupied.data, lattice, rings, candidates);
+    b.run([&](void* scratch, size_t& bytes){
+        return cub::DeviceRadixSort::SortKeys(scratch, bytes, candidates, sortedCandidates, candidateItems, 0, keyBits);
+    });
+    b.run([&](void* scratch, size_t& bytes){
+        return cub::DeviceSelect::Unique(scratch, bytes, sortedCandidates, cells, b.numbers.data, candidateItems);
+    });
+    int cellsFound = b.distinct(cells);
+    fieldCells = cellsFound;
+    int perCell = lattice.side*lattice.side*lattice.side;
+    size_t samples = (size_t)cellsFound*perCell;
+    if(samples + 1 > (size_t)INT_MAX || 27*(size_t)cellsFound > (size_t)INT_MAX){
+        throw std::runtime_error("too large fields to work out in one piece");
+    }
+    int* neighbours = b.neighbours.hold(27*(size_t)cellsFound);
+    findNeighbours<<<(int)((27*(size_t)cellsFound + threads - 1) / threads), threads>>>(cellsFound, cells, occupiedCount, b.occupied.data, lattice, neighbours);
+
+    //the particles' field and velocities, averaged where they reach; the velocities carried on a voxel a pass
+    float* field = b.field.hold(samples);
+    float4* velocities = b.velocities.hold(samples);
+    float4* spare = b.spareVelocities.hold(samples);
+    evaluateField<<<cellsFound, perCell>>>(cells, occupiedCount, b.occupied.data, b.starts.data, b.counts.data, b.positions.data, b.particleVelocities.data,
+                                           lattice, field, velocities);
+    for(int pass = 0; pass < passes; ++pass){
+        extendVelocity<<<cellsFound, perCell>>>(neighbours, lattice, velocities, spare);
+        std::swap(velocities, spare);
+    }
+
+    //the distances to the field's zero level: beside it, then out from it a voxel a pass, twice over for the diagonals
+    float* fixed = b.fixedDistances.hold(samples);
+    float* distances = b.distances.hold(samples);
+    float* spareDistances = b.spareDistances.hold(samples);
+    startDistances<<<cellsFound, perCell>>>(neighbours, lattice, field, fixed);
+    check(cudaMemcpy(distances, fixed, sizeof(float)*samples, cudaMemcpyDeviceToDevice), "the distances");
+    for(int pass = 0; pass < 2*passes + 2; ++pass){
+        relaxDistances<<<cellsFound, perCell>>>(neighbours, lattice, fixed, distances, spareDistances);
+        std::swap(distances, spareDistances);
+    }
+
+    //the voxels in the narrow band, and those with a velocity, listed
+    int scanned = (int)samples + 1;
+    unsigned int* places = b.cubePlaces.hold(samples + 1);
+    auto list = [&](auto flag){     //flags each sample, and sums the flags where they lie: returns how many are flagged
+        flag();
+        check(cudaMemset(places + samples, 0, sizeof(unsigned int)), "the flags");
+        b.run([&](void* scratch, size_t& bytes){
+            return cub::DeviceScan::ExclusiveSum(scratch, bytes, places, scanned);
+        });
+        unsigned int listed = 0;
+        check(cudaMemcpy(&listed, places + samples, sizeof(unsigned int), cudaMemcpyDeviceToHost), "counting voxels");
+        return (size_t)listed;
+    };
+    int3 corner = make_int3(first[0], first[1], first[2]);
+    size_t banded = list([&]{ flagDistances<<<cellsFound, perCell>>>(distances, settings.halfWidth*lattice.h, places); });
+    int* voxels = b.quads.hold(3*banded);
+    float* values = b.points.hold(banded);
+    listDistances<<<cellsFound, perCell>>>(cells, lattice, corner, distances, places, voxels, values);
+    out.surfaceVoxels.resize(3*banded);
+    out.distances.resize(banded);
+    check(cudaMemcpy(out.surfaceVoxels.data(), voxels, sizeof(int)*out.surfaceVoxels.size(), cudaMemcpyDeviceToHost), "copying voxels");
+    check(cudaMemcpy(out.distances.data(), values, sizeof(float)*out.distances.size(), cudaMemcpyDeviceToHost), "copying distances");
+    size_t moving = list([&]{ flagVelocities<<<cellsFound, perCell>>>(velocities, places); });
+    voxels = b.quads.hold(3*moving);
+    values = b.points.hold(3*moving);
+    listVelocities<<<cellsFound, perCell>>>(cells, lattice, corner, velocities, places, voxels, values);
+    check(cudaGetLastError(), "the fields");
+    out.velocityVoxels.resize(3*moving);
+    out.velocities.resize(3*moving);
+    check(cudaMemcpy(out.velocityVoxels.data(), voxels, sizeof(int)*out.velocityVoxels.size(), cudaMemcpyDeviceToHost), "copying voxels");
+    check(cudaMemcpy(out.velocities.data(), values, sizeof(float)*out.velocities.size(), cudaMemcpyDeviceToHost), "copying velocities");
+    fieldSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
 }
