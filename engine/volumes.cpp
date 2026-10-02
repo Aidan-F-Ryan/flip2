@@ -247,6 +247,7 @@ bool writeFluidFields(const std::string& path, const FluidFields& fields, std::s
         vel->setTransform(transform->copy());
         vel->setName("vel");
         vel->setVectorType(openvdb::VEC_CONTRAVARIANT_RELATIVE);    //a velocity: transforms turn it, but don't move it
+        vel->setGridClass(openvdb::GRID_FOG_VOLUME);                //as Houdini's FLIP marks its own
         {
             openvdb::Vec3SGrid::Accessor voxels = vel->getAccessor();
             for(size_t voxel = 0; voxel < fields.velocities.size()/3; ++voxel){

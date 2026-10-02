@@ -4,6 +4,7 @@
   <toolshelf name="flip2" label="flip2">
     <memberTool name="flip2_solver"/>
     <memberTool name="flip2_import"/>
+    <memberTool name="flip2_whitewater"/>
     <memberTool name="flip2_update"/>
   </toolshelf>
 
@@ -19,7 +20,7 @@ flip2houdini.solver.shelf_tool(kwargs)]]></script>
   </tool>
 
   <tool name="flip2_import" label="flip2 Import" icon="SOP_file">
-    <helpText><![CDATA[Loads a flip2 bake's particles at the current time, from the .bgeo files flip2 export writes.]]></helpText>
+    <helpText><![CDATA[Loads a flip2 bake's surface, particles and fluid fields at the current time, from the files flip2 export and flip2 mesh write.]]></helpText>
     <toolMenuContext name="network">
       <contextNetType>OBJ</contextNetType>
       <contextNetType>SOP</contextNetType>
@@ -27,6 +28,16 @@ flip2houdini.solver.shelf_tool(kwargs)]]></script>
     <toolSubmenu>flip2</toolSubmenu>
     <script scriptType="python"><![CDATA[import flip2houdini.importer
 flip2houdini.importer.shelf_tool(kwargs)]]></script>
+  </tool>
+
+  <tool name="flip2_whitewater" label="flip2 Whitewater" icon="SHELF_whitewater">
+    <helpText><![CDATA[Houdini's whitewater (foam, spray and bubbles) on the selected flip2 Solver or flip2 Import node's bake: Whitewater Source and Whitewater Solver, wired to its fluid fields, container and collisions, and sized for it.]]></helpText>
+    <toolMenuContext name="network">
+      <contextNetType>SOP</contextNetType>
+    </toolMenuContext>
+    <toolSubmenu>flip2</toolSubmenu>
+    <script scriptType="python"><![CDATA[import flip2houdini.whitewater
+flip2houdini.whitewater.shelf_tool(kwargs)]]></script>
   </tool>
 
   <tool name="flip2_update" label="Update flip2 Nodes" icon="BUTTONS_reload">

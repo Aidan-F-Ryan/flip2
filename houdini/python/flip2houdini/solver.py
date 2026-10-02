@@ -19,7 +19,8 @@ The surface is meshed on the GPU as each frame is committed (flip2 mesh, beside 
 outwards, their points carrying v for motion blur. Mesh Bake meshes a bake's frames again, with other settings or after a bake made without them.
 
 Its outputs: 1, the bake's surface, particles or both (Show); 2, its fluid fields, with Output Fluid Fields (surface, a level set, and vel, as Houdini's
-FLIP outputs them); 3, the domain. Outputs 2 and 3 are what Whitewater Source takes as its Liquid Simulation and Container.
+FLIP outputs them); 3, the domain, and 4, the collisions, both as Houdini's own FLIP nodes make them from the domain and the Collisions input. Outputs 2
+to 4 are what Whitewater Source takes as its Liquid Simulation, Container and Collisions: flip2 Whitewater (whitewater.py) sets Houdini's up on them.
 
 Bake On picks where flip2 runs: this machine, or another over ssh (a GPU box, for a Mac). A remote bake sends scene.json and geo/ to the remote
 directory, runs there detached (remote/job.sh), and is mirrored back every couple of seconds (remote/mirror.sh): its logs, its cache.json and its
@@ -162,7 +163,7 @@ def _network(node):
     folder, frame = '`chs("../outputdir")`/bake/export/houdini', 'round(($T - (ch("../startframe") - 1)/$FPS)*$FPS)'
     shown = importer.build_loaders(node, folder, frame)
     importer.build_fields(node, folder, frame)
-    box = importer.build_container(node)
+    box = importer.build_container(node, node.node("COLLISION"), ROLES.index("collision"))
     for axis in "xyz":
         box.parm("size" + axis).setExpression('ch("../domainsize%s")' % axis)
         box.parm("t" + axis).setExpression('ch("../domaincenter%s")' % axis)

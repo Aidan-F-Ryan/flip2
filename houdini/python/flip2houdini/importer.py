@@ -1,7 +1,7 @@
 """flip2 Import: a bake's surface and particles, at the current time, from the files `flip2 mesh` and `flip2 export` write
 (BAKE/export/houdini/surface.NNNN.bgeo.sc and particles.NNNN.bgeo.sc, or .bgeo uncompressed: Export Format, which it finds), on its first output. Its second has the bake's fluid fields if `flip2 mesh --fields`
-wrote them (fields.NNNN.vdb: surface and vel), and its third, the domain the bake filled: together, what Whitewater Source takes as its Liquid Simulation
-and its Container.
+wrote them (fields.NNNN.vdb: surface and vel), its third the domain the bake filled, and its fourth the collision geometry wired to its input, the last
+two as Houdini's own FLIP nodes make them: what Whitewater Source takes as its Liquid Simulation, Container and Collisions (whitewater.py sets it up).
 
 A flip2 frame is a time: frame N is N/fps seconds after the bake's start. Houdini's frame 1 is time 0, so loading by time puts the bake's frame 0 on
 Houdini's frame 1, and keeps it there whatever frame rate either uses. A frame the bake hasn't made (yet) loads as no geometry.
@@ -91,22 +91,45 @@ def build_fields(node, folder, frame):
     return loader
 
 
-def build_container(node):
-    """inside node, a box for the domain the bake filled, on the node's third output; the caller sizes it. Returns it"""
+def build_container(node, collision, wired):
+    """inside node, the domain and the collisions as Houdini's FLIP has them, for its whitewater: a box for the domain the bake filled, which the caller
+    sizes, through FLIP Container (the Container stream, on the node's third output), and the node's collision geometry (collision: an inner node, or
+    one of its inputs) through FLIP Collide (the Collisions stream, on its fourth: a level set of the colliders and their velocity); or while nothing's
+    wired to the node's input number wired, the container's own empty collisions. Both are at the node's particle separation. Returns the box. Makes
+    only what's missing, so an older node gains the rest"""
     box = node.node("container")
     if box is None:
         box = node.createNode("box", "container")
-    _output(node, 2, box)
+    container = node.node("container_stream")
+    if container is None:
+        container = node.createNode("flipcontainer", "container_stream")
+        container.setInput(0, box)
+        container.parm("particlesep").setExpression('ch("../particlesep")')
+    collide = node.node("collision_stream")
+    if collide is None:
+        collide = node.createNode("flipcollide", "collision_stream")
+        for index in range(3):
+            collide.setInput(index, container, index)
+        collide.setInput(3, collision)
+    collisions = node.node("collisions")
+    if collisions is None:
+        collisions = node.createNode("switch", "collisions")
+        collisions.setInput(0, container, 2)
+        collisions.setInput(1, collide, 2)
+        collisions.parm("input").setExpression('strlen(opinputpath("..", %d)) > 0' % wired)
+    _output(node, 2, container, 1)
+    _output(node, 3, collisions)
     return box
 
 
-def _output(node, index, source):
+def _output(node, index, source, source_output=0):
+    """the node's output number index, showing source's output"""
     output = node.node("output%d" % index)
     if output is None:
         output = node.createNode("output", "output%d" % index)
         output.parm("outputidx").set(index)
-        output.setInput(0, source)
         node.layoutChildren()
+    output.setInput(0, source, source_output)
     return output
 
 
@@ -126,6 +149,9 @@ def _interface(node):
                                        help="Frames per second of the bake, read from its cache.json"))
     group.append(hou.FloatParmTemplate("timeoffset", "Time Offset", 1, default_value=(0.0,),
                                        help="Seconds to delay the bake by: its start shows at this time"))
+    group.append(hou.FloatParmTemplate("particlesep", "Particle Separation", 1, default_value=(0.02,), min=0.0001,
+                                       help="The bake's particle separation, read from its cache.json: the size of the container and collisions on the third "
+                                            "and fourth outputs, and of whitewater set up on this bake"))
     group.append(show_parm())
     group.append(format_parm())
     group.append(hou.ButtonParmTemplate("reload", "Reload", script_callback="__import__('flip2houdini').importer.reload(kwargs['node'])",
@@ -143,7 +169,9 @@ def _network(node):
     folder, frame = '`chs("../bakedir")`/export/houdini', 'round(($T - ch("../timeoffset"))*ch("../fps"))'
     shown = build_loaders(node, folder, frame)
     build_fields(node, folder, frame)
-    build_container(node)
+    build_container(node, node.indirectInputs()[0], 0)
+    if node.parm("label1") is not None:
+        node.parm("label1").set("Collisions (for Whitewater)")
     return shown
 
 
@@ -180,6 +208,8 @@ def reload(node):
         node.parm("status").set("no bake there (no cache.json)" if node.evalParm("bakedir") else "")
     else:
         node.parm("fps").set(float(bake.get("fps", 24.0)))
+        if float(bake.get("voxelSize", 0.0)) > 0.0 and node.parm("particlesep") is not None:
+            node.parm("particlesep").set(float(bake["voxelSize"])/2)
         box = node.node("container")
         try:
             low = [float(value) for value in bake["domainMin"]]
