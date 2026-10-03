@@ -1096,6 +1096,7 @@ int main(int argc, char** argv){
     simulation->setViscosity(scene.viscosity / scene.density);
     simulation->setSurfaceTension(scene.surfaceTension / scene.density);
     simulation->setContactAngle(scene.contactAngle);
+    simulation->setViscousCfl(scene.viscousCfl);
     std::vector<ForceField> fields;
     for(const SceneForce& force : scene.forces){
         fields.push_back(toForceField(force));

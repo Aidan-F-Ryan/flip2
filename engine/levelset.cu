@@ -24,7 +24,7 @@
 //   unsmoothed, the noise's curvature is several times a drop's. Smoothing takes it down to a few percent of one 16 voxels across.
 //
 //Past the domain's walls the level set mirrors what's inside, so a wall isn't a surface, tilted to meet the wall at the contact angle the liquid is
-//given (pastWall): square on by default. Obstacles' first layer of voxels reads as liquid where liquid touches them, from step 1, but nothing is
+//given (pastWall): 60 degrees by default, which water on most things is near. Obstacles' first layer of voxels reads as liquid where liquid touches them, from step 1, but nothing is
 //stored deeper in, which reads as outside: curvature within a couple of voxels of an obstacle is off by about what a drop 20 voxels across has, the
 //way a wall that doesn't wet would make it, and the contact angle doesn't reach them.
 //

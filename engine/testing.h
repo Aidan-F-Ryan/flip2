@@ -70,6 +70,10 @@ public:
         simulation.forEachPartition([&](Particles& partition){ partition.setContactAngle(degrees); });
     }
 
+    void setViscousCfl(double voxels){
+        simulation.forEachPartition([&](Particles& partition){ partition.setViscousCfl(voxels); });
+    }
+
     void setObstacles(const std::vector<SceneObstacle>& obstacles){
         simulation.forEachPartition([&](Particles& partition){ partition.setObstacles(obstacles); });
     }

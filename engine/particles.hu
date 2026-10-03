@@ -140,10 +140,18 @@ public:
         surfaceTension = overDensity;
     }
 
-    //the angle the liquid's surface meets the domain's walls at, in degrees, measured through the liquid: 90, the default, square on; less and it wets
-    //them, spreading along them; more and it beads up on them. Only with surface tension (levelset.cu)
+    //the angle the liquid's surface meets the domain's walls at, in degrees, measured through the liquid: 90 square on; less and it wets them,
+    //spreading along them; more and it beads up on them. 60 by default. Only with surface tension (levelset.cu)
     void setContactAngle(double degrees){
         wallWetting = std::cos(degrees*3.14159265358979323846/180.0);
+    }
+
+    //With viscosity, how many voxels viscosity may spread across in a substep (6 by default; 0 for no limit): the timestep keeps to it as to the CFL
+    //condition, dt <= (voxels dx)^2 / nu. The viscous step and the pressure solve take turns rather than being solved together (viscosity.cu), and past
+    //about that a thread of thick liquid folds from side to side instead of coiling. Thin liquid never comes near it: water at a millimetre would
+    //have to take steps of half a minute
+    void setViscousCfl(double voxels){
+        viscousCfl = voxels;
     }
 
     void setForceFields(const std::vector<ForceField>& fields){   //the force fields besides gravity, up to MAX_FORCE_FIELDS of them (see forces.hu)
@@ -198,6 +206,10 @@ private:
     void buildLevelSet();           //the liquid's surface, for viscosity and surface tension (levelset.cu): each substep, if either is on
     void applySurfaceTension(bool takeBack);
     double capillaryDt() const;
+    double viscousDt() const{       //the longest substep setViscousCfl allows
+        double voxelSize = grid.cellSize / (2<<refinementLevel);
+        return viscousCfl*viscousCfl*voxelSize*voxelSize / viscosity;
+    }
     void keepVelocitiesForViscosity();  //viscosity.cu
     void applyViscosity();
     void undoViscosity();
@@ -333,7 +345,8 @@ private:
     long long pocketUnknowns = 0;   //unknowns no air reaches this substep
     double viscosity = 0.0;         //kinematic, m^2/s
     double surfaceTension = 0.0;    //over the density, m^3/s^2
-    double wallWetting = 0.0;       //the cosine of the angle the liquid meets the walls at
+    double wallWetting = 0.5;       //the cosine of the angle the liquid meets the walls at: 60 degrees
+    double viscousCfl = 6.0;        //voxels viscosity may spread across in a substep
     CudaVec<float> liquidLevel;     //per stored voxel: the liquid's signed distance at its centre, in voxels, negative inside, to LIQUID_BAND either way (levelset.cu)
     CudaVec<float> liquidCurvature; //per stored voxel beside the surface: its curvature, in 1/voxels, positive where the liquid bulges
     CudaVec<float> viscousBefore[3];    //the face velocities as the forces left them, which pressureSolve's retry goes back to

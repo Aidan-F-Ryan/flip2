@@ -355,7 +355,7 @@ Scene loadScene(const std::string& path){
     }
 
     if(const Json* solver = read.object(root, "solver", "the scene")){
-        read.checkKeys(*solver, "solver", {"flipRatio", "cfl", "densityCorrectionTime", "pressureSolver", "advection", "dotProducts", "transfer"});
+        read.checkKeys(*solver, "solver", {"flipRatio", "cfl", "densityCorrectionTime", "pressureSolver", "advection", "dotProducts", "transfer", "viscousCfl"});
         scene.flipRatio = read.number(*solver, "flipRatio", "solver", scene.flipRatio);
         scene.cfl = read.number(*solver, "cfl", "solver", scene.cfl);
         scene.densityCorrectionTime = read.number(*solver, "densityCorrectionTime", "solver", scene.densityCorrectionTime);
@@ -363,6 +363,7 @@ Scene loadScene(const std::string& path){
         scene.advection = read.text(*solver, "advection", "solver", scene.advection);
         scene.dotProducts = read.text(*solver, "dotProducts", "solver", scene.dotProducts);
         scene.transfer = read.text(*solver, "transfer", "solver", scene.transfer);
+        scene.viscousCfl = read.number(*solver, "viscousCfl", "solver", scene.viscousCfl);
         if(scene.pressureSolver != "multigrid" && scene.pressureSolver != "cg" && scene.pressureSolver != "jacobi" && scene.pressureSolver != "sor"){
             read.fail("solver.pressureSolver", "is multigrid, cg, jacobi or sor");
         }
@@ -375,8 +376,8 @@ Scene loadScene(const std::string& path){
         if(scene.dotProducts != "exact" && scene.dotProducts != "blocks"){
             read.fail("solver.dotProducts", "is exact or blocks");
         }
-        if(scene.cfl <= 0.0 || scene.flipRatio < 0.0 || scene.flipRatio > 1.0 || scene.densityCorrectionTime < 0.0){
-            read.fail("solver", "cfl has to be positive, flipRatio between 0 and 1, and densityCorrectionTime at least 0");
+        if(scene.cfl <= 0.0 || scene.flipRatio < 0.0 || scene.flipRatio > 1.0 || scene.densityCorrectionTime < 0.0 || !(scene.viscousCfl >= 0.0)){
+            read.fail("solver", "cfl has to be positive, flipRatio between 0 and 1, and densityCorrectionTime and viscousCfl at least 0");
         }
     }
 

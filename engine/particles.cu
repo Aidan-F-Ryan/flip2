@@ -1135,6 +1135,9 @@ void Particles::pressureSolve(){
     if(surfaceTension > 0.0){   //explicit surface tension holds only up to the capillary limit
         dt = std::min(dt, capillaryDt());
     }
+    if(viscosity > 0.0 && viscousCfl > 0.0){    //and thick liquid's threads only coil with viscosity spreading a few voxels a substep (setViscousCfl)
+        dt = std::min(dt, viscousDt());
+    }
     if(verbose()){
         std::cout<<"initial dt: "<<dt<<std::endl;
     }

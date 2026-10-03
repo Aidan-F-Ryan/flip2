@@ -30,7 +30,8 @@
 //isn't resisted until the next substep. Where gravity drives the flow that's small, as the first solve has already turned gravity into the pressure
 //gradient the viscous step then resists: a dam break of syrup keeps to Huppert's spreading law within 2%. Where the pressure itself drives the liquid
 //past something solid (squeezed through a gap by a moving wall), or bends a thread, it shows once c is large: the liquid slips along the walls by the
-//pressure's push of one substep, and a thread a few voxels across folds from side to side rather than coiling until c is under about 40.
+//pressure's push of one substep, and a thread a few voxels across folds from side to side rather than coiling until c is under about 40: so the
+//timestep keeps c under 36 by default (Particles::setViscousCfl).
 //
 //The sums CG needs are added up exactly, per node and then across partitions, as the pressure CG's are (conjugateGradientFunctions.cu), so the result
 //is the same bit for bit however the nodes are stored or split. Its iterations are queued in batches sized from the last substep's count, and each
