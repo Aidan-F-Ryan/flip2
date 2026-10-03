@@ -186,8 +186,9 @@ __device__ inline bool isWallVoxel(uint cell, int slot, int voxels1D, int apronC
 }
 
 //the slot whose dim face a particle reads in place of voxel's: a face inside a wall reads its mirror image in the domain, reversed (sign) when it's the
-//wall's normal component, so that's 0 on the wall itself, and as is when tangential, so walls don't drag. origin is the block's first voxel in domain coordinates
-__device__ inline int mirroredSlot(int3 voxel, int dim, int3 origin, int3 domainVoxels, int voxels1D, float& sign){
+//wall's normal component, so that's 0 on the wall itself, and times along when tangential: 1, as is, so walls don't drag, down to -1 for a liquid
+//viscous enough to hold to them (Particles::wallStick), which puts 0 on the wall for those too. origin is the block's first voxel in domain coordinates
+__device__ inline int mirroredSlot(int3 voxel, int dim, int3 origin, int3 domainVoxels, int voxels1D, float along, float& sign){
     int local[3] = {voxel.x, voxel.y, voxel.z};
     int start[3] = {origin.x, origin.y, origin.z};
     int size[3] = {domainVoxels.x, domainVoxels.y, domainVoxels.z};
@@ -197,7 +198,7 @@ __device__ inline int mirroredSlot(int3 voxel, int dim, int3 origin, int3 domain
         int tangential = axis != dim;   //a dim face sits on a voxel boundary along dim, and mid-voxel along the other axes
         if(global < 0 || global >= size[axis]){
             local[axis] += (global < 0 ? -2*global : 2*(size[axis] - global)) - tangential;
-            sign = tangential ? sign : -sign;
+            sign = tangential ? along*sign : -sign;
         }
     }
     return local[0] + local[1]*voxels1D + local[2]*voxels1D*voxels1D;
@@ -1119,6 +1120,9 @@ void Particles::pressureSolve(){
     double terminatingResidual;
     double voxelSize = grid.cellSize / (2<<refinementLevel);
     uint hasFreeSurface;
+    if(viscosity > 0.0 || surfaceTension > 0.0){    //both act at the liquid's surface, which the solve itself never needs
+        buildLevelSet();
+    }
     findSealedPockets();    //queued ahead of the wait for the free surface, which brings back whether any fluid can't see air
     cudaMemcpyAsync(&hasFreeSurface, freeSurface.devPtr(), sizeof(uint), cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream);
@@ -1128,6 +1132,9 @@ void Particles::pressureSolve(){
     double correctionRate = hasFreeSurface && densityCorrectionTime > 0.0 ? voxelSize / densityCorrectionTime : 0.0;
     //@TODO: need to use courant number for dt from max voxel u and voxel dimensions
     dt = getCourantDt();
+    if(surfaceTension > 0.0){   //explicit surface tension holds only up to the capillary limit
+        dt = std::min(dt, capillaryDt());
+    }
     if(verbose()){
         std::cout<<"initial dt: "<<dt<<std::endl;
     }
@@ -1135,6 +1142,9 @@ void Particles::pressureSolve(){
         dt = frameDt - elapsedTimeThisFrame;
     }
     applyForces(forces, false, dt, elapsedTime, forceVoxels(), stream);
+    if(surfaceTension > 0.0){
+        applySurfaceTension(false);
+    }
     cudaCalcDivU(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, voxelsUx, voxelsUy, voxelsUz, particleCounts, footprintDepth, restParticlesPerVoxel, correctionRate, divU, stream);
     addObstacleFlux();      //what obstacles' surfaces make of the flow through the faces they cut or close
     balanceSealedPockets(); //and fluid no air reaches can't change its volume
@@ -1160,21 +1170,49 @@ void Particles::pressureSolve(){
                                        numOwnVoxels, *context, stream);
         }
     };
+    //Viscosity goes between two solves: the first gives the flow the forces drive once the pressure has answered them, the viscous step acts on that,
+    //and the solve below takes out what divergence it leaves. Straight after the forces it would see gravity but not the pressure gradient that turns
+    //gravity into a puddle spreading, which would then go on unresisted, as if the floor were slippery
+    auto viscousStep = [&](){
+        keepVelocitiesForViscosity();
+        solve();
+        cudaVelocityUpdate(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, p, voxelsUx, voxelsUy, voxelsUz, dt/(density*voxelSize*voxelSize), stream);
+        p.zeroDeviceAsync(stream);
+        applyViscosity();
+        cudaCalcDivU(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, voxelsUx, voxelsUy, voxelsUz, particleCounts, footprintDepth, restParticlesPerVoxel, correctionRate, divU, stream);
+        addObstacleFlux();
+        balanceSealedPockets();
+    };
+    if(viscosity > 0.0){
+        viscousStep();
+    }
     while(previousTerminatingResidual - (terminatingResidual = solve()) > 0.0){    //while residual getting smaller
         gpuErrchk(cudaPeekAtLastError());
         if(terminatingResidual < tolerance){
             break;
         }
+        if(viscosity > 0.0){    //back to the velocities the forces left, then the forces off those: everything goes on again at the new dt
+            undoViscosity();
+        }
+        if(surfaceTension > 0.0){
+            applySurfaceTension(true);
+        }
         applyForces(forces, true, dt, elapsedTime, forceVoxels(), stream);
         dt /= 2.0f;
         p.zeroDeviceAsync(stream);
         applyForces(forces, false, dt, elapsedTime, forceVoxels(), stream);
+        if(surfaceTension > 0.0){
+            applySurfaceTension(false);
+        }
         previousTerminatingResidual = terminatingResidual;
         cudaCalcDivU(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, voxelsUx, voxelsUy, voxelsUz, particleCounts, footprintDepth, restParticlesPerVoxel, correctionRate, divU, stream);
         addObstacleFlux();
         balanceSealedPockets();
         cudaGetA(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, dt/(density*voxelSize*voxelSize), stream);
         weighCutCells(dt/(density*voxelSize*voxelSize));
+        if(viscosity > 0.0){
+            viscousStep();
+        }
         gpuErrchk(cudaPeekAtLastError());
     }
     elapsedTime += dt;
@@ -1215,7 +1253,7 @@ __global__ void gatherVoxelVelsToParticles(uint numParticleNodes, uint numPartic
                                             double* px, double* py, double* pz, float* vx, float* vy, float* vz, AffineVelocities affine, float voxelSize,
                                             const uint* numVoxelsEachNode, const uint* voxelIDs, const uint* voxelOwners, const char* solids,
                                             const float* ux, const float* uy, const float* uz, const float* oldUx, const float* oldUy, const float* oldUz,
-                                            float flipRatio, double radius, Grid grid, uint refinementLevel){
+                                            float flipRatio, float alongWalls, double radius, Grid grid, uint refinementLevel){
     extern __shared__ float blockVelocities[];  //per slot: new x, y, z, then old x, y, z
     int voxels1D = numVoxels1D;
     int voxels3D = voxels1D*voxels1D*voxels1D;
@@ -1255,7 +1293,7 @@ __global__ void gatherVoxelVelsToParticles(uint numParticleNodes, uint numPartic
             #pragma unroll
             for(int dim = 0; dim < 3; ++dim){
                 float sign = 1.0f;
-                int source = mirroredSlot(voxel, dim, origin, domainVoxels, voxels1D, sign);
+                int source = mirroredSlot(voxel, dim, origin, domainVoxels, voxels1D, alongWalls, sign);
                 images[k][dim] = sign*blockVelocities[dim*voxels3D + source];
                 images[k][3 + dim] = sign*blockVelocities[(3 + dim)*voxels3D + source];
             }
@@ -1358,8 +1396,10 @@ __device__ inline float sampleTile(const float* tile, int tileWidth, int dim, fl
 }
 
 //the grid's velocity at a point of the tile, any component with no velocity there taking fallback's. Each component's point is first kept inside the
-//walls: a wall's own faces hold its no-flow condition, and beside a wall the tangential velocity carries on to it unchanged, like G2P's mirrored ghosts
-__device__ inline float3 sampleVelocity(const float* tile, int tileWidth, float3 point, int3 tileOrigin, int3 domainVoxels, float3 fallback){
+//walls: a wall's own faces hold its no-flow condition, and beside a wall the tangential velocity carries on to it unchanged, like G2P's mirrored ghosts.
+//With stick (Particles::wallStick), a liquid viscous enough to hold to the walls, it falls off instead over the half voxel between the last faces and
+//the wall, to 1 - stick of theirs on the wall itself
+__device__ inline float3 sampleVelocity(const float* tile, int tileWidth, float3 point, int3 tileOrigin, int3 domainVoxels, float3 fallback, float stick){
     int origin[3] = {tileOrigin.x, tileOrigin.y, tileOrigin.z};
     int size[3] = {domainVoxels.x, domainVoxels.y, domainVoxels.z};
     float fallbacks[3] = {fallback.x, fallback.y, fallback.z};
@@ -1373,6 +1413,16 @@ __device__ inline float3 sampleVelocity(const float* tile, int tileWidth, float3
             coordinates[axis] = fminf(fmaxf(coordinates[axis], inset - origin[axis]), size[axis] - inset - origin[axis]);
         }
         float v = sampleTile(tile + dim*tileWidth*tileWidth*tileWidth, tileWidth, dim, make_float3(coordinates[0], coordinates[1], coordinates[2]));
+        if(stick > 0.0f){
+            float along[3] = {point.x, point.y, point.z};
+            #pragma unroll
+            for(int axis = 0; axis < 3; ++axis){
+                float fromWall = fminf(along[axis] + origin[axis], size[axis] - origin[axis] - along[axis]);    //the nearer of the two across this axis, in voxels
+                if(axis != dim && fromWall < 0.5f){
+                    v *= 1.0f - stick*(1.0f - 2.0f*fmaxf(fromWall, 0.0f));
+                }
+            }
+        }
         velocity[dim] = isnan(v) ? fallbacks[dim] : v;
     }
     return make_float3(velocity[0], velocity[1], velocity[2]);
@@ -1387,7 +1437,7 @@ __global__ void advectThroughGrid(uint numParticleNodes, uint numParticles, cons
                                   double* px, double* py, double* pz, const float* vx, const float* vy, const float* vz,
                                   uint numUsedGridNodes, const uint* nodeCells, const uint* cellToNode, const uint* interiorVoxels,
                                   const float* ux, const float* uy, const float* uz, const float* weightsX, const float* weightsY, const float* weightsZ,
-                                  float dt, bool rungeKutta3, Grid grid, uint refinementLevel){
+                                  float dt, bool rungeKutta3, float stick, Grid grid, uint refinementLevel){
     extern __shared__ float tile[];     //per component, the tile's voxels' negative faces
     __shared__ uint neighborNodes[27];
     int interiorWidth = 2<<refinementLevel;
@@ -1419,11 +1469,11 @@ __global__ void advectThroughGrid(uint numParticleNodes, uint numParticles, cons
     float step = dt / voxelSize;    //turns a velocity into voxels moved this step
     for(uint index = firstParticle + threadIdx.x; index < lastParticle; index += blockDim.x){
         float3 point = make_float3((px[index] - grid.negX)/voxelSize - tileOrigin.x, (py[index] - grid.negY)/voxelSize - tileOrigin.y, (pz[index] - grid.negZ)/voxelSize - tileOrigin.z);
-        float3 k1 = sampleVelocity(tile, tileWidth, point, tileOrigin, domainVoxels, make_float3(vx[index], vy[index], vz[index]));
+        float3 k1 = sampleVelocity(tile, tileWidth, point, tileOrigin, domainVoxels, make_float3(vx[index], vy[index], vz[index]), stick);
         float3 velocity = k1;
         if(rungeKutta3){
-            float3 k2 = sampleVelocity(tile, tileWidth, make_float3(point.x + 0.5f*step*k1.x, point.y + 0.5f*step*k1.y, point.z + 0.5f*step*k1.z), tileOrigin, domainVoxels, k1);
-            float3 k3 = sampleVelocity(tile, tileWidth, make_float3(point.x + 0.75f*step*k2.x, point.y + 0.75f*step*k2.y, point.z + 0.75f*step*k2.z), tileOrigin, domainVoxels, k2);
+            float3 k2 = sampleVelocity(tile, tileWidth, make_float3(point.x + 0.5f*step*k1.x, point.y + 0.5f*step*k1.y, point.z + 0.5f*step*k1.z), tileOrigin, domainVoxels, k1, stick);
+            float3 k3 = sampleVelocity(tile, tileWidth, make_float3(point.x + 0.75f*step*k2.x, point.y + 0.75f*step*k2.y, point.z + 0.75f*step*k2.z), tileOrigin, domainVoxels, k2, stick);
             velocity = make_float3((2.0f*k1.x + 3.0f*k2.x + 4.0f*k3.x)/9.0f, (2.0f*k1.y + 3.0f*k2.y + 4.0f*k3.y)/9.0f, (2.0f*k1.z + 3.0f*k2.z + 4.0f*k3.z)/9.0f);
         }
         px[index] += dt*velocity.x;
@@ -1440,14 +1490,15 @@ void Particles::voxelVelsToParticles(){
         std::cerr<<"Particles: a node of "<<numVoxelsPerNode<<" voxels is more than G2P mirrors walls for ("<<NODE_THREADS*MIRRORED_PER_THREAD<<"): raise MIRRORED_PER_THREAD\n";
         exit(1);
     }
+    float stick = (float)wallStick();   //how far a viscous liquid's particles hold to the walls, as its faces do in the viscous solve
     auto gather = apic ? gatherVoxelVelsToParticles<true> : gatherVoxelVelsToParticles<false>;
     gather<<<numParticleNodes, NODE_THREADS, 6*sizeof(float)*numVoxelsPerNode, stream>>>(numParticleNodes, size, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(),
-        affineVelocities(affine), (float)(grid.cellSize / (2<<refinementLevel)), nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(), voxelOwners.devPtr(), solids.devPtr(), voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr(), voxelsUxOld.devPtr(), voxelsUyOld.devPtr(), voxelsUzOld.devPtr(), flipRatio, radius, grid, refinementLevel);
+        affineVelocities(affine), (float)(grid.cellSize / (2<<refinementLevel)), nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(), voxelOwners.devPtr(), solids.devPtr(), voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr(), voxelsUxOld.devPtr(), voxelsUyOld.devPtr(), voxelsUzOld.devPtr(), flipRatio, 1.0f - 2.0f*stick, radius, grid, refinementLevel);
     gpuErrchk(cudaPeekAtLastError());
     uint tileWidth = 3*(numVoxels1D - 2*(uint)std::floor(radius));
     advectThroughGrid<<<numParticleNodes, NODE_THREADS, 3*sizeof(float)*tileWidth*tileWidth*tileWidth, stream>>>(numParticleNodes, size, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(),
         px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(), numUsedGridNodes, nodeCells.devPtr(), cellToNode.devPtr(), nodeInteriorVoxels.devPtr(),
-        voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr(), voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), dt, rungeKutta3, grid, refinementLevel);
+        voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr(), voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), dt, rungeKutta3, stick, grid, refinementLevel);
     gpuErrchk(cudaPeekAtLastError());
 }
 
@@ -1637,6 +1688,9 @@ Particles::~Particles(){     //with its GPU the current one
     }
     if(pocketSeen != nullptr){
         cudaFreeHost(pocketSeen);
+    }
+    if(viscousSeen != nullptr){
+        cudaFreeHost(viscousSeen);
     }
     gpuErrchk( cudaStreamDestroy(stream) );
 }

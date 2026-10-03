@@ -58,6 +58,18 @@ public:
         simulation.forEachPartition([&](Particles& partition){ partition.setGravity(gravity); });
     }
 
+    void setViscosity(double kinematic){
+        simulation.forEachPartition([&](Particles& partition){ partition.setViscosity(kinematic); });
+    }
+
+    void setSurfaceTension(double overDensity){
+        simulation.forEachPartition([&](Particles& partition){ partition.setSurfaceTension(overDensity); });
+    }
+
+    void setContactAngle(double degrees){
+        simulation.forEachPartition([&](Particles& partition){ partition.setContactAngle(degrees); });
+    }
+
     void setObstacles(const std::vector<SceneObstacle>& obstacles){
         simulation.forEachPartition([&](Particles& partition){ partition.setObstacles(obstacles); });
     }

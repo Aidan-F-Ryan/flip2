@@ -3,10 +3,13 @@
 Houdini's Whitewater Source and Whitewater Solver take a liquid simulation as its fluid fields, its container and its collisions, which a flip2 Solver or
 flip2 Import node has on its second, third and fourth outputs. This makes the two nodes, wired to those, and sizes them for the bake: Houdini's defaults
 are for a scene tens of metres across (whitewater 10 cm apart, depths of a metre), so in a tank they make a handful of points. Here the whitewater's
-separation is the bake's particle separation, and every length that goes with it (the solver's voxels, the depths either side of the foam layer) follows
-it in proportion, as expressions: change Whitewater Scale on the solver, and they all follow.
+separation is two thirds of the bake's particle separation, which is a third of its voxel, as Houdini's own whitewater tool sets it on a FLIP simulation,
+and every length that goes with it (the solver's voxels, the depths either side of the foam layer) follows it in proportion, as expressions: change
+Whitewater Scale on the solver, and they all follow. Halving it makes eight times the points.
 
-What isn't set: what emits. Whitewater Source's Speed Range starts at 2 m/s, and nothing slower than that makes whitewater; a slow scene wants it lower.
+What isn't set: what emits, which is the look's to decide. Whitewater Source's Speed Range is 2 to 4 m/s, and nothing slower than its low end makes
+whitewater: a slow scene makes none until it's lowered, and lowering it is the strongest way to more (on a 3 m dam break, 1 to 2 m/s made four times the
+whitewater once the flood had slowed). Emission Amount, on the source and the solver, scales what does emit.
 """
 import glob
 import os
@@ -44,7 +47,7 @@ def create_whitewater(node):
     for index in range(3):      #the liquid's fields, its container, its collisions
         source.setInput(index, node, index + 1)
         solver.setInput(index, source, index)
-    solver.parm("scale").setExpression('ch("%s/particlesep")' % solver.relativePathTo(node))
+    solver.parm("scale").setExpression('ch("%s/particlesep")*2/3' % solver.relativePathTo(node))     #a third of the bake's voxel, as Houdini's own tool has it
     source.parm("wwscale").setExpression('ch("%s/scale")' % source.relativePathTo(solver))
     _follow(solver, "scale", SOLVER_LENGTHS)
     _follow(source, "wwscale", SOURCE_LENGTHS)
@@ -53,7 +56,7 @@ def create_whitewater(node):
         whitewater.parm("startframe").setExpression('ch("%s/startframe")' % path if kind == "solver" else 'ch("%s/timeoffset")*$FPS + 1' % path)
     source.setPosition(node.position() + hou.Vector2(2.5, -1.5))
     solver.setPosition(node.position() + hou.Vector2(2.5, -3.0))
-    source.setComment("No whitewater? Lower Speed Range below the liquid's speed")
+    source.setComment("More whitewater: lower Speed Range (it emits only where the liquid is faster), or raise Emission Amount here and on the solver")
     source.setGenericFlag(hou.nodeFlag.DisplayComment, True)
     solver.setDisplayFlag(True)
     todo = None

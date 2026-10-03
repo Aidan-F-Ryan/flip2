@@ -1,0 +1,10 @@
+{
+  "schema": "flip2.scene/1",
+  "fps": 24,
+  "frames": 24,
+  "domain": {"min": [0, 0, 0], "max": [0.4, 0.2, 0.4], "voxelSize": 0.00625},
+  "liquid": {"density": 1000, "viscosity": 2},
+  "fluids": [{"shape": "box", "min": [0, 0, 0.1], "max": [0.15, 0.15, 0.3]}],
+  "obstacles": [{"shape": "box", "min": [0.22, 0, 0.14], "max": [0.28, 0.08, 0.26]}],
+  "output": {"dir": "viscous-dam", "diagnostics": "diagnostics.jsonl"}
+}

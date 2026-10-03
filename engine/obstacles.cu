@@ -1431,10 +1431,6 @@ __device__ inline float squareInside(float c0, float c1, float c2, float c3){
     return 0.5f*segmentInside(c[0], c[1])*segmentInside(c[0], c[3]) + 0.5f*segmentInside(c[2], c[1])*segmentInside(c[2], c[3]);    //opposite, apart
 }
 
-//obstacleNear's bits, per stored voxel: whether a surface passes near enough to cut its faces, and (CLOSED_FACE << face) whether each face is closed
-static constexpr char NEAR_SURFACE = 1;
-static constexpr int CLOSED_FACE = 2;
-
 //obstacleOpen: a near voxel's six open fractions, worked out once a substep (findSolidVoxels) for every pass to read rather than look up its corners
 //again, each a fraction of OPEN_FULL in 16 bits: 0 and 1 exactly, and nothing between closer than 1.5e-5 to either. Three words a voxel, one per axis,
 //its lower face in the low half
@@ -2050,6 +2046,12 @@ void Particles::obstacleGhostVelocities(CudaVec<float>& ux, CudaVec<float>& uy, 
     }
     int voxels1D = numVoxels1D;
     size_t shared = (3*sizeof(float) + 3)*voxels1D*voxels1D*voxels1D;
+    Obstacles state = obstacles.state();
+    if(viscosity > 0.0){    //a viscous liquid holds to them at least as much as to the walls
+        for(int obstacle = 0; obstacle < state.count; ++obstacle){
+            state.items[obstacle].friction = std::max(state.items[obstacle].friction, (float)wallStick());
+        }
+    }
     //Each layer reads the faces as they were before it and writes the faces it sets. Nodes store their own sparse voxels, so where one node's block lacks a
     //voxel another stores, the two can see a face differently (inside by its centre, or fluid by its solid flag): one block would read as fluid a face
     //another is setting, and get either value, by timing
@@ -2063,7 +2065,7 @@ void Particles::obstacleGhostVelocities(CudaVec<float>& ux, CudaVec<float>& uy, 
         for(int dim = 0; dim < 3; ++dim){
             gpuErrchk(cudaMemcpyAsync(ghostBefore[dim].devPtr(), velocity[dim]->devPtr(), sizeof(float)*ux.size(), cudaMemcpyDeviceToDevice, stream));
         }
-        obstacleGhostFaces<<<obstacleBlocks(), OBSTACLE_THREADS, shared, stream>>>(layer, obstacles.state(), voxelPlaces(), obstacleNodes.devPtr(), numOwnNodes, voxelOwners.devPtr(), obstacleSolids.devPtr(), obstacleNear.devPtr(),
+        obstacleGhostFaces<<<obstacleBlocks(), OBSTACLE_THREADS, shared, stream>>>(layer, state, voxelPlaces(), obstacleNodes.devPtr(), numOwnNodes, voxelOwners.devPtr(), obstacleSolids.devPtr(), obstacleNear.devPtr(),
             ghostBefore[0].devPtr(), ghostBefore[1].devPtr(), ghostBefore[2].devPtr(), ux.devPtr(), uy.devPtr(), uz.devPtr());
         gpuErrchk(cudaPeekAtLastError());
         for(CudaVec<float>* velocity : {&ux, &uy, &uz}){   //the next layer, and the ghosts, read what this one wrote

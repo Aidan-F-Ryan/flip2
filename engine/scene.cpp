@@ -307,7 +307,7 @@ Scene loadScene(const std::string& path){
     if(root.kind != Json::OBJECT){
         read.fail("the file", "should be one JSON object, {...}");
     }
-    read.checkKeys(root, "the scene", {"schema", "fps", "frames", "domain", "solver", "gravity", "particlesPerVoxel", "seed", "fluids", "emitters", "sinks", "obstacles", "forces", "partitions", "devices", "output"});
+    read.checkKeys(root, "the scene", {"schema", "fps", "frames", "domain", "solver", "gravity", "liquid", "particlesPerVoxel", "seed", "fluids", "emitters", "sinks", "obstacles", "forces", "partitions", "devices", "output"});
     std::string schema = read.text(root, "schema", "the scene", "flip2.scene/1");
     if(schema != "flip2.scene/1"){
         read.fail("schema", "is \"" + schema + "\"; this flip2 reads \"flip2.scene/1\"");
@@ -381,6 +381,16 @@ Scene loadScene(const std::string& path){
     }
 
     read.vector3(root, "gravity", "the scene", scene.gravity);
+    if(const Json* liquid = read.object(root, "liquid", "the scene")){
+        read.checkKeys(*liquid, "liquid", {"density", "viscosity", "surfaceTension", "contactAngle"});
+        scene.density = read.number(*liquid, "density", "liquid", scene.density);
+        scene.viscosity = read.number(*liquid, "viscosity", "liquid", scene.viscosity);
+        scene.surfaceTension = read.number(*liquid, "surfaceTension", "liquid", scene.surfaceTension);
+        scene.contactAngle = read.number(*liquid, "contactAngle", "liquid", scene.contactAngle);
+        if(!(scene.density > 0.0) || !(scene.viscosity >= 0.0) || !(scene.surfaceTension >= 0.0) || !(scene.contactAngle >= 0.0 && scene.contactAngle <= 180.0)){
+            read.fail("liquid", "density has to be positive, viscosity and surfaceTension at least 0, and contactAngle from 0 to 180 degrees");
+        }
+    }
     scene.particlesPerVoxel = (int)read.number(root, "particlesPerVoxel", "the scene", scene.particlesPerVoxel);
     if(scene.particlesPerVoxel != 1 && scene.particlesPerVoxel != 8 && scene.particlesPerVoxel != 27){
         read.fail("particlesPerVoxel", "is 1, 8 or 27: a lattice of 1, 2 or 3 per side");

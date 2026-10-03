@@ -55,6 +55,11 @@ struct Obstacles{
     ObstacleState items[MAX_OBSTACLES];
 };
 
+//obstacleNear's bits, per stored voxel: whether a surface passes near enough to cut its faces, and (CLOSED_FACE << face) whether each face is closed,
+//the faces in the neighbour arrays' order (-x, +x, -y, +y, -z, +z)
+static constexpr char NEAR_SURFACE = 1;
+static constexpr int CLOSED_FACE = 2;
+
 //where the stored voxels are: per node, its run of voxels, its cell, and each voxel's slot in its block
 struct VoxelPlaces{
     const uint* nodeVoxelEnds;

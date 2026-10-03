@@ -15,6 +15,11 @@
 //    "solver": {"flipRatio": 0.95, "cfl": 4, "densityCorrectionTime": 0.1, "pressureSolver": "multigrid", "advection": "rk3", "dotProducts": "exact",
 //               "transfer": "flip"},                                       //or "apic": particles carry their velocity's gradient; flipRatio 0 for pure APIC
 //    "gravity": [0, -9.8, 0],
+//    "liquid": {"density": 1000, "viscosity": 0, "surfaceTension": 0,       //kg/m^3; Pa s, dynamic (water 0.001, honey 2 to 10); N/m (water 0.073). With
+//               "contactAngle": 90},                                        //viscosity, it sticks to walls and obstacles; with surface tension, the
+//                                                                           //timestep keeps to the capillary limit, sqrt(density voxelSize^3 / 2 pi it),
+//                                                                           //and its surface meets the domain's walls at contactAngle degrees: under 90
+//                                                                           //it wets them, over 90 it beads up on them
 //    "particlesPerVoxel": 8, "seed": 1,                                     //1, 8 or 27: seeded on a jittered 1^3, 2^3 or 3^3 lattice per voxel
 //    "fluids": [{"shape": "box", "min": [...], "max": [...], "velocity": [0, 0, 0]},
 //               {"shape": "sphere", "center": [...], "radius": 0.1, "velocity": [0, 0, 0]},
@@ -127,6 +132,10 @@ struct Scene{
     std::string dotProducts = "exact";
     std::string transfer = "flip";
     double gravity[3] = {0.0, -9.8, 0.0};
+    double density = 1000.0;        //the liquid's, kg/m^3: what turns its viscosity and surface tension into accelerations
+    double viscosity = 0.0;         //dynamic, Pa s
+    double surfaceTension = 0.0;    //N/m
+    double contactAngle = 90.0;     //degrees, through the liquid, where its surface meets the domain's walls
     int particlesPerVoxel = 8;
     unsigned long long seed = 1;
     std::vector<SceneShape> fluids;

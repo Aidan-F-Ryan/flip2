@@ -7,7 +7,8 @@ One of those settings is the reason to have this at all. flip2's surface carries
 and Karma blurs a moving mesh by them, but only when its Velocity Blur says to, and it starts at No Velocity Blur: a flip2 surface renders with no
 motion blur at all until that's changed. Here it's on.
 
-Whitewater is rendered as points a fraction of the whitewater's separation wide (the solver's pscale is the whole separation, which renders as beads).
+Whitewater is rendered as points as wide as they are apart (the solver's pscale makes each twice that, which renders as beads), and the sun is on the
+camera's side: where Karma Physical Sky starts it, behind the scene, whitewater and everything else facing the camera is in shade, and reads as grey.
 """
 import math
 
@@ -20,7 +21,7 @@ LOOKS = {     #MaterialX standard surfaces
     "solid": dict(base=1.0, base_colorr=0.35, base_colorg=0.33, base_colorb=0.3, specular_roughness=0.5),
     "ground": dict(base=1.0, base_colorr=0.45, base_colorg=0.45, base_colorb=0.45, specular_roughness=0.7),
 }
-WHITEWATER_WIDTH = 0.3      #a whitewater point's radius, as a fraction of the whitewater's separation
+WHITEWATER_WIDTH = 0.5      #a whitewater point's radius, as a fraction of the whitewater's separation: so each is as wide as they are apart
 FOCAL_LENGTH, APERTURE, ASPECT = 30.0, 20.955, 16.0/9.0
 
 
@@ -97,6 +98,8 @@ def create_render(node):
     camera.parmTuple("r").set((-math.degrees(math.atan(0.5*size[1] / distance)), 0.0, 0.0))
     sky = stage.createNode("karmaphysicalsky", prefix + "_sky")
     sky.setInput(0, camera)
+    sky.parm("solar_altitude").set(50.0)
+    sky.parm("solar_azimuth").set(150.0)    #from the camera's side and a little to one: at its 0 the sun is behind the scene, which leaves everything facing the camera dark
     settings = stage.createNode("karmarenderproperties", prefix + "_karma")
     settings.setInput(0, sky)
     settings.parm("camera").set(camera.evalParm("primpath"))

@@ -97,6 +97,25 @@ def _interface(node):
     simulation.addParmTemplate(hou.FloatParmTemplate("densitytime", "Density Correction Time", 1, default_value=(0.1,), min=0.0,
                                                      help="Seconds over which crowded or sparse fluid is brought back to its rest density; 0 for none"))
     group.append(simulation)
+    liquid = hou.FolderParmTemplate("liquid", "Liquid", folder_type=hou.folderType.Tabs)
+    liquid.addParmTemplate(hou.FloatParmTemplate("density", "Density", 1, default_value=(1000.0,), min=1.0, max=20000.0,
+                                                 help="kg/m3: water 1000, honey 1400. Only viscosity and surface tension use it: what moves the liquid is each "
+                                                      "of them over its density"))
+    liquid.addParmTemplate(hou.FloatParmTemplate("viscosity", "Viscosity", 1, default_value=(0.0,), min=0.0, max=100.0,
+                                                 help="Pa s: water 0.001, olive oil 0.1, honey 2 to 10, molasses 10 to 100; 0 for none. Viscous liquid "
+                                                      "sticks to the domain's walls and to collisions. Thin threads only coil with CFL Condition at 1 or "
+                                                      "below: at 4 they fold from side to side"))
+    liquid.addParmTemplate(hou.FloatParmTemplate("surfacetension", "Surface Tension", 1, default_value=(0.0,), min=0.0, max=1.0,
+                                                 help="N/m: water 0.073; 0 for none. It only shows on liquid a few centimetres across or less, and it "
+                                                      "shortens the timestep: to sqrt(density x voxel^3 / (2 pi x surface tension)), 6 ms at 2.5 mm voxels "
+                                                      "for water and 0.5 ms at 0.5 mm"))
+    liquid.addParmTemplate(hou.FloatParmTemplate("contactangle", "Contact Angle", 1, default_value=(90.0,), min=0.0, max=180.0,
+                                                 disable_when="{ surfacetension == 0 }",
+                                                 help="Degrees between the liquid's surface and the domain's walls where they meet, measured through the "
+                                                      "liquid. Under 90 the liquid wets them: it spreads along them, and a splash's crater in a shallow pool "
+                                                      "closes again. Over 90 it beads up on them, and a pool shallower than a few millimetres pulls back "
+                                                      "from a dry patch. Collisions don't have one yet: liquid beads on them a little"))
+    group.append(liquid)
     collisions = hou.FolderParmTemplate("collisions", "Collisions", folder_type=hou.folderType.Tabs)
     collisions.addParmTemplate(hou.FloatParmTemplate("friction", "Friction", 1, default_value=(0.0,), min=0.0, max=1.0,
                                                      help="0: the fluid slips along collisions freely; 1: the fluid touching them moves with them"))
@@ -455,6 +474,9 @@ def write_scene(node):
         "solver": {"flipRatio": node.evalParm("flipratio"), "cfl": node.evalParm("cfl"), "densityCorrectionTime": node.evalParm("densitytime"),
                    "transfer": ("flip", "apic")[node.evalParm("transfer")]},
         "gravity": list(node.evalParmTuple("gravity")),
+        "liquid": {key: node.evalParm(name) if node.parm(name) is not None else default       #a node from before the Liquid tab has none of it
+                   for key, name, default in (("density", "density", 1000.0), ("viscosity", "viscosity", 0.0), ("surfaceTension", "surfacetension", 0.0),
+                                              ("contactAngle", "contactangle", 90.0))},
         "fluids": [], "emitters": [], "sinks": [], "obstacles": [],
         "partitions": node.evalParm("partitions"), "devices": node.evalParm("gpus"),
         "output": {"dir": "bake", "compression": ("zstd", "lz4", "none")[node.evalParm("compression")],

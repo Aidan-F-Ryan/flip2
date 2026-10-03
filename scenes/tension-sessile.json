@@ -1,0 +1,10 @@
+{
+  "schema": "flip2.scene/1",
+  "fps": 24,
+  "frames": 24,
+  "domain": {"min": [-0.2, 0, -0.2], "max": [0.2, 0.2, 0.2], "voxelSize": 0.00625},
+  "gravity": [0, 0, 0],
+  "liquid": {"density": 1000, "surfaceTension": 10, "contactAngle": 60},
+  "fluids": [{"shape": "sphere", "centre": [0, 0, 0], "radius": 0.1}],
+  "output": {"dir": "tension-sessile", "diagnostics": "diagnostics.jsonl"}
+}

@@ -1093,6 +1093,9 @@ int main(int argc, char** argv){
     simulation->setRungeKutta3(scene.advection == "rk3");
     simulation->setDotProductSums(scene.dotProducts == "blocks" ? DotProductSums::perBlock : DotProductSums::exact);
     simulation->setGravity(make_float3((float)scene.gravity[0], (float)scene.gravity[1], (float)scene.gravity[2]));
+    simulation->setViscosity(scene.viscosity / scene.density);
+    simulation->setSurfaceTension(scene.surfaceTension / scene.density);
+    simulation->setContactAngle(scene.contactAngle);
     std::vector<ForceField> fields;
     for(const SceneForce& force : scene.forces){
         fields.push_back(toForceField(force));

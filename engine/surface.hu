@@ -11,9 +11,10 @@
 struct SurfaceSettings{
     float separation = 0.0f;        //the bake's particle separation (half its voxel size)
     float voxelScale = 0.5f;        //the field's sample spacing, in particle separations: smaller is finer
-    float influenceScale = 2.0f;    //how far each particle reaches into the field, in particle separations
-    float radiusScale = 0.6f;       //each particle's radius, in particle separations: sets where the surface sits
-    int smoothing = 2;              //passes of a mean filter over the field before it's meshed
+    float influenceScale = 3.0f;    //how far each particle reaches into the field, in particle separations: at 2 the surface dimples over each particle
+    float radiusScale = 0.8f;       //each particle's radius, in particle separations: sets where the surface sits. This keeps the liquid's volume
+                                    //at that reach; a shorter reach wants less (0.6 at 2)
+    int smoothing = 4;              //passes of a mean filter over the field before it's meshed
     std::string problem() const;    //what's wrong with these, if anything
 };
 

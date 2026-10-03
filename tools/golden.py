@@ -48,8 +48,11 @@ SCENES = {   #main's arguments after the frame count (and any environment it run
     "tank-vdbsphere": "scenes/tank-vdbsphere.json", #a still tank around a VDB level set sphere: against tank-meshsphere and tank-sphere
     "drop-vdbsphere": "scenes/drop-vdbsphere.json", #a ball of water from a VDB level set: against drop-sphere
     "tank-meshspin": "scenes/tank-meshspin.json",   #tank-vdbspin's spin as keyframes of the rigid mesh sphere
+    "tension-drop": "scenes/tension-drop.json",     #a stretched drop in zero gravity, pulled back and past round by surface tension (engine/levelset.cu)
+    "tension-sessile": "scenes/tension-sessile.json",   #half a drop on the floor in zero gravity, spreading to meet it at a 60 degree contact angle
+    "viscous-dam": "scenes/viscous-dam.json",       #a dam break of syrup around a box: viscosity, sticking to the floor, the walls and the box (engine/viscosity.cu)
 }
-DEFAULT_SCENES = ["dam16", "tank", "swirl", "swirl-apic", "nozzle", "drain", "forces", "tank-box", "paddle", "tank-meshsphere", "tank-pulse", "mesh-sources", "tank-vdbspin", "sealed-pulse", "sealed-box"]
+DEFAULT_SCENES = ["dam16", "tank", "swirl", "swirl-apic", "nozzle", "drain", "forces", "tank-box", "paddle", "tank-meshsphere", "tank-pulse", "mesh-sources", "tank-vdbspin", "sealed-pulse", "sealed-box", "tension-drop", "tension-sessile", "viscous-dam"]
 
 EXACT = ["particles", "hash", "occupiedVoxels", "perVoxel", "core", "substeps", "time", "dtMin", "dtMax", "lowest", "highest", "fastest"]
 SUMS = ["kineticEnergy", "momentum", "angularMomentum", "centroid"]
