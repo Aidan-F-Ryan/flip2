@@ -1,0 +1,64 @@
+{
+ "schema": "flip2.scene/1",
+ "fps": 24,
+ "frames": 48,
+ "domain": {
+  "min": [
+   -0.25,
+   0,
+   -0.25
+  ],
+  "max": [
+   0.25,
+   0.5,
+   0.25
+  ],
+  "voxelSize": 0.0078125,
+  "open": [
+   "+x"
+  ]
+ },
+ "fluids": [
+  {
+   "shape": "box",
+   "min": [
+    -0.25,
+    0,
+    -0.25
+   ],
+   "max": [
+    0.25,
+    0.25,
+    0.25
+   ]
+  }
+ ],
+ "sinks": [
+  {
+   "mesh": "geo/sphere.obj",
+   "transform": [
+    0.06,
+    0,
+    0,
+    0,
+    0,
+    0.06,
+    0,
+    0,
+    0,
+    0,
+    0.06,
+    0,
+    0,
+    0,
+    0,
+    1
+   ]
+  }
+ ],
+ "output": {
+  "dir": "drain-mesh",
+  "diagnostics": "diagnostics.jsonl",
+  "positions": false
+ }
+}

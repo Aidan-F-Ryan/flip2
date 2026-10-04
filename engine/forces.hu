@@ -5,6 +5,7 @@
 
 #include "typedefs.h"
 #include "grid.hpp"
+#include "obstacles.hu"     //SolidSDF: the bricks a volume's vectors are kept in, as a level set's velocities are
 
 #define MAX_FORCE_FIELDS 16
 
@@ -12,7 +13,13 @@ enum ForceKind{
     FORCE_POINT,        //pulls towards position (pushes away with a negative strength)
     FORCE_VORTEX,       //swirls around the line through position along axis, by the right-hand rule
     FORCE_TURBULENCE,   //curl noise: swirls of about scale metres, divergence free, drifting at speed eddies per second
-    FORCE_WIND          //pulls the faces within depth voxels of the surface towards velocity, at drag per second
+    FORCE_WIND,         //pulls the faces within depth voxels of the surface towards velocity, at drag per second
+    FORCE_VOLUME        //a field of vectors from a volume: accelerations, or velocities the fluid is drawn to at drag per second
+};
+
+enum VolumeMode{
+    VOLUME_FORCE,       //the volume's vectors are accelerations, m/s^2
+    VOLUME_VELOCITY     //they're velocities, m/s, which the fluid inside the volume takes up at drag per second
 };
 
 //one force field on the fluid besides gravity; scene.hpp says what each kind's settings mean
@@ -29,6 +36,8 @@ struct ForceField{
     unsigned int seed = 0;
     float drag = 1.0f;
     float depth = 2.0f;
+    int mode = VOLUME_FORCE;                //volume
+    SolidSDF volume = {};                   //volume: on this partition's GPU (uploadForceVolume), its vectors in velocities and, in pool, how much of each is its own
 };
 
 //every acceleration on the fluid: gravity, and up to MAX_FORCE_FIELDS fields
@@ -56,7 +65,12 @@ struct ForceVoxels{
 
 //adds dt times every force's acceleration to the faces of every stored voxel outside the walls, or, with takeBack, takes it back off, as pressureSolve's
 //retry does when it halves dt. Gravity's faces get exactly the arithmetic applyGravity and removeGravity did. A field acts at each face's position, and
-//turbulence at the simulation's time; wind pulls from the velocities before any force, so taking a force back off subtracts what adding it added
+//turbulence at the simulation's time; wind and a volume of velocities pull from the velocities before any force, so taking a force back off subtracts
+//what adding it added
 void applyForces(const Forces& forces, bool takeBack, float dt, double time, const ForceVoxels& voxels, cudaStream_t stream);
+
+//a volume's vectors (volumes.hpp's loadVectorField) onto the current GPU, for a ForceField's volume; and its memory given back
+SolidSDF uploadForceVolume(const SceneField& field, cudaStream_t stream);
+void freeForceVolume(SolidSDF& volume);
 
 #endif

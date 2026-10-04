@@ -9,7 +9,9 @@
 #include "partitionContext.hu"
 #include "forces.hu"
 #include "sources.hu"
+#include "obstacles.hu"
 #include "algorithms/conjugateGradientFunctions.hu"
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -21,6 +23,12 @@ enum class PressureSolver{
     cg,         //conjugate gradient
     jacobi,     //conjugate gradient, Jacobi-preconditioned
     multigrid   //conjugate gradient, preconditioned by a multigrid V-cycle
+};
+
+//where the pressure solve puts the liquid's surface (freesurface.cu)
+enum class FreeSurface{
+    footprint,  //every voxel the particles' stencils reach is liquid, and the pressure is 0 at the centres of the air voxels past them
+    sharp       //the liquid is what the level set finds, and the pressure is 0 (or the surface tension's) at the surface itself: the ghost fluid method
 };
 
 //The particles in one partition of the domain, and the grid they need: the nodes they occupy, the empty nodes their stencils reach into, and, when the
@@ -59,6 +67,19 @@ public:
 
     const float* packPositions();   //float32 x, y, z per particle, for a frame, on this partition's GPU; valid for the work queued on its stream after this
     void copyPositionsToHost(float* xyz, cudaEvent_t copied);   //the same, into pinned xyz, recording copied once it's there
+    //a frame for the cache (cacheWriter.hu), into pinned planes: float32 P x, y, z, then v x, y, z, then with ids each particle's id (64 bits), and with
+    //ages how long ago it came to be, in seconds, each a plane of every particle's value, recording copied once they're there
+    void copyFrameColumnsToHost(float* planes, bool ids, bool ages, cudaEvent_t copied);
+    //this partition's whole state for a checkpoint, into pinned host memory (CacheWriter::checkpointBytes), recording copied once it's there
+    void copyCheckpointToHost(char* host, cudaEvent_t copied);
+    //carries on from a checkpoint taken at time, after substep substeps, in place of initialize: its particles set as setParticles does
+    void resume(double time, unsigned long long substep);
+    //a checkpoint's particles' ids and birth times, in the order its particles were set in, and the next id to hand out: before resume. Without it, the
+    //particles are numbered in the order they were set, born at time 0
+    void setIdentities(const uint* ids, const float* births, unsigned long long nextId);
+    unsigned long long nextId() const{  //the next id a new particle gets: every partition's is the same
+        return nextParticleId;
+    }
 
     uint numParticles() const{
         return size;
@@ -92,6 +113,10 @@ public:
         flipRatio = ratio;
     }
 
+    //APIC transfers (Jiang et al. 2015): each particle also carries its velocity's gradient, which P2G spreads with it and G2P measures again, so
+    //rotation and shear survive the round trip that PIC damps. flipRatio still blends FLIP's change in on top: 0 is pure APIC
+    void setApic(bool on);
+
     void setCfl(double voxels){ //how far the fastest particle may move per substep, in voxels
         cfl = voxels;
     }
@@ -108,27 +133,108 @@ public:
         sources = emittersAndSinks;
     }
 
-    void setForceFields(const std::vector<ForceField>& fields){   //the force fields besides gravity, up to MAX_FORCE_FIELDS of them (see forces.hu)
-        forces.numFields = 0;
-        for(const ForceField& field : fields){
-            if(forces.numFields == MAX_FORCE_FIELDS){
-                std::cerr<<"Particles: only the first "<<MAX_FORCE_FIELDS<<" force fields act\n";
-                break;
-            }
-            forces.fields[forces.numFields++] = field;
-        }
+    //the meshes the emitters, sinks and fluids use: a FluidShape of kind MESH names its place in meshes, which are voxelized at the domain's voxel
+    //size and moved as obstacles are. fluids is every fluid the scene starts with, in order: emitParticles seeds the meshes among them on the GPU,
+    //where nothing else already is (sources.cu). After setDomain and setSources
+    void setSourceMeshes(const std::vector<SceneObstacle>& meshes, const std::vector<FluidShape>& fluids);
+
+    void setObstacles(const std::vector<SceneObstacle>& descriptions);  //what the fluid flows around (see obstacles.hu); after setDomain
+
+    //the liquid's kinematic viscosity, in m^2/s: its dynamic viscosity over its density (water 1e-6, honey around 5e-3). 0, the default, for none:
+    //the viscous solve (viscosity.cu) only runs with some
+    void setViscosity(double kinematic){
+        viscosity = kinematic;
     }
+
+    //the liquid's surface tension over its density, in m^3/s^2 (water 7.3e-5). 0, the default, for none. With some, the timestep also keeps to the
+    //capillary limit (levelset.cu)
+    void setSurfaceTension(double overDensity){
+        surfaceTension = overDensity;
+    }
+
+    //the angle the liquid's surface meets the domain's walls at, in degrees, measured through the liquid: 90 square on; less and it wets them,
+    //spreading along them; more and it beads up on them. 60 by default. Only with surface tension (levelset.cu)
+    void setContactAngle(double degrees){
+        wallWetting = std::cos(degrees*3.14159265358979323846/180.0);
+    }
+
+    //With viscosity, how many voxels viscosity may spread across in a substep (6 by default; 0 for no limit): the timestep keeps to it as to the CFL
+    //condition, dt <= (voxels dx)^2 / nu. The viscous step and the pressure solve take turns rather than being solved together (viscosity.cu), and past
+    //about that a thread of thick liquid folds from side to side instead of coiling. Thin liquid never comes near it: water at a millimetre would
+    //have to take steps of half a minute
+    void setViscousCfl(double voxels){
+        viscousCfl = voxels;
+    }
+
+    //where the pressure solve puts the liquid's surface (see FreeSurface): the particles' footprint, the default, or the level set's surface, sharp,
+    //which also finds the level set every substep and, with surface tension, keeps to a capillary limit 1/sqrt(2) as long
+    void setFreeSurface(FreeSurface mode){
+        freeSurfaceMode = mode;
+    }
+
+    //the force fields besides gravity, up to MAX_FORCE_FIELDS of them (see forces.hu). volumes holds, for each field that's a volume, its vectors (and
+    //nothing for the others, or for any past its end): they go onto this partition's GPU
+    void setForceFields(const std::vector<ForceField>& fields, const std::vector<std::shared_ptr<const SceneField>>& volumes = {});
 
     ~Particles();
 private:
     void exchangeParticles();
     ForceVoxels forceVoxels();
     void resizeParticleArrays(uint newSize, uint keep);
+    std::vector<CudaVec<float>*> particleFloats();      //the per-particle float arrays: velocities, and with APIC their gradients
     void markRemovedParticles();
     void killRemovedParticles();
     void dropRemovedParticles();
     void emitParticles();
     void pinEmitterVelocities();
+    bool removing() const;      //whether this initialize removes any particles: sinks, open faces, or at the start, fluid inside obstacles
+    void updateObstacles();
+    void placeSourceMeshes();
+    void pushOutParticles();
+    void markParticlesInsideObstacles();
+    void markObstacleSolids();
+    void addObstacleFlux();
+    void weighCutCells(float scale);
+    void obstacleGhostVelocities(CudaVec<float>& ux, CudaVec<float>& uy, CudaVec<float>& uz);   //of these face velocities: the new ones, or FLIP's old
+    void mixObstacleFaces(CudaVec<float>& ux, CudaVec<float>& uy, CudaVec<float>& uz);          //the faces obstacles cut carry what crosses them all told
+    void creditObstacleVolume();
+    void findSealedPockets();       //fluid no air reaches (pockets.cu): labelled once a substep, settled across partitions, its divergence balanced before each solve
+    void settleSealedPockets();
+    void balanceSealedPockets();
+    void pocketRound(long long* summed);
+    VoxelPlaces voxelPlaces();
+    //How far the liquid holds to what's solid, 0 to 1: c/(1 + c), c = nu/(24 dx^2), how many voxels' worth viscosity spreads a wall's grip in a 24th of
+    //a second. The viscous solve holds the faces to the walls whatever the viscosity, but particles read the faces past a wall as mirror images, and
+    //move with the grid's velocity carried on to it, both of which let the last half voxel slide: with thick liquid, a film creeps along the floor
+    //ahead of the rest. So the images' tangential components and the velocity at the wall go to 1 - 2 stick and 1 - stick of the last faces' (G2P and
+    //advection), and obstacles' friction is at least stick (obstacleGhostVelocities). It doesn't go by the substep, so the faces before and after a
+    //solve are held alike, whatever dt turns out to be. With no viscosity it's 0, and nothing changes
+    double wallStick() const{
+        double voxelSize = grid.cellSize / (2<<refinementLevel);
+        double c = viscosity / (24.0*voxelSize*voxelSize);
+        return c / (1.0 + c);
+    }
+    void buildLevelSet();           //the liquid's surface, for viscosity, surface tension and the sharp free surface (levelset.cu): each substep, if any is on
+    bool needsLevelSet() const{
+        return viscosity > 0.0 || surfaceTension > 0.0 || freeSurfaceMode == FreeSurface::sharp;
+    }
+    void applySurfaceTension(bool takeBack);
+    //the sharp free surface (freesurface.cu): the unknowns whose centres are outside the liquid retired; the pressure equations' faces to air weighed by
+    //how near the surface is; on the divergence, the surface tension's pressure and the density correction for packed voxels near the surface; the
+    //velocity update's faces to air weighed as the equations are; and the liquid's velocities carried out into the voxels around it
+    void retireDryUnknowns();
+    void weighSurfaceFaces(float scale);
+    void addSurfaceDivergence(float correctionRate);
+    void correctSurfaceFaces();
+    void extendLiquidVelocities();
+    double capillaryDt() const;
+    double viscousDt() const{       //the longest substep setViscousCfl allows
+        double voxelSize = grid.cellSize / (2<<refinementLevel);
+        return viscousCfl*viscousCfl*voxelSize*voxelSize / viscosity;
+    }
+    void keepVelocitiesForViscosity();  //viscosity.cu
+    void applyViscosity();
+    void undoViscosity();
     void receiveParticleNodes(uint maskWords);
     void orderNodes(uint maskWords);
     void checkGhostRuns();
@@ -138,6 +244,14 @@ private:
 
     CudaVec<double> px, py, pz;    //positions stay double: in a large domain, float would round a slow particle's step away
     CudaVec<float> vx, vy, vz;
+    CudaVec<float> affine[9];   //APIC: per particle, velocity component c's gradient along axis a, in 1/s, at [3*c + a]; empty without APIC
+    //Each particle's id, which it keeps for as long as it exists and no other ever has, and when it came to be, in seconds from the start. The fluid
+    //the scene starts with is numbered in the order it's given in, born at 0; each particle made after that (emitParticles) takes the next id in the
+    //order of the lattice point it came from, which every partition works out for every new particle, its own or not: so the ids are the same however
+    //the domain is split, with nothing passed between partitions. They follow the particles through the sort and between partitions, as velocities do
+    CudaVec<uint> particleIds;
+    CudaVec<float> particleBirths;
+    unsigned long long nextParticleId = 0;
     CudaVec<uint> gridCell;
     CudaVec<char> solids;
     CudaVec<float> p;
@@ -232,6 +346,7 @@ private:
     uint size;
     double radius;
     double flipRatio = 0.95;
+    bool apic = false;
     double cfl = 4.0;   //RK3 advection holds up to 4: past it, its stages reach beyond advectThroughGrid's 3-node tile
     bool rungeKutta3 = true;
     PressureSolver pressureSolver = PressureSolver::multigrid;
@@ -240,6 +355,34 @@ private:
     Forces forces;              //gravity and the force fields
     Sources sources;            //emitters, sinks and open faces
     CudaVec<char> removedFlags; //per particle, while initialize runs: whether a sink or an open face takes it
+    ObstacleSet obstacles;      //what the fluid flows around
+    ObstacleSet sourceMeshes;   //the meshes of the emitters, sinks and fluids
+    FluidShapes fluids;         //the fluid to start with (setSourceMeshes)
+    CudaVec<char> obstacleSolids;   //per stored voxel: whether obstacles close every face of it
+    CudaVec<char> obstacleNear;     //per stored voxel: whether a surface passes close enough to cut its faces, so the other passes can skip the rest, and which
+                                    //of its faces are closed (bits, obstacles.cu)
+    CudaVec<uint> obstacleOpen;     //per stored voxel near a surface: its six faces' open fractions and how much of it is covered this substep, in 16-bit
+                                    //fixed point (obstacles.cu)
+    CudaVec<float> ghostBefore[3];  //the face velocities before a layer of obstacleGhostVelocities, which it reads while it writes the faces it sets
+    CudaVec<uint> obstacleNodes;    //the stored nodes any voxel of whose block is solid or within 1.5 voxels of a surface: how many, then them. The obstacle passes
+                                    //only visit those
+    CudaVec<uint> pocketParents;    //sealed pockets (pockets.cu), per stored voxel: its piece of fluid's root, its label (0 if air reaches it), and scratch, each
+    CudaVec<uint> pocketLabels;     //root's smallest label and then its pocket's place in the table
+    CudaVec<uint> pocketMinima;
+    CudaVec<double> pocketWords;    //the pockets' bookkeeping, in 64-bit words
+    long long* pocketSeen = nullptr;    //pinned: the counts the host reads back
+    long long pocketUnknowns = 0;   //unknowns no air reaches this substep
+    double viscosity = 0.0;         //kinematic, m^2/s
+    double surfaceTension = 0.0;    //over the density, m^3/s^2
+    double wallWetting = 0.5;       //the cosine of the angle the liquid meets the walls at: 60 degrees
+    double viscousCfl = 6.0;        //voxels viscosity may spread across in a substep
+    FreeSurface freeSurfaceMode = FreeSurface::footprint;
+    CudaVec<float> liquidLevel;     //per stored voxel: the liquid's signed distance at its centre, in voxels, negative inside, to LIQUID_BAND either way (levelset.cu)
+    CudaVec<float> liquidCurvature; //per stored voxel beside the surface: its curvature, in 1/voxels, positive where the liquid bulges
+    CudaVec<float> surfaceLevel;    //per stored voxel, with the sharp free surface: the level set smoothed for the pressure solve (SURFACE_PASSES)
+    CudaVec<float> viscousBefore[3];    //the face velocities as the forces left them, which pressureSolve's retry goes back to
+    void* viscousSeen = nullptr;    //pinned: the viscous solve's state as the host last read it
+    uint viscousIterations = 0;     //what the last viscous solve took, which sizes the next one's first batch
     unsigned long long substepIndex = 0;    //substeps taken, which seeds the emitters' jitter
     double restParticlesPerVoxel = 8.0;
     double densityCorrectionTime = 0.1;
@@ -259,9 +402,12 @@ private:
     std::vector<cudaDeviceProp> deviceProp;
 
     CudaVec<float> framePositions;          //a frame's x, y, z, packed for the copy to the host
+    CudaVec<float> frameColumns;            //a frame's P and v planes, packed for the cache's copy to the host
     cudaStream_t frameStream = nullptr;     //copies frames to the host alongside the simulation
     cudaEvent_t framePacked = nullptr;
     cudaEvent_t frameCopied = nullptr;      //framePositions has been copied out, so it can take the next frame
+    cudaEvent_t columnsCopied = nullptr;    //and frameColumns
+    void makeFrameStream();
     std::vector<uint> selectedDevices;
 
     //the partition: this is rank of numRanks, owning node planes [boxLo, boxHi). Partitions exchange through the transport, and the solver's exchanges go

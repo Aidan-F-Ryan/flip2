@@ -92,6 +92,12 @@ int main(int argc, char** argv){
     if(const char* advection = std::getenv("FLIP2_ADVECTION")){  //FLIP2_ADVECTION=euler moves particles straight along the grid velocity instead of RK3
         particles.setRungeKutta3(std::string(advection) != "euler");
     }
+    if(const char* transfer = std::getenv("FLIP2_TRANSFER")){    //FLIP2_TRANSFER=apic carries each particle's velocity gradient (flipRatio still blends FLIP in)
+        particles.setApic(std::string(transfer) == "apic");
+    }
+    if(const char* surface = std::getenv("FLIP2_FREE_SURFACE")){     //FLIP2_FREE_SURFACE=sharp puts the pressure solve's surface at the level set's (freesurface.cu)
+        particles.setFreeSurface(std::string(surface) == "sharp" ? FreeSurface::sharp : FreeSurface::footprint);
+    }
     //FLIP2_DIAGNOSTICS=file writes a line of JSON per frame there: the particles' energy, momentum and extent, how they fill the voxels, and a hash of
     //every particle's state, which tools/golden.py compares between runs (see diagnostics.hu)
     const char* diagnostics = std::getenv("FLIP2_DIAGNOSTICS");

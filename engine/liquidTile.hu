@@ -1,0 +1,128 @@
+//Copyright 2023 Aberrant Behavior LLC
+
+#ifndef LIQUIDTILE_HU
+#define LIQUIDTILE_HU
+
+#include "typedefs.h"
+#include "grid.hpp"
+#include "algorithms/voxelSolveFunctions.hu"    //NO_VOXEL
+
+//The liquid's level set (levelset.cu) is kept in voxels, negative inside, and never past this either way: what reads it only asks about the voxels
+//beside the surface. A place nothing is stored reads as this far outside
+#define LIQUID_BAND 4.0f
+
+//voxels from the surface within which a voxel's curvature is worked out (levelset.cu): the ones a face the surface crosses lies between
+static constexpr float CURVED_WITHIN = 1.5f;
+
+//passes of blur over the level set the sharp free surface's pressure solve uses (Particles::surfaceLevel, freesurface.cu). The particles' unevenness
+//moves the level set's surface up and down a tenth of a voxel or so from one column of voxels to the next, and the solve turns that into pressure,
+//about g dt times as much velocity. Two passes take it down six times, and move a curved surface in by 4/3 its curvature, in voxels. It has to be an
+//even number: one pass of an even blur over 3 voxels turns ripples that alternate from one column of voxels to the next upside down, a third their
+//size (its response there is negative), so the solve pushes each the way that grows it: a still tank churns at half a metre a second with 1 pass, and
+//a fifth of one with 3. Four are no steadier than two
+static constexpr int SURFACE_PASSES = 2;
+
+//how much of a voxel-sized box is liquid, from the level set at its centre: half at the surface, and all or none of it half a voxel either side. Exact
+//for a flat surface facing along an axis, and it moves smoothly with any surface, so nothing pops as the liquid crosses a voxel
+__device__ inline float liquidFraction(float level){
+    return fminf(fmaxf(0.5f - level, 0.0f), 1.0f);
+}
+
+//a node's 27 neighbours' node indices (13 is itself), numUsedGridNodes where there's none: the first 27 threads of a block each look one up.
+//cellToNode is never cleared, so an entry only counts if nodeCells agrees (as loadNeighborNodes has it, particles.cu)
+__device__ inline void loadTileNodes(uint* nodes, uint cell, uint numUsedGridNodes, const uint* nodeCells, const uint* cellToNode, Grid grid){
+    if(threadIdx.x < 27){
+        int x = (int)(cell % grid.sizeX) + (int)threadIdx.x % 3 - 1;
+        int y = (int)(cell / grid.sizeX % grid.sizeY) + (int)threadIdx.x / 3 % 3 - 1;
+        int z = (int)(cell / (grid.sizeX*grid.sizeY)) + (int)threadIdx.x / 9 - 1;
+        uint node = numUsedGridNodes;
+        if(x >= 0 && y >= 0 && z >= 0 && x < (int)grid.sizeX && y < (int)grid.sizeY && z < (int)grid.sizeZ){
+            uint neighbor = x + y*grid.sizeX + z*grid.sizeX*grid.sizeY;
+            uint entry = cellToNode[neighbor];
+            node = entry < numUsedGridNodes && nodeCells[entry] == neighbor ? entry : numUsedGridNodes;
+        }
+        nodes[threadIdx.x] = node;
+    }
+}
+
+//A tile: a node's interior voxels and halo more on every side, which a block gathers into shared memory from the interiors of the 27 nodes around it
+//(halo can't be more than a node's interior). Stencils then reach whatever is stored around each of the node's voxels, in any direction, which the
+//neighbour arrays only give the pressure unknowns along the axes. A slot is a place in the tile, x fastest. Every node computes its own voxels' values
+//from its own tile, from what their owners hold, so a value doesn't depend on how the nodes are stored or split between partitions
+struct Tile{
+    int interiorWidth;
+    int halo;
+    int width;          //interiorWidth + 2*halo
+    int3 origin;        //its first voxel, in the domain's voxels
+    int3 domainVoxels;
+
+    __device__ Tile(uint cell, Grid grid, int interiorWidth, int halo)
+    : interiorWidth(interiorWidth)
+    , halo(halo)
+    , width(interiorWidth + 2*halo)
+    , origin(make_int3((int)(cell % grid.sizeX)*interiorWidth - halo, (int)(cell / grid.sizeX % grid.sizeY)*interiorWidth - halo, (int)(cell / (grid.sizeX*grid.sizeY))*interiorWidth - halo))
+    , domainVoxels(make_int3(grid.sizeX*interiorWidth, grid.sizeY*interiorWidth, grid.sizeZ*interiorWidth))
+    {}
+
+    __device__ int slots() const{
+        return width*width*width;
+    }
+
+    __device__ int3 at(int slot) const{
+        return make_int3(slot % width, slot / width % width, slot / (width*width));
+    }
+
+    __device__ int slot(int3 t) const{
+        return t.x + width*(t.y + width*t.z);
+    }
+
+    //the slot's voxel, in the domain's voxels
+    __device__ int3 global(int3 t) const{
+        return make_int3(origin.x + t.x, origin.y + t.y, origin.z + t.z);
+    }
+
+    __device__ bool inDomain(int3 t) const{
+        int3 g = global(t);
+        return g.x >= 0 && g.y >= 0 && g.z >= 0 && g.x < domainVoxels.x && g.y < domainVoxels.y && g.z < domainVoxels.z;
+    }
+
+    //whether the slot is one of the node's own voxels
+    __device__ bool interior(int3 t) const{
+        return t.x >= halo && t.y >= halo && t.z >= halo && t.x < halo + interiorWidth && t.y < halo + interiorWidth && t.z < halo + interiorWidth;
+    }
+
+    //the stored voxel at a slot inside the domain: the one in the interior of the node that owns it, or NO_VOXEL if nothing's stored there
+    __device__ uint voxel(int3 t, const uint* nodes, uint numUsedGridNodes, const uint* interiorVoxels) const{
+        int local[3] = {t.x - halo, t.y - halo, t.z - halo};
+        int which = 0, index = 0, nodeStride = 1, stride = 1;
+        #pragma unroll
+        for(int axis = 0; axis < 3; ++axis){
+            int offset = local[axis] < 0 ? -1 : local[axis] >= interiorWidth ? 1 : 0;
+            which += (offset + 1)*nodeStride;
+            index += (local[axis] - offset*interiorWidth)*stride;
+            nodeStride *= 3;
+            stride *= interiorWidth;
+        }
+        uint node = nodes[which];
+        return node < numUsedGridNodes ? interiorVoxels[(size_t)node*stride + index] : NO_VOXEL;
+    }
+
+    //how far past the domain's walls a slot's centre is, in voxels, added up over the walls it's past; 0 inside
+    __device__ float pastWalls(int3 t) const{
+        int3 g = global(t);
+        return (g.x < 0 ? -0.5f - g.x : g.x >= domainVoxels.x ? g.x + 0.5f - domainVoxels.x : 0.0f)
+             + (g.y < 0 ? -0.5f - g.y : g.y >= domainVoxels.y ? g.y + 0.5f - domainVoxels.y : 0.0f)
+             + (g.z < 0 ? -0.5f - g.z : g.z >= domainVoxels.z ? g.z + 0.5f - domainVoxels.z : 0.0f);
+    }
+
+    //for a slot past the domain's walls: the slot of its mirror image inside them, voxel for voxel
+    __device__ int3 mirrored(int3 t) const{
+        int3 g = global(t);
+        int x = g.x < 0 ? -1 - g.x : g.x >= domainVoxels.x ? 2*domainVoxels.x - 1 - g.x : g.x;
+        int y = g.y < 0 ? -1 - g.y : g.y >= domainVoxels.y ? 2*domainVoxels.y - 1 - g.y : g.y;
+        int z = g.z < 0 ? -1 - g.z : g.z >= domainVoxels.z ? 2*domainVoxels.z - 1 - g.z : g.z;
+        return make_int3(x - origin.x, y - origin.y, z - origin.z);
+    }
+};
+
+#endif

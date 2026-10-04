@@ -34,6 +34,10 @@ public:
         simulation.forEachPartition([&](Particles& partition){ partition.setFlipRatio(ratio); });
     }
 
+    void setApic(bool on){
+        simulation.forEachPartition([&](Particles& partition){ partition.setApic(on); });
+    }
+
     void setCfl(double voxels){
         simulation.forEachPartition([&](Particles& partition){ partition.setCfl(voxels); });
     }
@@ -54,12 +58,40 @@ public:
         simulation.forEachPartition([&](Particles& partition){ partition.setGravity(gravity); });
     }
 
+    void setViscosity(double kinematic){
+        simulation.forEachPartition([&](Particles& partition){ partition.setViscosity(kinematic); });
+    }
+
+    void setSurfaceTension(double overDensity){
+        simulation.forEachPartition([&](Particles& partition){ partition.setSurfaceTension(overDensity); });
+    }
+
+    void setContactAngle(double degrees){
+        simulation.forEachPartition([&](Particles& partition){ partition.setContactAngle(degrees); });
+    }
+
+    void setViscousCfl(double voxels){
+        simulation.forEachPartition([&](Particles& partition){ partition.setViscousCfl(voxels); });
+    }
+
+    void setFreeSurface(FreeSurface mode){
+        simulation.forEachPartition([&](Particles& partition){ partition.setFreeSurface(mode); });
+    }
+
+    void setObstacles(const std::vector<SceneObstacle>& obstacles){
+        simulation.forEachPartition([&](Particles& partition){ partition.setObstacles(obstacles); });
+    }
+
     void setSources(const Sources& sources){
         simulation.forEachPartition([&](Particles& partition){ partition.setSources(sources); });
     }
 
-    void setForceFields(const std::vector<ForceField>& fields){
-        simulation.forEachPartition([&](Particles& partition){ partition.setForceFields(fields); });
+    void setSourceMeshes(const std::vector<SceneObstacle>& meshes, const std::vector<FluidShape>& fluids){
+        simulation.forEachPartition([&](Particles& partition){ partition.setSourceMeshes(meshes, fluids); });
+    }
+
+    void setForceFields(const std::vector<ForceField>& fields, const std::vector<std::shared_ptr<const SceneField>>& volumes = {}){
+        simulation.forEachPartition([&](Particles& partition){ partition.setForceFields(fields, volumes); });
     }
 
     void setDotProductSums(DotProductSums sums){
@@ -165,6 +197,22 @@ public:
         });
     }
 
+    //APIC's velocity gradients for setParticles' particles, after setApic(true): nine arrays of every particle's, component c along axis a at [3c + a]
+    void setAffine(const std::vector<std::vector<float>>& gradients){
+        simulation.forEachPartition([&](Particles& partition){
+            for(int k = 0; k < 9 && partition.size > 0; ++k){   //from pageable memory, so it's copied before this returns
+                gpuErrchk(cudaMemcpyAsync(partition.affine[k].devPtr(), gradients[k].data(), sizeof(float)*partition.size, cudaMemcpyHostToDevice, partition.stream));
+            }
+        });
+    }
+
+    //a checkpoint's ids and birth times for setParticles' particles, and the next id to hand out (Particles::setIdentities)
+    void setIdentities(const std::vector<uint>& ids, const std::vector<float>& births, unsigned long long nextId){
+        simulation.forEachPartition([&](Particles& partition){
+            partition.setIdentities(ids.data(), births.data(), nextId);
+        });
+    }
+
     void runVerify(){
         particles.alignParticlesToGrid();
         storeGridCellMap();
@@ -221,6 +269,38 @@ public:
 
     void writeDiagnostics(const std::string& path, int frame){
         simulation.writeDiagnostics(path, frame);
+    }
+
+    void startCache(const std::string& directory, const CacheDescription& description, int committedBefore, std::function<void(const char*, int)> done){
+        simulation.startCache(directory, description, committedBefore, std::move(done));
+    }
+
+    void writeCacheFrame(int frame){
+        simulation.writeCacheFrame(frame);
+    }
+
+    std::string cacheError(){
+        return simulation.cacheError();
+    }
+
+    std::string finishCache(){
+        return simulation.finishCache();
+    }
+
+    void writeCheckpoint(int frame){
+        simulation.writeCheckpoint(frame);
+    }
+
+    void resume(double time, unsigned long long substep){
+        simulation.resume(time, substep);
+    }
+
+    bool anyRank(bool mine){
+        return simulation.anyRank(mine);
+    }
+
+    void continueDiagnostics(const std::string& path, int lastFrame){
+        simulation.continueDiagnostics(path, lastFrame);
     }
 
 private:

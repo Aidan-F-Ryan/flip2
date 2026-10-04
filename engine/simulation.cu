@@ -5,6 +5,7 @@
 #include "diagnostics.hu"
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <thread>
 
 Simulation::Simulation(uint numParticles, int numPartitions, int numDevices)
@@ -73,6 +74,7 @@ void Simulation::startFrameWriter(){
 }
 
 Simulation::~Simulation(){
+    cacheWriter.reset();    //writes and commits every frame, and
     frameWriter.reset();    //writes every frame, so nothing waits on the events any more
     for(int index = numPartitions() - 1; index >= 0; --index){     //each partition's things, freed on its own GPU
         gpuErrchk(cudaSetDevice(partitions[index]->device()));
@@ -81,12 +83,17 @@ Simulation::~Simulation(){
                 cudaEventDestroy(copied);
             }
         }
+        if(index < (int)cacheCopies.size()){
+            for(cudaEvent_t copied : cacheCopies[index]){
+                cudaEventDestroy(copied);
+            }
+        }
         contexts[index].reset();
         partitions[index].reset();
     }
 }
 
-void Simulation::setDomain(double nx, double ny, double nz, uint x, uint y, uint z, double cellSize){
+std::vector<uint> Simulation::planesFor(uint z, int numRanks){
     std::vector<uint> planes(numRanks + 1);
     for(int rank = 0; rank < numRanks; ++rank){
         planes[rank] = (uint)((unsigned long long)z*rank/numRanks) & ~1u;
@@ -94,10 +101,19 @@ void Simulation::setDomain(double nx, double ny, double nz, uint x, uint y, uint
     planes[numRanks] = z;
     for(int rank = 0; rank < numRanks; ++rank){
         if(planes[rank + 1] < planes[rank] + 2){
-            std::cerr<<"Simulation: "<<numRanks<<" ranks is too many for "<<z<<" node planes; each needs at least 2\n";
-            exit(1);
+            return {};
         }
     }
+    return planes;
+}
+
+void Simulation::setDomain(double nx, double ny, double nz, uint x, uint y, uint z, double cellSize){
+    std::vector<uint> planes = planesFor(z, numRanks);
+    if(planes.empty()){
+        std::cerr<<"Simulation: "<<numRanks<<" ranks is too many for "<<z<<" node planes; each needs at least 2\n";
+        exit(1);
+    }
+    this->planes = planes;
     for(int index = 0; index < numPartitions(); ++index){
         Particles& partition = *partitions[index];
         gpuErrchk(cudaSetDevice(partition.device()));
@@ -224,6 +240,134 @@ void Simulation::writeDiagnostics(const std::string& path, int frame){
     std::snprintf(tail, sizeof(tail), ",\"fastest\":%.9g,\"occupiedVoxels\":%llu,\"volume\":%.17g,", d.fastest, d.occupiedVoxels, d.occupiedVoxels*voxelSize*voxelSize*voxelSize);
     diagnostics<<tail<<"\"perVoxel\":"<<jsonArray(d.perVoxel, DIAGNOSTIC_BUCKETS, "%llu")<<",\"core\":"<<jsonArray(d.core, DIAGNOSTIC_BUCKETS, "%llu")<<"}\n";
     diagnostics.flush();
+}
+
+void Simulation::startCache(const std::string& directory, CacheDescription description, int committedBefore, std::function<void(const char*, int)> done){
+    const Particles& first = *partitions[0];
+    cudaDeviceProp properties;
+    gpuErrchk(cudaGetDeviceProperties(&properties, first.device()));
+    cudaRuntimeGetVersion(&description.cudaRuntime);
+    description.gpu = properties.name;
+    description.sm = properties.major*10 + properties.minor;
+    description.worldSize = numRanks;
+    description.partitionPlanes = planes;
+    description.nodes[0] = first.grid.sizeX;
+    description.nodes[1] = first.grid.sizeY;
+    description.nodes[2] = first.grid.sizeZ;
+    description.nodeSize = first.grid.cellSize;
+    description.voxelSize = first.grid.cellSize / (2<<first.refinementLevel);
+    description.domainMin[0] = first.grid.negX;
+    description.domainMin[1] = first.grid.negY;
+    description.domainMin[2] = first.grid.negZ;
+    cacheWriter = std::make_unique<CacheWriter>(directory, description, ranks, committedBefore, std::move(done));
+    cacheCopies.resize(partitions.size());
+    for(size_t index = 0; index < partitions.size(); ++index){
+        gpuErrchk(cudaSetDevice(partitions[index]->device()));
+        for(int buffer = 0; buffer < cacheWriter->numBuffers(); ++buffer){
+            cudaEvent_t copied;
+            gpuErrchk(cudaEventCreateWithFlags(&copied, cudaEventDisableTiming));
+            cacheCopies[index].push_back(copied);
+        }
+    }
+    gpuErrchk(cudaSetDevice(partitions[0]->device()));
+}
+
+void Simulation::writeCacheFrame(int frame){
+    bool ids = cacheWriter->writesIds(), ages = cacheWriter->writesAges();
+    int buffer = cacheWriter->acquire(CacheWriter::frameBytes(particlesHere(), ids, ages));    //emitters and sinks change the count from frame to frame
+    char* host = cacheWriter->hostBuffer(buffer);
+    std::vector<CacheShard> shards;
+    std::vector<cudaEvent_t> copies;
+    size_t offset = 0;
+    for(int index = 0; index < numPartitions(); ++index){   //each copies its own planes straight from its GPU
+        Particles& partition = *partitions[index];
+        gpuErrchk(cudaSetDevice(partition.device()));
+        partition.copyFrameColumnsToHost((float*)(host + offset), ids, ages, cacheCopies[index][buffer]);
+        shards.push_back({ranks[index], partition.numParticles(), offset});
+        copies.push_back(cacheCopies[index][buffer]);
+        offset += CacheWriter::frameBytes(partition.numParticles(), ids, ages);
+    }
+    gpuErrchk(cudaSetDevice(partitions[0]->device()));
+    cacheWriter->submit(buffer, frame, partitions[0]->elapsedTime, shards, copies);
+}
+
+void Simulation::writeCheckpoint(int frame){
+    bool apic = partitions[0]->apic;
+    int buffer = cacheWriter->acquire(CacheWriter::checkpointBytes(particlesHere(), apic));
+    char* host = cacheWriter->hostBuffer(buffer);
+    std::vector<CacheShard> shards;
+    std::vector<cudaEvent_t> copies;
+    size_t offset = 0;
+    for(int index = 0; index < numPartitions(); ++index){
+        Particles& partition = *partitions[index];
+        gpuErrchk(cudaSetDevice(partition.device()));
+        partition.copyCheckpointToHost(host + offset, cacheCopies[index][buffer]);
+        shards.push_back({ranks[index], partition.numParticles(), offset});
+        copies.push_back(cacheCopies[index][buffer]);
+        offset += CacheWriter::checkpointBytes(partition.numParticles(), apic);
+    }
+    gpuErrchk(cudaSetDevice(partitions[0]->device()));
+    CheckpointState state;
+    state.time = partitions[0]->elapsedTime;
+    state.substep = partitions[0]->substepIndex;
+    state.apic = apic;
+    state.nextId = partitions[0]->nextId();
+    cacheWriter->submitCheckpoint(buffer, frame, state, shards, copies);
+}
+
+void Simulation::resume(double time, unsigned long long substep){
+    inLockstep([time, substep](Particles& partition){ partition.resume(time, substep); });
+}
+
+bool Simulation::anyRank(bool mine){
+    if(numPartitions() == numRanks){    //every rank is here, and sees what this process does
+        return mine;
+    }
+    char says = mine ? 1 : 0;
+    std::vector<char> all(numRanks);
+    transports[0]->allGatherHost(&says, all.data(), 1);
+    return std::any_of(all.begin(), all.end(), [](char each){ return each != 0; });
+}
+
+void Simulation::continueDiagnostics(const std::string& path, int lastFrame){
+    if(ranks[0] != 0){
+        return;
+    }
+    std::vector<std::string> kept;
+    {
+        std::ifstream in(path);
+        std::string line;
+        while(std::getline(in, line)){
+            size_t at = line.find("\"frame\":");
+            if(at == std::string::npos ? line.find("\"flip2\"") != std::string::npos : std::atoi(line.c_str() + at + 8) <= lastFrame){
+                kept.push_back(line);
+            }
+        }
+    }
+    if(kept.empty()){   //nothing to carry on: writeDiagnostics starts it afresh
+        return;
+    }
+    diagnostics.open(path, std::ios::trunc);
+    if(!diagnostics){
+        std::cerr<<"Simulation: can't write diagnostics to "<<path<<"\n";
+        exit(1);
+    }
+    for(const std::string& line : kept){
+        diagnostics<<line<<"\n";
+    }
+    diagnostics.flush();
+}
+
+std::string Simulation::cacheError(){
+    return cacheWriter ? cacheWriter->error() : "";
+}
+
+std::string Simulation::finishCache(){
+    if(!cacheWriter){
+        return "";
+    }
+    cacheWriter->flush();
+    return cacheWriter->error();
 }
 
 void Simulation::writePositionsToFile(const std::string& fileName){

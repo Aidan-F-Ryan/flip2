@@ -1,0 +1,71 @@
+//Copyright 2023 Aberrant Behavior LLC
+#ifndef SURFACE_HU
+#define SURFACE_HU
+#include <string>
+#include <vector>
+
+//A liquid's surface from its particles, on the GPU (surface.cu): a smooth field around them, Houdini's Average Position method (Zhu and Bridson,
+//Animating sand as a fluid, 2005), worked out only in a narrow band around the edge of the space they fill, and a mesh of its zero level by surface nets,
+//closed and welded, its points carrying the liquid's velocity. And the liquid's velocity as a field, for tools that want one (Houdini's whitewater)
+
+struct SurfaceSettings{
+    float separation = 0.0f;        //the bake's particle separation (half its voxel size)
+    float voxelScale = 0.5f;        //the field's sample spacing, in particle separations: smaller is finer
+    float influenceScale = 3.0f;    //how far each particle reaches into the field, in particle separations: at 2 the surface dimples over each particle
+    float radiusScale = 0.8f;       //each particle's radius, in particle separations: sets where the surface sits. This keeps the liquid's volume
+                                    //at that reach; a shorter reach wants less (0.6 at 2)
+    int smoothing = 4;              //passes of a mean filter over the field before it's meshed
+    std::string problem() const;    //what's wrong with these, if anything
+};
+
+struct SurfaceMesh{
+    std::vector<float> points;      //x, y, z per point
+    std::vector<float> velocities;  //x, y, z per point, metres per second
+    std::vector<int> quads;         //4 point indices per face, counter-clockwise seen from outside
+};
+
+//the liquid's fields, as Houdini's FLIP has them for its whitewater: its surface as a signed distance field, and its velocity
+struct FieldSettings{
+    float voxelScale = 2.0f;        //the fields' voxel size, in particle separations: 2 is the bake's own
+    float halfWidth = 3.0f;         //how far past the surface they reach, in voxels: the distance field's narrow band either side of it
+    std::string problem() const;
+};
+
+//the fields' voxels, (i, j, k) centred at (i, j, k) voxel sizes from the origin, as a VDB's are. The surface: the distance to the zero level of the
+//particles' field as the mesh has it (but at these voxels), negative inside, at voxels within the half width of it; deeper in, everything is inside. The
+//velocity: the particles' velocities averaged wherever they reach, as the mesh's points have them, and carried on as far again as the half width
+struct FluidFields{
+    float voxelSize = 0.0f;
+    float halfWidth = 0.0f;
+    std::vector<int> surfaceVoxels;     //i, j, k per voxel
+    std::vector<float> distances;       //per voxel, metres
+    std::vector<int> velocityVoxels;    //i, j, k per voxel
+    std::vector<float> velocities;      //x, y, z per voxel, metres per second
+};
+
+//keeps its GPU buffers between frames, growing them as needed; one per thread, on the device that's current when it's made
+class SurfaceMesher{
+public:
+    SurfaceMesher();
+    ~SurfaceMesher();
+    SurfaceMesher(const SurfaceMesher&) = delete;
+    SurfaceMesher& operator=(const SurfaceMesher&) = delete;
+    //meshes count particles: positions and velocities as x, y and z planes (each count floats, one after another), within bounds low and high
+    void mesh(const float* positions, const float* velocities, unsigned long long count, const float low[3], const float high[3], const SurfaceSettings& settings,
+              SurfaceMesh& out);
+    //the fields of the particles the last mesh() meshed
+    void fields(const FieldSettings& settings, FluidFields& out);
+    double seconds = 0.0;           //the last mesh's time on the GPU, copies included
+    double fieldSeconds = 0.0;      //and the last fields'
+    size_t fieldCells = 0;          //the cells of the last fields' lattice, each holding a cube of voxels
+    int rounds = 0;                 //how many times the last mesh's field was worked out: once, and again each time its band grew
+    size_t bandCells = 0;           //the cells of the last mesh's band, each holding a cube of samples
+private:
+    struct Buffers;
+    Buffers* buffers;
+    unsigned long long count = 0;   //the last mesh's particles, which are still on the GPU, and their bounds and separation
+    float low[3] = {0.0f, 0.0f, 0.0f}, high[3] = {0.0f, 0.0f, 0.0f};
+    SurfaceSettings surface;        //the last mesh's settings, which the fields share
+};
+
+#endif

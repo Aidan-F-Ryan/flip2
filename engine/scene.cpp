@@ -1,6 +1,8 @@
 //Copyright 2023 Aberrant Behavior LLC
 
 #include "scene.hpp"
+#include "json.hpp"
+#include "volumes.hpp"
 #include <algorithm>
 #include <cmath>
 #include <initializer_list>
@@ -10,194 +12,6 @@
 #include <map>
 #include <sstream>
 #include <stdexcept>
-
-//Just enough JSON for scene files: objects, arrays, numbers, strings, true, false and null
-struct Json{
-    enum Kind{NUL, BOOLEAN, NUMBER, STRING, ARRAY, OBJECT};
-    Kind kind = NUL;
-    bool boolean = false;
-    double number = 0.0;
-    std::string text;
-    std::vector<Json> items;
-    std::vector<std::pair<std::string, Json>> fields;     //in file order
-
-    const Json* find(const std::string& key) const{
-        for(const auto& field : fields){
-            if(field.first == key){
-                return &field.second;
-            }
-        }
-        return nullptr;
-    }
-};
-
-class JsonReader{
-public:
-    JsonReader(const std::string& text, const std::string& name)
-    : text(text)
-    , name(name)
-    {}
-
-    Json document(){
-        Json value = parse();
-        skipSpace();
-        if(at < text.size()){
-            fail("more after the end of the document");
-        }
-        return value;
-    }
-
-private:
-    [[noreturn]] void fail(const std::string& what){
-        int line = 1;
-        for(size_t i = 0; i < at && i < text.size(); ++i){
-            line += text[i] == '\n';
-        }
-        throw std::runtime_error(name + ":" + std::to_string(line) + ": " + what);
-    }
-
-    void skipSpace(){
-        while(at < text.size() && (text[at] == ' ' || text[at] == '\t' || text[at] == '\n' || text[at] == '\r')){
-            ++at;
-        }
-    }
-
-    bool consume(const char* word){
-        size_t length = std::char_traits<char>::length(word);
-        if(text.compare(at, length, word) == 0){
-            at += length;
-            return true;
-        }
-        return false;
-    }
-
-    Json parse(){
-        skipSpace();
-        if(at >= text.size()){
-            fail("unexpected end of file");
-        }
-        Json value;
-        char c = text[at];
-        if(c == '{'){
-            value.kind = Json::OBJECT;
-            ++at;
-            skipSpace();
-            if(at < text.size() && text[at] == '}'){
-                ++at;
-                return value;
-            }
-            while(true){
-                skipSpace();
-                if(at >= text.size() || text[at] != '"'){
-                    fail("expected a quoted key");
-                }
-                std::string key = string();
-                skipSpace();
-                if(at >= text.size() || text[at] != ':'){
-                    fail("expected ':' after \"" + key + "\"");
-                }
-                ++at;
-                value.fields.emplace_back(key, parse());
-                skipSpace();
-                if(at < text.size() && text[at] == ','){
-                    ++at;
-                    continue;
-                }
-                if(at < text.size() && text[at] == '}'){
-                    ++at;
-                    return value;
-                }
-                fail("expected ',' or '}' in an object");
-            }
-        }
-        if(c == '['){
-            value.kind = Json::ARRAY;
-            ++at;
-            skipSpace();
-            if(at < text.size() && text[at] == ']'){
-                ++at;
-                return value;
-            }
-            while(true){
-                value.items.push_back(parse());
-                skipSpace();
-                if(at < text.size() && text[at] == ','){
-                    ++at;
-                    continue;
-                }
-                if(at < text.size() && text[at] == ']'){
-                    ++at;
-                    return value;
-                }
-                fail("expected ',' or ']' in an array");
-            }
-        }
-        if(c == '"'){
-            value.kind = Json::STRING;
-            value.text = string();
-            return value;
-        }
-        if(consume("true")){
-            value.kind = Json::BOOLEAN;
-            value.boolean = true;
-            return value;
-        }
-        if(consume("false")){
-            value.kind = Json::BOOLEAN;
-            return value;
-        }
-        if(consume("null")){
-            return value;
-        }
-        const char* start = text.c_str() + at;
-        char* end;
-        value.number = std::strtod(start, &end);
-        if(end == start){
-            fail(std::string("unexpected '") + c + "'");
-        }
-        value.kind = Json::NUMBER;
-        at += end - start;
-        return value;
-    }
-
-    std::string string(){    //at the opening quote
-        std::string out;
-        ++at;
-        while(at < text.size() && text[at] != '"'){
-            char c = text[at++];
-            if(c == '\\' && at < text.size()){
-                char escaped = text[at++];
-                switch(escaped){
-                    case 'n': out += '\n'; break;
-                    case 't': out += '\t'; break;
-                    case 'r': out += '\r'; break;
-                    case 'b': out += '\b'; break;
-                    case 'f': out += '\f'; break;
-                    case 'u':   //only the ASCII range: scene files are paths and names
-                        if(at + 4 > text.size()){
-                            fail("a short \\u escape");
-                        }
-                        out += (char)std::strtol(text.substr(at, 4).c_str(), nullptr, 16);
-                        at += 4;
-                        break;
-                    default: out += escaped;
-                }
-            }
-            else{
-                out += c;
-            }
-        }
-        if(at >= text.size()){
-            fail("a string that never ends");
-        }
-        ++at;
-        return out;
-    }
-
-    const std::string& text;
-    std::string name;
-    size_t at = 0;
-};
 
 //reads a scene's values, complaining in terms of where they are in the file
 class SceneReader{
@@ -294,7 +108,148 @@ public:
     std::string name;
 };
 
+void loadObj(const std::string& path, std::vector<float>& vertices, std::vector<int>& triangles){
+    std::ifstream file(path);
+    if(!file){
+        throw std::runtime_error(path + ": can't open it");
+    }
+    std::string line;
+    int lineNumber = 0;
+    while(std::getline(file, line)){
+        ++lineNumber;
+        std::istringstream words(line);
+        std::string kind;
+        words>>kind;
+        if(kind == "v"){
+            double x, y, z;
+            if(!(words>>x>>y>>z)){
+                throw std::runtime_error(path + ":" + std::to_string(lineNumber) + ": a vertex needs x, y and z");
+            }
+            vertices.push_back((float)x);
+            vertices.push_back((float)y);
+            vertices.push_back((float)z);
+        }
+        else if(kind == "f"){
+            std::vector<int> corners;
+            std::string corner;
+            while(words>>corner){   //v, v/vt, v//vn or v/vt/vn; negative counts back from the last vertex so far
+                int index = std::atoi(corner.c_str());
+                int numVertices = (int)vertices.size() / 3;
+                index = index < 0 ? numVertices + index : index - 1;
+                if(index < 0 || index >= numVertices){
+                    throw std::runtime_error(path + ":" + std::to_string(lineNumber) + ": a face names vertex " + corner + ", which isn't there");
+                }
+                corners.push_back(index);
+            }
+            for(size_t fan = 1; fan + 1 < corners.size(); ++fan){
+                triangles.push_back(corners[0]);
+                triangles.push_back(corners[fan]);
+                triangles.push_back(corners[fan + 1]);
+            }
+        }
+    }
+    if(triangles.empty()){
+        throw std::runtime_error(path + ": no faces");
+    }
+}
+
+//a .npy file's numbers, as doubles: a little-endian float32, float64, int32, int64 or uint32 array of shape (n, 3), in C order
+static std::vector<double> loadNpy(const std::string& path){
+    std::ifstream file(path, std::ios::binary);
+    if(!file){
+        throw std::runtime_error(path + ": can't open it");
+    }
+    char magic[8];
+    file.read(magic, 8);
+    if(!file || std::string(magic, 6) != "\x93NUMPY"){
+        throw std::runtime_error(path + ": not a .npy file");
+    }
+    size_t headerLength = 0;
+    if(magic[6] == 1){
+        unsigned char bytes[2];
+        file.read((char*)bytes, 2);
+        headerLength = bytes[0] | bytes[1] << 8;
+    }
+    else{
+        unsigned char bytes[4];
+        file.read((char*)bytes, 4);
+        headerLength = bytes[0] | bytes[1] << 8 | bytes[2] << 16 | (size_t)bytes[3] << 24;
+    }
+    std::string header(headerLength, ' ');
+    file.read(&header[0], headerLength);
+    auto field = [&](const std::string& key){
+        size_t at = header.find("'" + key + "'");
+        if(at == std::string::npos){
+            throw std::runtime_error(path + ": its header has no " + key);
+        }
+        return header.substr(header.find(':', at) + 1);
+    };
+    std::string descr = field("descr");
+    descr = descr.substr(descr.find('\'') + 1);
+    descr = descr.substr(0, descr.find('\''));
+    if(field("fortran_order").find("True") < field("fortran_order").find(',')){
+        throw std::runtime_error(path + ": a Fortran-order array; save it in C order");
+    }
+    std::string shape = field("shape");
+    shape = shape.substr(shape.find('(') + 1, shape.find(')') - shape.find('(') - 1);
+    size_t rows = std::strtoull(shape.c_str(), nullptr, 10);
+    size_t columns = shape.find(',') == std::string::npos ? 1 : std::strtoull(shape.c_str() + shape.find(',') + 1, nullptr, 10);
+    if(columns != 3){
+        throw std::runtime_error(path + ": should be an array of shape (n, 3), not (" + shape + ")");
+    }
+    size_t count = rows*columns;
+    std::vector<double> values(count);
+    auto read = [&](auto sample){
+        std::vector<decltype(sample)> raw(count);
+        file.read((char*)raw.data(), sizeof(sample)*count);
+        if(!file){
+            throw std::runtime_error(path + ": shorter than its header says");
+        }
+        for(size_t i = 0; i < count; ++i){
+            values[i] = (double)raw[i];
+        }
+    };
+    if(descr == "<f4"){
+        read(0.0f);
+    }
+    else if(descr == "<f8"){
+        read(0.0);
+    }
+    else if(descr == "<i4"){
+        read((int)0);
+    }
+    else if(descr == "<i8"){
+        read((long long)0);
+    }
+    else if(descr == "<u4"){
+        read((unsigned int)0);
+    }
+    else{
+        throw std::runtime_error(path + ": holds " + descr + "; flip2 reads little-endian f4, f8, i4, i8 and u4");
+    }
+    return values;
+}
+
+void loadNpyMesh(const std::string& verticesPath, const std::string& trianglesPath, std::vector<float>& vertices, std::vector<int>& triangles){
+    for(double value : loadNpy(verticesPath)){
+        vertices.push_back((float)value);
+    }
+    int numVertices = (int)vertices.size() / 3;
+    for(double value : loadNpy(trianglesPath)){
+        if(value < 0 || value >= numVertices){
+            throw std::runtime_error(trianglesPath + ": names vertex " + std::to_string((long long)value) + ", but " + verticesPath + " has " + std::to_string(numVertices));
+        }
+        triangles.push_back((int)value);
+    }
+    if(triangles.empty()){
+        throw std::runtime_error(trianglesPath + ": no triangles");
+    }
+}
+
 bool SceneShape::contains(const double point[3]) const{
+    if(kind == MESH){
+        return false;
+    }
     if(kind == SPHERE){
         double squared = 0.0;
         for(int axis = 0; axis < 3; ++axis){
@@ -312,8 +267,30 @@ bool SceneShape::contains(const double point[3]) const{
 
 void SceneShape::bounds(double low[3], double high[3]) const{
     for(int axis = 0; axis < 3; ++axis){
-        low[axis] = kind == SPHERE ? centre[axis] - radius : min[axis];
-        high[axis] = kind == SPHERE ? centre[axis] + radius : max[axis];
+        low[axis] = kind == SPHERE ? centre[axis] - radius : kind == MESH ? INFINITY : min[axis];
+        high[axis] = kind == SPHERE ? centre[axis] + radius : kind == MESH ? -INFINITY : max[axis];
+    }
+    if(kind == MESH && mesh.field){     //a level set's box through its first transform: the box around its corners there
+        const std::array<double, 16>& m = mesh.transforms[0];
+        for(int corner = 0; corner < 8; ++corner){
+            double local[3] = {corner & 1 ? mesh.field->high[0] : mesh.field->low[0], corner & 2 ? mesh.field->high[1] : mesh.field->low[1], corner & 4 ? mesh.field->high[2] : mesh.field->low[2]};
+            for(int axis = 0; axis < 3; ++axis){
+                double world = m[4*axis]*local[0] + m[4*axis + 1]*local[1] + m[4*axis + 2]*local[2] + m[4*axis + 3];
+                low[axis] = std::min(low[axis], world);
+                high[axis] = std::max(high[axis], world);
+            }
+        }
+    }
+    else if(kind == MESH){   //at the start: its vertices through its first transform, or its first deforming sample
+        const std::array<double, 16>& m = mesh.transforms[0];
+        for(size_t vertex = 0; 3*vertex + 2 < mesh.vertices.size(); ++vertex){
+            const float* v = mesh.samples ? mesh.samples->data() + 3*vertex : mesh.vertices.data() + 3*vertex;
+            for(int axis = 0; axis < 3; ++axis){
+                double world = mesh.samples ? v[axis] : m[4*axis]*v[0] + m[4*axis + 1]*v[1] + m[4*axis + 2]*v[2] + m[4*axis + 3];
+                low[axis] = std::min(low[axis], world);
+                high[axis] = std::max(high[axis], world);
+            }
+        }
     }
 }
 
@@ -330,7 +307,7 @@ Scene loadScene(const std::string& path){
     if(root.kind != Json::OBJECT){
         read.fail("the file", "should be one JSON object, {...}");
     }
-    read.checkKeys(root, "the scene", {"schema", "fps", "frames", "domain", "solver", "gravity", "particlesPerVoxel", "seed", "fluids", "emitters", "sinks", "forces", "partitions", "devices", "output"});
+    read.checkKeys(root, "the scene", {"schema", "fps", "frames", "domain", "solver", "gravity", "liquid", "particlesPerVoxel", "seed", "fluids", "emitters", "sinks", "obstacles", "forces", "partitions", "devices", "output"});
     std::string schema = read.text(root, "schema", "the scene", "flip2.scene/1");
     if(schema != "flip2.scene/1"){
         read.fail("schema", "is \"" + schema + "\"; this flip2 reads \"flip2.scene/1\"");
@@ -378,33 +355,207 @@ Scene loadScene(const std::string& path){
     }
 
     if(const Json* solver = read.object(root, "solver", "the scene")){
-        read.checkKeys(*solver, "solver", {"flipRatio", "cfl", "densityCorrectionTime", "pressureSolver", "advection", "dotProducts"});
+        read.checkKeys(*solver, "solver", {"flipRatio", "cfl", "densityCorrectionTime", "pressureSolver", "advection", "dotProducts", "transfer", "viscousCfl", "freeSurface"});
         scene.flipRatio = read.number(*solver, "flipRatio", "solver", scene.flipRatio);
         scene.cfl = read.number(*solver, "cfl", "solver", scene.cfl);
         scene.densityCorrectionTime = read.number(*solver, "densityCorrectionTime", "solver", scene.densityCorrectionTime);
         scene.pressureSolver = read.text(*solver, "pressureSolver", "solver", scene.pressureSolver);
         scene.advection = read.text(*solver, "advection", "solver", scene.advection);
         scene.dotProducts = read.text(*solver, "dotProducts", "solver", scene.dotProducts);
+        scene.transfer = read.text(*solver, "transfer", "solver", scene.transfer);
+        scene.viscousCfl = read.number(*solver, "viscousCfl", "solver", scene.viscousCfl);
+        scene.freeSurface = read.text(*solver, "freeSurface", "solver", scene.freeSurface);
         if(scene.pressureSolver != "multigrid" && scene.pressureSolver != "cg" && scene.pressureSolver != "jacobi" && scene.pressureSolver != "sor"){
             read.fail("solver.pressureSolver", "is multigrid, cg, jacobi or sor");
         }
         if(scene.advection != "rk3" && scene.advection != "euler"){
             read.fail("solver.advection", "is rk3 or euler");
         }
+        if(scene.transfer != "flip" && scene.transfer != "apic"){
+            read.fail("solver.transfer", "is flip or apic");
+        }
         if(scene.dotProducts != "exact" && scene.dotProducts != "blocks"){
             read.fail("solver.dotProducts", "is exact or blocks");
         }
-        if(scene.cfl <= 0.0 || scene.flipRatio < 0.0 || scene.flipRatio > 1.0 || scene.densityCorrectionTime < 0.0){
-            read.fail("solver", "cfl has to be positive, flipRatio between 0 and 1, and densityCorrectionTime at least 0");
+        if(scene.freeSurface != "footprint" && scene.freeSurface != "sharp"){
+            read.fail("solver.freeSurface", "is footprint or sharp");
+        }
+        if(scene.cfl <= 0.0 || scene.flipRatio < 0.0 || scene.flipRatio > 1.0 || scene.densityCorrectionTime < 0.0 || !(scene.viscousCfl >= 0.0)){
+            read.fail("solver", "cfl has to be positive, flipRatio between 0 and 1, and densityCorrectionTime and viscousCfl at least 0");
         }
     }
 
     read.vector3(root, "gravity", "the scene", scene.gravity);
+    if(const Json* liquid = read.object(root, "liquid", "the scene")){
+        read.checkKeys(*liquid, "liquid", {"density", "viscosity", "surfaceTension", "contactAngle"});
+        scene.density = read.number(*liquid, "density", "liquid", scene.density);
+        scene.viscosity = read.number(*liquid, "viscosity", "liquid", scene.viscosity);
+        scene.surfaceTension = read.number(*liquid, "surfaceTension", "liquid", scene.surfaceTension);
+        scene.contactAngle = read.number(*liquid, "contactAngle", "liquid", scene.contactAngle);
+        if(!(scene.density > 0.0) || !(scene.viscosity >= 0.0) || !(scene.surfaceTension >= 0.0) || !(scene.contactAngle >= 0.0 && scene.contactAngle <= 180.0)){
+            read.fail("liquid", "density has to be positive, viscosity and surfaceTension at least 0, and contactAngle from 0 to 180 degrees");
+        }
+    }
     scene.particlesPerVoxel = (int)read.number(root, "particlesPerVoxel", "the scene", scene.particlesPerVoxel);
     if(scene.particlesPerVoxel != 1 && scene.particlesPerVoxel != 8 && scene.particlesPerVoxel != 27){
         read.fail("particlesPerVoxel", "is 1, 8 or 27: a lattice of 1, 2 or 3 per side");
     }
     scene.seed = (unsigned long long)read.number(root, "seed", "the scene", (double)scene.seed);
+
+    std::string directory = path.find('/') == std::string::npos ? "" : path.substr(0, path.rfind('/') + 1);    //meshes are named relative to the scene
+    auto resolve = [&](const std::string& file){
+        return file.empty() || file[0] == '/' ? file : directory + file;
+    };
+    //runs load, saying where in the scene a file it reads was named if reading it fails
+    auto naming = [&](const std::string& where, auto load){
+        try{
+            load();
+        }
+        catch(const std::runtime_error& error){
+            if(std::string(error.what()).rfind(path, 0) == 0){
+                throw;
+            }
+            read.fail(where, error.what());
+        }
+    };
+    //a mesh's vertices and triangles, from "mesh" (an OBJ) or "vertices" and "triangles" (.npy files); or a level set from "vdb", resampled at the
+    //domain's voxel size (volumes.hpp), from its "grid", with velocities from its "velocityGrid": whether it names one
+    auto readMesh = [&](const Json& item, const std::string& where, SceneObstacle& placed){
+        if(item.find("vdb")){
+            if(item.find("mesh") || item.find("vertices") || item.find("triangles") || item.find("deforming")){
+                read.fail(where, "is a mesh or a \"vdb\", not both");
+            }
+            naming(where, [&]{
+                placed.field = loadLevelSet(resolve(read.text(item, "vdb", where, "")), read.text(item, "grid", where, ""), read.text(item, "velocityGrid", where, ""),
+                                            scene.voxelSize());
+            });
+            placed.kind = SceneObstacle::FIELD;
+            return true;
+        }
+        bool named = item.find("mesh") || item.find("vertices") || item.find("triangles");
+        naming(where, [&]{
+            if(item.find("mesh")){
+                loadObj(resolve(read.text(item, "mesh", where, "")), placed.vertices, placed.triangles);
+            }
+            else if(named){
+                loadNpyMesh(resolve(read.text(item, "vertices", where, "")), resolve(read.text(item, "triangles", where, "")), placed.vertices, placed.triangles);
+            }
+        });
+        if(named){
+            placed.kind = SceneObstacle::MESH;
+        }
+        return named;
+    };
+    auto matrix = [&](const Json& value, const std::string& at){
+        std::array<double, 16> out;
+        if(value.kind != Json::ARRAY || value.items.size() != 16){
+            read.fail(at, "should be 16 numbers: a row-major 4x4 matrix");
+        }
+        for(int i = 0; i < 16; ++i){
+            if(value.items[i].kind != Json::NUMBER){
+                read.fail(at, "should be 16 numbers: a row-major 4x4 matrix");
+            }
+            out[i] = value.items[i].number;
+        }
+        return out;
+    };
+    //where it is: placed by a "transform" (or none), moved by "keyframes", or for a mesh, "deforming" samples of its vertices in the world. A level set
+    //can only be turned and moved, as scaling would make its distances wrong, and one with velocities stays where it is, as they're the world's
+    auto readPlacement = [&](const Json& item, const std::string& where, SceneObstacle& placed){
+        if(item.find("deforming") && (item.find("transform") || item.find("keyframes"))){
+            read.fail(where, "a deforming mesh's samples are in the world already: it can't have a \"transform\" or \"keyframes\" too");
+        }
+        if(placed.kind == SceneObstacle::FIELD && !placed.field->velocities.empty() && (item.find("transform") || item.find("keyframes"))){
+            read.fail(where, "a level set with a \"velocityGrid\" is in the world already: it can't have a \"transform\" or \"keyframes\" too");
+        }
+        if(const Json* keyframes = read.array(item, "keyframes", where)){
+            for(size_t key = 0; key < keyframes->items.size(); ++key){
+                const Json& keyframe = keyframes->items[key];
+                std::string at = where + ".keyframes[" + std::to_string(key) + "]";
+                const Json* transform = keyframe.kind == Json::OBJECT ? keyframe.find("transform") : nullptr;
+                if(transform == nullptr || !keyframe.find("time")){
+                    read.fail(at, "needs a \"time\" and a \"transform\"");
+                }
+                double time = read.number(keyframe, "time", at, 0.0);
+                if(!placed.keyTimes.empty() && time <= placed.keyTimes.back()){
+                    read.fail(at, "keyframes have to be in increasing time");
+                }
+                placed.keyTimes.push_back(time);
+                placed.transforms.push_back(matrix(*transform, at + ".transform"));
+            }
+            if(placed.keyTimes.empty()){
+                read.fail(where + ".keyframes", "is empty");
+            }
+        }
+        else if(const Json* transform = item.find("transform")){
+            placed.transforms.push_back(matrix(*transform, where + ".transform"));
+        }
+        else{
+            placed.transforms.push_back({1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1});
+        }
+        for(const std::array<double, 16>& m : placed.transforms){
+            double determinant = m[0]*(m[5]*m[10] - m[6]*m[9]) - m[1]*(m[4]*m[10] - m[6]*m[8]) + m[2]*(m[4]*m[9] - m[5]*m[8]);
+            for(int column = 0; column < 3 && placed.kind == SceneObstacle::FIELD; ++column){
+                double length = std::sqrt(m[column]*m[column] + m[4 + column]*m[4 + column] + m[8 + column]*m[8 + column]);
+                if(std::fabs(length - 1.0) > 1e-4 || determinant < 0.0){
+                    read.fail(where, "a level set can only be turned and moved: its transforms can't scale or mirror it, which would make its distances wrong");
+                }
+            }
+        }
+        if(const Json* deforming = read.array(item, "deforming", where)){
+            auto samples = std::make_shared<std::vector<float>>();
+            for(size_t key = 0; key < deforming->items.size(); ++key){
+                const Json& sample = deforming->items[key];
+                std::string at = where + ".deforming[" + std::to_string(key) + "]";
+                if(sample.kind != Json::OBJECT || !sample.find("time") || (!sample.find("mesh") && !sample.find("vertices"))){
+                    read.fail(at, "needs a \"time\", and a \"mesh\" or \"vertices\"");
+                }
+                read.checkKeys(sample, at, {"time", "mesh", "vertices"});
+                double time = read.number(sample, "time", at, 0.0);
+                if(!placed.sampleTimes.empty() && time <= placed.sampleTimes.back()){
+                    read.fail(at, "samples have to be in increasing time");
+                }
+                std::vector<float> vertices;
+                std::vector<int> triangles;
+                try{
+                    if(sample.find("mesh")){
+                        loadObj(resolve(read.text(sample, "mesh", at, "")), vertices, triangles);
+                    }
+                    else{
+                        for(double value : loadNpy(resolve(read.text(sample, "vertices", at, "")))){
+                            vertices.push_back((float)value);
+                        }
+                    }
+                }
+                catch(const std::runtime_error& error){
+                    if(std::string(error.what()).rfind(path, 0) == 0){
+                        throw;
+                    }
+                    read.fail(at, error.what());
+                }
+                if(placed.triangles.empty()){     //the mesh's triangles come from its first sample
+                    if(triangles.empty()){
+                        read.fail(at, "the first sample has to be a \"mesh\" to give the triangles, unless it has a \"mesh\" or \"vertices\" and \"triangles\"");
+                    }
+                    placed.kind = SceneObstacle::MESH;
+                    placed.vertices = vertices;
+                    placed.triangles = triangles;
+                }
+                else if(!triangles.empty() && triangles != placed.triangles){
+                    read.fail(at, "its triangles aren't the mesh's: a deforming mesh keeps its triangles, and only its vertices move");
+                }
+                if(vertices.size() != placed.vertices.size()){
+                    read.fail(at, "has " + std::to_string(vertices.size() / 3) + " vertices, but the mesh has " + std::to_string(placed.vertices.size() / 3));
+                }
+                placed.sampleTimes.push_back(time);
+                samples->insert(samples->end(), vertices.begin(), vertices.end());
+            }
+            if(placed.sampleTimes.empty()){
+                read.fail(where + ".deforming", "is empty");
+            }
+            placed.samples = samples;
+        }
+    };
 
     auto readShapes = [&](const char* key, std::vector<SceneShape>& shapes){
         const Json* list = read.array(root, key, "the scene");
@@ -417,10 +568,19 @@ Scene loadScene(const std::string& path){
             if(item.kind != Json::OBJECT){
                 read.fail(where, "should be an object, {...}");
             }
-            read.checkKeys(item, where, {"shape", "min", "max", "center", "centre", "radius", "velocity"});
+            read.checkKeys(item, where, {"shape", "min", "max", "center", "centre", "radius", "velocity", "mesh", "vertices", "triangles", "vdb", "grid", "velocityGrid",
+                                         "transform", "keyframes", "deforming"});
             SceneShape shape;
             std::string kind = read.text(item, "shape", where, "box");
-            if(kind == "box"){
+            if(item.find("mesh") || item.find("vertices") || item.find("triangles") || item.find("deforming") || item.find("vdb")){
+                if(item.find("shape")){
+                    read.fail(where, "is a mesh or a \"shape\", not both");
+                }
+                shape.kind = SceneShape::MESH;
+                readMesh(item, where, shape.mesh);
+                readPlacement(item, where, shape.mesh);
+            }
+            else if(kind == "box"){
                 shape.kind = SceneShape::BOX;
                 read.vector3(item, "min", where, shape.min, true);
                 read.vector3(item, "max", where, shape.max, true);
@@ -445,6 +605,67 @@ Scene loadScene(const std::string& path){
     readShapes("sinks", scene.sinks);
     if(scene.emitters.size() > 16 || scene.sinks.size() > 16){
         read.fail("the scene", "can have up to 16 emitters and 16 sinks");
+    }
+    size_t meshes = 0, meshFluids = 0;
+    for(const std::vector<SceneShape>* shapes : {&scene.fluids, &scene.emitters, &scene.sinks}){
+        for(const SceneShape& shape : *shapes){
+            meshes += shape.kind == SceneShape::MESH;
+            meshFluids += shape.kind == SceneShape::MESH && shapes == &scene.fluids;
+        }
+    }
+    if(meshes > 16 || (meshFluids > 0 && scene.fluids.size() > 16)){
+        read.fail("the scene", "can have up to 16 meshes among its fluids, emitters and sinks, and up to 16 fluids if any is a mesh");
+    }
+
+    if(const Json* obstacles = read.array(root, "obstacles", "the scene")){
+        for(size_t index = 0; index < obstacles->items.size(); ++index){
+            const Json& item = obstacles->items[index];
+            std::string where = "obstacles[" + std::to_string(index) + "]";
+            if(item.kind != Json::OBJECT){
+                read.fail(where, "should be an object, {...}");
+            }
+            read.checkKeys(item, where, {"mesh", "vertices", "triangles", "vdb", "grid", "velocityGrid", "shape", "min", "max", "center", "centre", "radius", "transform", "keyframes",
+                                         "deforming", "friction", "thickness"});
+            SceneObstacle obstacle;
+            bool deforms = item.find("deforming") != nullptr;
+            if(deforms && item.find("shape")){
+                read.fail(where, "a deforming obstacle is a mesh: it can't have a \"shape\" too");
+            }
+            if(!readMesh(item, where, obstacle) && !deforms){
+                std::string shape = read.text(item, "shape", where, "");
+                if(shape == "box"){
+                    obstacle.kind = SceneObstacle::BOX;
+                    read.vector3(item, "min", where, obstacle.min, true);
+                    read.vector3(item, "max", where, obstacle.max, true);
+                    for(int axis = 0; axis < 3; ++axis){
+                        if(obstacle.max[axis] <= obstacle.min[axis]){
+                            read.fail(where, "a box's max has to be above its min on every axis");
+                        }
+                    }
+                }
+                else if(shape == "sphere"){
+                    obstacle.kind = SceneObstacle::SPHERE;
+                    read.vector3(item, item.find("centre") ? "centre" : "center", where, obstacle.centre, true);
+                    obstacle.radius = read.number(item, "radius", where, 0.0);
+                    if(obstacle.radius <= 0.0){
+                        read.fail(where, "a sphere needs a positive \"radius\"");
+                    }
+                }
+                else{
+                    read.fail(where, "needs a \"mesh\", \"vertices\" and \"triangles\", or a \"shape\" of box or sphere");
+                }
+            }
+            readPlacement(item, where, obstacle);
+            obstacle.friction = read.number(item, "friction", where, obstacle.friction);
+            obstacle.thickness = read.number(item, "thickness", where, obstacle.thickness);
+            if(obstacle.friction < 0.0 || obstacle.friction > 1.0 || obstacle.thickness < 0.0){
+                read.fail(where, "friction is between 0 and 1, and thickness can't be negative");
+            }
+            scene.obstacles.push_back(obstacle);
+        }
+        if(scene.obstacles.size() > 16){
+            read.fail("obstacles", "can have up to 16 of them");
+        }
     }
 
     if(const Json* forces = read.array(root, "forces", "the scene")){
@@ -493,8 +714,28 @@ Scene loadScene(const std::string& path){
                     read.fail(where, "drag and depth can't be negative");
                 }
             }
+            else if(type == "volume"){
+                force.kind = SceneForce::VOLUME;
+                read.checkKeys(item, where, {"type", "vdb", "grid", "mode", "strength", "drag"});
+                std::string mode = read.text(item, "mode", where, "force");
+                if(mode != "force" && mode != "velocity"){
+                    read.fail(where + ".mode", "is force or velocity, not \"" + mode + "\"");
+                }
+                force.velocities = mode == "velocity";
+                force.strength = read.number(item, "strength", where, 1.0);
+                force.drag = read.number(item, "drag", where, force.drag);
+                if(force.drag < 0.0){
+                    read.fail(where, "drag can't be negative");
+                }
+                if(read.text(item, "vdb", where, "").empty()){
+                    read.fail(where, "a volume force needs a \"vdb\": the file its vectors are in");
+                }
+                naming(where, [&]{
+                    force.field = loadVectorField(resolve(read.text(item, "vdb", where, "")), read.text(item, "grid", where, ""), scene.voxelSize());
+                });
+            }
             else{
-                read.fail(where + ".type", "is point, vortex, turbulence or wind, not \"" + type + "\"");
+                read.fail(where + ".type", "is point, vortex, turbulence, wind or volume, not \"" + type + "\"");
             }
             scene.forces.push_back(force);
         }
@@ -506,8 +747,32 @@ Scene loadScene(const std::string& path){
         read.fail("the scene", "partitions has to be at least 1 and devices at least 0");
     }
     if(const Json* output = read.object(root, "output", "the scene")){
-        read.checkKeys(*output, "output", {"dir", "positions", "diagnostics"});
+        read.checkKeys(*output, "output", {"dir", "cache", "compression", "attributes", "checkpoints", "positions", "diagnostics"});
         scene.outputDirectory = read.text(*output, "dir", "output", scene.outputDirectory);
+        scene.writeCache = read.flag(*output, "cache", "output", scene.writeCache);
+        scene.compression = read.text(*output, "compression", "output", scene.compression);
+        if(scene.compression != "zstd" && scene.compression != "lz4" && scene.compression != "none"){
+            read.fail("output.compression", "is \"" + scene.compression + "\"; it can be \"zstd\", \"lz4\" or \"none\"");
+        }
+        if(const Json* attributes = read.array(*output, "attributes", "output")){
+            scene.writeIds = scene.writeAges = false;
+            for(const Json& attribute : attributes->items){
+                bool id = attribute.kind == Json::STRING && attribute.text == "id", age = attribute.kind == Json::STRING && attribute.text == "age";
+                if(!id && !age){
+                    read.fail("output.attributes", "lists what the frames carry besides P and v, each \"id\" or \"age\"");
+                }
+                scene.writeIds = scene.writeIds || id;
+                scene.writeAges = scene.writeAges || age;
+            }
+        }
+        if(const Json* checkpoints = read.object(*output, "checkpoints", "output")){
+            read.checkKeys(*checkpoints, "output.checkpoints", {"every", "keep"});
+            scene.checkpointEvery = (int)read.number(*checkpoints, "every", "output.checkpoints", scene.checkpointEvery);
+            scene.keepCheckpoints = (int)read.number(*checkpoints, "keep", "output.checkpoints", scene.keepCheckpoints);
+            if(scene.checkpointEvery < 0 || scene.keepCheckpoints < 1){
+                read.fail("output.checkpoints", "every has to be at least 0, and keep at least 1");
+            }
+        }
         scene.writePositions = read.flag(*output, "positions", "output", scene.writePositions);
         scene.diagnostics = read.text(*output, "diagnostics", "output", scene.diagnostics);
     }
@@ -536,6 +801,9 @@ void seedParticles(const Scene& scene, std::vector<double>& x, std::vector<doubl
     }
     for(size_t index = 0; index < scene.fluids.size(); ++index){
         const SceneShape& shape = scene.fluids[index];
+        if(shape.kind == SceneShape::MESH){     //the GPU seeds those (Particles::emitParticles)
+            continue;
+        }
         double low[3], high[3];
         shape.bounds(low, high);
         unsigned long long first[3], last[3];   //the lattice cells whose centres can be inside it

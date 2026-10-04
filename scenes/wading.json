@@ -1,0 +1,2415 @@
+{
+ "schema": "flip2.scene/1",
+ "fps": 24,
+ "frames": 72,
+ "domain": {
+  "min": [
+   0,
+   0,
+   0
+  ],
+  "max": [
+   3.0,
+   1.2,
+   1.2
+  ],
+  "voxelSize": 0.02
+ },
+ "fluids": [
+  {
+   "shape": "box",
+   "min": [
+    0,
+    0,
+    0
+   ],
+   "max": [
+    3.04,
+    0.55,
+    1.2
+   ]
+  }
+ ],
+ "obstacles": [
+  {
+   "mesh": "geo/wading/leg-left.obj",
+   "deforming": [
+    {
+     "time": 0.0,
+     "vertices": "geo/wading/leg-left/000.npy"
+    },
+    {
+     "time": 0.041666666666666664,
+     "vertices": "geo/wading/leg-left/001.npy"
+    },
+    {
+     "time": 0.08333333333333333,
+     "vertices": "geo/wading/leg-left/002.npy"
+    },
+    {
+     "time": 0.125,
+     "vertices": "geo/wading/leg-left/003.npy"
+    },
+    {
+     "time": 0.16666666666666666,
+     "vertices": "geo/wading/leg-left/004.npy"
+    },
+    {
+     "time": 0.20833333333333334,
+     "vertices": "geo/wading/leg-left/005.npy"
+    },
+    {
+     "time": 0.25,
+     "vertices": "geo/wading/leg-left/006.npy"
+    },
+    {
+     "time": 0.2916666666666667,
+     "vertices": "geo/wading/leg-left/007.npy"
+    },
+    {
+     "time": 0.3333333333333333,
+     "vertices": "geo/wading/leg-left/008.npy"
+    },
+    {
+     "time": 0.375,
+     "vertices": "geo/wading/leg-left/009.npy"
+    },
+    {
+     "time": 0.4166666666666667,
+     "vertices": "geo/wading/leg-left/010.npy"
+    },
+    {
+     "time": 0.4583333333333333,
+     "vertices": "geo/wading/leg-left/011.npy"
+    },
+    {
+     "time": 0.5,
+     "vertices": "geo/wading/leg-left/012.npy"
+    },
+    {
+     "time": 0.5416666666666666,
+     "vertices": "geo/wading/leg-left/013.npy"
+    },
+    {
+     "time": 0.5833333333333334,
+     "vertices": "geo/wading/leg-left/014.npy"
+    },
+    {
+     "time": 0.625,
+     "vertices": "geo/wading/leg-left/015.npy"
+    },
+    {
+     "time": 0.6666666666666666,
+     "vertices": "geo/wading/leg-left/016.npy"
+    },
+    {
+     "time": 0.7083333333333334,
+     "vertices": "geo/wading/leg-left/017.npy"
+    },
+    {
+     "time": 0.75,
+     "vertices": "geo/wading/leg-left/018.npy"
+    },
+    {
+     "time": 0.7916666666666666,
+     "vertices": "geo/wading/leg-left/019.npy"
+    },
+    {
+     "time": 0.8333333333333334,
+     "vertices": "geo/wading/leg-left/020.npy"
+    },
+    {
+     "time": 0.875,
+     "vertices": "geo/wading/leg-left/021.npy"
+    },
+    {
+     "time": 0.9166666666666666,
+     "vertices": "geo/wading/leg-left/022.npy"
+    },
+    {
+     "time": 0.9583333333333334,
+     "vertices": "geo/wading/leg-left/023.npy"
+    },
+    {
+     "time": 1.0,
+     "vertices": "geo/wading/leg-left/024.npy"
+    },
+    {
+     "time": 1.0416666666666667,
+     "vertices": "geo/wading/leg-left/025.npy"
+    },
+    {
+     "time": 1.0833333333333333,
+     "vertices": "geo/wading/leg-left/026.npy"
+    },
+    {
+     "time": 1.125,
+     "vertices": "geo/wading/leg-left/027.npy"
+    },
+    {
+     "time": 1.1666666666666667,
+     "vertices": "geo/wading/leg-left/028.npy"
+    },
+    {
+     "time": 1.2083333333333333,
+     "vertices": "geo/wading/leg-left/029.npy"
+    },
+    {
+     "time": 1.25,
+     "vertices": "geo/wading/leg-left/030.npy"
+    },
+    {
+     "time": 1.2916666666666667,
+     "vertices": "geo/wading/leg-left/031.npy"
+    },
+    {
+     "time": 1.3333333333333333,
+     "vertices": "geo/wading/leg-left/032.npy"
+    },
+    {
+     "time": 1.375,
+     "vertices": "geo/wading/leg-left/033.npy"
+    },
+    {
+     "time": 1.4166666666666667,
+     "vertices": "geo/wading/leg-left/034.npy"
+    },
+    {
+     "time": 1.4583333333333333,
+     "vertices": "geo/wading/leg-left/035.npy"
+    },
+    {
+     "time": 1.5,
+     "vertices": "geo/wading/leg-left/036.npy"
+    },
+    {
+     "time": 1.5416666666666667,
+     "vertices": "geo/wading/leg-left/037.npy"
+    },
+    {
+     "time": 1.5833333333333333,
+     "vertices": "geo/wading/leg-left/038.npy"
+    },
+    {
+     "time": 1.625,
+     "vertices": "geo/wading/leg-left/039.npy"
+    },
+    {
+     "time": 1.6666666666666667,
+     "vertices": "geo/wading/leg-left/040.npy"
+    },
+    {
+     "time": 1.7083333333333333,
+     "vertices": "geo/wading/leg-left/041.npy"
+    },
+    {
+     "time": 1.75,
+     "vertices": "geo/wading/leg-left/042.npy"
+    },
+    {
+     "time": 1.7916666666666667,
+     "vertices": "geo/wading/leg-left/043.npy"
+    },
+    {
+     "time": 1.8333333333333333,
+     "vertices": "geo/wading/leg-left/044.npy"
+    },
+    {
+     "time": 1.875,
+     "vertices": "geo/wading/leg-left/045.npy"
+    },
+    {
+     "time": 1.9166666666666667,
+     "vertices": "geo/wading/leg-left/046.npy"
+    },
+    {
+     "time": 1.9583333333333333,
+     "vertices": "geo/wading/leg-left/047.npy"
+    },
+    {
+     "time": 2.0,
+     "vertices": "geo/wading/leg-left/048.npy"
+    },
+    {
+     "time": 2.0416666666666665,
+     "vertices": "geo/wading/leg-left/049.npy"
+    },
+    {
+     "time": 2.0833333333333335,
+     "vertices": "geo/wading/leg-left/050.npy"
+    },
+    {
+     "time": 2.125,
+     "vertices": "geo/wading/leg-left/051.npy"
+    },
+    {
+     "time": 2.1666666666666665,
+     "vertices": "geo/wading/leg-left/052.npy"
+    },
+    {
+     "time": 2.2083333333333335,
+     "vertices": "geo/wading/leg-left/053.npy"
+    },
+    {
+     "time": 2.25,
+     "vertices": "geo/wading/leg-left/054.npy"
+    },
+    {
+     "time": 2.2916666666666665,
+     "vertices": "geo/wading/leg-left/055.npy"
+    },
+    {
+     "time": 2.3333333333333335,
+     "vertices": "geo/wading/leg-left/056.npy"
+    },
+    {
+     "time": 2.375,
+     "vertices": "geo/wading/leg-left/057.npy"
+    },
+    {
+     "time": 2.4166666666666665,
+     "vertices": "geo/wading/leg-left/058.npy"
+    },
+    {
+     "time": 2.4583333333333335,
+     "vertices": "geo/wading/leg-left/059.npy"
+    },
+    {
+     "time": 2.5,
+     "vertices": "geo/wading/leg-left/060.npy"
+    },
+    {
+     "time": 2.5416666666666665,
+     "vertices": "geo/wading/leg-left/061.npy"
+    },
+    {
+     "time": 2.5833333333333335,
+     "vertices": "geo/wading/leg-left/062.npy"
+    },
+    {
+     "time": 2.625,
+     "vertices": "geo/wading/leg-left/063.npy"
+    },
+    {
+     "time": 2.6666666666666665,
+     "vertices": "geo/wading/leg-left/064.npy"
+    },
+    {
+     "time": 2.7083333333333335,
+     "vertices": "geo/wading/leg-left/065.npy"
+    },
+    {
+     "time": 2.75,
+     "vertices": "geo/wading/leg-left/066.npy"
+    },
+    {
+     "time": 2.7916666666666665,
+     "vertices": "geo/wading/leg-left/067.npy"
+    },
+    {
+     "time": 2.8333333333333335,
+     "vertices": "geo/wading/leg-left/068.npy"
+    },
+    {
+     "time": 2.875,
+     "vertices": "geo/wading/leg-left/069.npy"
+    },
+    {
+     "time": 2.9166666666666665,
+     "vertices": "geo/wading/leg-left/070.npy"
+    },
+    {
+     "time": 2.9583333333333335,
+     "vertices": "geo/wading/leg-left/071.npy"
+    },
+    {
+     "time": 3.0,
+     "vertices": "geo/wading/leg-left/072.npy"
+    }
+   ]
+  },
+  {
+   "mesh": "geo/wading/foot-left.obj",
+   "deforming": [
+    {
+     "time": 0.0,
+     "vertices": "geo/wading/foot-left/000.npy"
+    },
+    {
+     "time": 0.041666666666666664,
+     "vertices": "geo/wading/foot-left/001.npy"
+    },
+    {
+     "time": 0.08333333333333333,
+     "vertices": "geo/wading/foot-left/002.npy"
+    },
+    {
+     "time": 0.125,
+     "vertices": "geo/wading/foot-left/003.npy"
+    },
+    {
+     "time": 0.16666666666666666,
+     "vertices": "geo/wading/foot-left/004.npy"
+    },
+    {
+     "time": 0.20833333333333334,
+     "vertices": "geo/wading/foot-left/005.npy"
+    },
+    {
+     "time": 0.25,
+     "vertices": "geo/wading/foot-left/006.npy"
+    },
+    {
+     "time": 0.2916666666666667,
+     "vertices": "geo/wading/foot-left/007.npy"
+    },
+    {
+     "time": 0.3333333333333333,
+     "vertices": "geo/wading/foot-left/008.npy"
+    },
+    {
+     "time": 0.375,
+     "vertices": "geo/wading/foot-left/009.npy"
+    },
+    {
+     "time": 0.4166666666666667,
+     "vertices": "geo/wading/foot-left/010.npy"
+    },
+    {
+     "time": 0.4583333333333333,
+     "vertices": "geo/wading/foot-left/011.npy"
+    },
+    {
+     "time": 0.5,
+     "vertices": "geo/wading/foot-left/012.npy"
+    },
+    {
+     "time": 0.5416666666666666,
+     "vertices": "geo/wading/foot-left/013.npy"
+    },
+    {
+     "time": 0.5833333333333334,
+     "vertices": "geo/wading/foot-left/014.npy"
+    },
+    {
+     "time": 0.625,
+     "vertices": "geo/wading/foot-left/015.npy"
+    },
+    {
+     "time": 0.6666666666666666,
+     "vertices": "geo/wading/foot-left/016.npy"
+    },
+    {
+     "time": 0.7083333333333334,
+     "vertices": "geo/wading/foot-left/017.npy"
+    },
+    {
+     "time": 0.75,
+     "vertices": "geo/wading/foot-left/018.npy"
+    },
+    {
+     "time": 0.7916666666666666,
+     "vertices": "geo/wading/foot-left/019.npy"
+    },
+    {
+     "time": 0.8333333333333334,
+     "vertices": "geo/wading/foot-left/020.npy"
+    },
+    {
+     "time": 0.875,
+     "vertices": "geo/wading/foot-left/021.npy"
+    },
+    {
+     "time": 0.9166666666666666,
+     "vertices": "geo/wading/foot-left/022.npy"
+    },
+    {
+     "time": 0.9583333333333334,
+     "vertices": "geo/wading/foot-left/023.npy"
+    },
+    {
+     "time": 1.0,
+     "vertices": "geo/wading/foot-left/024.npy"
+    },
+    {
+     "time": 1.0416666666666667,
+     "vertices": "geo/wading/foot-left/025.npy"
+    },
+    {
+     "time": 1.0833333333333333,
+     "vertices": "geo/wading/foot-left/026.npy"
+    },
+    {
+     "time": 1.125,
+     "vertices": "geo/wading/foot-left/027.npy"
+    },
+    {
+     "time": 1.1666666666666667,
+     "vertices": "geo/wading/foot-left/028.npy"
+    },
+    {
+     "time": 1.2083333333333333,
+     "vertices": "geo/wading/foot-left/029.npy"
+    },
+    {
+     "time": 1.25,
+     "vertices": "geo/wading/foot-left/030.npy"
+    },
+    {
+     "time": 1.2916666666666667,
+     "vertices": "geo/wading/foot-left/031.npy"
+    },
+    {
+     "time": 1.3333333333333333,
+     "vertices": "geo/wading/foot-left/032.npy"
+    },
+    {
+     "time": 1.375,
+     "vertices": "geo/wading/foot-left/033.npy"
+    },
+    {
+     "time": 1.4166666666666667,
+     "vertices": "geo/wading/foot-left/034.npy"
+    },
+    {
+     "time": 1.4583333333333333,
+     "vertices": "geo/wading/foot-left/035.npy"
+    },
+    {
+     "time": 1.5,
+     "vertices": "geo/wading/foot-left/036.npy"
+    },
+    {
+     "time": 1.5416666666666667,
+     "vertices": "geo/wading/foot-left/037.npy"
+    },
+    {
+     "time": 1.5833333333333333,
+     "vertices": "geo/wading/foot-left/038.npy"
+    },
+    {
+     "time": 1.625,
+     "vertices": "geo/wading/foot-left/039.npy"
+    },
+    {
+     "time": 1.6666666666666667,
+     "vertices": "geo/wading/foot-left/040.npy"
+    },
+    {
+     "time": 1.7083333333333333,
+     "vertices": "geo/wading/foot-left/041.npy"
+    },
+    {
+     "time": 1.75,
+     "vertices": "geo/wading/foot-left/042.npy"
+    },
+    {
+     "time": 1.7916666666666667,
+     "vertices": "geo/wading/foot-left/043.npy"
+    },
+    {
+     "time": 1.8333333333333333,
+     "vertices": "geo/wading/foot-left/044.npy"
+    },
+    {
+     "time": 1.875,
+     "vertices": "geo/wading/foot-left/045.npy"
+    },
+    {
+     "time": 1.9166666666666667,
+     "vertices": "geo/wading/foot-left/046.npy"
+    },
+    {
+     "time": 1.9583333333333333,
+     "vertices": "geo/wading/foot-left/047.npy"
+    },
+    {
+     "time": 2.0,
+     "vertices": "geo/wading/foot-left/048.npy"
+    },
+    {
+     "time": 2.0416666666666665,
+     "vertices": "geo/wading/foot-left/049.npy"
+    },
+    {
+     "time": 2.0833333333333335,
+     "vertices": "geo/wading/foot-left/050.npy"
+    },
+    {
+     "time": 2.125,
+     "vertices": "geo/wading/foot-left/051.npy"
+    },
+    {
+     "time": 2.1666666666666665,
+     "vertices": "geo/wading/foot-left/052.npy"
+    },
+    {
+     "time": 2.2083333333333335,
+     "vertices": "geo/wading/foot-left/053.npy"
+    },
+    {
+     "time": 2.25,
+     "vertices": "geo/wading/foot-left/054.npy"
+    },
+    {
+     "time": 2.2916666666666665,
+     "vertices": "geo/wading/foot-left/055.npy"
+    },
+    {
+     "time": 2.3333333333333335,
+     "vertices": "geo/wading/foot-left/056.npy"
+    },
+    {
+     "time": 2.375,
+     "vertices": "geo/wading/foot-left/057.npy"
+    },
+    {
+     "time": 2.4166666666666665,
+     "vertices": "geo/wading/foot-left/058.npy"
+    },
+    {
+     "time": 2.4583333333333335,
+     "vertices": "geo/wading/foot-left/059.npy"
+    },
+    {
+     "time": 2.5,
+     "vertices": "geo/wading/foot-left/060.npy"
+    },
+    {
+     "time": 2.5416666666666665,
+     "vertices": "geo/wading/foot-left/061.npy"
+    },
+    {
+     "time": 2.5833333333333335,
+     "vertices": "geo/wading/foot-left/062.npy"
+    },
+    {
+     "time": 2.625,
+     "vertices": "geo/wading/foot-left/063.npy"
+    },
+    {
+     "time": 2.6666666666666665,
+     "vertices": "geo/wading/foot-left/064.npy"
+    },
+    {
+     "time": 2.7083333333333335,
+     "vertices": "geo/wading/foot-left/065.npy"
+    },
+    {
+     "time": 2.75,
+     "vertices": "geo/wading/foot-left/066.npy"
+    },
+    {
+     "time": 2.7916666666666665,
+     "vertices": "geo/wading/foot-left/067.npy"
+    },
+    {
+     "time": 2.8333333333333335,
+     "vertices": "geo/wading/foot-left/068.npy"
+    },
+    {
+     "time": 2.875,
+     "vertices": "geo/wading/foot-left/069.npy"
+    },
+    {
+     "time": 2.9166666666666665,
+     "vertices": "geo/wading/foot-left/070.npy"
+    },
+    {
+     "time": 2.9583333333333335,
+     "vertices": "geo/wading/foot-left/071.npy"
+    },
+    {
+     "time": 3.0,
+     "vertices": "geo/wading/foot-left/072.npy"
+    }
+   ]
+  },
+  {
+   "mesh": "geo/wading/leg-right.obj",
+   "deforming": [
+    {
+     "time": 0.0,
+     "vertices": "geo/wading/leg-right/000.npy"
+    },
+    {
+     "time": 0.041666666666666664,
+     "vertices": "geo/wading/leg-right/001.npy"
+    },
+    {
+     "time": 0.08333333333333333,
+     "vertices": "geo/wading/leg-right/002.npy"
+    },
+    {
+     "time": 0.125,
+     "vertices": "geo/wading/leg-right/003.npy"
+    },
+    {
+     "time": 0.16666666666666666,
+     "vertices": "geo/wading/leg-right/004.npy"
+    },
+    {
+     "time": 0.20833333333333334,
+     "vertices": "geo/wading/leg-right/005.npy"
+    },
+    {
+     "time": 0.25,
+     "vertices": "geo/wading/leg-right/006.npy"
+    },
+    {
+     "time": 0.2916666666666667,
+     "vertices": "geo/wading/leg-right/007.npy"
+    },
+    {
+     "time": 0.3333333333333333,
+     "vertices": "geo/wading/leg-right/008.npy"
+    },
+    {
+     "time": 0.375,
+     "vertices": "geo/wading/leg-right/009.npy"
+    },
+    {
+     "time": 0.4166666666666667,
+     "vertices": "geo/wading/leg-right/010.npy"
+    },
+    {
+     "time": 0.4583333333333333,
+     "vertices": "geo/wading/leg-right/011.npy"
+    },
+    {
+     "time": 0.5,
+     "vertices": "geo/wading/leg-right/012.npy"
+    },
+    {
+     "time": 0.5416666666666666,
+     "vertices": "geo/wading/leg-right/013.npy"
+    },
+    {
+     "time": 0.5833333333333334,
+     "vertices": "geo/wading/leg-right/014.npy"
+    },
+    {
+     "time": 0.625,
+     "vertices": "geo/wading/leg-right/015.npy"
+    },
+    {
+     "time": 0.6666666666666666,
+     "vertices": "geo/wading/leg-right/016.npy"
+    },
+    {
+     "time": 0.7083333333333334,
+     "vertices": "geo/wading/leg-right/017.npy"
+    },
+    {
+     "time": 0.75,
+     "vertices": "geo/wading/leg-right/018.npy"
+    },
+    {
+     "time": 0.7916666666666666,
+     "vertices": "geo/wading/leg-right/019.npy"
+    },
+    {
+     "time": 0.8333333333333334,
+     "vertices": "geo/wading/leg-right/020.npy"
+    },
+    {
+     "time": 0.875,
+     "vertices": "geo/wading/leg-right/021.npy"
+    },
+    {
+     "time": 0.9166666666666666,
+     "vertices": "geo/wading/leg-right/022.npy"
+    },
+    {
+     "time": 0.9583333333333334,
+     "vertices": "geo/wading/leg-right/023.npy"
+    },
+    {
+     "time": 1.0,
+     "vertices": "geo/wading/leg-right/024.npy"
+    },
+    {
+     "time": 1.0416666666666667,
+     "vertices": "geo/wading/leg-right/025.npy"
+    },
+    {
+     "time": 1.0833333333333333,
+     "vertices": "geo/wading/leg-right/026.npy"
+    },
+    {
+     "time": 1.125,
+     "vertices": "geo/wading/leg-right/027.npy"
+    },
+    {
+     "time": 1.1666666666666667,
+     "vertices": "geo/wading/leg-right/028.npy"
+    },
+    {
+     "time": 1.2083333333333333,
+     "vertices": "geo/wading/leg-right/029.npy"
+    },
+    {
+     "time": 1.25,
+     "vertices": "geo/wading/leg-right/030.npy"
+    },
+    {
+     "time": 1.2916666666666667,
+     "vertices": "geo/wading/leg-right/031.npy"
+    },
+    {
+     "time": 1.3333333333333333,
+     "vertices": "geo/wading/leg-right/032.npy"
+    },
+    {
+     "time": 1.375,
+     "vertices": "geo/wading/leg-right/033.npy"
+    },
+    {
+     "time": 1.4166666666666667,
+     "vertices": "geo/wading/leg-right/034.npy"
+    },
+    {
+     "time": 1.4583333333333333,
+     "vertices": "geo/wading/leg-right/035.npy"
+    },
+    {
+     "time": 1.5,
+     "vertices": "geo/wading/leg-right/036.npy"
+    },
+    {
+     "time": 1.5416666666666667,
+     "vertices": "geo/wading/leg-right/037.npy"
+    },
+    {
+     "time": 1.5833333333333333,
+     "vertices": "geo/wading/leg-right/038.npy"
+    },
+    {
+     "time": 1.625,
+     "vertices": "geo/wading/leg-right/039.npy"
+    },
+    {
+     "time": 1.6666666666666667,
+     "vertices": "geo/wading/leg-right/040.npy"
+    },
+    {
+     "time": 1.7083333333333333,
+     "vertices": "geo/wading/leg-right/041.npy"
+    },
+    {
+     "time": 1.75,
+     "vertices": "geo/wading/leg-right/042.npy"
+    },
+    {
+     "time": 1.7916666666666667,
+     "vertices": "geo/wading/leg-right/043.npy"
+    },
+    {
+     "time": 1.8333333333333333,
+     "vertices": "geo/wading/leg-right/044.npy"
+    },
+    {
+     "time": 1.875,
+     "vertices": "geo/wading/leg-right/045.npy"
+    },
+    {
+     "time": 1.9166666666666667,
+     "vertices": "geo/wading/leg-right/046.npy"
+    },
+    {
+     "time": 1.9583333333333333,
+     "vertices": "geo/wading/leg-right/047.npy"
+    },
+    {
+     "time": 2.0,
+     "vertices": "geo/wading/leg-right/048.npy"
+    },
+    {
+     "time": 2.0416666666666665,
+     "vertices": "geo/wading/leg-right/049.npy"
+    },
+    {
+     "time": 2.0833333333333335,
+     "vertices": "geo/wading/leg-right/050.npy"
+    },
+    {
+     "time": 2.125,
+     "vertices": "geo/wading/leg-right/051.npy"
+    },
+    {
+     "time": 2.1666666666666665,
+     "vertices": "geo/wading/leg-right/052.npy"
+    },
+    {
+     "time": 2.2083333333333335,
+     "vertices": "geo/wading/leg-right/053.npy"
+    },
+    {
+     "time": 2.25,
+     "vertices": "geo/wading/leg-right/054.npy"
+    },
+    {
+     "time": 2.2916666666666665,
+     "vertices": "geo/wading/leg-right/055.npy"
+    },
+    {
+     "time": 2.3333333333333335,
+     "vertices": "geo/wading/leg-right/056.npy"
+    },
+    {
+     "time": 2.375,
+     "vertices": "geo/wading/leg-right/057.npy"
+    },
+    {
+     "time": 2.4166666666666665,
+     "vertices": "geo/wading/leg-right/058.npy"
+    },
+    {
+     "time": 2.4583333333333335,
+     "vertices": "geo/wading/leg-right/059.npy"
+    },
+    {
+     "time": 2.5,
+     "vertices": "geo/wading/leg-right/060.npy"
+    },
+    {
+     "time": 2.5416666666666665,
+     "vertices": "geo/wading/leg-right/061.npy"
+    },
+    {
+     "time": 2.5833333333333335,
+     "vertices": "geo/wading/leg-right/062.npy"
+    },
+    {
+     "time": 2.625,
+     "vertices": "geo/wading/leg-right/063.npy"
+    },
+    {
+     "time": 2.6666666666666665,
+     "vertices": "geo/wading/leg-right/064.npy"
+    },
+    {
+     "time": 2.7083333333333335,
+     "vertices": "geo/wading/leg-right/065.npy"
+    },
+    {
+     "time": 2.75,
+     "vertices": "geo/wading/leg-right/066.npy"
+    },
+    {
+     "time": 2.7916666666666665,
+     "vertices": "geo/wading/leg-right/067.npy"
+    },
+    {
+     "time": 2.8333333333333335,
+     "vertices": "geo/wading/leg-right/068.npy"
+    },
+    {
+     "time": 2.875,
+     "vertices": "geo/wading/leg-right/069.npy"
+    },
+    {
+     "time": 2.9166666666666665,
+     "vertices": "geo/wading/leg-right/070.npy"
+    },
+    {
+     "time": 2.9583333333333335,
+     "vertices": "geo/wading/leg-right/071.npy"
+    },
+    {
+     "time": 3.0,
+     "vertices": "geo/wading/leg-right/072.npy"
+    }
+   ]
+  },
+  {
+   "mesh": "geo/wading/foot-right.obj",
+   "deforming": [
+    {
+     "time": 0.0,
+     "vertices": "geo/wading/foot-right/000.npy"
+    },
+    {
+     "time": 0.041666666666666664,
+     "vertices": "geo/wading/foot-right/001.npy"
+    },
+    {
+     "time": 0.08333333333333333,
+     "vertices": "geo/wading/foot-right/002.npy"
+    },
+    {
+     "time": 0.125,
+     "vertices": "geo/wading/foot-right/003.npy"
+    },
+    {
+     "time": 0.16666666666666666,
+     "vertices": "geo/wading/foot-right/004.npy"
+    },
+    {
+     "time": 0.20833333333333334,
+     "vertices": "geo/wading/foot-right/005.npy"
+    },
+    {
+     "time": 0.25,
+     "vertices": "geo/wading/foot-right/006.npy"
+    },
+    {
+     "time": 0.2916666666666667,
+     "vertices": "geo/wading/foot-right/007.npy"
+    },
+    {
+     "time": 0.3333333333333333,
+     "vertices": "geo/wading/foot-right/008.npy"
+    },
+    {
+     "time": 0.375,
+     "vertices": "geo/wading/foot-right/009.npy"
+    },
+    {
+     "time": 0.4166666666666667,
+     "vertices": "geo/wading/foot-right/010.npy"
+    },
+    {
+     "time": 0.4583333333333333,
+     "vertices": "geo/wading/foot-right/011.npy"
+    },
+    {
+     "time": 0.5,
+     "vertices": "geo/wading/foot-right/012.npy"
+    },
+    {
+     "time": 0.5416666666666666,
+     "vertices": "geo/wading/foot-right/013.npy"
+    },
+    {
+     "time": 0.5833333333333334,
+     "vertices": "geo/wading/foot-right/014.npy"
+    },
+    {
+     "time": 0.625,
+     "vertices": "geo/wading/foot-right/015.npy"
+    },
+    {
+     "time": 0.6666666666666666,
+     "vertices": "geo/wading/foot-right/016.npy"
+    },
+    {
+     "time": 0.7083333333333334,
+     "vertices": "geo/wading/foot-right/017.npy"
+    },
+    {
+     "time": 0.75,
+     "vertices": "geo/wading/foot-right/018.npy"
+    },
+    {
+     "time": 0.7916666666666666,
+     "vertices": "geo/wading/foot-right/019.npy"
+    },
+    {
+     "time": 0.8333333333333334,
+     "vertices": "geo/wading/foot-right/020.npy"
+    },
+    {
+     "time": 0.875,
+     "vertices": "geo/wading/foot-right/021.npy"
+    },
+    {
+     "time": 0.9166666666666666,
+     "vertices": "geo/wading/foot-right/022.npy"
+    },
+    {
+     "time": 0.9583333333333334,
+     "vertices": "geo/wading/foot-right/023.npy"
+    },
+    {
+     "time": 1.0,
+     "vertices": "geo/wading/foot-right/024.npy"
+    },
+    {
+     "time": 1.0416666666666667,
+     "vertices": "geo/wading/foot-right/025.npy"
+    },
+    {
+     "time": 1.0833333333333333,
+     "vertices": "geo/wading/foot-right/026.npy"
+    },
+    {
+     "time": 1.125,
+     "vertices": "geo/wading/foot-right/027.npy"
+    },
+    {
+     "time": 1.1666666666666667,
+     "vertices": "geo/wading/foot-right/028.npy"
+    },
+    {
+     "time": 1.2083333333333333,
+     "vertices": "geo/wading/foot-right/029.npy"
+    },
+    {
+     "time": 1.25,
+     "vertices": "geo/wading/foot-right/030.npy"
+    },
+    {
+     "time": 1.2916666666666667,
+     "vertices": "geo/wading/foot-right/031.npy"
+    },
+    {
+     "time": 1.3333333333333333,
+     "vertices": "geo/wading/foot-right/032.npy"
+    },
+    {
+     "time": 1.375,
+     "vertices": "geo/wading/foot-right/033.npy"
+    },
+    {
+     "time": 1.4166666666666667,
+     "vertices": "geo/wading/foot-right/034.npy"
+    },
+    {
+     "time": 1.4583333333333333,
+     "vertices": "geo/wading/foot-right/035.npy"
+    },
+    {
+     "time": 1.5,
+     "vertices": "geo/wading/foot-right/036.npy"
+    },
+    {
+     "time": 1.5416666666666667,
+     "vertices": "geo/wading/foot-right/037.npy"
+    },
+    {
+     "time": 1.5833333333333333,
+     "vertices": "geo/wading/foot-right/038.npy"
+    },
+    {
+     "time": 1.625,
+     "vertices": "geo/wading/foot-right/039.npy"
+    },
+    {
+     "time": 1.6666666666666667,
+     "vertices": "geo/wading/foot-right/040.npy"
+    },
+    {
+     "time": 1.7083333333333333,
+     "vertices": "geo/wading/foot-right/041.npy"
+    },
+    {
+     "time": 1.75,
+     "vertices": "geo/wading/foot-right/042.npy"
+    },
+    {
+     "time": 1.7916666666666667,
+     "vertices": "geo/wading/foot-right/043.npy"
+    },
+    {
+     "time": 1.8333333333333333,
+     "vertices": "geo/wading/foot-right/044.npy"
+    },
+    {
+     "time": 1.875,
+     "vertices": "geo/wading/foot-right/045.npy"
+    },
+    {
+     "time": 1.9166666666666667,
+     "vertices": "geo/wading/foot-right/046.npy"
+    },
+    {
+     "time": 1.9583333333333333,
+     "vertices": "geo/wading/foot-right/047.npy"
+    },
+    {
+     "time": 2.0,
+     "vertices": "geo/wading/foot-right/048.npy"
+    },
+    {
+     "time": 2.0416666666666665,
+     "vertices": "geo/wading/foot-right/049.npy"
+    },
+    {
+     "time": 2.0833333333333335,
+     "vertices": "geo/wading/foot-right/050.npy"
+    },
+    {
+     "time": 2.125,
+     "vertices": "geo/wading/foot-right/051.npy"
+    },
+    {
+     "time": 2.1666666666666665,
+     "vertices": "geo/wading/foot-right/052.npy"
+    },
+    {
+     "time": 2.2083333333333335,
+     "vertices": "geo/wading/foot-right/053.npy"
+    },
+    {
+     "time": 2.25,
+     "vertices": "geo/wading/foot-right/054.npy"
+    },
+    {
+     "time": 2.2916666666666665,
+     "vertices": "geo/wading/foot-right/055.npy"
+    },
+    {
+     "time": 2.3333333333333335,
+     "vertices": "geo/wading/foot-right/056.npy"
+    },
+    {
+     "time": 2.375,
+     "vertices": "geo/wading/foot-right/057.npy"
+    },
+    {
+     "time": 2.4166666666666665,
+     "vertices": "geo/wading/foot-right/058.npy"
+    },
+    {
+     "time": 2.4583333333333335,
+     "vertices": "geo/wading/foot-right/059.npy"
+    },
+    {
+     "time": 2.5,
+     "vertices": "geo/wading/foot-right/060.npy"
+    },
+    {
+     "time": 2.5416666666666665,
+     "vertices": "geo/wading/foot-right/061.npy"
+    },
+    {
+     "time": 2.5833333333333335,
+     "vertices": "geo/wading/foot-right/062.npy"
+    },
+    {
+     "time": 2.625,
+     "vertices": "geo/wading/foot-right/063.npy"
+    },
+    {
+     "time": 2.6666666666666665,
+     "vertices": "geo/wading/foot-right/064.npy"
+    },
+    {
+     "time": 2.7083333333333335,
+     "vertices": "geo/wading/foot-right/065.npy"
+    },
+    {
+     "time": 2.75,
+     "vertices": "geo/wading/foot-right/066.npy"
+    },
+    {
+     "time": 2.7916666666666665,
+     "vertices": "geo/wading/foot-right/067.npy"
+    },
+    {
+     "time": 2.8333333333333335,
+     "vertices": "geo/wading/foot-right/068.npy"
+    },
+    {
+     "time": 2.875,
+     "vertices": "geo/wading/foot-right/069.npy"
+    },
+    {
+     "time": 2.9166666666666665,
+     "vertices": "geo/wading/foot-right/070.npy"
+    },
+    {
+     "time": 2.9583333333333335,
+     "vertices": "geo/wading/foot-right/071.npy"
+    },
+    {
+     "time": 3.0,
+     "vertices": "geo/wading/foot-right/072.npy"
+    }
+   ]
+  },
+  {
+   "mesh": "geo/wading/torso.obj",
+   "deforming": [
+    {
+     "time": 0.0,
+     "vertices": "geo/wading/torso/000.npy"
+    },
+    {
+     "time": 0.041666666666666664,
+     "vertices": "geo/wading/torso/001.npy"
+    },
+    {
+     "time": 0.08333333333333333,
+     "vertices": "geo/wading/torso/002.npy"
+    },
+    {
+     "time": 0.125,
+     "vertices": "geo/wading/torso/003.npy"
+    },
+    {
+     "time": 0.16666666666666666,
+     "vertices": "geo/wading/torso/004.npy"
+    },
+    {
+     "time": 0.20833333333333334,
+     "vertices": "geo/wading/torso/005.npy"
+    },
+    {
+     "time": 0.25,
+     "vertices": "geo/wading/torso/006.npy"
+    },
+    {
+     "time": 0.2916666666666667,
+     "vertices": "geo/wading/torso/007.npy"
+    },
+    {
+     "time": 0.3333333333333333,
+     "vertices": "geo/wading/torso/008.npy"
+    },
+    {
+     "time": 0.375,
+     "vertices": "geo/wading/torso/009.npy"
+    },
+    {
+     "time": 0.4166666666666667,
+     "vertices": "geo/wading/torso/010.npy"
+    },
+    {
+     "time": 0.4583333333333333,
+     "vertices": "geo/wading/torso/011.npy"
+    },
+    {
+     "time": 0.5,
+     "vertices": "geo/wading/torso/012.npy"
+    },
+    {
+     "time": 0.5416666666666666,
+     "vertices": "geo/wading/torso/013.npy"
+    },
+    {
+     "time": 0.5833333333333334,
+     "vertices": "geo/wading/torso/014.npy"
+    },
+    {
+     "time": 0.625,
+     "vertices": "geo/wading/torso/015.npy"
+    },
+    {
+     "time": 0.6666666666666666,
+     "vertices": "geo/wading/torso/016.npy"
+    },
+    {
+     "time": 0.7083333333333334,
+     "vertices": "geo/wading/torso/017.npy"
+    },
+    {
+     "time": 0.75,
+     "vertices": "geo/wading/torso/018.npy"
+    },
+    {
+     "time": 0.7916666666666666,
+     "vertices": "geo/wading/torso/019.npy"
+    },
+    {
+     "time": 0.8333333333333334,
+     "vertices": "geo/wading/torso/020.npy"
+    },
+    {
+     "time": 0.875,
+     "vertices": "geo/wading/torso/021.npy"
+    },
+    {
+     "time": 0.9166666666666666,
+     "vertices": "geo/wading/torso/022.npy"
+    },
+    {
+     "time": 0.9583333333333334,
+     "vertices": "geo/wading/torso/023.npy"
+    },
+    {
+     "time": 1.0,
+     "vertices": "geo/wading/torso/024.npy"
+    },
+    {
+     "time": 1.0416666666666667,
+     "vertices": "geo/wading/torso/025.npy"
+    },
+    {
+     "time": 1.0833333333333333,
+     "vertices": "geo/wading/torso/026.npy"
+    },
+    {
+     "time": 1.125,
+     "vertices": "geo/wading/torso/027.npy"
+    },
+    {
+     "time": 1.1666666666666667,
+     "vertices": "geo/wading/torso/028.npy"
+    },
+    {
+     "time": 1.2083333333333333,
+     "vertices": "geo/wading/torso/029.npy"
+    },
+    {
+     "time": 1.25,
+     "vertices": "geo/wading/torso/030.npy"
+    },
+    {
+     "time": 1.2916666666666667,
+     "vertices": "geo/wading/torso/031.npy"
+    },
+    {
+     "time": 1.3333333333333333,
+     "vertices": "geo/wading/torso/032.npy"
+    },
+    {
+     "time": 1.375,
+     "vertices": "geo/wading/torso/033.npy"
+    },
+    {
+     "time": 1.4166666666666667,
+     "vertices": "geo/wading/torso/034.npy"
+    },
+    {
+     "time": 1.4583333333333333,
+     "vertices": "geo/wading/torso/035.npy"
+    },
+    {
+     "time": 1.5,
+     "vertices": "geo/wading/torso/036.npy"
+    },
+    {
+     "time": 1.5416666666666667,
+     "vertices": "geo/wading/torso/037.npy"
+    },
+    {
+     "time": 1.5833333333333333,
+     "vertices": "geo/wading/torso/038.npy"
+    },
+    {
+     "time": 1.625,
+     "vertices": "geo/wading/torso/039.npy"
+    },
+    {
+     "time": 1.6666666666666667,
+     "vertices": "geo/wading/torso/040.npy"
+    },
+    {
+     "time": 1.7083333333333333,
+     "vertices": "geo/wading/torso/041.npy"
+    },
+    {
+     "time": 1.75,
+     "vertices": "geo/wading/torso/042.npy"
+    },
+    {
+     "time": 1.7916666666666667,
+     "vertices": "geo/wading/torso/043.npy"
+    },
+    {
+     "time": 1.8333333333333333,
+     "vertices": "geo/wading/torso/044.npy"
+    },
+    {
+     "time": 1.875,
+     "vertices": "geo/wading/torso/045.npy"
+    },
+    {
+     "time": 1.9166666666666667,
+     "vertices": "geo/wading/torso/046.npy"
+    },
+    {
+     "time": 1.9583333333333333,
+     "vertices": "geo/wading/torso/047.npy"
+    },
+    {
+     "time": 2.0,
+     "vertices": "geo/wading/torso/048.npy"
+    },
+    {
+     "time": 2.0416666666666665,
+     "vertices": "geo/wading/torso/049.npy"
+    },
+    {
+     "time": 2.0833333333333335,
+     "vertices": "geo/wading/torso/050.npy"
+    },
+    {
+     "time": 2.125,
+     "vertices": "geo/wading/torso/051.npy"
+    },
+    {
+     "time": 2.1666666666666665,
+     "vertices": "geo/wading/torso/052.npy"
+    },
+    {
+     "time": 2.2083333333333335,
+     "vertices": "geo/wading/torso/053.npy"
+    },
+    {
+     "time": 2.25,
+     "vertices": "geo/wading/torso/054.npy"
+    },
+    {
+     "time": 2.2916666666666665,
+     "vertices": "geo/wading/torso/055.npy"
+    },
+    {
+     "time": 2.3333333333333335,
+     "vertices": "geo/wading/torso/056.npy"
+    },
+    {
+     "time": 2.375,
+     "vertices": "geo/wading/torso/057.npy"
+    },
+    {
+     "time": 2.4166666666666665,
+     "vertices": "geo/wading/torso/058.npy"
+    },
+    {
+     "time": 2.4583333333333335,
+     "vertices": "geo/wading/torso/059.npy"
+    },
+    {
+     "time": 2.5,
+     "vertices": "geo/wading/torso/060.npy"
+    },
+    {
+     "time": 2.5416666666666665,
+     "vertices": "geo/wading/torso/061.npy"
+    },
+    {
+     "time": 2.5833333333333335,
+     "vertices": "geo/wading/torso/062.npy"
+    },
+    {
+     "time": 2.625,
+     "vertices": "geo/wading/torso/063.npy"
+    },
+    {
+     "time": 2.6666666666666665,
+     "vertices": "geo/wading/torso/064.npy"
+    },
+    {
+     "time": 2.7083333333333335,
+     "vertices": "geo/wading/torso/065.npy"
+    },
+    {
+     "time": 2.75,
+     "vertices": "geo/wading/torso/066.npy"
+    },
+    {
+     "time": 2.7916666666666665,
+     "vertices": "geo/wading/torso/067.npy"
+    },
+    {
+     "time": 2.8333333333333335,
+     "vertices": "geo/wading/torso/068.npy"
+    },
+    {
+     "time": 2.875,
+     "vertices": "geo/wading/torso/069.npy"
+    },
+    {
+     "time": 2.9166666666666665,
+     "vertices": "geo/wading/torso/070.npy"
+    },
+    {
+     "time": 2.9583333333333335,
+     "vertices": "geo/wading/torso/071.npy"
+    },
+    {
+     "time": 3.0,
+     "vertices": "geo/wading/torso/072.npy"
+    }
+   ]
+  },
+  {
+   "mesh": "geo/wading/head.obj",
+   "deforming": [
+    {
+     "time": 0.0,
+     "vertices": "geo/wading/head/000.npy"
+    },
+    {
+     "time": 0.041666666666666664,
+     "vertices": "geo/wading/head/001.npy"
+    },
+    {
+     "time": 0.08333333333333333,
+     "vertices": "geo/wading/head/002.npy"
+    },
+    {
+     "time": 0.125,
+     "vertices": "geo/wading/head/003.npy"
+    },
+    {
+     "time": 0.16666666666666666,
+     "vertices": "geo/wading/head/004.npy"
+    },
+    {
+     "time": 0.20833333333333334,
+     "vertices": "geo/wading/head/005.npy"
+    },
+    {
+     "time": 0.25,
+     "vertices": "geo/wading/head/006.npy"
+    },
+    {
+     "time": 0.2916666666666667,
+     "vertices": "geo/wading/head/007.npy"
+    },
+    {
+     "time": 0.3333333333333333,
+     "vertices": "geo/wading/head/008.npy"
+    },
+    {
+     "time": 0.375,
+     "vertices": "geo/wading/head/009.npy"
+    },
+    {
+     "time": 0.4166666666666667,
+     "vertices": "geo/wading/head/010.npy"
+    },
+    {
+     "time": 0.4583333333333333,
+     "vertices": "geo/wading/head/011.npy"
+    },
+    {
+     "time": 0.5,
+     "vertices": "geo/wading/head/012.npy"
+    },
+    {
+     "time": 0.5416666666666666,
+     "vertices": "geo/wading/head/013.npy"
+    },
+    {
+     "time": 0.5833333333333334,
+     "vertices": "geo/wading/head/014.npy"
+    },
+    {
+     "time": 0.625,
+     "vertices": "geo/wading/head/015.npy"
+    },
+    {
+     "time": 0.6666666666666666,
+     "vertices": "geo/wading/head/016.npy"
+    },
+    {
+     "time": 0.7083333333333334,
+     "vertices": "geo/wading/head/017.npy"
+    },
+    {
+     "time": 0.75,
+     "vertices": "geo/wading/head/018.npy"
+    },
+    {
+     "time": 0.7916666666666666,
+     "vertices": "geo/wading/head/019.npy"
+    },
+    {
+     "time": 0.8333333333333334,
+     "vertices": "geo/wading/head/020.npy"
+    },
+    {
+     "time": 0.875,
+     "vertices": "geo/wading/head/021.npy"
+    },
+    {
+     "time": 0.9166666666666666,
+     "vertices": "geo/wading/head/022.npy"
+    },
+    {
+     "time": 0.9583333333333334,
+     "vertices": "geo/wading/head/023.npy"
+    },
+    {
+     "time": 1.0,
+     "vertices": "geo/wading/head/024.npy"
+    },
+    {
+     "time": 1.0416666666666667,
+     "vertices": "geo/wading/head/025.npy"
+    },
+    {
+     "time": 1.0833333333333333,
+     "vertices": "geo/wading/head/026.npy"
+    },
+    {
+     "time": 1.125,
+     "vertices": "geo/wading/head/027.npy"
+    },
+    {
+     "time": 1.1666666666666667,
+     "vertices": "geo/wading/head/028.npy"
+    },
+    {
+     "time": 1.2083333333333333,
+     "vertices": "geo/wading/head/029.npy"
+    },
+    {
+     "time": 1.25,
+     "vertices": "geo/wading/head/030.npy"
+    },
+    {
+     "time": 1.2916666666666667,
+     "vertices": "geo/wading/head/031.npy"
+    },
+    {
+     "time": 1.3333333333333333,
+     "vertices": "geo/wading/head/032.npy"
+    },
+    {
+     "time": 1.375,
+     "vertices": "geo/wading/head/033.npy"
+    },
+    {
+     "time": 1.4166666666666667,
+     "vertices": "geo/wading/head/034.npy"
+    },
+    {
+     "time": 1.4583333333333333,
+     "vertices": "geo/wading/head/035.npy"
+    },
+    {
+     "time": 1.5,
+     "vertices": "geo/wading/head/036.npy"
+    },
+    {
+     "time": 1.5416666666666667,
+     "vertices": "geo/wading/head/037.npy"
+    },
+    {
+     "time": 1.5833333333333333,
+     "vertices": "geo/wading/head/038.npy"
+    },
+    {
+     "time": 1.625,
+     "vertices": "geo/wading/head/039.npy"
+    },
+    {
+     "time": 1.6666666666666667,
+     "vertices": "geo/wading/head/040.npy"
+    },
+    {
+     "time": 1.7083333333333333,
+     "vertices": "geo/wading/head/041.npy"
+    },
+    {
+     "time": 1.75,
+     "vertices": "geo/wading/head/042.npy"
+    },
+    {
+     "time": 1.7916666666666667,
+     "vertices": "geo/wading/head/043.npy"
+    },
+    {
+     "time": 1.8333333333333333,
+     "vertices": "geo/wading/head/044.npy"
+    },
+    {
+     "time": 1.875,
+     "vertices": "geo/wading/head/045.npy"
+    },
+    {
+     "time": 1.9166666666666667,
+     "vertices": "geo/wading/head/046.npy"
+    },
+    {
+     "time": 1.9583333333333333,
+     "vertices": "geo/wading/head/047.npy"
+    },
+    {
+     "time": 2.0,
+     "vertices": "geo/wading/head/048.npy"
+    },
+    {
+     "time": 2.0416666666666665,
+     "vertices": "geo/wading/head/049.npy"
+    },
+    {
+     "time": 2.0833333333333335,
+     "vertices": "geo/wading/head/050.npy"
+    },
+    {
+     "time": 2.125,
+     "vertices": "geo/wading/head/051.npy"
+    },
+    {
+     "time": 2.1666666666666665,
+     "vertices": "geo/wading/head/052.npy"
+    },
+    {
+     "time": 2.2083333333333335,
+     "vertices": "geo/wading/head/053.npy"
+    },
+    {
+     "time": 2.25,
+     "vertices": "geo/wading/head/054.npy"
+    },
+    {
+     "time": 2.2916666666666665,
+     "vertices": "geo/wading/head/055.npy"
+    },
+    {
+     "time": 2.3333333333333335,
+     "vertices": "geo/wading/head/056.npy"
+    },
+    {
+     "time": 2.375,
+     "vertices": "geo/wading/head/057.npy"
+    },
+    {
+     "time": 2.4166666666666665,
+     "vertices": "geo/wading/head/058.npy"
+    },
+    {
+     "time": 2.4583333333333335,
+     "vertices": "geo/wading/head/059.npy"
+    },
+    {
+     "time": 2.5,
+     "vertices": "geo/wading/head/060.npy"
+    },
+    {
+     "time": 2.5416666666666665,
+     "vertices": "geo/wading/head/061.npy"
+    },
+    {
+     "time": 2.5833333333333335,
+     "vertices": "geo/wading/head/062.npy"
+    },
+    {
+     "time": 2.625,
+     "vertices": "geo/wading/head/063.npy"
+    },
+    {
+     "time": 2.6666666666666665,
+     "vertices": "geo/wading/head/064.npy"
+    },
+    {
+     "time": 2.7083333333333335,
+     "vertices": "geo/wading/head/065.npy"
+    },
+    {
+     "time": 2.75,
+     "vertices": "geo/wading/head/066.npy"
+    },
+    {
+     "time": 2.7916666666666665,
+     "vertices": "geo/wading/head/067.npy"
+    },
+    {
+     "time": 2.8333333333333335,
+     "vertices": "geo/wading/head/068.npy"
+    },
+    {
+     "time": 2.875,
+     "vertices": "geo/wading/head/069.npy"
+    },
+    {
+     "time": 2.9166666666666665,
+     "vertices": "geo/wading/head/070.npy"
+    },
+    {
+     "time": 2.9583333333333335,
+     "vertices": "geo/wading/head/071.npy"
+    },
+    {
+     "time": 3.0,
+     "vertices": "geo/wading/head/072.npy"
+    }
+   ]
+  },
+  {
+   "mesh": "geo/wading/arm-left.obj",
+   "deforming": [
+    {
+     "time": 0.0,
+     "vertices": "geo/wading/arm-left/000.npy"
+    },
+    {
+     "time": 0.041666666666666664,
+     "vertices": "geo/wading/arm-left/001.npy"
+    },
+    {
+     "time": 0.08333333333333333,
+     "vertices": "geo/wading/arm-left/002.npy"
+    },
+    {
+     "time": 0.125,
+     "vertices": "geo/wading/arm-left/003.npy"
+    },
+    {
+     "time": 0.16666666666666666,
+     "vertices": "geo/wading/arm-left/004.npy"
+    },
+    {
+     "time": 0.20833333333333334,
+     "vertices": "geo/wading/arm-left/005.npy"
+    },
+    {
+     "time": 0.25,
+     "vertices": "geo/wading/arm-left/006.npy"
+    },
+    {
+     "time": 0.2916666666666667,
+     "vertices": "geo/wading/arm-left/007.npy"
+    },
+    {
+     "time": 0.3333333333333333,
+     "vertices": "geo/wading/arm-left/008.npy"
+    },
+    {
+     "time": 0.375,
+     "vertices": "geo/wading/arm-left/009.npy"
+    },
+    {
+     "time": 0.4166666666666667,
+     "vertices": "geo/wading/arm-left/010.npy"
+    },
+    {
+     "time": 0.4583333333333333,
+     "vertices": "geo/wading/arm-left/011.npy"
+    },
+    {
+     "time": 0.5,
+     "vertices": "geo/wading/arm-left/012.npy"
+    },
+    {
+     "time": 0.5416666666666666,
+     "vertices": "geo/wading/arm-left/013.npy"
+    },
+    {
+     "time": 0.5833333333333334,
+     "vertices": "geo/wading/arm-left/014.npy"
+    },
+    {
+     "time": 0.625,
+     "vertices": "geo/wading/arm-left/015.npy"
+    },
+    {
+     "time": 0.6666666666666666,
+     "vertices": "geo/wading/arm-left/016.npy"
+    },
+    {
+     "time": 0.7083333333333334,
+     "vertices": "geo/wading/arm-left/017.npy"
+    },
+    {
+     "time": 0.75,
+     "vertices": "geo/wading/arm-left/018.npy"
+    },
+    {
+     "time": 0.7916666666666666,
+     "vertices": "geo/wading/arm-left/019.npy"
+    },
+    {
+     "time": 0.8333333333333334,
+     "vertices": "geo/wading/arm-left/020.npy"
+    },
+    {
+     "time": 0.875,
+     "vertices": "geo/wading/arm-left/021.npy"
+    },
+    {
+     "time": 0.9166666666666666,
+     "vertices": "geo/wading/arm-left/022.npy"
+    },
+    {
+     "time": 0.9583333333333334,
+     "vertices": "geo/wading/arm-left/023.npy"
+    },
+    {
+     "time": 1.0,
+     "vertices": "geo/wading/arm-left/024.npy"
+    },
+    {
+     "time": 1.0416666666666667,
+     "vertices": "geo/wading/arm-left/025.npy"
+    },
+    {
+     "time": 1.0833333333333333,
+     "vertices": "geo/wading/arm-left/026.npy"
+    },
+    {
+     "time": 1.125,
+     "vertices": "geo/wading/arm-left/027.npy"
+    },
+    {
+     "time": 1.1666666666666667,
+     "vertices": "geo/wading/arm-left/028.npy"
+    },
+    {
+     "time": 1.2083333333333333,
+     "vertices": "geo/wading/arm-left/029.npy"
+    },
+    {
+     "time": 1.25,
+     "vertices": "geo/wading/arm-left/030.npy"
+    },
+    {
+     "time": 1.2916666666666667,
+     "vertices": "geo/wading/arm-left/031.npy"
+    },
+    {
+     "time": 1.3333333333333333,
+     "vertices": "geo/wading/arm-left/032.npy"
+    },
+    {
+     "time": 1.375,
+     "vertices": "geo/wading/arm-left/033.npy"
+    },
+    {
+     "time": 1.4166666666666667,
+     "vertices": "geo/wading/arm-left/034.npy"
+    },
+    {
+     "time": 1.4583333333333333,
+     "vertices": "geo/wading/arm-left/035.npy"
+    },
+    {
+     "time": 1.5,
+     "vertices": "geo/wading/arm-left/036.npy"
+    },
+    {
+     "time": 1.5416666666666667,
+     "vertices": "geo/wading/arm-left/037.npy"
+    },
+    {
+     "time": 1.5833333333333333,
+     "vertices": "geo/wading/arm-left/038.npy"
+    },
+    {
+     "time": 1.625,
+     "vertices": "geo/wading/arm-left/039.npy"
+    },
+    {
+     "time": 1.6666666666666667,
+     "vertices": "geo/wading/arm-left/040.npy"
+    },
+    {
+     "time": 1.7083333333333333,
+     "vertices": "geo/wading/arm-left/041.npy"
+    },
+    {
+     "time": 1.75,
+     "vertices": "geo/wading/arm-left/042.npy"
+    },
+    {
+     "time": 1.7916666666666667,
+     "vertices": "geo/wading/arm-left/043.npy"
+    },
+    {
+     "time": 1.8333333333333333,
+     "vertices": "geo/wading/arm-left/044.npy"
+    },
+    {
+     "time": 1.875,
+     "vertices": "geo/wading/arm-left/045.npy"
+    },
+    {
+     "time": 1.9166666666666667,
+     "vertices": "geo/wading/arm-left/046.npy"
+    },
+    {
+     "time": 1.9583333333333333,
+     "vertices": "geo/wading/arm-left/047.npy"
+    },
+    {
+     "time": 2.0,
+     "vertices": "geo/wading/arm-left/048.npy"
+    },
+    {
+     "time": 2.0416666666666665,
+     "vertices": "geo/wading/arm-left/049.npy"
+    },
+    {
+     "time": 2.0833333333333335,
+     "vertices": "geo/wading/arm-left/050.npy"
+    },
+    {
+     "time": 2.125,
+     "vertices": "geo/wading/arm-left/051.npy"
+    },
+    {
+     "time": 2.1666666666666665,
+     "vertices": "geo/wading/arm-left/052.npy"
+    },
+    {
+     "time": 2.2083333333333335,
+     "vertices": "geo/wading/arm-left/053.npy"
+    },
+    {
+     "time": 2.25,
+     "vertices": "geo/wading/arm-left/054.npy"
+    },
+    {
+     "time": 2.2916666666666665,
+     "vertices": "geo/wading/arm-left/055.npy"
+    },
+    {
+     "time": 2.3333333333333335,
+     "vertices": "geo/wading/arm-left/056.npy"
+    },
+    {
+     "time": 2.375,
+     "vertices": "geo/wading/arm-left/057.npy"
+    },
+    {
+     "time": 2.4166666666666665,
+     "vertices": "geo/wading/arm-left/058.npy"
+    },
+    {
+     "time": 2.4583333333333335,
+     "vertices": "geo/wading/arm-left/059.npy"
+    },
+    {
+     "time": 2.5,
+     "vertices": "geo/wading/arm-left/060.npy"
+    },
+    {
+     "time": 2.5416666666666665,
+     "vertices": "geo/wading/arm-left/061.npy"
+    },
+    {
+     "time": 2.5833333333333335,
+     "vertices": "geo/wading/arm-left/062.npy"
+    },
+    {
+     "time": 2.625,
+     "vertices": "geo/wading/arm-left/063.npy"
+    },
+    {
+     "time": 2.6666666666666665,
+     "vertices": "geo/wading/arm-left/064.npy"
+    },
+    {
+     "time": 2.7083333333333335,
+     "vertices": "geo/wading/arm-left/065.npy"
+    },
+    {
+     "time": 2.75,
+     "vertices": "geo/wading/arm-left/066.npy"
+    },
+    {
+     "time": 2.7916666666666665,
+     "vertices": "geo/wading/arm-left/067.npy"
+    },
+    {
+     "time": 2.8333333333333335,
+     "vertices": "geo/wading/arm-left/068.npy"
+    },
+    {
+     "time": 2.875,
+     "vertices": "geo/wading/arm-left/069.npy"
+    },
+    {
+     "time": 2.9166666666666665,
+     "vertices": "geo/wading/arm-left/070.npy"
+    },
+    {
+     "time": 2.9583333333333335,
+     "vertices": "geo/wading/arm-left/071.npy"
+    },
+    {
+     "time": 3.0,
+     "vertices": "geo/wading/arm-left/072.npy"
+    }
+   ]
+  },
+  {
+   "mesh": "geo/wading/arm-right.obj",
+   "deforming": [
+    {
+     "time": 0.0,
+     "vertices": "geo/wading/arm-right/000.npy"
+    },
+    {
+     "time": 0.041666666666666664,
+     "vertices": "geo/wading/arm-right/001.npy"
+    },
+    {
+     "time": 0.08333333333333333,
+     "vertices": "geo/wading/arm-right/002.npy"
+    },
+    {
+     "time": 0.125,
+     "vertices": "geo/wading/arm-right/003.npy"
+    },
+    {
+     "time": 0.16666666666666666,
+     "vertices": "geo/wading/arm-right/004.npy"
+    },
+    {
+     "time": 0.20833333333333334,
+     "vertices": "geo/wading/arm-right/005.npy"
+    },
+    {
+     "time": 0.25,
+     "vertices": "geo/wading/arm-right/006.npy"
+    },
+    {
+     "time": 0.2916666666666667,
+     "vertices": "geo/wading/arm-right/007.npy"
+    },
+    {
+     "time": 0.3333333333333333,
+     "vertices": "geo/wading/arm-right/008.npy"
+    },
+    {
+     "time": 0.375,
+     "vertices": "geo/wading/arm-right/009.npy"
+    },
+    {
+     "time": 0.4166666666666667,
+     "vertices": "geo/wading/arm-right/010.npy"
+    },
+    {
+     "time": 0.4583333333333333,
+     "vertices": "geo/wading/arm-right/011.npy"
+    },
+    {
+     "time": 0.5,
+     "vertices": "geo/wading/arm-right/012.npy"
+    },
+    {
+     "time": 0.5416666666666666,
+     "vertices": "geo/wading/arm-right/013.npy"
+    },
+    {
+     "time": 0.5833333333333334,
+     "vertices": "geo/wading/arm-right/014.npy"
+    },
+    {
+     "time": 0.625,
+     "vertices": "geo/wading/arm-right/015.npy"
+    },
+    {
+     "time": 0.6666666666666666,
+     "vertices": "geo/wading/arm-right/016.npy"
+    },
+    {
+     "time": 0.7083333333333334,
+     "vertices": "geo/wading/arm-right/017.npy"
+    },
+    {
+     "time": 0.75,
+     "vertices": "geo/wading/arm-right/018.npy"
+    },
+    {
+     "time": 0.7916666666666666,
+     "vertices": "geo/wading/arm-right/019.npy"
+    },
+    {
+     "time": 0.8333333333333334,
+     "vertices": "geo/wading/arm-right/020.npy"
+    },
+    {
+     "time": 0.875,
+     "vertices": "geo/wading/arm-right/021.npy"
+    },
+    {
+     "time": 0.9166666666666666,
+     "vertices": "geo/wading/arm-right/022.npy"
+    },
+    {
+     "time": 0.9583333333333334,
+     "vertices": "geo/wading/arm-right/023.npy"
+    },
+    {
+     "time": 1.0,
+     "vertices": "geo/wading/arm-right/024.npy"
+    },
+    {
+     "time": 1.0416666666666667,
+     "vertices": "geo/wading/arm-right/025.npy"
+    },
+    {
+     "time": 1.0833333333333333,
+     "vertices": "geo/wading/arm-right/026.npy"
+    },
+    {
+     "time": 1.125,
+     "vertices": "geo/wading/arm-right/027.npy"
+    },
+    {
+     "time": 1.1666666666666667,
+     "vertices": "geo/wading/arm-right/028.npy"
+    },
+    {
+     "time": 1.2083333333333333,
+     "vertices": "geo/wading/arm-right/029.npy"
+    },
+    {
+     "time": 1.25,
+     "vertices": "geo/wading/arm-right/030.npy"
+    },
+    {
+     "time": 1.2916666666666667,
+     "vertices": "geo/wading/arm-right/031.npy"
+    },
+    {
+     "time": 1.3333333333333333,
+     "vertices": "geo/wading/arm-right/032.npy"
+    },
+    {
+     "time": 1.375,
+     "vertices": "geo/wading/arm-right/033.npy"
+    },
+    {
+     "time": 1.4166666666666667,
+     "vertices": "geo/wading/arm-right/034.npy"
+    },
+    {
+     "time": 1.4583333333333333,
+     "vertices": "geo/wading/arm-right/035.npy"
+    },
+    {
+     "time": 1.5,
+     "vertices": "geo/wading/arm-right/036.npy"
+    },
+    {
+     "time": 1.5416666666666667,
+     "vertices": "geo/wading/arm-right/037.npy"
+    },
+    {
+     "time": 1.5833333333333333,
+     "vertices": "geo/wading/arm-right/038.npy"
+    },
+    {
+     "time": 1.625,
+     "vertices": "geo/wading/arm-right/039.npy"
+    },
+    {
+     "time": 1.6666666666666667,
+     "vertices": "geo/wading/arm-right/040.npy"
+    },
+    {
+     "time": 1.7083333333333333,
+     "vertices": "geo/wading/arm-right/041.npy"
+    },
+    {
+     "time": 1.75,
+     "vertices": "geo/wading/arm-right/042.npy"
+    },
+    {
+     "time": 1.7916666666666667,
+     "vertices": "geo/wading/arm-right/043.npy"
+    },
+    {
+     "time": 1.8333333333333333,
+     "vertices": "geo/wading/arm-right/044.npy"
+    },
+    {
+     "time": 1.875,
+     "vertices": "geo/wading/arm-right/045.npy"
+    },
+    {
+     "time": 1.9166666666666667,
+     "vertices": "geo/wading/arm-right/046.npy"
+    },
+    {
+     "time": 1.9583333333333333,
+     "vertices": "geo/wading/arm-right/047.npy"
+    },
+    {
+     "time": 2.0,
+     "vertices": "geo/wading/arm-right/048.npy"
+    },
+    {
+     "time": 2.0416666666666665,
+     "vertices": "geo/wading/arm-right/049.npy"
+    },
+    {
+     "time": 2.0833333333333335,
+     "vertices": "geo/wading/arm-right/050.npy"
+    },
+    {
+     "time": 2.125,
+     "vertices": "geo/wading/arm-right/051.npy"
+    },
+    {
+     "time": 2.1666666666666665,
+     "vertices": "geo/wading/arm-right/052.npy"
+    },
+    {
+     "time": 2.2083333333333335,
+     "vertices": "geo/wading/arm-right/053.npy"
+    },
+    {
+     "time": 2.25,
+     "vertices": "geo/wading/arm-right/054.npy"
+    },
+    {
+     "time": 2.2916666666666665,
+     "vertices": "geo/wading/arm-right/055.npy"
+    },
+    {
+     "time": 2.3333333333333335,
+     "vertices": "geo/wading/arm-right/056.npy"
+    },
+    {
+     "time": 2.375,
+     "vertices": "geo/wading/arm-right/057.npy"
+    },
+    {
+     "time": 2.4166666666666665,
+     "vertices": "geo/wading/arm-right/058.npy"
+    },
+    {
+     "time": 2.4583333333333335,
+     "vertices": "geo/wading/arm-right/059.npy"
+    },
+    {
+     "time": 2.5,
+     "vertices": "geo/wading/arm-right/060.npy"
+    },
+    {
+     "time": 2.5416666666666665,
+     "vertices": "geo/wading/arm-right/061.npy"
+    },
+    {
+     "time": 2.5833333333333335,
+     "vertices": "geo/wading/arm-right/062.npy"
+    },
+    {
+     "time": 2.625,
+     "vertices": "geo/wading/arm-right/063.npy"
+    },
+    {
+     "time": 2.6666666666666665,
+     "vertices": "geo/wading/arm-right/064.npy"
+    },
+    {
+     "time": 2.7083333333333335,
+     "vertices": "geo/wading/arm-right/065.npy"
+    },
+    {
+     "time": 2.75,
+     "vertices": "geo/wading/arm-right/066.npy"
+    },
+    {
+     "time": 2.7916666666666665,
+     "vertices": "geo/wading/arm-right/067.npy"
+    },
+    {
+     "time": 2.8333333333333335,
+     "vertices": "geo/wading/arm-right/068.npy"
+    },
+    {
+     "time": 2.875,
+     "vertices": "geo/wading/arm-right/069.npy"
+    },
+    {
+     "time": 2.9166666666666665,
+     "vertices": "geo/wading/arm-right/070.npy"
+    },
+    {
+     "time": 2.9583333333333335,
+     "vertices": "geo/wading/arm-right/071.npy"
+    },
+    {
+     "time": 3.0,
+     "vertices": "geo/wading/arm-right/072.npy"
+    }
+   ]
+  }
+ ],
+ "output": {
+  "dir": "wading",
+  "diagnostics": "diagnostics.jsonl"
+ }
+}

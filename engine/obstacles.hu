@@ -1,0 +1,342 @@
+//Copyright 2023 Aberrant Behavior LLC
+
+#ifndef OBSTACLES_HU
+#define OBSTACLES_HU
+
+#include "typedefs.h"
+#include "grid.hpp"
+#include "scene.hpp"
+#include <memory>
+#include <vector>
+
+#define MAX_OBSTACLES 16
+#define SDF_BRICK 8             //samples along a brick's side
+#define SDF_OUTSIDE -1          //a brick table entry for a brick with no samples, all of it outside
+#define SDF_INSIDE -2           //and all of it inside
+
+//An obstacle's signed distance field in its own space, negative inside, kept sparse: a table of bricks of SDF_BRICK^3 samples over its bounds, where only
+//the bricks near its surface hold samples and the others just say inside or outside. Distances are clamped to band either way: what the simulation needs
+//is which side a point is on and, near the surface, how far and which way out. A deforming mesh's field is in the world, and also holds how fast the
+//surface moves: at each sample, the velocity of the nearest point on the mesh
+struct SolidSDF{
+    float3 origin;          //sample (0, 0, 0)
+    float spacing;          //between samples
+    int3 bricks;            //the table's size, in bricks
+    const int* table;       //per brick, x fastest: its samples' place in pool, in bricks, or SDF_OUTSIDE or SDF_INSIDE
+    const float* pool;      //per brick holding samples: SDF_BRICK^3 of them, x fastest
+    float band;
+    const float* velocities;    //deforming: per brick in pool, SDF_BRICK^3 x velocities, then y, then z; otherwise nullptr
+    float3 farVelocity;         //deforming: the mesh's mean velocity, for points in bricks without samples
+};
+
+enum ObstacleKind{
+    OBSTACLE_MESH,
+    OBSTACLE_BOX,
+    OBSTACLE_SPHERE
+};
+
+//one obstacle where it is now, for the kernels: its shape in its own space, how the world maps into that space, and how fast each point of it moves
+struct ObstacleState{
+    int kind;
+    SolidSDF sdf;               //a mesh
+    float3 low;                 //a box's corners
+    float3 high;
+    float radius;               //a sphere's, around its own origin
+    float worldToObject[12];    //row-major 3x4, rigid: (x, 1) to its own space
+    float velocity[12];         //row-major 3x4: the solid's velocity at world point x is velocity times (x, 1)
+    float friction;
+    float3 reachLow, reachHigh; //the box in the world past which nothing asks its distance: around its surface, 3 voxels wider every way
+};
+
+//every obstacle, as one kernel argument
+struct Obstacles{
+    int count = 0;
+    bool moving = false;        //whether any of them moves
+    ObstacleState items[MAX_OBSTACLES];
+};
+
+//obstacleNear's bits, per stored voxel: whether a surface passes near enough to cut its faces, and (CLOSED_FACE << face) whether each face is closed,
+//the faces in the neighbour arrays' order (-x, +x, -y, +y, -z, +z)
+static constexpr char NEAR_SURFACE = 1;
+static constexpr int CLOSED_FACE = 2;
+
+//obstacleOpen: a near voxel's six open fractions, worked out once a substep (findSolidVoxels) for every pass to read rather than look up its corners
+//again, each a fraction of OPEN_FULL in 16 bits: 0 and 1 exactly, and nothing between closer than 1.5e-5 to either. Three words a voxel, one per axis,
+//its lower face in the low half
+static constexpr float OPEN_FULL = 65535.0f;
+
+//a voxel's faces' open fractions, in the neighbour arrays' order (-x, +x, -y, +y, -z, +z); near: whether a surface passes close enough that any could be
+//cut. Every corner of a voxel is within 0.87 of a voxel of its centre, so one farther from every surface is all open or all closed
+struct CutFaces{
+    float open[6];
+    bool near;
+    float centre;   //the centre's distance from the nearest surface, negative inside; INFINITY with no obstacles
+    float covered;  //how much of the voxel is inside obstacles (coveredFraction, obstacles.cu)
+};
+
+//a near voxel's faces as findSolidVoxels found them this substep
+__device__ inline CutFaces cachedCut(const uint* opens, uint index){
+    CutFaces cut;
+    #pragma unroll
+    for(int face = 0; face < 6; ++face){
+        uint word = opens[4*(size_t)index + face/2];
+        cut.open[face] = (face % 2 ? word >> 16 : word & 0xFFFFu) / OPEN_FULL;
+    }
+    cut.near = true;
+    cut.centre = 0.0f;
+    cut.covered = opens[4*(size_t)index + 3] / OPEN_FULL;
+    return cut;
+}
+
+//where the stored voxels are: per node, its run of voxels, its cell, and each voxel's slot in its block
+struct VoxelPlaces{
+    const uint* nodeVoxelEnds;
+    const uint* nodeCells;
+    const uint* voxelSlots;
+    Grid grid;
+    int interiorWidth;
+    int apronCells;
+
+    //the voxel's lowest corner, in the domain's voxels, for a node's slot
+    __device__ int3 voxelOf(uint cell, int slot) const{
+        int voxels1D = interiorWidth + 2*apronCells;
+        return make_int3((int)(cell % grid.sizeX)*interiorWidth - apronCells + slot % voxels1D, (int)(cell / grid.sizeX % grid.sizeY)*interiorWidth - apronCells + slot / voxels1D % voxels1D,
+                         (int)(cell / (grid.sizeX*grid.sizeY))*interiorWidth - apronCells + slot / (voxels1D*voxels1D));
+    }
+
+    __device__ float voxelSize() const{
+        return grid.cellSize / interiorWidth;
+    }
+
+    __device__ bool inDomain(int3 voxel) const{
+        return voxel.x >= 0 && voxel.y >= 0 && voxel.z >= 0 && voxel.x < (int)(grid.sizeX*interiorWidth) && voxel.y < (int)(grid.sizeY*interiorWidth) && voxel.z < (int)(grid.sizeZ*interiorWidth);
+    }
+
+    //a point at an offset (in voxels) from a voxel's lowest corner, in the world
+    __device__ float3 point(int3 voxel, float x, float y, float z) const{
+        float h = voxelSize();
+        return make_float3(grid.negX + (voxel.x + x)*h, grid.negY + (voxel.y + y)*h, grid.negZ + (voxel.z + z)*h);
+    }
+};
+
+// ---- small vector helpers ----
+
+__host__ __device__ inline float3 operator+(float3 a, float3 b){
+    return make_float3(a.x + b.x, a.y + b.y, a.z + b.z);
+}
+
+__host__ __device__ inline float3 operator-(float3 a, float3 b){
+    return make_float3(a.x - b.x, a.y - b.y, a.z - b.z);
+}
+
+__host__ __device__ inline float3 operator*(float s, float3 a){
+    return make_float3(s*a.x, s*a.y, s*a.z);
+}
+
+__host__ __device__ inline float dot(float3 a, float3 b){
+    return a.x*b.x + a.y*b.y + a.z*b.z;
+}
+
+__host__ __device__ inline float component(float3 v, int axis){
+    return axis == 0 ? v.x : axis == 1 ? v.y : v.z;
+}
+
+// ---- reading the fields: here rather than in obstacles.cu, so emitters and sinks made of meshes can be tested too (sources.hu) ----
+
+__device__ inline float sdfSample(const SolidSDF& sdf, int x, int y, int z){
+    if(x < 0 || y < 0 || z < 0 || x >= sdf.bricks.x*SDF_BRICK || y >= sdf.bricks.y*SDF_BRICK || z >= sdf.bricks.z*SDF_BRICK){
+        return sdf.band;    //past the bounds: well outside
+    }
+    int entry = sdf.table[x/SDF_BRICK + sdf.bricks.x*(y/SDF_BRICK + sdf.bricks.y*(z/SDF_BRICK))];
+    if(entry < 0){
+        return entry == SDF_INSIDE ? -sdf.band : sdf.band;
+    }
+    return sdf.pool[(size_t)entry*SDF_BRICK*SDF_BRICK*SDF_BRICK + x%SDF_BRICK + SDF_BRICK*(y%SDF_BRICK + SDF_BRICK*(z%SDF_BRICK))];
+}
+
+//trilinear between the 8 samples around p, in the field's own space, and its gradient
+__device__ inline float sdfTrilinear(const SolidSDF& sdf, float3 p, float3& gradient){
+    float q[3] = {(p.x - sdf.origin.x) / sdf.spacing, (p.y - sdf.origin.y) / sdf.spacing, (p.z - sdf.origin.z) / sdf.spacing};
+    int i[3];
+    float f[3];
+    for(int axis = 0; axis < 3; ++axis){
+        i[axis] = (int)floorf(q[axis]);
+        f[axis] = q[axis] - i[axis];
+    }
+    float c[8];
+    for(int corner = 0; corner < 8; ++corner){
+        c[corner] = sdfSample(sdf, i[0] + (corner & 1), i[1] + (corner >> 1 & 1), i[2] + (corner >> 2));
+    }
+    float gx = (c[1] - c[0])*(1 - f[1])*(1 - f[2]) + (c[3] - c[2])*f[1]*(1 - f[2]) + (c[5] - c[4])*(1 - f[1])*f[2] + (c[7] - c[6])*f[1]*f[2];
+    float gy = (c[2] - c[0])*(1 - f[0])*(1 - f[2]) + (c[3] - c[1])*f[0]*(1 - f[2]) + (c[6] - c[4])*(1 - f[0])*f[2] + (c[7] - c[5])*f[0]*f[2];
+    float gz = (c[4] - c[0])*(1 - f[0])*(1 - f[1]) + (c[5] - c[1])*f[0]*(1 - f[1]) + (c[6] - c[2])*(1 - f[0])*f[1] + (c[7] - c[3])*f[0]*f[1];
+    gradient = make_float3(gx / sdf.spacing, gy / sdf.spacing, gz / sdf.spacing);
+    float x0 = c[0] + f[0]*(c[1] - c[0]), x1 = c[2] + f[0]*(c[3] - c[2]), x2 = c[4] + f[0]*(c[5] - c[4]), x3 = c[6] + f[0]*(c[7] - c[6]);
+    float y0 = x0 + f[1]*(x1 - x0), y1 = x2 + f[1]*(x3 - x2);
+    return y0 + f[2]*(y1 - y0);
+}
+
+__device__ inline float boxDistance(float3 low, float3 high, float3 p, float3& gradient){
+    float3 centre = 0.5f*(low + high);
+    float3 half = 0.5f*(high - low);
+    float3 d = p - centre;
+    float q[3] = {fabsf(d.x) - half.x, fabsf(d.y) - half.y, fabsf(d.z) - half.z};
+    float out[3] = {fmaxf(q[0], 0.0f), fmaxf(q[1], 0.0f), fmaxf(q[2], 0.0f)};
+    float outside = sqrtf(out[0]*out[0] + out[1]*out[1] + out[2]*out[2]);
+    float signs[3] = {d.x < 0.0f ? -1.0f : 1.0f, d.y < 0.0f ? -1.0f : 1.0f, d.z < 0.0f ? -1.0f : 1.0f};
+    if(outside > 0.0f){
+        gradient = make_float3(signs[0]*out[0] / outside, signs[1]*out[1] / outside, signs[2]*out[2] / outside);
+        return outside;
+    }
+    int axis = q[0] >= q[1] && q[0] >= q[2] ? 0 : q[1] >= q[2] ? 1 : 2;     //inside: out through the nearest face
+    gradient = make_float3(axis == 0 ? signs[0] : 0.0f, axis == 1 ? signs[1] : 0.0f, axis == 2 ? signs[2] : 0.0f);
+    return q[axis];
+}
+
+//how far a world point is outside the obstacle (negative inside), and the way out of it there: its unit normal in the world
+__device__ inline float obstacleDistance(const ObstacleState& obstacle, float3 x, float3& normal){
+    const float* m = obstacle.worldToObject;
+    float3 p = make_float3(m[0]*x.x + m[1]*x.y + m[2]*x.z + m[3], m[4]*x.x + m[5]*x.y + m[6]*x.z + m[7], m[8]*x.x + m[9]*x.y + m[10]*x.z + m[11]);
+    float3 g;
+    float distance;
+    if(obstacle.kind == OBSTACLE_MESH){
+        distance = sdfTrilinear(obstacle.sdf, p, g);
+    }
+    else if(obstacle.kind == OBSTACLE_BOX){
+        distance = boxDistance(obstacle.low, obstacle.high, p, g);
+    }
+    else{
+        float length = sqrtf(dot(p, p));
+        g = length > 0.0f ? (1.0f / length)*p : make_float3(0.0f, 1.0f, 0.0f);
+        distance = length - obstacle.radius;
+    }
+    float3 world = make_float3(m[0]*g.x + m[4]*g.y + m[8]*g.z, m[1]*g.x + m[5]*g.y + m[9]*g.z, m[2]*g.x + m[6]*g.y + m[10]*g.z);  //rigid: the transpose rotates back
+    float length = sqrtf(dot(world, world));
+    normal = length > 0.0f ? (1.0f / length)*world : make_float3(0.0f, 1.0f, 0.0f);
+    return distance;
+}
+
+//a deforming mesh's surface velocity at p: trilinear between the 8 samples around it, each the velocity of the nearest point on the mesh to it; in bricks
+//without samples, deep inside or well outside, the mesh's mean velocity
+__device__ inline float3 sdfVelocity(const SolidSDF& sdf, float3 p){
+    const int samples = SDF_BRICK*SDF_BRICK*SDF_BRICK;
+    float q[3] = {(p.x - sdf.origin.x) / sdf.spacing, (p.y - sdf.origin.y) / sdf.spacing, (p.z - sdf.origin.z) / sdf.spacing};
+    int i[3];
+    float f[3];
+    for(int axis = 0; axis < 3; ++axis){
+        i[axis] = (int)floorf(q[axis]);
+        f[axis] = q[axis] - i[axis];
+    }
+    float3 sum = make_float3(0.0f, 0.0f, 0.0f);
+    for(int corner = 0; corner < 8; ++corner){
+        int x = i[0] + (corner & 1), y = i[1] + (corner >> 1 & 1), z = i[2] + (corner >> 2);
+        float weight = (corner & 1 ? f[0] : 1.0f - f[0])*(corner >> 1 & 1 ? f[1] : 1.0f - f[1])*(corner >> 2 ? f[2] : 1.0f - f[2]);
+        float3 velocity = sdf.farVelocity;
+        if(x >= 0 && y >= 0 && z >= 0 && x < sdf.bricks.x*SDF_BRICK && y < sdf.bricks.y*SDF_BRICK && z < sdf.bricks.z*SDF_BRICK){
+            int entry = sdf.table[x/SDF_BRICK + sdf.bricks.x*(y/SDF_BRICK + sdf.bricks.y*(z/SDF_BRICK))];
+            if(entry >= 0){
+                size_t at = (size_t)entry*3*samples + x%SDF_BRICK + SDF_BRICK*(y%SDF_BRICK + SDF_BRICK*(z%SDF_BRICK));
+                velocity = make_float3(sdf.velocities[at], sdf.velocities[at + samples], sdf.velocities[at + 2*samples]);
+            }
+        }
+        sum = sum + weight*velocity;
+    }
+    return sum;
+}
+
+//how fast the obstacle's surface moves at world point x: a rigid one's from its motion, a deforming mesh's from its field, which is in the world
+__device__ inline float3 obstacleVelocity(const ObstacleState& obstacle, float3 x){
+    if(obstacle.kind == OBSTACLE_MESH && obstacle.sdf.velocities != nullptr){
+        return sdfVelocity(obstacle.sdf, x);
+    }
+    const float* v = obstacle.velocity;
+    return make_float3(v[0]*x.x + v[1]*x.y + v[2]*x.z + v[3], v[4]*x.x + v[5]*x.y + v[6]*x.z + v[7], v[8]*x.x + v[9]*x.y + v[10]*x.z + v[11]);
+}
+
+//the obstacle a point is deepest inside, or nearest to: its index and the distance and normal there. Obstacles whose reach the point is outside are passed
+//over, as every question asked of them is about inside or within a voxel or two of them; -1, and an infinite distance, if it's outside every one's
+__device__ inline int nearestObstacle(const Obstacles& obstacles, float3 x, float& distance, float3& normal){
+    int nearest = -1;
+    distance = INFINITY;
+    for(int index = 0; index < obstacles.count; ++index){
+        const ObstacleState& obstacle = obstacles.items[index];
+        if(x.x < obstacle.reachLow.x || x.y < obstacle.reachLow.y || x.z < obstacle.reachLow.z || x.x > obstacle.reachHigh.x || x.y > obstacle.reachHigh.y || x.z > obstacle.reachHigh.z){
+            continue;
+        }
+        float3 n;
+        float d = obstacleDistance(obstacles.items[index], x, n);
+        if(d < distance){
+            distance = d;
+            normal = n;
+            nearest = index;
+        }
+    }
+    return nearest;
+}
+
+struct MeshField;   //a mesh's field and what building it takes (obstacles.cu)
+
+//The obstacles of one partition, on its GPU: their distance fields, and where they are at any time. A mesh is voxelized at the simulation's voxel size
+//into a narrow band of 3 voxels around its surface (see MeshField in obstacles.cu), once if it's rigid, at every update if it deforms; boxes and spheres
+//are exact
+class ObstacleSet{
+public:
+    ObstacleSet() = default;
+    ObstacleSet(const ObstacleSet&) = delete;
+    ObstacleSet& operator=(const ObstacleSet&) = delete;
+    ~ObstacleSet();
+
+    //builds every obstacle's distance field on the current GPU, at voxelSize, on stream, which updates use too; replaces any there were
+    void build(const std::vector<SceneObstacle>& obstacles, double voxelSize, cudaStream_t stream);
+
+    //where they are and how they move at time; a deforming mesh's field is rebuilt there, queued on the stream without waiting for it
+    void update(double time);
+
+    const Obstacles& state() const{
+        return current;
+    }
+
+    int count() const{
+        return current.count;
+    }
+
+    //how fast the fastest point of any obstacle's surface moves at the last update, in m/s: the timestep keeps it within cfl voxels a substep too
+    float fastest() const{
+        return fastestSurface;
+    }
+
+    //where an obstacle can be at the last update, in the world: around a rigid one where it is now, and a deforming one wherever it goes
+    void bounds(int index, double low[3], double high[3]) const;
+
+    //which obstacle build made of the description at index, or -1 if it left it out (a mesh whose triangles have no area, or past MAX_OBSTACLES)
+    int builtFrom(size_t description) const{
+        return description < builtIndex.size() ? builtIndex[description] : -1;
+    }
+
+private:
+    struct Built{
+        int kind;
+        MeshField* field = nullptr;     //a mesh's
+        SolidSDF sdf = {};
+        float3 low, high;
+        float radius;
+        float3 objectLow, objectHigh;       //its bounds in its own space, for how fast its surface can move
+        double worldLow[3], worldHigh[3];   //and in the world, as of the last update
+        float fieldSpeed = 0.0f;            //a level set with velocities: the fastest of them
+        std::vector<double> keyTimes;       //empty: it doesn't move
+        std::vector<double> translations;   //per key: x, y, z
+        std::vector<double> rotations;      //per key: a unit quaternion, w x y z
+        float friction;
+    };
+    void release();
+    void rigidAt(const Built& obstacle, double time, double matrix[12], int interval = -1) const;
+
+    std::vector<Built> built;
+    std::vector<int> builtIndex;    //per description given to build: its place in built, or -1
+    double voxel = 0.0;             //the size build voxelized at
+    Obstacles current;
+    float fastestSurface = 0.0f;
+    cudaStream_t stream = nullptr;
+};
+
+#endif

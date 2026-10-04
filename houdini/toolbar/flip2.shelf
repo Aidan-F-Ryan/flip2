@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- flip2's tools: on the flip2 shelf, and in the Tab menu under flip2 -->
+<shelfDocument>
+  <toolshelf name="flip2" label="flip2">
+    <memberTool name="flip2_solver"/>
+    <memberTool name="flip2_import"/>
+    <memberTool name="flip2_whitewater"/>
+    <memberTool name="flip2_karma"/>
+    <memberTool name="flip2_update"/>
+  </toolshelf>
+
+  <tool name="flip2_solver" label="flip2 Solver" icon="DOP_flipsolver">
+    <helpText><![CDATA[A flip2 simulation: fluid, collisions, sources and sinks as inputs; bakes with the flip2 program and loads the result.]]></helpText>
+    <toolMenuContext name="network">
+      <contextNetType>OBJ</contextNetType>
+      <contextNetType>SOP</contextNetType>
+    </toolMenuContext>
+    <toolSubmenu>flip2</toolSubmenu>
+    <script scriptType="python"><![CDATA[import flip2houdini.solver
+flip2houdini.solver.shelf_tool(kwargs)]]></script>
+  </tool>
+
+  <tool name="flip2_import" label="flip2 Import" icon="SOP_file">
+    <helpText><![CDATA[Loads a flip2 bake's surface, particles and fluid fields at the current time, from the files flip2 export and flip2 mesh write.]]></helpText>
+    <toolMenuContext name="network">
+      <contextNetType>OBJ</contextNetType>
+      <contextNetType>SOP</contextNetType>
+    </toolMenuContext>
+    <toolSubmenu>flip2</toolSubmenu>
+    <script scriptType="python"><![CDATA[import flip2houdini.importer
+flip2houdini.importer.shelf_tool(kwargs)]]></script>
+  </tool>
+
+  <tool name="flip2_whitewater" label="flip2 Whitewater" icon="SHELF_whitewater">
+    <helpText><![CDATA[Houdini's whitewater (foam, spray and bubbles) on the selected flip2 Solver or flip2 Import node's bake: Whitewater Source and Whitewater Solver, wired to its fluid fields, container and collisions, and sized for it.]]></helpText>
+    <toolMenuContext name="network">
+      <contextNetType>SOP</contextNetType>
+    </toolMenuContext>
+    <toolSubmenu>flip2</toolSubmenu>
+    <script scriptType="python"><![CDATA[import flip2houdini.whitewater
+flip2houdini.whitewater.shelf_tool(kwargs)]]></script>
+  </tool>
+
+  <tool name="flip2_karma" label="flip2 Karma Setup" icon="ROP_karma">
+    <helpText><![CDATA[A Karma setup in /stage for the selected flip2 Solver or flip2 Import node's bake: its surface as water, its collisions, its whitewater if flip2 Whitewater set it up, a ground, a sky and a camera, with Velocity Blur on so the surface's motion blurs.]]></helpText>
+    <toolMenuContext name="network">
+      <contextNetType>SOP</contextNetType>
+    </toolMenuContext>
+    <toolSubmenu>flip2</toolSubmenu>
+    <script scriptType="python"><![CDATA[import flip2houdini.render
+flip2houdini.render.shelf_tool(kwargs)]]></script>
+  </tool>
+
+  <tool name="flip2_update" label="Update flip2 Nodes" icon="BUTTONS_reload">
+    <helpText><![CDATA[Gives every flip2 node in the scene the parameters of the flip2 version installed, keeping their values.]]></helpText>
+    <toolMenuContext name="network">
+      <contextNetType>OBJ</contextNetType>
+      <contextNetType>SOP</contextNetType>
+    </toolMenuContext>
+    <toolSubmenu>flip2</toolSubmenu>
+    <script scriptType="python"><![CDATA[import flip2houdini.solver
+flip2houdini.solver.update_tool(kwargs)]]></script>
+  </tool>
+</shelfDocument>
