@@ -2,9 +2,10 @@
 
 //The liquid's level set on the simulation's own voxels, and surface tension from it.
 //
-//The pressure solve needs no surface: its fluid is every voxel a particle's stencil reaches, a voxel or two past the particles. Viscosity and surface
-//tension act at the liquid's real surface, so when either is on, each substep finds it: the signed distance to the surface at every stored voxel's
-//centre, in voxels, negative inside (Particles::liquidLevel), in three steps.
+//The pressure solve needs no surface as it comes: its fluid is every voxel a particle's stencil reaches, a voxel or two past the particles. Viscosity and
+//surface tension act at the liquid's real surface, and the sharp free surface (freesurface.cu) solves for the liquid inside it, so when any of them is on,
+//each substep finds it: the signed distance to the surface at every stored voxel's centre, in voxels, negative inside (Particles::liquidLevel), in three
+//steps.
 //
 //1. The particles' field, after Zhu and Bridson: at a point, how far it is from the mean of the particles within reach of it, weighted by how near
 //   each is. Deep in the liquid the mean is the point itself; near the surface it leans inwards, by an amount that says how far off the surface is
@@ -33,7 +34,8 @@
 //the surface crosses between them. That's a discrete gradient of sigma*kappa*H over the same faces the pressure update covers, H being 1 in the
 //liquid's unknowns and 0 everywhere the pressure is 0, so wherever kappa is constant a pressure of sigma*kappa cancels it exactly: a still drop stays
 //still, and only the curvature's changes along the surface move anything. Nothing about the pressure equations changes. It's explicit, so the timestep
-//can't pass the time the shortest capillary wave takes to cross a voxel (Particles::capillaryDt), which only applies with surface tension on.
+//can't pass the time the shortest capillary wave takes to cross a voxel (Particles::capillaryDt), which only applies with surface tension on. The sharp
+//free surface takes the same curvature as the pressure at its surface instead, inside the solve (freesurface.cu), and none of this force.
 
 #include "particles.hu"
 #include "liquidTile.hu"
@@ -52,7 +54,6 @@ static constexpr int LEVEL_WIDTH = 12;              //a tile's side: a node's 4 
 static constexpr int LEVEL_SLOTS = LEVEL_WIDTH*LEVEL_WIDTH*LEVEL_WIDTH;
 static constexpr uint LEVEL_THREADS = 256;
 static constexpr float UNKNOWN_DISTANCE = 1e20f;    //a distance not yet known
-static constexpr float CURVED_WITHIN = 1.5f;        //voxels from the surface within which a voxel's curvature is worked out: the ones a crossing face lies between
 static constexpr float KEPT_WITHIN = 1.0f;          //and within which smoothing takes the level set as it is: every voxel that near is stored (the nearest
                                                     //unstored one has no particle in the voxels around it, so it's 1.25 or more outside)
 
@@ -473,9 +474,10 @@ __device__ inline void smoothTile(int passes, float*& from, float*& to){
 //The level set smoothed for the curvature, in two steps, as a tile has room for 4 passes that reach a slot each and the curvature's differences take
 //one: this one's 4 passes of blur leave the node's own voxels as passes over the whole grid would, and curveLevelSet's 3 more go on from that. Seven
 //passes take a particle-sized bump's curvature down to about 4% of a drop's 16 voxels across (3 leave 12%), and cost a drop that size about 1% of its
-//frequency. Only tiles holding a voxel near enough the surface for its curvature to be asked do anything: no other is read
-__global__ void smoothLevelSet(uint numUsedGridNodes, const uint* nodeCells, const uint* cellToNode, const uint* interiorVoxels, Grid grid, float wetting, const float* level,
-                               float* smoothed){
+//frequency. Only tiles holding a voxel near enough the surface for its curvature to be asked do anything: no other is read. The sharp free surface
+//takes fewer passes of its own (freesurface.cu)
+__global__ void smoothLevelSet(uint numUsedGridNodes, const uint* nodeCells, const uint* cellToNode, const uint* interiorVoxels, Grid grid, float wetting, int passes,
+                               const float* level, float* smoothed){
     __shared__ float fields[2][LEVEL_SLOTS];
     __shared__ char flags[2][LEVEL_SLOTS];
     __shared__ uint nodes[27];
@@ -491,7 +493,7 @@ __global__ void smoothLevelSet(uint numUsedGridNodes, const uint* nodeCells, con
         near = near || fabsf(from[slot]) < CURVED_WITHIN;
     }
     if(__syncthreads_or(near)){
-        smoothTile(4, from, to);
+        smoothTile(passes, from, to);
     }
     for(int slot = threadIdx.x; slot < LEVEL_SLOTS; slot += blockDim.x){
         int3 t = tile.at(slot);
@@ -634,11 +636,23 @@ void Particles::buildLevelSet(){
             raw, liquidLevel.devPtr());
     }
     context->fillGhosts(liquidLevel.devPtr(), stream);
+    if(freeSurfaceMode == FreeSurface::sharp){  //the pressure solve's surface: smoothed a little, so particles' unevenness doesn't become pressure (freesurface.cu)
+        surfaceLevel.resizeAsync(numVoxels, stream);
+        if(numVoxels > 0){
+            fillLevels<<<numVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numVoxels, LIQUID_BAND, surfaceLevel.devPtr());
+        }
+        if(numOwnNodes > 0 && numVoxels > 0){   //mirrored square on at the walls: the contact angle is the curvature's to impose, and tilted into the blur it
+                                                //would wet the floor beside a drop, or dry the drop's underside
+            smoothLevelSet<<<numOwnNodes, LEVEL_THREADS, 0, stream>>>(numUsedGridNodes, nodeCells.devPtr(), cellToNode.devPtr(), nodeInteriorVoxels.devPtr(), grid, 0.0f,
+                SURFACE_PASSES, liquidLevel.devPtr(), surfaceLevel.devPtr());
+        }
+        context->fillGhosts(surfaceLevel.devPtr(), stream);
+    }
     if(surfaceTension > 0.0){
         liquidCurvature.resizeAsync(numVoxels, stream);
         liquidCurvature.zeroDeviceAsync(stream);    //0 wherever it isn't worked out
         if(numOwnNodes > 0 && numVoxels > 0){   //the smoothed level set goes where the particles' field was: every voxel a tile reads gets one
-            smoothLevelSet<<<numOwnNodes, LEVEL_THREADS, 0, stream>>>(numUsedGridNodes, nodeCells.devPtr(), cellToNode.devPtr(), nodeInteriorVoxels.devPtr(), grid, wetting,
+            smoothLevelSet<<<numOwnNodes, LEVEL_THREADS, 0, stream>>>(numUsedGridNodes, nodeCells.devPtr(), cellToNode.devPtr(), nodeInteriorVoxels.devPtr(), grid, wetting, 4,
                 liquidLevel.devPtr(), raw);
         }
         context->fillGhosts(raw, stream);
@@ -656,8 +670,11 @@ void Particles::buildLevelSet(){
 }
 
 //adds dt of surface tension to the faces the surface crosses, or takes it back off, as pressureSolve's retry does with every force when it halves dt.
-//The ghosts' faces take their owners'
+//The ghosts' faces take their owners'. The sharp free surface has none of this: the solve itself holds the surface's pressure (freesurface.cu)
 void Particles::applySurfaceTension(bool takeBack){
+    if(freeSurfaceMode == FreeSurface::sharp){
+        return;
+    }
     double voxelSize = grid.cellSize / (2<<refinementLevel);
     float scale = (float)(dt*surfaceTension / (voxelSize*voxelSize));
     if(numOwnVoxels > 0){
@@ -671,8 +688,11 @@ void Particles::applySurfaceTension(bool takeBack){
 }
 
 //the longest timestep explicit surface tension holds for: the shortest capillary wave the grid carries mustn't cross a voxel in one (Brackbill, Kothe
-//and Zemach 1992)
+//and Zemach 1992), sqrt(rho dx^3 / (2 pi sigma)) with rho the mean of the densities either side of the surface. The footprint's surface has unknowns as
+//heavy as liquid on both sides, so that's the liquid's. The sharp surface has air on one, half of it: at the footprint's limit a drop at rest on a wall
+//loses a couple of particles in every thousand over 5 s, and at this one none
 double Particles::capillaryDt() const{
     double voxelSize = grid.cellSize / (2<<refinementLevel);
-    return std::sqrt(voxelSize*voxelSize*voxelSize / (2.0*M_PI*surfaceTension));
+    double sides = freeSurfaceMode == FreeSurface::sharp ? 0.5 : 1.0;
+    return std::sqrt(sides*voxelSize*voxelSize*voxelSize / (2.0*M_PI*surfaceTension));
 }

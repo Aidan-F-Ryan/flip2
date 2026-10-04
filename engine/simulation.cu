@@ -273,7 +273,8 @@ void Simulation::startCache(const std::string& directory, CacheDescription descr
 }
 
 void Simulation::writeCacheFrame(int frame){
-    int buffer = cacheWriter->acquire(CacheWriter::frameBytes(particlesHere()));    //emitters and sinks change the count from frame to frame
+    bool ids = cacheWriter->writesIds(), ages = cacheWriter->writesAges();
+    int buffer = cacheWriter->acquire(CacheWriter::frameBytes(particlesHere(), ids, ages));    //emitters and sinks change the count from frame to frame
     char* host = cacheWriter->hostBuffer(buffer);
     std::vector<CacheShard> shards;
     std::vector<cudaEvent_t> copies;
@@ -281,10 +282,10 @@ void Simulation::writeCacheFrame(int frame){
     for(int index = 0; index < numPartitions(); ++index){   //each copies its own planes straight from its GPU
         Particles& partition = *partitions[index];
         gpuErrchk(cudaSetDevice(partition.device()));
-        partition.copyFrameColumnsToHost((float*)(host + offset), cacheCopies[index][buffer]);
+        partition.copyFrameColumnsToHost((float*)(host + offset), ids, ages, cacheCopies[index][buffer]);
         shards.push_back({ranks[index], partition.numParticles(), offset});
         copies.push_back(cacheCopies[index][buffer]);
-        offset += CacheWriter::frameBytes(partition.numParticles());
+        offset += CacheWriter::frameBytes(partition.numParticles(), ids, ages);
     }
     gpuErrchk(cudaSetDevice(partitions[0]->device()));
     cacheWriter->submit(buffer, frame, partitions[0]->elapsedTime, shards, copies);
@@ -310,6 +311,7 @@ void Simulation::writeCheckpoint(int frame){
     state.time = partitions[0]->elapsedTime;
     state.substep = partitions[0]->substepIndex;
     state.apic = apic;
+    state.nextId = partitions[0]->nextId();
     cacheWriter->submitCheckpoint(buffer, frame, state, shards, copies);
 }
 

@@ -51,8 +51,18 @@ SCENES = {   #main's arguments after the frame count (and any environment it run
     "tension-drop": "scenes/tension-drop.json",     #a stretched drop in zero gravity, pulled back and past round by surface tension (engine/levelset.cu)
     "tension-sessile": "scenes/tension-sessile.json",   #half a drop on the floor in zero gravity, spreading to meet it at a 60 degree contact angle
     "viscous-dam": "scenes/viscous-dam.json",       #a dam break of syrup around a box: viscosity, sticking to the floor, the walls and the box (engine/viscosity.cu)
+    "dam16-sharp": (["0.95", "0.1", "16"], {"FLIP2_FREE_SURFACE": "sharp"}),           #dam16 with the sharp free surface (engine/freesurface.cu)
+    "tank-sharp": (["0.95", "0.1", "tank", "16"], {"FLIP2_FREE_SURFACE": "sharp"}),    #the still tank with it: nothing much should move
+    "tension-drop-sharp": "scenes/tension-drop-sharp.json",     #tension-drop with it: surface tension as the surface's pressure, not a force
+    "tank-box-sharp": "scenes/tank-box-sharp.json", #tank-box with it: an obstacle's cut faces and the surface's together
+    "viscous-dam-sharp": "scenes/viscous-dam-sharp.json",       #viscous-dam with it: the viscous step between two solves with the sharp surface
+    "force-volume": "scenes/force-volume.json",     #a drop in zero gravity pushed by a VDB of accelerations (needs OpenVDB): 0.3 m/s^2 along x everywhere
+    "velocity-volume": "scenes/velocity-volume.json",   #and drawn to a VDB of velocities: towards 0.2 m/s along x, at 4 a second
+    "linear-volume": "scenes/linear-volume.json",   #accelerations that change across the drop, each component by another axis: where the volume is, and which way round
+    "patch-volume": "scenes/patch-volume.json",     #a drop crossing the part of a velocity VDB that isn't active, which does nothing, into the part that is
+    "strain-volume": "scenes/strain-volume.json",   #accelerations from a staggered VDB, each component changing along its own axis, where its faces are
 }
-DEFAULT_SCENES = ["dam16", "tank", "swirl", "swirl-apic", "nozzle", "drain", "forces", "tank-box", "paddle", "tank-meshsphere", "tank-pulse", "mesh-sources", "tank-vdbspin", "sealed-pulse", "sealed-box", "tension-drop", "tension-sessile", "viscous-dam"]
+DEFAULT_SCENES = ["dam16", "tank", "swirl", "swirl-apic", "nozzle", "drain", "forces", "tank-box", "paddle", "tank-meshsphere", "tank-pulse", "mesh-sources", "tank-vdbspin", "sealed-pulse", "sealed-box", "tension-drop", "tension-sessile", "viscous-dam", "dam16-sharp", "tank-sharp", "tension-drop-sharp", "tank-box-sharp", "viscous-dam-sharp", "force-volume", "velocity-volume", "linear-volume", "patch-volume", "strain-volume"]
 
 EXACT = ["particles", "hash", "occupiedVoxels", "perVoxel", "core", "substeps", "time", "dtMin", "dtMax", "lowest", "highest", "fastest"]
 SUMS = ["kineticEnergy", "momentum", "angularMomentum", "centroid"]

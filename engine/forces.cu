@@ -1,6 +1,7 @@
 //Copyright 2023 Aberrant Behavior LLC
 
 #include "forces.hu"
+#include <algorithm>
 
 //Gravity, as applyGravity and removeGravity did it on y, on whichever axes it has. The same expressions, so the same bits
 __global__ void addGravity(uint numVoxels, float3 gravity, float dt, const char* solids, float* ux, float* uy, float* uz){
@@ -113,8 +114,48 @@ __device__ inline float fade(float r, float radius, float falloff){
     return radius <= 0.0f ? 1.0f : r >= radius ? 0.0f : powf(1.0f - r/radius, falloff);
 }
 
-//a field's acceleration of the dim face at point, which has velocity before any force and lies depth voxels inside the fluid's footprint
-__device__ float fieldAcceleration(const ForceField& field, int dim, float3 point, float time, float before, int depth){
+//a volume's vector at p: trilinear between the 8 samples around it, as sdfVelocity reads a level set's velocities. Where the volume has nothing, past
+//its bounds, in its bricks without samples or at samples past its active voxels, it's 0, and coverage is how much of the weight fell on what is the
+//volume's own: a velocity of 0 can then be told from no velocity at all
+__device__ inline float3 volumeVector(const SolidSDF& volume, float3 p, float& coverage){
+    const int samples = SDF_BRICK*SDF_BRICK*SDF_BRICK;
+    float q[3] = {(p.x - volume.origin.x) / volume.spacing, (p.y - volume.origin.y) / volume.spacing, (p.z - volume.origin.z) / volume.spacing};
+    int i[3];
+    float f[3];
+    #pragma unroll
+    for(int axis = 0; axis < 3; ++axis){
+        i[axis] = (int)floorf(q[axis]);
+        f[axis] = q[axis] - i[axis];
+    }
+    float3 sum = make_float3(0.0f, 0.0f, 0.0f);
+    coverage = 0.0f;
+    if(i[0] < -1 || i[1] < -1 || i[2] < -1 || i[0] >= volume.bricks.x*SDF_BRICK || i[1] >= volume.bricks.y*SDF_BRICK || i[2] >= volume.bricks.z*SDF_BRICK){
+        return sum;     //well outside it: most faces, for a small volume
+    }
+    #pragma unroll
+    for(int corner = 0; corner < 8; ++corner){
+        int x = i[0] + (corner & 1), y = i[1] + (corner >> 1 & 1), z = i[2] + (corner >> 2);
+        if(x < 0 || y < 0 || z < 0 || x >= volume.bricks.x*SDF_BRICK || y >= volume.bricks.y*SDF_BRICK || z >= volume.bricks.z*SDF_BRICK){
+            continue;
+        }
+        int entry = volume.table[x/SDF_BRICK + volume.bricks.x*(y/SDF_BRICK + volume.bricks.y*(z/SDF_BRICK))];
+        if(entry < 0){
+            continue;
+        }
+        float weight = (corner & 1 ? f[0] : 1.0f - f[0])*(corner >> 1 & 1 ? f[1] : 1.0f - f[1])*(corner >> 2 ? f[2] : 1.0f - f[2]);
+        int within = x%SDF_BRICK + SDF_BRICK*(y%SDF_BRICK + SDF_BRICK*(z%SDF_BRICK));
+        size_t at = (size_t)entry*3*samples + within;
+        sum.x += weight*volume.velocities[at];
+        sum.y += weight*volume.velocities[at + samples];
+        sum.z += weight*volume.velocities[at + 2*samples];
+        coverage += weight*volume.pool[(size_t)entry*samples + within];
+    }
+    return sum;
+}
+
+//a field's acceleration of the dim face at point over a substep of dt, which has velocity before any force and lies depth voxels inside the fluid's
+//footprint
+__device__ float fieldAcceleration(const ForceField& field, int dim, float3 point, float time, float dt, float before, int depth){
     switch(field.kind){
         case FORCE_POINT:{
             float3 towards = make_float3(field.position.x - point.x, field.position.y - point.y, field.position.z - point.z);
@@ -134,6 +175,16 @@ __device__ float fieldAcceleration(const ForceField& field, int dim, float3 poin
             float3 p = make_float3(point.x/field.scale + 0.31f*drift, point.y/field.scale + 0.83f*drift, point.z/field.scale + 0.47f*drift);
             float3 swirl = curlNoise(p, field.seed);
             return field.strength*(&swirl.x)[dim];
+        }
+        case FORCE_VOLUME:{
+            float coverage;
+            float3 vector = volumeVector(field.volume, point, coverage);
+            if(field.mode == VOLUME_FORCE){
+                return field.strength*(&vector.x)[dim];
+            }
+            //towards the volume's velocity where it has one, by as much of the gap as drag closes in dt, so a strong drag over a long substep can't
+            //overshoot it; from the velocity before any force, as wind is, so taking it back off is exact
+            return -expm1f(-field.drag*dt)/dt*(field.strength*(&vector.x)[dim] - coverage*before);
         }
         default:    //FORCE_WIND
             return depth <= field.depth ? field.drag*((&field.velocity.x)[dim] - before) : 0.0f;
@@ -166,7 +217,7 @@ __global__ void addForceFields(Forces forces, bool takeBack, float dt, float tim
             float before = voxels.before[dim][index];
             float acceleration = 0.0f;
             for(int field = 0; field < forces.numFields; ++field){
-                acceleration += fieldAcceleration(forces.fields[field], dim, point, time, before, depth);
+                acceleration += fieldAcceleration(forces.fields[field], dim, point, time, dt, before, depth);
             }
             if(takeBack){
                 voxels.velocities[dim][index] -= acceleration*dt;
@@ -193,4 +244,38 @@ void applyForces(const Forces& forces, bool takeBack, float dt, double time, con
         addForceFields<<<voxels.numNodes, 128, 0, stream>>>(forces, takeBack, dt, (float)time, voxels);
         gpuErrchk(cudaPeekAtLastError());
     }
+}
+
+SolidSDF uploadForceVolume(const SceneField& field, cudaStream_t stream){
+    static_assert(SDF_BRICK == 8 && SDF_OUTSIDE == -1, "SceneField's layout (scene.hpp) has to be SolidSDF's");
+    SolidSDF volume = {};
+    volume.origin = make_float3((float)field.origin[0], (float)field.origin[1], (float)field.origin[2]);
+    volume.spacing = (float)field.spacing;
+    volume.bricks = make_int3(field.bricks[0], field.bricks[1], field.bricks[2]);
+    int* table = nullptr;
+    float* vectors = nullptr;
+    float* own = nullptr;
+    gpuErrchk(cudaMalloc((void**)&table, sizeof(int)*std::max(field.table.size(), (size_t)1)));
+    gpuErrchk(cudaMalloc((void**)&vectors, sizeof(float)*std::max(field.velocities.size(), (size_t)1)));
+    gpuErrchk(cudaMalloc((void**)&own, sizeof(float)*std::max(field.pool.size(), (size_t)1)));
+    if(!field.table.empty()){    //from pageable memory, so they're copied before this returns
+        gpuErrchk(cudaMemcpyAsync(table, field.table.data(), sizeof(int)*field.table.size(), cudaMemcpyHostToDevice, stream));
+    }
+    if(!field.velocities.empty()){
+        gpuErrchk(cudaMemcpyAsync(vectors, field.velocities.data(), sizeof(float)*field.velocities.size(), cudaMemcpyHostToDevice, stream));
+        gpuErrchk(cudaMemcpyAsync(own, field.pool.data(), sizeof(float)*field.pool.size(), cudaMemcpyHostToDevice, stream));
+    }
+    volume.table = table;
+    volume.velocities = vectors;
+    volume.pool = own;
+    return volume;
+}
+
+void freeForceVolume(SolidSDF& volume){
+    if(volume.table != nullptr){
+        cudaFree(const_cast<int*>(volume.table));
+        cudaFree(const_cast<float*>(volume.velocities));
+        cudaFree(const_cast<float*>(volume.pool));
+    }
+    volume = {};
 }

@@ -11,6 +11,17 @@
 //beside the surface. A place nothing is stored reads as this far outside
 #define LIQUID_BAND 4.0f
 
+//voxels from the surface within which a voxel's curvature is worked out (levelset.cu): the ones a face the surface crosses lies between
+static constexpr float CURVED_WITHIN = 1.5f;
+
+//passes of blur over the level set the sharp free surface's pressure solve uses (Particles::surfaceLevel, freesurface.cu). The particles' unevenness
+//moves the level set's surface up and down a tenth of a voxel or so from one column of voxels to the next, and the solve turns that into pressure,
+//about g dt times as much velocity. Two passes take it down six times, and move a curved surface in by 4/3 its curvature, in voxels. It has to be an
+//even number: one pass of an even blur over 3 voxels turns ripples that alternate from one column of voxels to the next upside down, a third their
+//size (its response there is negative), so the solve pushes each the way that grows it: a still tank churns at half a metre a second with 1 pass, and
+//a fifth of one with 3. Four are no steadier than two
+static constexpr int SURFACE_PASSES = 2;
+
 //how much of a voxel-sized box is liquid, from the level set at its centre: half at the surface, and all or none of it half a voxel either side. Exact
 //for a flat surface facing along an axis, and it moves smoothly with any surface, so nothing pops as the liquid crosses a voxel
 __device__ inline float liquidFraction(float level){

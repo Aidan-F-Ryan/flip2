@@ -43,6 +43,7 @@ add_library(particles STATIC
     pockets.cu
     levelset.cu
     viscosity.cu
+    freesurface.cu
     cacheWriter.cu
 )
 

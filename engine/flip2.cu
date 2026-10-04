@@ -438,8 +438,8 @@ static bool makeDirectory(const std::string& path){
 
 //flip2 export: the cache's committed frames, as files DCCs load natively. For now Houdini's: OUT/particles.NNNN.bgeo.sc (OUT is DIR/export/houdini
 //unless --out says; .bgeo, uncompressed, with format "bgeo"), each a frame's every shard in one point cloud, in rank order (the order one partition would
-//have held them), with P and v (bgeo.cu). Frame NNNN is the cache's: frame 0 is the start, at time 0. Frames are picked, redone and followed as
-//eachCommittedFrame says
+//have held them), with P and v, and id and age if the cache's frames carry them (bgeo.cu). Frame NNNN is the cache's: frame 0 is the start, at time
+//0. Frames are picked, redone and followed as eachCommittedFrame says
 static int exportCache(const std::string& directory, int first, int last, std::string out, bool overwrite, bool follow, const std::string& format){
     if(out.empty()){
         out = directory + "/export/houdini";
@@ -615,7 +615,9 @@ static FluidShape toFluidShape(const SceneShape& shape, std::vector<SceneObstacl
 
 static ForceField toForceField(const SceneForce& force){
     ForceField field;
-    field.kind = force.kind == SceneForce::POINT ? FORCE_POINT : force.kind == SceneForce::VORTEX ? FORCE_VORTEX : force.kind == SceneForce::TURBULENCE ? FORCE_TURBULENCE : FORCE_WIND;
+    field.kind = force.kind == SceneForce::POINT ? FORCE_POINT : force.kind == SceneForce::VORTEX ? FORCE_VORTEX : force.kind == SceneForce::TURBULENCE ? FORCE_TURBULENCE :
+                 force.kind == SceneForce::VOLUME ? FORCE_VOLUME : FORCE_WIND;
+    field.mode = force.velocities ? VOLUME_VELOCITY : VOLUME_FORCE;
     field.position = make_float3((float)force.position[0], (float)force.position[1], (float)force.position[2]);
     double length = std::sqrt(force.axis[0]*force.axis[0] + force.axis[1]*force.axis[1] + force.axis[2]*force.axis[2]);
     field.axis = length > 0.0 ? make_float3((float)(force.axis[0]/length), (float)(force.axis[1]/length), (float)(force.axis[2]/length)) : make_float3(0.0f, 1.0f, 0.0f);
@@ -651,6 +653,8 @@ struct Checkpoint{
     unsigned long long substep = 0;
     bool apic = false;
     unsigned long long particles = 0;
+    bool hasNextId = false;     //one from before particles had ids has none
+    unsigned long long nextId = 0;
     std::string sceneHash;
     std::vector<uint> planes;   //its ranks' first node planes, and the last one's end
     struct State{
@@ -700,6 +704,10 @@ static bool newestCheckpoint(const std::string& directory, Checkpoint& out, std:
         out.substep = (unsigned long long)need("substep")->number;
         out.apic = need("apic")->boolean;
         out.particles = (unsigned long long)need("particles")->number;
+        if(const Json* nextId = record.find("nextId")){
+            out.hasNextId = true;
+            out.nextId = (unsigned long long)nextId->number;
+        }
         out.sceneHash = need("sceneXxh64")->text;
         for(const Json& plane : need("partitionPlanes")->items){
             out.planes.push_back((uint)plane.number);
@@ -725,11 +733,12 @@ static bool newestCheckpoint(const std::string& directory, Checkpoint& out, std:
 }
 
 //the checkpoint's particles in the ranks whose planes overlap node planes [low, high), in rank order: the order one partition would hold them in. Each
-//state shard is checked against its record's XXH64 as it's read
+//state shard is checked against its record's XXH64 as it's read. ids and births come back empty from a checkpoint made before particles had them
 static bool loadCheckpoint(const std::string& directory, const Checkpoint& checkpoint, uint low, uint high, std::vector<double>& x, std::vector<double>& y,
                            std::vector<double>& z, std::vector<float>& u, std::vector<float>& v, std::vector<float>& w,
-                           std::vector<std::vector<float>>& gradients, std::string& why){
+                           std::vector<std::vector<float>>& gradients, std::vector<uint>& ids, std::vector<float>& births, std::string& why){
     gradients.assign(9, {});
+    bool identified = true;
     for(const Checkpoint::State& state : checkpoint.states){
         if(checkpoint.planes[state.rank] >= high || checkpoint.planes[state.rank + 1] <= low){
             continue;
@@ -760,6 +769,23 @@ static bool loadCheckpoint(const std::string& directory, const Checkpoint& check
                 gradients[k].insert(gradients[k].end(), c + k*count, c + (k + 1)*count);
             }
         }
+        const ShardData::Attribute* id = shard.find("id");
+        const ShardData::Attribute* birth = shard.find("birth");
+        if(id != nullptr && birth != nullptr && id->type == 3 && birth->type == 1 && id->components == 1 && birth->components == 1){
+            const uint64_t* i = (const uint64_t*)id->planes.data();     //the engine keeps their low 32 bits
+            const float* b = (const float*)birth->planes.data();
+            for(size_t particle = 0; particle < count; ++particle){
+                ids.push_back((uint)i[particle]);
+            }
+            births.insert(births.end(), b, b + count);
+        }
+        else{
+            identified = false;
+        }
+    }
+    if(!identified){
+        ids.clear();
+        births.clear();
     }
     return true;
 }
@@ -1026,6 +1052,8 @@ int main(int argc, char** argv){
     std::vector<double> x, y, z;
     std::vector<float> u, v, w;
     std::vector<std::vector<float>> gradients;
+    std::vector<uint> ids;
+    std::vector<float> births;
     if(resuming){   //every rank's particles here, or across processes, those of the checkpoint's ranks whose planes overlap this rank's
         uint low = 0, high = scene.nodes[2];
         if(!alone){
@@ -1037,8 +1065,14 @@ int main(int argc, char** argv){
             high = planes[myRank + 1];
         }
         std::string why;
-        if(!loadCheckpoint(scene.outputDirectory, checkpoint, low, high, x, y, z, u, v, w, gradients, why)){
+        if(!loadCheckpoint(scene.outputDirectory, checkpoint, low, high, x, y, z, u, v, w, gradients, ids, births, why)){
             return failure(why);
+        }
+        if((ids.empty() && !x.empty()) || !checkpoint.hasNextId){   //made before particles had ids: they're numbered as they come, from here on
+            std::cerr<<scene.outputDirectory<<": its checkpoint has no particle ids, so they start again from this frame"<<(alone ? "" : ", and ranks in separate "
+                       "processes will hand out the same ones")<<"\n";
+            ids.clear();
+            births.clear();
         }
     }
     else{
@@ -1086,6 +1120,9 @@ int main(int argc, char** argv){
     if(resuming && scene.transfer == "apic" && checkpoint.apic){    //otherwise, as at the start, they have none
         simulation->setAffine(gradients);
     }
+    if(resuming && !ids.empty()){
+        simulation->setIdentities(ids, births, checkpoint.nextId);
+    }
     simulation->setDensityCorrectionTime(scene.densityCorrectionTime);
     simulation->setCfl(scene.cfl);
     simulation->setPressureSolver(scene.pressureSolver == "sor" ? PressureSolver::sor : scene.pressureSolver == "cg" ? PressureSolver::cg :
@@ -1097,11 +1134,20 @@ int main(int argc, char** argv){
     simulation->setSurfaceTension(scene.surfaceTension / scene.density);
     simulation->setContactAngle(scene.contactAngle);
     simulation->setViscousCfl(scene.viscousCfl);
+    simulation->setFreeSurface(scene.freeSurface == "sharp" ? FreeSurface::sharp : FreeSurface::footprint);
     std::vector<ForceField> fields;
+    std::vector<std::shared_ptr<const SceneField>> volumes;     //each volume force's vectors, which every partition puts on its own GPU
     for(const SceneForce& force : scene.forces){
         fields.push_back(toForceField(force));
+        volumes.push_back(force.field);
+        if(force.kind == SceneForce::VOLUME && force.field && printsEvents){
+            const SceneField& f = *force.field;
+            std::cerr<<"Force volume: "<<f.velocities.size()/(3*512)<<" bricks of "<<f.spacing<<" m samples, from ("<<f.low[0]<<", "<<f.low[1]<<", "<<f.low[2]<<") to ("
+                     <<f.high[0]<<", "<<f.high[1]<<", "<<f.high[2]<<"), its longest vector "<<f.fastest<<(force.velocities ? " m/s" : " m/s^2")<<" ("
+                     <<std::round((f.velocities.size() + f.pool.size())*sizeof(float)/104857.6)/10.0<<" MB)\n";
+        }
     }
-    simulation->setForceFields(fields);
+    simulation->setForceFields(fields, volumes);
     Sources sources;
     sources.latticePerSide = scene.particlesPerVoxel == 27 ? 3 : scene.particlesPerVoxel == 8 ? 2 : 1;
     sources.seed = scene.seed;
@@ -1131,6 +1177,8 @@ int main(int argc, char** argv){
         description.fps = scene.fps;
         description.frames = scene.frames;
         description.compression = scene.compression;
+        description.ids = scene.writeIds;
+        description.ages = scene.writeAges;
         description.keepCheckpoints = scene.keepCheckpoints;
         simulation->startCache(scene.outputDirectory, description, resuming ? checkpoint.frame : -1, [](const char* what, int frame){
             event("{\"event\":\"" + std::string(what) + "\",\"frame\":" + std::to_string(frame) + "}");

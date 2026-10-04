@@ -355,7 +355,7 @@ Scene loadScene(const std::string& path){
     }
 
     if(const Json* solver = read.object(root, "solver", "the scene")){
-        read.checkKeys(*solver, "solver", {"flipRatio", "cfl", "densityCorrectionTime", "pressureSolver", "advection", "dotProducts", "transfer", "viscousCfl"});
+        read.checkKeys(*solver, "solver", {"flipRatio", "cfl", "densityCorrectionTime", "pressureSolver", "advection", "dotProducts", "transfer", "viscousCfl", "freeSurface"});
         scene.flipRatio = read.number(*solver, "flipRatio", "solver", scene.flipRatio);
         scene.cfl = read.number(*solver, "cfl", "solver", scene.cfl);
         scene.densityCorrectionTime = read.number(*solver, "densityCorrectionTime", "solver", scene.densityCorrectionTime);
@@ -364,6 +364,7 @@ Scene loadScene(const std::string& path){
         scene.dotProducts = read.text(*solver, "dotProducts", "solver", scene.dotProducts);
         scene.transfer = read.text(*solver, "transfer", "solver", scene.transfer);
         scene.viscousCfl = read.number(*solver, "viscousCfl", "solver", scene.viscousCfl);
+        scene.freeSurface = read.text(*solver, "freeSurface", "solver", scene.freeSurface);
         if(scene.pressureSolver != "multigrid" && scene.pressureSolver != "cg" && scene.pressureSolver != "jacobi" && scene.pressureSolver != "sor"){
             read.fail("solver.pressureSolver", "is multigrid, cg, jacobi or sor");
         }
@@ -375,6 +376,9 @@ Scene loadScene(const std::string& path){
         }
         if(scene.dotProducts != "exact" && scene.dotProducts != "blocks"){
             read.fail("solver.dotProducts", "is exact or blocks");
+        }
+        if(scene.freeSurface != "footprint" && scene.freeSurface != "sharp"){
+            read.fail("solver.freeSurface", "is footprint or sharp");
         }
         if(scene.cfl <= 0.0 || scene.flipRatio < 0.0 || scene.flipRatio > 1.0 || scene.densityCorrectionTime < 0.0 || !(scene.viscousCfl >= 0.0)){
             read.fail("solver", "cfl has to be positive, flipRatio between 0 and 1, and densityCorrectionTime and viscousCfl at least 0");
@@ -710,8 +714,28 @@ Scene loadScene(const std::string& path){
                     read.fail(where, "drag and depth can't be negative");
                 }
             }
+            else if(type == "volume"){
+                force.kind = SceneForce::VOLUME;
+                read.checkKeys(item, where, {"type", "vdb", "grid", "mode", "strength", "drag"});
+                std::string mode = read.text(item, "mode", where, "force");
+                if(mode != "force" && mode != "velocity"){
+                    read.fail(where + ".mode", "is force or velocity, not \"" + mode + "\"");
+                }
+                force.velocities = mode == "velocity";
+                force.strength = read.number(item, "strength", where, 1.0);
+                force.drag = read.number(item, "drag", where, force.drag);
+                if(force.drag < 0.0){
+                    read.fail(where, "drag can't be negative");
+                }
+                if(read.text(item, "vdb", where, "").empty()){
+                    read.fail(where, "a volume force needs a \"vdb\": the file its vectors are in");
+                }
+                naming(where, [&]{
+                    force.field = loadVectorField(resolve(read.text(item, "vdb", where, "")), read.text(item, "grid", where, ""), scene.voxelSize());
+                });
+            }
             else{
-                read.fail(where + ".type", "is point, vortex, turbulence or wind, not \"" + type + "\"");
+                read.fail(where + ".type", "is point, vortex, turbulence, wind or volume, not \"" + type + "\"");
             }
             scene.forces.push_back(force);
         }
@@ -723,12 +747,23 @@ Scene loadScene(const std::string& path){
         read.fail("the scene", "partitions has to be at least 1 and devices at least 0");
     }
     if(const Json* output = read.object(root, "output", "the scene")){
-        read.checkKeys(*output, "output", {"dir", "cache", "compression", "checkpoints", "positions", "diagnostics"});
+        read.checkKeys(*output, "output", {"dir", "cache", "compression", "attributes", "checkpoints", "positions", "diagnostics"});
         scene.outputDirectory = read.text(*output, "dir", "output", scene.outputDirectory);
         scene.writeCache = read.flag(*output, "cache", "output", scene.writeCache);
         scene.compression = read.text(*output, "compression", "output", scene.compression);
         if(scene.compression != "zstd" && scene.compression != "lz4" && scene.compression != "none"){
             read.fail("output.compression", "is \"" + scene.compression + "\"; it can be \"zstd\", \"lz4\" or \"none\"");
+        }
+        if(const Json* attributes = read.array(*output, "attributes", "output")){
+            scene.writeIds = scene.writeAges = false;
+            for(const Json& attribute : attributes->items){
+                bool id = attribute.kind == Json::STRING && attribute.text == "id", age = attribute.kind == Json::STRING && attribute.text == "age";
+                if(!id && !age){
+                    read.fail("output.attributes", "lists what the frames carry besides P and v, each \"id\" or \"age\"");
+                }
+                scene.writeIds = scene.writeIds || id;
+                scene.writeAges = scene.writeAges || age;
+            }
         }
         if(const Json* checkpoints = read.object(*output, "checkpoints", "output")){
             read.checkKeys(*checkpoints, "output.checkpoints", {"every", "keep"});

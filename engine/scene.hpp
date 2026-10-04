@@ -14,7 +14,9 @@
 //               "open": []},                                               //faces that delete the fluid reaching them: "-x", "+x", "-y", "+y", "-z", "+z"
 //    "solver": {"flipRatio": 0.95, "cfl": 4, "densityCorrectionTime": 0.1, "pressureSolver": "multigrid", "advection": "rk3", "dotProducts": "exact",
 //               "transfer": "flip",                                        //or "apic": particles carry their velocity's gradient; flipRatio 0 for pure APIC
-//               "viscousCfl": 6},                                          //with viscosity: voxels it may spread across in a substep; 0 for no limit
+//               "viscousCfl": 6,                                           //with viscosity: voxels it may spread across in a substep; 0 for no limit
+//               "freeSurface": "footprint"},                               //or "sharp": the pressure is 0 at the level set's surface (ghost fluid),
+//                                                                           //which costs more a substep and, with surface tension, 0.7 the timestep
 //    "gravity": [0, -9.8, 0],
 //    "liquid": {"density": 1000, "viscosity": 0, "surfaceTension": 0,       //kg/m^3; Pa s, dynamic (water 0.001, honey 2 to 10); N/m (water 0.073). With
 //               "contactAngle": 60},                                        //viscosity, it sticks to walls and obstacles; with surface tension, the
@@ -35,9 +37,17 @@
 //    "forces": [{"type": "point", "position": [...], "strength": 9.8, "radius": 0, "falloff": 1},       //strength in m/s^2, towards it (negative: away)
 //               {"type": "vortex", "position": [...], "axis": [0, 1, 0], "strength": 5, "radius": 0, "falloff": 1},
 //               {"type": "turbulence", "strength": 2, "scale": 0.1, "speed": 0.5, "seed": 0},
-//               {"type": "wind", "velocity": [2, 0, 0], "drag": 1, "depth": 2}],               //drag per second, on the voxels within depth of the surface
+//               {"type": "wind", "velocity": [2, 0, 0], "drag": 1, "depth": 2},                //drag per second, on the voxels within depth of the surface
+//               {"type": "volume", "vdb": "push.vdb", "grid": "", "mode": "force",             //a VDB of vectors (its first, or the one grid names), fixed in
+//                "strength": 1, "drag": 1}],                                                    //the world, acting where it has active voxels and not
+//                                                                                               //elsewhere: accelerations in m/s^2 times strength, or with
+//                                                                                               //mode "velocity", velocities times strength, which the
+//                                                                                               //fluid there takes up at drag per second
 //    "partitions": 1, "devices": 0,
 //    "output": {"dir": ".", "cache": true, "compression": "zstd",           //the cache DCCs read (cacheWriter.hu), in dir; "zstd", "lz4" or "none"
+//               "attributes": ["id", "age"],                               //what its frames carry besides P and v: each particle's id, which it keeps
+//                                                                          //and no other ever has, and its age in seconds. 12 bytes a particle
+//                                                                          //between them, about 3 once compressed
 //               "checkpoints": {"every": 10, "keep": 2},                   //in the cache, for flip2 resume: every so many frames (0: only on cancel and at
 //                                                                          //the end), keeping the newest few
 //               "positions": false, "diagnostics": ""}                     //N.bin, float32 x, y, z per particle; diagnostics: a file name in dir, or ""
@@ -49,7 +59,9 @@
 #include <vector>
 
 //A distance field in the engine's own sparse layout (SolidSDF, obstacles.hu), sampled at the domain's voxel size: what a VDB level set is resampled to
-//(volumes.hpp). Bricks of 8^3 samples cover its bounds, x fastest; only those near its surface hold samples, and the rest are all inside or all outside
+//(volumes.hpp). Bricks of 8^3 samples cover its bounds, x fastest; only those near its surface hold samples, and the rest are all inside or all outside.
+//A force's volume of vectors is kept the same way, at its own spacing: table says which bricks hold samples, velocities holds the vectors, and pool, in
+//place of distances, how much of each sample is the volume's own: 1 among its active voxels, 0 past them, where its vector is 0 too
 struct SceneField{
     double origin[3] = {0.0, 0.0, 0.0};     //sample (0, 0, 0)
     double spacing = 0.0;                   //between samples
@@ -103,7 +115,7 @@ struct SceneShape{
 };
 
 struct SceneForce{
-    enum Kind{POINT, VORTEX, TURBULENCE, WIND};
+    enum Kind{POINT, VORTEX, TURBULENCE, WIND, VOLUME};
     Kind kind = POINT;
     double position[3] = {0.0, 0.0, 0.0};   //point: where it pulls to; vortex: a point on its axis
     double axis[3] = {0.0, 1.0, 0.0};       //vortex: its axis, which needn't be unit length
@@ -114,8 +126,10 @@ struct SceneForce{
     double scale = 0.1;                     //turbulence: the size of its eddies
     double speed = 0.5;                     //turbulence: how fast its pattern drifts, in eddies per second
     unsigned int seed = 0;                  //turbulence
-    double drag = 1.0;                      //wind: how quickly the surface takes up its velocity, per second
+    double drag = 1.0;                      //wind: how quickly the surface takes up its velocity, per second; volume, in velocity mode: the fluid inside it
     double depth = 2.0;                     //wind: how many voxels below the surface it reaches
+    std::shared_ptr<const SceneField> field;    //volume: its vectors (volumes.hpp's loadVectorField); strength scales them
+    bool velocities = false;                //volume: whether they're velocities to take up, rather than accelerations
 };
 
 struct Scene{
@@ -133,6 +147,7 @@ struct Scene{
     std::string dotProducts = "exact";
     std::string transfer = "flip";
     double viscousCfl = 6.0;        //with viscosity: voxels it may spread across in a substep; 0 for no limit
+    std::string freeSurface = "footprint";  //or "sharp": where the pressure solve puts the liquid's surface (FreeSurface, particles.hu)
     double gravity[3] = {0.0, -9.8, 0.0};
     double density = 1000.0;        //the liquid's, kg/m^3: what turns its viscosity and surface tension into accelerations
     double viscosity = 0.0;         //dynamic, Pa s
@@ -151,6 +166,8 @@ struct Scene{
     std::string outputDirectory = ".";
     bool writeCache = true;     //frames/NNNN/ and cache.json in the output directory (cacheWriter.hu)
     std::string compression = "zstd";   //of the cache's shards: "zstd" or "lz4" (blosc), or "none"
+    bool writeIds = true;       //whether the cache's frames carry each particle's "id"
+    bool writeAges = true;      //and its "age"
     int checkpointEvery = 10;   //frames between the cache's checkpoints: 0 for none but on cancel and at the end
     int keepCheckpoints = 2;    //the newest kept
     bool writePositions = false;    //N.bin, float32 x, y, z per particle, gathered into one file per frame: for quick looks

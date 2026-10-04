@@ -16,6 +16,11 @@ collisions: with more names than that, the still ones go as one object, and if n
 VDBs in the Collisions input stay volumes: a level set that's still (with a velocity VDB beside it, if there is one: named after it with "vel" on the
 end, or "vel" or "v") or moved rigidly goes to flip2 as it is. One that changes shape over time flip2 can't take yet.
 
+Forces come from a SOP too, but one named on the Forces tab, as a subnet has only the four inputs: every vector VDB it holds is a force on the fluid
+wherever it has active voxels, and nothing elsewhere. Its vectors are accelerations, which push the fluid, or velocities, which the fluid inside it is
+drawn to at Drag a second: Volumes Are says which, or leaves it to each volume's name. flip2 takes them as they are at the start frame; it doesn't yet
+take ones that change over time.
+
 Everything goes in the output directory ($HIP/geo/<scene>.<node> by default, beside File Cache's caches): scene.json and geo/ (what the node writes), bake/ (flip2's cache, which a
 running bake commits frames to, and export/houdini/ beside it) and logs/. The bake's frame 0 is the start frame, and the node shows it there: its
 surface, its particles or both (Show).
@@ -60,12 +65,15 @@ i@flip2_c = corners == 3 ? primpoint(0, @primnum, 2) : -1;
 """
 SOLIDS = 'if(primintrinsic(0, "typename", @primnum) == "VDB") removeprim(0, @primnum, 1);'      #the Collisions input without its VDBs, and only them
 VOLUMES = 'if(primintrinsic(0, "typename", @primnum) != "VDB") removeprim(0, @primnum, 1);'
+VECTORS = 'if(!match("vec3*", primintrinsic(0, "vdb_value_type", @primnum))) removeprim(0, @primnum, 1);'     #of VDBs, only those of vectors
 VOLUME_FILE = "collision_volumes.vdb"
+FORCE_FILE = "force_volumes.vdb"
 LIMIT = 16      #the obstacles flip2 takes, and the meshes among its fluids, emitters and sinks
+FORCE_LIMIT = 16    #and the forces
 SURFACE_DEFAULTS = {"influencescale": (3.0,), "radiusscale": (0.8,), "smoothing": (4,)}     #flip2 mesh's own
 OLD_SURFACE_DEFAULTS = {"influencescale": 2.0, "radiusscale": 0.6, "smoothing": 2}         #what they were, which left the surface dimpled
 _jobs = {}      #per node path, its bake's processes, while this session runs them
-GEO_FILE = re.compile(r"^((%s)\d+_(triangles|vertices|f-?\d+)\.npy|collision_volumes\.vdb)$" % "|".join(ROLES))    #the files write_scene writes into geo/
+GEO_FILE = re.compile(r"^((%s)\d+_(triangles|vertices|f-?\d+)\.npy|(collision|force)_volumes\.vdb)$" % "|".join(ROLES))    #the files write_scene writes into geo/
 
 
 def _callback(function):
@@ -89,6 +97,13 @@ def _interface(node):
     simulation.addParmTemplate(hou.IntParmTemplate("startframe", "Start Frame", 1, default_expression=("$FSTART",)))
     simulation.addParmTemplate(hou.IntParmTemplate("endframe", "End Frame", 1, default_expression=("$FEND",)))
     simulation.addParmTemplate(hou.MenuParmTemplate("transfer", "Velocity Transfer", ("flip", "apic"), ("FLIP (Splashy)", "APIC (Swirly)"), default_value=0))
+    simulation.addParmTemplate(hou.MenuParmTemplate("freesurface", "Free Surface", ("footprint", "sharp"), ("Footprint (Calm, Fast)", "Sharp (Accurate Surface)"),
+                                                    default_value=0,
+                                                    help="Where the pressure solve puts the liquid's surface. Footprint: a voxel or so outside the particles, which "
+                                                         "settles quickly and damps small waves. Sharp: at the particles' own surface (ghost fluid), so drops "
+                                                         "oscillate and waves travel at the right speed and the liquid keeps its volume better, but calm "
+                                                         "water stays a little livelier, and a bake takes about twice as long: more per substep, and more "
+                                                         "substeps, as the liquid keeps moving for longer"))
     simulation.addParmTemplate(hou.FloatParmTemplate("flipratio", "FLIP Ratio", 1, default_value=(0.95,), min=0.0, max=1.0,
                                                      help="How much of each particle's own velocity it keeps: 0 is pure PIC (or pure APIC), 1 pure FLIP"))
     simulation.addParmTemplate(hou.FloatParmTemplate("cfl", "CFL Condition", 1, default_value=(4.0,), min=0.1, max=4.0,
@@ -103,18 +118,25 @@ def _interface(node):
                                                       "of them over its density"))
     liquid.addParmTemplate(hou.FloatParmTemplate("viscosity", "Viscosity", 1, default_value=(0.0,), min=0.0, max=100.0,
                                                  help="Pa s: water 0.001, olive oil 0.1, honey 2 to 10, molasses 10 to 100; 0 for none. Viscous liquid "
-                                                      "sticks to the domain's walls and to collisions. Thin threads only coil with CFL Condition at 1 or "
-                                                      "below: at 4 they fold from side to side"))
+                                                      "sticks to the domain's walls and to collisions"))
+    liquid.addParmTemplate(hou.FloatParmTemplate("viscouscfl", "Viscous CFL", 1, default_value=(6.0,), min=0.0, max=20.0,
+                                                 disable_when="{ viscosity == 0 }",
+                                                 help="How many voxels viscosity may spread across in a substep, as CFL Condition is for how far the fastest "
+                                                      "particle moves: the substeps shorten to keep to both. Past about 6, threads of thick liquid fold "
+                                                      "from side to side instead of coiling. 0 for no limit, which is fine for liquid that only spreads "
+                                                      "and pools. Thicker liquid and smaller voxels need more substeps: honey at 2.5 mm voxels about 2 a "
+                                                      "frame, at 1 mm about 9"))
     liquid.addParmTemplate(hou.FloatParmTemplate("surfacetension", "Surface Tension", 1, default_value=(0.0,), min=0.0, max=1.0,
                                                  help="N/m: water 0.073; 0 for none. It only shows on liquid a few centimetres across or less, and it "
                                                       "shortens the timestep: to sqrt(density x voxel^3 / (2 pi x surface tension)), 6 ms at 2.5 mm voxels "
                                                       "for water and 0.5 ms at 0.5 mm"))
-    liquid.addParmTemplate(hou.FloatParmTemplate("contactangle", "Contact Angle", 1, default_value=(90.0,), min=0.0, max=180.0,
+    liquid.addParmTemplate(hou.FloatParmTemplate("contactangle", "Contact Angle", 1, default_value=(60.0,), min=0.0, max=180.0,
                                                  disable_when="{ surfacetension == 0 }",
                                                  help="Degrees between the liquid's surface and the domain's walls where they meet, measured through the "
                                                       "liquid. Under 90 the liquid wets them: it spreads along them, and a splash's crater in a shallow pool "
-                                                      "closes again. Over 90 it beads up on them, and a pool shallower than a few millimetres pulls back "
-                                                      "from a dry patch. Collisions don't have one yet: liquid beads on them a little"))
+                                                      "closes again; water on glass is about 30, on most other things nearer 60. Over 90 it beads up on "
+                                                      "them, and a pool shallower than a few millimetres pulls back from a dry patch. Collisions don't have "
+                                                      "one yet: liquid beads on them a little"))
     group.append(liquid)
     collisions = hou.FolderParmTemplate("collisions", "Collisions", folder_type=hou.folderType.Tabs)
     collisions.addParmTemplate(hou.FloatParmTemplate("friction", "Friction", 1, default_value=(0.0,), min=0.0, max=1.0,
@@ -127,6 +149,25 @@ def _interface(node):
                                                    help="Each source emits at its points' mean v, if it has a v attribute; otherwise at the emission velocity"))
     sources.addParmTemplate(hou.FloatParmTemplate("emitvel", "Emission Velocity", 3, default_value=(0.0, 0.0, 0.0)))
     group.append(sources)
+    forces = hou.FolderParmTemplate("forces", "Forces", folder_type=hou.folderType.Tabs)
+    forces.addParmTemplate(hou.StringParmTemplate("forcesop", "Force Volumes", 1, default_value=("",), string_type=hou.stringParmType.NodeReference,
+                                                  tags={"opfilter": "!!SOP!!", "oprelative": "."},
+                                                  help="A SOP whose vector VDBs act on the fluid, each a force of its own (up to 16), wherever it has "
+                                                       "active voxels and not elsewhere. They're taken as they are at the start frame: flip2 doesn't yet "
+                                                       "take volumes that change over time. Anything else the SOP holds is left out"))
+    forces.addParmTemplate(hou.MenuParmTemplate("forcemode", "Volumes Are", ("name", "force", "velocity"),
+                                                ("Told by Name (v, vel...: Velocities)", "Forces", "Velocities"), default_value=0,
+                                                help="What the volumes' vectors are. Forces: accelerations in m/s2, which push the fluid as gravity "
+                                                     "does. Velocities: the fluid inside the volume is drawn to them, as wind carries smoke: a current, "
+                                                     "a pump, or another simulation's flow to follow. Told by Name: a volume named v, or whose name "
+                                                     "starts or ends with vel (vel, velocity, pump_vel), is velocities, and any other is forces"))
+    forces.addParmTemplate(hou.FloatParmTemplate("forcestrength", "Strength", 1, default_value=(1.0,), min=0.0, max=10.0,
+                                                 help="Multiplies the volumes' vectors"))
+    forces.addParmTemplate(hou.FloatParmTemplate("forcedrag", "Drag", 1, default_value=(1.0,), min=0.0, max=100.0, disable_when="{ forcemode == force }",
+                                                 help="How fast the fluid takes up a velocity volume's velocities, per second: at 1 it closes about two "
+                                                      "thirds of the gap in a second, at 10 in a tenth of one, and from 100 or so it has them almost at "
+                                                      "once. However large, it never overshoots them"))
+    group.append(forces)
     surface = hou.FolderParmTemplate("surfacefolder", "Surface", folder_type=hou.folderType.Tabs)
     surface.addParmTemplate(hou.ToggleParmTemplate("meshsurface", "Mesh the Surface", default_value=True,
                                                    help="Mesh the liquid's surface on the GPU as the bake commits each frame (flip2 mesh): closed, facing "
@@ -170,6 +211,14 @@ def _interface(node):
                                              help="Frames between checkpoints, which a cancelled bake resumes from; 0 for one only on cancel and at the end"))
     bake.addParmTemplate(hou.MenuParmTemplate("compression", "Compression", ("zstd", "lz4", "none"), ("Zstd", "LZ4", "None"), default_value=0,
                                               help="How flip2's own cache of the bake is compressed"))
+    bake.addParmTemplate(hou.ToggleParmTemplate("writeid", "Write id", default_value=True, join_with_next=True,
+                                                help="Give the particles Houdini's id attribute: a number each keeps from the frame it's emitted to the "
+                                                     "frame it's gone, and that no other particle of the bake has, the same however many GPUs bake it and "
+                                                     "across a resume. It's what lets Houdini follow a particle from one frame to the next: for trails, "
+                                                     "retiming, and anything that blends frames. 8 bytes a particle in flip2's cache before compression"))
+    bake.addParmTemplate(hou.ToggleParmTemplate("writeage", "Write age", default_value=True,
+                                                help="Give the particles Houdini's age attribute: seconds since each was emitted, or since the start for "
+                                                     "the fluid that was there then. 4 bytes a particle in flip2's cache before compression"))
     bake.addParmTemplate(importer.format_parm())
     bake.addParmTemplate(hou.ButtonParmTemplate("writescene", "Write Scene", help="Write scene.json and geo/ without baking", **_callback("write_scene")))
     bake.addParmTemplate(hou.ButtonParmTemplate("bake", "Bake", join_with_next=True, help="Write the scene and bake it from the start", **_callback("bake")))
@@ -195,6 +244,7 @@ def _network(node):
     shown = importer.build_loaders(node, folder, frame)
     importer.build_fields(node, folder, frame)
     _split_volumes(node)
+    _force_network(node)
     box = importer.build_container(node, node.node("collision_unpack"), ROLES.index("collision"))
     for axis in "xyz":
         box.parm("size" + axis).setExpression('ch("../domainsize%s")' % axis)
@@ -222,6 +272,26 @@ def _split_volumes(node):
         only.setInput(0, unpack)
         node.createNode("null", "COLLISION_VOLUMES").setInput(0, only)
         node.layoutChildren()
+
+
+def _force_network(node):
+    """the Force Volumes SOP's geometry brought into this node's space (force_merge), and of it only the vector VDBs (FORCE_VOLUMES). Makes only what's
+    missing, so an older node gains it"""
+    if node.node("FORCE_VOLUMES") is not None:
+        return
+    merge = node.createNode("object_merge", "force_merge")
+    merge.parm("objpath1").set('`chsop("../forcesop")`')
+    merge.parm("xformtype").set("local")    #into this object, as the inputs are
+    volumes = node.createNode("attribwrangle", "force_vdbs")
+    volumes.parm("class").set(1)
+    volumes.parm("snippet").set(VOLUMES)
+    volumes.setInput(0, merge)
+    vectors = node.createNode("attribwrangle", "force_vectors")
+    vectors.parm("class").set(1)
+    vectors.parm("snippet").set(VECTORS)
+    vectors.setInput(0, volumes)
+    node.createNode("null", "FORCE_VOLUMES").setInput(0, vectors)
+    node.layoutChildren()
 
 
 def create_solver(parent, name="flip2_solver"):
@@ -446,6 +516,59 @@ def _sample_volumes(node, frames, progress=None):
     return volumes
 
 
+def _velocities(name, mode):
+    """whether a force volume's vectors are velocities the fluid is drawn to, or accelerations that push it: as the Forces tab says, or by its name"""
+    if mode != "name":
+        return mode == "velocity"
+    name = name.lower()
+    return name == "v" or name.startswith("vel") or name.endswith("vel")
+
+
+def _force_volumes(node, frame, geo_dir):
+    """the Forces tab's volumes as they are at frame: the scene's forces for them, their VDBs written into geo_dir in one file, each named, and what to
+    say of them (None with no Force Volumes)"""
+    import numpy
+    if node.parm("forcesop") is None or not node.evalParm("forcesop").strip():      #a node from before the Forces tab has none
+        return [], None
+    if node.parm("forcesop").evalAsNode() is None:
+        raise hou.NodeError("Forces: Force Volumes names %r, and there's no such node" % node.evalParm("forcesop"))
+    source = node.node("FORCE_VOLUMES")
+    geometry = source.geometryAtFrame(frame)
+    held = len(node.node("force_merge").geometryAtFrame(frame).prims())
+    named = geometry.findPrimAttrib("name") is not None
+    mode = ("name", "force", "velocity")[node.evalParm("forcemode")]
+    forces, names = [], set()
+    for volume in geometry.prims():
+        name = volume.attribValue("name") if named else ""
+        if name in names:
+            raise hou.NodeError("Forces: two volumes are both named %r; flip2 tells them apart by name, so give each its own" % name)
+        names.add(name)
+        kind = volume.intrinsicValue("vdb_value_type")
+        if kind != "vec3s":
+            raise hou.NodeError("Forces: the volume %r holds %s values, and flip2 takes 32-bit float vectors: convert it (Convert VDB, with VDB "
+                                "Precision at 32-bit)" % (name, kind))
+        scales = numpy.linalg.svd(numpy.array(volume.intrinsicValue("transform"), dtype=numpy.float64).reshape(4, 4)[:3, :3], compute_uv=False)
+        if scales.max() - scales.min() > 1e-4*scales.max():
+            raise hou.NodeError("Forces: the volume %r is scaled more along one axis than another, so its voxels aren't cubes; flip2 takes ones that "
+                                "are: resample it (VDB Resample) after scaling it" % name)
+        forces.append({"type": "volume", "vdb": "geo/" + FORCE_FILE, "grid": name, "mode": "velocity" if _velocities(name, mode) else "force",
+                       "strength": node.evalParm("forcestrength"), "drag": node.evalParm("forcedrag")})
+    if len(forces) > 1 and "" in names:
+        raise hou.NodeError("Forces: with more than one volume, each needs a name for flip2 to tell them apart; one here has none")
+    if len(forces) > FORCE_LIMIT:
+        raise hou.NodeError("flip2 takes up to %d forces; Force Volumes has %d vector VDBs" % (FORCE_LIMIT, len(forces)))
+    if forces:
+        geometry.saveToFile(os.path.join(geo_dir, FORCE_FILE))
+    kinds = [force["mode"] for force in forces]
+    said = "forces: " + (", ".join("%d of %s" % (kinds.count(kind), label) for kind, label in (("force", "forces"), ("velocity", "velocities")) if kind in kinds)
+                         or "no vector VDBs")
+    if forces and source.isTimeDependent():
+        said += " (they change over time: taken as they are at frame %d)" % frame
+    if held > len(forces):
+        said += ", %d other primitive%s left out" % (held - len(forces), "" if held - len(forces) == 1 else "s")
+    return forces, said
+
+
 def _output_directory(node):
     directory = node.evalParm("outputdir").rstrip("/")
     if not directory:
@@ -472,14 +595,17 @@ def write_scene(node):
         "domain": {"min": [c - s/2 for c, s in zip(center, size)], "max": [c + s/2 for c, s in zip(center, size)], "voxelSize": 2*separation,
                    "open": [face for index, face in enumerate(FACES) if not node.evalParm("closed%d" % index)]},
         "solver": {"flipRatio": node.evalParm("flipratio"), "cfl": node.evalParm("cfl"), "densityCorrectionTime": node.evalParm("densitytime"),
-                   "transfer": ("flip", "apic")[node.evalParm("transfer")]},
+                   "transfer": ("flip", "apic")[node.evalParm("transfer")],
+                   "viscousCfl": node.evalParm("viscouscfl") if node.parm("viscouscfl") is not None else 6.0,
+                   "freeSurface": ("footprint", "sharp")[node.evalParm("freesurface")] if node.parm("freesurface") is not None else "footprint"},
         "gravity": list(node.evalParmTuple("gravity")),
         "liquid": {key: node.evalParm(name) if node.parm(name) is not None else default       #a node from before the Liquid tab has none of it
                    for key, name, default in (("density", "density", 1000.0), ("viscosity", "viscosity", 0.0), ("surfaceTension", "surfacetension", 0.0),
-                                              ("contactAngle", "contactangle", 90.0))},
+                                              ("contactAngle", "contactangle", 60.0))},
         "fluids": [], "emitters": [], "sinks": [], "obstacles": [],
         "partitions": node.evalParm("partitions"), "devices": node.evalParm("gpus"),
         "output": {"dir": "bake", "compression": ("zstd", "lz4", "none")[node.evalParm("compression")],
+                   "attributes": [name for name in ("id", "age") if node.parm("write" + name) is None or node.evalParm("write" + name)],
                    "checkpoints": {"every": node.evalParm("checkpoints"), "keep": 2}},
     }
     roles = [role for role in ROLES if _connected(node, ROLES.index(role))]
@@ -525,6 +651,11 @@ def write_scene(node):
         if volume["transforms"]:
             entry["keyframes"] = [{"time": (frame - frames[0]) / fps, "transform": transform} for frame, transform in zip(frames, volume["transforms"])]
         scene["obstacles"].append(entry)
+    forces, said = _force_volumes(node, frames[0], geo_dir)
+    if forces:
+        scene["forces"] = forces
+    if said:
+        made.append(said)
     path = os.path.join(directory, "scene.json")
     with open(path, "w") as out:
         json.dump(scene, out, indent=1)

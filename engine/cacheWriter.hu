@@ -28,13 +28,14 @@
 //
 //A shard (.f2p, version 1) is little-endian: a 64-byte header, a 64-byte entry per attribute, then each attribute's data. Header: "FLIP2SHD", version,
 //attribute count, particle count (uint64), frame, rank, world size, flags, then the particles' bounds, float32 low x, y, z and high x, y, z. Attribute:
-//name (16 bytes, zero padded), type (1: float32, 2: float64), components, codec (0: raw, 1: blosc), 4 reserved bytes, then as uint64 the offset of its
-//data from the start of the file, the data's stored size, its raw size and 8 reserved bytes. The data: each component's stored size (uint64), then the
-//components, each a plane of every particle's value in the shard's order; with blosc, each plane is one blosc buffer (zstd with bit shuffle, or lz4 with
-//byte shuffle: blosc's own header says which, so any blosc reader takes either). A frame's attributes: "P" (position) and "v" (velocity), float32 x, y, z
-//each. A checkpoint's: "P" as float64, "v", and with APIC "c", float32 velocity gradients (component c along axis a at 3c + a). Particles carry no ids
-//yet, and their order changes from frame to frame. Floats from a simulation are noisy: losslessly they come to about 17 bytes a particle (1.4x) with zstd
-//and 18.5 with lz4, measured on the dam break
+//name (16 bytes, zero padded), type (1: float32, 2: float64, 3: uint64), components, codec (0: raw, 1: blosc), 4 reserved bytes, then as uint64 the offset
+//of its data from the start of the file, the data's stored size, its raw size and 8 reserved bytes. The data: each component's stored size (uint64), then
+//the components, each a plane of every particle's value in the shard's order; with blosc, each plane is one blosc buffer (zstd with bit shuffle, or lz4
+//with byte shuffle: blosc's own header says which, so any blosc reader takes either). A frame's attributes: "P" (position) and "v" (velocity), float32 x,
+//y, z each, and unless the scene leaves them out, "id", uint64, which a particle keeps for as long as it exists and no other ever has, and "age",
+//float32, the seconds since it came to be. A checkpoint's: "P" as float64, "v", with APIC "c", float32 velocity gradients (component c along axis a at
+//3c + a), "id", and "birth", float32, when each particle came to be. The particles' order changes from frame to frame: the ids say which is which. Floats
+//from a simulation are noisy: losslessly P and v come to about 17 bytes a particle (1.4x) with zstd and 18.5 with lz4, measured on the dam break
 struct CacheDescription{
     std::string scenePath;      //as given
     std::string sceneHash;      //XXH64 of the scene file, hex
@@ -50,6 +51,8 @@ struct CacheDescription{
     int sm = 0;
     int cudaRuntime = 0;
     std::string compression = "zstd";   //the shards' planes: "zstd" or "lz4" (blosc), or "none"
+    bool ids = true;            //whether the frames carry "id"
+    bool ages = true;           //and "age"
     int keepCheckpoints = 2;    //the newest ones kept; older ones are deleted once a newer one is down
 };
 
@@ -58,6 +61,7 @@ struct CheckpointState{
     double time = 0.0;                  //seconds simulated
     unsigned long long substep = 0;     //substeps taken, which seeds the emitters' jitter
     bool apic = false;                  //whether the particles carry velocity gradients ("c")
+    unsigned long long nextId = 0;      //the id the next new particle gets
 };
 
 //one rank's part of a frame or a checkpoint in a host buffer: its attributes one after another (frameBytes, checkpointBytes), each a plane per component
@@ -75,7 +79,7 @@ struct ShardData{
     int worldSize = 0;
     struct Attribute{
         std::string name;
-        uint32_t type = 0;          //1 float32, 2 float64
+        uint32_t type = 0;          //1 float32, 2 float64, 3 uint64
         uint32_t components = 0;
         std::vector<char> planes;   //every component's plane, raw, one after another
     };
@@ -98,11 +102,17 @@ public:
                 std::function<void(const char*, int)> done, int numBuffers = 3);
     ~CacheWriter();     //finishes every job submitted
 
-    static size_t frameBytes(size_t particles){
-        return (3*sizeof(float) + 3*sizeof(float))*particles;
+    static size_t frameBytes(size_t particles, bool ids, bool ages){
+        return (3*sizeof(float) + 3*sizeof(float) + (ids ? sizeof(uint64_t) : 0) + (ages ? sizeof(float) : 0))*particles;
     }
     static size_t checkpointBytes(size_t particles, bool apic){
-        return (3*sizeof(double) + 3*sizeof(float) + (apic ? 9*sizeof(float) : 0))*particles;
+        return (3*sizeof(double) + 3*sizeof(float) + (apic ? 9*sizeof(float) : 0) + sizeof(uint64_t) + sizeof(float))*particles;
+    }
+    bool writesIds() const{
+        return description.ids;
+    }
+    bool writesAges() const{
+        return description.ages;
     }
 
     int numBuffers() const{
@@ -122,7 +132,8 @@ private:
     struct Layout{
         std::string name;
         int components;
-        int bytes;      //per value: 4 float32, 8 float64
+        int bytes;      //per value: 4 or 8
+        bool integer;   //uint64, rather than a float of that many bytes
     };
     struct Job{
         bool checkpoint;

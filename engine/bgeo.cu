@@ -10,7 +10,8 @@
 //   "attributes", ["pointattributes", [[definition, values], ...]],
 //   "primitives", []]
 //
-//and each attribute's values are a page of raw data: every point's tuple in order, x, y, z interleaved, in pages of 1024 points (Houdini's own page
+//with P first and the other attributes after it in alphabetical order, as Houdini has them: age (a float), id (an int32, marked as an integer that isn't
+//to be blended, as Houdini marks its own ids) and v. Each attribute's values are a page of raw data: every point's tuple in order, x, y, z interleaved, in pages of 1024 points (Houdini's own page
 //size), none of them flagged constant. That's what Houdini 22 writes for a point cloud, down to the keys' order. A mesh of quads adds its vertices, each
 //naming its point, to the topology's indices, a quad's 4 after another's, and one run of polygons to the primitives:
 //
@@ -281,6 +282,15 @@ const float* planesOf(const ShardData& shard, const char* name){
     return (const float*)attribute->planes.data();
 }
 
+//an attribute's one plane of a type (1 float32, 3 uint64) from a shard, or nullptr if it hasn't it
+const void* planeOf(const ShardData& shard, const char* name, uint32_t type){
+    const ShardData::Attribute* attribute = shard.find(name);
+    if(attribute == nullptr || attribute->type != type || attribute->components != 1 || attribute->planes.size() != (type == 1 ? 4 : 8)*shard.particles){
+        return nullptr;
+    }
+    return attribute->planes.data();
+}
+
 //writes path through write(json), compressed if it ends .sc: to path.tmp, moved into place once it's whole, so nothing reading it ever sees half of one.
 //Says why not if it can't
 template<typename Write>
@@ -353,10 +363,12 @@ void writeHeader(BinaryJson& json, uint64_t points, uint64_t vertices, uint64_t 
     json.endMap();
 }
 
-//a point attribute of 3 float32s per point, whose values, every point's tuple in order, the caller then writes with raw() before endVector()
-void beginVector(BinaryJson& json, const char* name, uint64_t points){
+//a point attribute of size values per point, float32s or with integers int32s, whose values, every point's in order, the caller then writes with raw()
+//before endVector(). kind is what Houdini should take it for, which tells it how transforms and blends treat it: "point" (P), "vector" (v),
+//"nonarithmetic_integer" (id), or nullptr for a plain number
+void beginAttribute(BinaryJson& json, const char* name, uint64_t points, int size, bool integers, const char* kind){
     json.beginArray();
-    json.beginArray();      //the definition: P is a position, v a direction, which tells Houdini how transforms move them
+    json.beginArray();      //the definition
     json.string("scope");
     json.string("public");
     json.string("type");
@@ -365,41 +377,58 @@ void beginVector(BinaryJson& json, const char* name, uint64_t points){
     json.string(name);
     json.string("options");
     json.beginMap();
-    json.string("type");
-    json.beginMap();
-    json.string("type");
-    json.string("string");
-    json.string("value");
-    json.string(std::strcmp(name, "P") == 0 ? "point" : "vector");
-    json.endMap();
+    if(kind != nullptr){
+        json.string("type");
+        json.beginMap();
+        json.string("type");
+        json.string("string");
+        json.string("value");
+        json.string(kind);
+        json.endMap();
+    }
     json.endMap();
     json.endArray();
     json.beginArray();      //the values
     json.string("size");
-    json.integer(3);
+    json.integer(size);
     json.string("storage");
-    json.string("fpreal32");
+    json.string(integers ? "int32" : "fpreal32");
     json.string("defaults");
     json.beginArray();
     json.string("size");
     json.integer(1);
     json.string("storage");
-    json.string("fpreal64");
+    json.string(integers ? "int64" : "fpreal64");
     json.string("values");
     json.beginArray();
-    json.real(0.0);
+    if(integers){
+        json.integer(0);
+    }
+    else{
+        json.real(0.0);
+    }
     json.endArray();
     json.endArray();
     json.string("values");
     json.beginArray();
     json.string("size");
-    json.integer(3);
+    json.integer(size);
     json.string("storage");
-    json.string("fpreal32");
+    json.string(integers ? "int32" : "fpreal32");
     json.string("pagesize");
     json.integer(PAGE_SIZE);
     json.string("rawpagedata");
-    json.beginFloats(3*points);
+    if(integers){
+        json.beginInts(size*points);
+    }
+    else{
+        json.beginFloats(size*points);
+    }
+}
+
+//a point attribute of 3 float32s per point: P is a position, anything else a direction
+void beginVector(BinaryJson& json, const char* name, uint64_t points){
+    beginAttribute(json, name, points, 3, false, std::strcmp(name, "P") == 0 ? "point" : "vector");
 }
 
 void endVector(BinaryJson& json){
@@ -413,12 +442,15 @@ void endVector(BinaryJson& json){
 bool writeParticlesBgeo(const std::string& path, const std::vector<const ShardData*>& shards, const std::string& software, std::string& why){
     uint64_t points = 0;
     float low[3] = {INFINITY, INFINITY, INFINITY}, high[3] = {-INFINITY, -INFINITY, -INFINITY};
+    bool ids = true, ages = true;   //written if every shard has them
     for(const ShardData* shard : shards){
         const float* positions = planesOf(*shard, "P");
         if(positions == nullptr || planesOf(*shard, "v") == nullptr){
             why = "a shard without float32 P and v";
             return false;
         }
+        ids = ids && planeOf(*shard, "id", 3) != nullptr;
+        ages = ages && planeOf(*shard, "age", 1) != nullptr;
         for(int axis = 0; axis < 3; ++axis){
             for(uint64_t particle = 0; particle < shard->particles; ++particle){
                 float value = positions[axis*shard->particles + particle];
@@ -445,7 +477,31 @@ bool writeParticlesBgeo(const std::string& path, const std::vector<const ShardDa
         json.string("pointattributes");
         json.beginArray();
         std::vector<float> tuples;
+        std::vector<int32_t> narrow;
+        auto scalar = [&](const char* name, bool integers){     //a plane, shard after shard: floats as they are, ids as the int32s Houdini's are
+            beginAttribute(json, name, points, 1, integers, integers ? "nonarithmetic_integer" : nullptr);
+            for(const ShardData* shard : shards){
+                const void* plane = planeOf(*shard, name, integers ? 3 : 1);
+                if(integers){
+                    narrow.resize(shard->particles);
+                    for(uint64_t particle = 0; particle < shard->particles; ++particle){
+                        narrow[particle] = (int32_t)((const uint64_t*)plane)[particle];
+                    }
+                    plane = narrow.data();
+                }
+                json.raw(plane, 4*shard->particles);
+            }
+            endVector(json);
+        };
         for(const char* name : {"P", "v"}){
+            if(std::strcmp(name, "v") == 0){    //between P and v, as Houdini orders them
+                if(ages){
+                    scalar("age", false);
+                }
+                if(ids){
+                    scalar("id", true);
+                }
+            }
             beginVector(json, name, points);
             for(const ShardData* shard : shards){   //each shard's planes interleaved into tuples, a block at a time
                 const float* planes = planesOf(*shard, name);

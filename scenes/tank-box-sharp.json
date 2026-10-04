@@ -1,0 +1,11 @@
+{
+  "schema": "flip2.scene/1",
+  "fps": 24,
+  "frames": 48,
+  "domain": {"min": [0, 0, 0], "max": [0.25, 0.25, 0.25], "voxelSize": 0.0078125},
+  "solver": {"freeSurface": "sharp"},
+  "fluids": [{"shape": "box", "min": [0, 0, 0], "max": [0.25, 0.125, 0.25]}],
+  "obstacles": [{"shape": "box", "min": [-0.025, -0.025, -0.025], "max": [0.025, 0.025, 0.025],
+                 "transform": [0.8660254037844387, 0, 0.49999999999999994, 0.125,  0, 1, 0, 0.06,  -0.49999999999999994, 0, 0.8660254037844387, 0.125,  0, 0, 0, 1]}],
+  "output": {"dir": "tank-box-sharp", "diagnostics": "diagnostics.jsonl", "positions": false}
+}

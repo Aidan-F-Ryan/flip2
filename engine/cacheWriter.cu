@@ -31,6 +31,7 @@ constexpr uint32_t CODEC_RAW = 0;
 constexpr uint32_t CODEC_BLOSC = 1;
 constexpr uint32_t TYPE_FLOAT32 = 1;
 constexpr uint32_t TYPE_FLOAT64 = 2;
+constexpr uint32_t TYPE_UINT64 = 3;
 
 struct ShardHeader{
     char magic[8];
@@ -218,10 +219,10 @@ bool readShard(const std::string& path, const std::string& xxh64, ShardData& out
         attribute.name = std::string(entry.name, strnlen(entry.name, sizeof(entry.name)));
         attribute.type = entry.type;
         attribute.components = entry.components;
-        if(entry.type != TYPE_FLOAT32 && entry.type != TYPE_FLOAT64){   //a type a later version added: skipped, as docs/cache-format.md says readers do
-            continue;
+        if(entry.type != TYPE_FLOAT32 && entry.type != TYPE_FLOAT64 && entry.type != TYPE_UINT64){  //a type a later version added: skipped, as
+            continue;                                                                               //docs/cache-format.md says readers do
         }
-        size_t valueBytes = entry.type == TYPE_FLOAT64 ? 8 : 4;
+        size_t valueBytes = entry.type == TYPE_FLOAT32 ? 4 : 8;
         size_t planeBytes = valueBytes*header.particles;
         if(entry.offset + entry.storedBytes > data.size() || entry.rawBytes != planeBytes*entry.components){
             why = path + ": attribute " + attribute.name + " doesn't fit the file";
@@ -412,9 +413,18 @@ void CacheWriter::process(const Job& job){
     bool fine = error().empty();    //after a failure nothing more is committed, so what's committed stays what came before it
     const char* base = job.checkpoint ? "state" : "particles";
     std::string place = directory + (job.checkpoint ? "/checkpoints/" : "/frames/") + frameName(job.frame);
-    std::vector<Layout> layout = {{"P", 3, job.checkpoint ? 8 : 4}, {"v", 3, 4}};
+    std::vector<Layout> layout = {{"P", 3, job.checkpoint ? 8 : 4, false}, {"v", 3, 4, false}};    //in the order the partitions pack them
     if(job.checkpoint && job.state.apic){
-        layout.push_back({"c", 9, 4});
+        layout.push_back({"c", 9, 4, false});
+    }
+    if(job.checkpoint || description.ids){
+        layout.push_back({"id", 1, 8, true});
+    }
+    if(job.checkpoint){
+        layout.push_back({"birth", 1, 4, false});
+    }
+    else if(description.ages){
+        layout.push_back({"age", 1, 4, false});
     }
     if(fine){
         std::error_code made;
@@ -603,7 +613,7 @@ bool CacheWriter::writeShard(const std::string& path, int frame, const CacheShar
         ShardAttribute& entry = entries[attribute];
         std::memset(&entry, 0, sizeof(entry));
         std::strncpy(entry.name, layout[attribute].name.c_str(), sizeof(entry.name));
-        entry.type = layout[attribute].bytes == 8 ? TYPE_FLOAT64 : TYPE_FLOAT32;
+        entry.type = layout[attribute].integer ? TYPE_UINT64 : layout[attribute].bytes == 8 ? TYPE_FLOAT64 : TYPE_FLOAT32;
         entry.components = (uint32_t)layout[attribute].components;
         entry.codec = compress ? CODEC_BLOSC : CODEC_RAW;
         entry.offset = offset;
@@ -732,7 +742,8 @@ bool CacheWriter::commitCheckpoint(const std::string& checkpointDirectory, const
         planes += (i ? "," : "") + std::to_string(description.partitionPlanes[i]);
     }
     std::string text = "{\"flip2\":\"checkpoint\",\"version\":1,\"frame\":" + std::to_string(job.frame) + ",\"time\":" + number(job.state.time) + ",\"substep\":" +
-                       std::to_string(job.state.substep) + ",\"apic\":" + (job.state.apic ? "true" : "false") + ",\"particles\":" + std::to_string(total) +
+                       std::to_string(job.state.substep) + ",\"apic\":" + (job.state.apic ? "true" : "false") + ",\"nextId\":" + std::to_string(job.state.nextId) +
+                       ",\"particles\":" + std::to_string(total) +
                        ",\n \"worldSize\":" + std::to_string(description.worldSize) + ",\"partitionPlanes\":[" + planes + "],\"sceneXxh64\":\"" + description.sceneHash +
                        "\",\"build\":" + quoted(FLIP2_BUILD_ID) + ",\n \"states\":[" + shardsJson(records, "state") + "]}\n";
     std::string why;
@@ -785,5 +796,6 @@ std::string CacheWriter::cacheJson() const{
            ",\"voxelSize\":" + number(d.voxelSize) + ",\"domainMin\":[" + number(d.domainMin[0]) + "," + number(d.domainMin[1]) + "," + number(d.domainMin[2]) + "],\n"
            " \"gpu\":" + quoted(d.gpu) + ",\"sm\":" + std::to_string(d.sm) + ",\"cudaRuntime\":" + std::to_string(d.cudaRuntime) + ",\"build\":" + quoted(FLIP2_BUILD_ID) + ",\n"
            " \"shards\":{\"format\":\"f2p\",\"version\":1,\"compression\":\"" + (d.compression == "none" ? std::string("none") : "blosc-" + d.compression) + "\","
-           "\"attributes\":[{\"name\":\"P\",\"type\":\"float32\",\"components\":3},{\"name\":\"v\",\"type\":\"float32\",\"components\":3}]}}\n";
+           "\"attributes\":[{\"name\":\"P\",\"type\":\"float32\",\"components\":3},{\"name\":\"v\",\"type\":\"float32\",\"components\":3}" +
+           (d.ids ? ",{\"name\":\"id\",\"type\":\"uint64\",\"components\":1}" : "") + (d.ages ? ",{\"name\":\"age\",\"type\":\"float32\",\"components\":1}" : "") + "]}}\n";
 }

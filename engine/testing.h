@@ -74,6 +74,10 @@ public:
         simulation.forEachPartition([&](Particles& partition){ partition.setViscousCfl(voxels); });
     }
 
+    void setFreeSurface(FreeSurface mode){
+        simulation.forEachPartition([&](Particles& partition){ partition.setFreeSurface(mode); });
+    }
+
     void setObstacles(const std::vector<SceneObstacle>& obstacles){
         simulation.forEachPartition([&](Particles& partition){ partition.setObstacles(obstacles); });
     }
@@ -86,8 +90,8 @@ public:
         simulation.forEachPartition([&](Particles& partition){ partition.setSourceMeshes(meshes, fluids); });
     }
 
-    void setForceFields(const std::vector<ForceField>& fields){
-        simulation.forEachPartition([&](Particles& partition){ partition.setForceFields(fields); });
+    void setForceFields(const std::vector<ForceField>& fields, const std::vector<std::shared_ptr<const SceneField>>& volumes = {}){
+        simulation.forEachPartition([&](Particles& partition){ partition.setForceFields(fields, volumes); });
     }
 
     void setDotProductSums(DotProductSums sums){
@@ -199,6 +203,13 @@ public:
             for(int k = 0; k < 9 && partition.size > 0; ++k){   //from pageable memory, so it's copied before this returns
                 gpuErrchk(cudaMemcpyAsync(partition.affine[k].devPtr(), gradients[k].data(), sizeof(float)*partition.size, cudaMemcpyHostToDevice, partition.stream));
             }
+        });
+    }
+
+    //a checkpoint's ids and birth times for setParticles' particles, and the next id to hand out (Particles::setIdentities)
+    void setIdentities(const std::vector<uint>& ids, const std::vector<float>& births, unsigned long long nextId){
+        simulation.forEachPartition([&](Particles& partition){
+            partition.setIdentities(ids.data(), births.data(), nextId);
         });
     }
 

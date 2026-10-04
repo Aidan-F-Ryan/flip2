@@ -6,7 +6,8 @@
 #include <string>
 #include <vector>
 
-//Houdini's geometry files (.bgeo), laid out as Houdini 22 writes them (bgeo.cu): a frame's particles as a point cloud, P and v, or its surface as quads
+//Houdini's geometry files (.bgeo), laid out as Houdini 22 writes them (bgeo.cu): a frame's particles as a point cloud, P and v and what the shards carry
+//of id and age, or its surface as quads
 
 //writes path, the particles of shards one after another, so in the order one partition would have held them. Says why not if it can't
 bool writeParticlesBgeo(const std::string& path, const std::vector<const ShardData*>& shards, const std::string& software, std::string& why);

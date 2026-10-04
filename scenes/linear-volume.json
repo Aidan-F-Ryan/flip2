@@ -1,0 +1,10 @@
+{
+  "schema": "flip2.scene/1",
+  "fps": 24,
+  "frames": 16,
+  "domain": {"min": [-0.25, -0.25, -0.25], "max": [0.25, 0.25, 0.25], "voxelSize": 0.0078125},
+  "gravity": [0, 0, 0],
+  "fluids": [{"shape": "sphere", "centre": [-0.1, 0.05, 0.02], "radius": 0.08}],
+  "forces": [{"type": "volume", "vdb": "geo/vectors.vdb", "grid": "linear"}],
+  "output": {"dir": "linear-volume", "diagnostics": "diagnostics.jsonl"}
+}

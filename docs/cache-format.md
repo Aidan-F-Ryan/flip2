@@ -93,7 +93,7 @@ A shard is little-endian and is laid out in this order:
 | Offset | Type | Field |
 |---|---|---|
 | 0 | char[16] | name, zero-padded |
-| 16 | uint32 | type: `1` float32, `2` float64. Reserved for later versions: `3` uint64, `4` int32, `5` uint8, `6` float16 |
+| 16 | uint32 | type: `1` float32, `2` float64, `3` uint64. Reserved for later versions: `4` int32, `5` uint8, `6` float16 |
 | 20 | uint32 | components *k* |
 | 24 | uint32 | codec: `0` raw, `1` blosc |
 | 28 | uint32 | reserved, `0` |
@@ -113,6 +113,10 @@ A shard is little-endian and is laid out in this order:
 |---|---|---|---|
 | `P` | float32 | 3 | position in metres, x y z |
 | `v` | float32 | 3 | velocity in metres per second |
+| `id` | uint64 | 1 | the particle's id: it keeps it for as long as it exists, and no other particle in the bake ever has it |
+| `age` | float32 | 1 | seconds since the particle came to be: the frame's time for the fluid the scene started with, less for emitted fluid |
+
+`id` and `age` are there unless the scene's `output.attributes` leaves them out; `cache.json`'s `shards.attributes` lists what a bake's frames carry. Caches made before ids existed have neither.
 
 **Checkpoint shards** have these attributes:
 
@@ -121,13 +125,17 @@ A shard is little-endian and is laid out in this order:
 | `P` | float64 | 3 | position in metres, x y z |
 | `v` | float32 | 3 | velocity in metres per second |
 | `c` | float32 | 9 | with APIC only: velocity gradient, component c along axis a at 3c + a, per second |
+| `id` | uint64 | 1 | the particle's id |
+| `birth` | float32 | 1 | when the particle came to be, in simulated seconds |
 
-Particles have no ids yet. Their order within a shard changes from frame to frame, so match particles across frames by position and velocity, not by index. Concatenating a frame's shards in rank order gives the order a single partition would have held the particles in.
+**Ids.** The fluid a scene starts with is numbered from 0 in the order the scene gives it; each particle an emitter makes takes the next number. The numbering doesn't depend on how the domain is split between ranks: the same bake on 1 GPU or 4 gives every particle the same id. Ids aren't reused when sinks or open faces delete particles, so they have gaps. Today they fit in 32 bits (the engine keeps 32 per particle), and `flip2 export` writes them to Houdini as int32 `id`.
+
+A particle's order within a shard changes from frame to frame, so match particles across frames by `id`, not by index. Concatenating a frame's shards in rank order gives the order a single partition would have held the particles in.
 
 ## ckpt.json
 
 ```json
-{"flip2":"checkpoint","version":1,"frame":40,"time":1.6666666666666667,"substep":152,"apic":false,"particles":1240000,
+{"flip2":"checkpoint","version":1,"frame":40,"time":1.6666666666666667,"substep":152,"apic":false,"nextId":1240000,"particles":1240000,
  "worldSize":3,"partitionPlanes":[0,10,20,32],"sceneXxh64":"0e648f55050d9cfa","build":"a68ccce",
  "states":[{"file":"state.r000.f2p","rank":0,"particles":413000,"bytes":12582912,"xxh64":"...","low":[...],"high":[...]}, ...]}
 ```
@@ -137,6 +145,7 @@ Particles have no ids yet. Their order within a shard changes from frame to fram
 | `time` | Simulated seconds at the end of the frame. |
 | `substep` | Substeps taken so far; it seeds the emitters' jitter. |
 | `apic` | Whether the states carry `c`. |
+| `nextId` | The id the next new particle gets. A checkpoint from before ids existed has none, and a resume from it numbers the particles afresh. |
 | `partitionPlanes` | The checkpoint's split, as in `cache.json`. A resume can use a different split. |
 | `states` | The state shards in rank order, listed like a commit record's `shards`. |
 
@@ -146,7 +155,7 @@ Particles have no ids yet. Their order within a shard changes from frame to fram
 
 Version 1 is frozen. Later versions keep these rules:
 
-- **Adding an attribute** to frame or checkpoint shards doesn't change any version. Particle ids will arrive this way, as `id` of type uint64.
+- **Adding an attribute** to frame or checkpoint shards doesn't change any version. Particle ids arrived this way, as `id` of type uint64, with `age` and `birth`.
 - **Readers skip attributes they don't know,** including ones whose type is reserved above. They rely only on the attributes listed here.
 - **Adding a key** to a JSON record doesn't change its version. Readers ignore keys they don't know.
 - **Any other change bumps a version:**

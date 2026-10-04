@@ -16,6 +16,14 @@
 #include <sstream>
 #include <type_traits>
 
+//ids first, first + 1, ... for count particles
+__global__ void numberParticles(uint count, uint first, uint* ids){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(index < count){
+        ids[index] = first + index;
+    }
+}
+
 Particles::Particles(uint size)
 : size(size)
 , radius(2)
@@ -35,6 +43,14 @@ Particles::Particles(uint size)
 
     gridCell.resize(size);
 
+    particleIds.resizeAsync(size, stream);      //numbered in the order they're given in, born at the start; setIdentities says otherwise
+    particleBirths.resizeAsync(size, stream);
+    particleBirths.zeroDeviceAsync(stream);
+    if(size > 0){
+        numberParticles<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, 0, particleIds.devPtr());
+    }
+    nextParticleId = size;
+
     reorderedGridIndices.resize(size);
 
     uniqueGridNodeIndices.resize(size);
@@ -45,6 +61,28 @@ Particles::Particles(uint size)
     numVoxelsPerNode = numVoxels1D*numVoxels1D*numVoxels1D;
     frameDt = 1.0/24.0;
     prevDt = 0.0;
+}
+
+void Particles::setForceFields(const std::vector<ForceField>& fields, const std::vector<std::shared_ptr<const SceneField>>& volumes){
+    for(int field = 0; field < forces.numFields; ++field){     //any there were
+        freeForceVolume(forces.fields[field].volume);
+    }
+    forces.numFields = 0;
+    for(size_t index = 0; index < fields.size(); ++index){
+        if(forces.numFields == MAX_FORCE_FIELDS){
+            std::cerr<<"Particles: only the first "<<MAX_FORCE_FIELDS<<" force fields act\n";
+            break;
+        }
+        ForceField field = fields[index];
+        field.volume = {};
+        if(field.kind == FORCE_VOLUME){
+            if(index >= volumes.size() || !volumes[index]){
+                continue;   //a volume with nothing in it does nothing
+            }
+            field.volume = uploadForceVolume(*volumes[index], stream);
+        }
+        forces.fields[forces.numFields++] = field;
+    }
 }
 
 void Particles::setPartition(int rank, int numRanks, Transport* transport, PartitionContext* context, const std::vector<uint>& planes){
@@ -100,6 +138,8 @@ void Particles::sortParticles(){
     for(CudaVec<float>* data : particleFloats()){
         reorder(data);
     }
+    reorder(&particleIds);
+    reorder(&particleBirths);
     gpuErrchk(cudaPeekAtLastError());
 }
 
@@ -609,6 +649,8 @@ void Particles::exchangeParticles(){
         newFloats.push_back(rebuild(*data));
     }
     uint* newCells = rebuild(gridCell);
+    uint* newIds = rebuild(particleIds);
+    float* newBirths = rebuild(particleBirths);
     gpuErrchk(cudaPeekAtLastError());
     transport->exchange(sends, receives, stream);   //the old arrays are freed after it, in stream order
     px.adoptAsync(newPx, newSize, stream);
@@ -618,6 +660,8 @@ void Particles::exchangeParticles(){
         floats[array]->adoptAsync(newFloats[array], newSize, stream);
     }
     gridCell.adoptAsync(newCells, newSize, stream);
+    particleIds.adoptAsync(newIds, newSize, stream);
+    particleBirths.adoptAsync(newBirths, newSize, stream);
     size = newSize;
     reorderedGridIndices.resizeAsync(size, stream);
     uniqueGridNodeIndices.resizeAsync(size, stream);
@@ -1102,6 +1146,10 @@ void Particles::particleVelToVoxels(){
     creditObstacleVolume();     //voxels obstacles partly cover hold fewer particles at rest: the density correction mustn't read them as thin
     cudaExtrapolateUnreachedFaces(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, voxelWeightsX, voxelWeightsY, voxelWeightsZ, voxelsUx, voxelsUy, voxelsUz, *context, stream);
     cudaFindFootprintDepth(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, footprintDepth, freeSurface, *context, stream);
+    if(needsLevelSet()){    //the liquid's surface, where viscosity and surface tension act, and the sharp free surface's liquid (freesurface.cu)
+        buildLevelSet();
+    }
+    retireDryUnknowns();    //sharp, the solve's liquid is the unknowns whose centres are in it
     obstacleGhostVelocities(voxelsUx, voxelsUy, voxelsUz);      //the faces in and beside obstacles, so FLIP's change over the solve is measured from the same kind of value there
     for(auto [velocity, before] : {std::pair{&voxelsUx, &voxelsUxOld}, {&voxelsUy, &voxelsUyOld}, {&voxelsUz, &voxelsUzOld}}){    //for FLIP's velocity change over the solve
         cudaMemcpyAsync(before->devPtr(), velocity->devPtr(), sizeof(float)*velocity->size(), cudaMemcpyDeviceToDevice, stream);
@@ -1120,9 +1168,6 @@ void Particles::pressureSolve(){
     double terminatingResidual;
     double voxelSize = grid.cellSize / (2<<refinementLevel);
     uint hasFreeSurface;
-    if(viscosity > 0.0 || surfaceTension > 0.0){    //both act at the liquid's surface, which the solve itself never needs
-        buildLevelSet();
-    }
     findSealedPockets();    //queued ahead of the wait for the free surface, which brings back whether any fluid can't see air
     cudaMemcpyAsync(&hasFreeSurface, freeSurface.devPtr(), sizeof(uint), cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream);
@@ -1150,9 +1195,11 @@ void Particles::pressureSolve(){
     }
     cudaCalcDivU(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, voxelsUx, voxelsUy, voxelsUz, particleCounts, footprintDepth, restParticlesPerVoxel, correctionRate, divU, stream);
     addObstacleFlux();      //what obstacles' surfaces make of the flow through the faces they cut or close
+    addSurfaceDivergence(correctionRate);   //sharp: the surface tension's pressure, and spreading what's packed near the surface
     balanceSealedPockets(); //and fluid no air reaches can't change its volume
     cudaGetA(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, dt/(density*voxelSize*voxelSize), stream);
     weighCutCells(dt/(density*voxelSize*voxelSize));      //the faces obstacles cut weigh as much as they're open
+    weighSurfaceFaces(dt/(density*voxelSize*voxelSize));  //sharp, the liquid's faces to air as near as the surface is
     gpuErrchk(cudaPeekAtLastError());
     uint interiorWidth = numVoxels1D - 2*(uint)std::floor(radius);
     uint3 domainVoxels = make_uint3(grid.sizeX*interiorWidth, grid.sizeY*interiorWidth, grid.sizeZ*interiorWidth);
@@ -1180,10 +1227,12 @@ void Particles::pressureSolve(){
         keepVelocitiesForViscosity();
         solve();
         cudaVelocityUpdate(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, p, voxelsUx, voxelsUy, voxelsUz, dt/(density*voxelSize*voxelSize), stream);
+        correctSurfaceFaces();
         p.zeroDeviceAsync(stream);
         applyViscosity();
         cudaCalcDivU(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, voxelsUx, voxelsUy, voxelsUz, particleCounts, footprintDepth, restParticlesPerVoxel, correctionRate, divU, stream);
         addObstacleFlux();
+        addSurfaceDivergence(correctionRate);
         balanceSealedPockets();
     };
     if(viscosity > 0.0){
@@ -1210,9 +1259,11 @@ void Particles::pressureSolve(){
         previousTerminatingResidual = terminatingResidual;
         cudaCalcDivU(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, voxelsUx, voxelsUy, voxelsUz, particleCounts, footprintDepth, restParticlesPerVoxel, correctionRate, divU, stream);
         addObstacleFlux();
+        addSurfaceDivergence(correctionRate);
         balanceSealedPockets();
         cudaGetA(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, dt/(density*voxelSize*voxelSize), stream);
         weighCutCells(dt/(density*voxelSize*voxelSize));
+        weighSurfaceFaces(dt/(density*voxelSize*voxelSize));
         if(viscosity > 0.0){
             viscousStep();
         }
@@ -1237,6 +1288,8 @@ void Particles::updateVoxelVelocities(){
     double voxelSize = grid.cellSize / (2<<refinementLevel);
     cudaVelocityUpdate(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, p, voxelsUx, voxelsUy, voxelsUz, dt/(0.014*voxelSize*voxelSize), stream);
     gpuErrchk(cudaPeekAtLastError());
+    correctSurfaceFaces();      //sharp, the liquid's faces to air with the ghost pressure past them
+    extendLiquidVelocities();   //and the faces around the liquid that particles read carry its velocity on
     pinEmitterVelocities();     //an emitter's fluid leaves at its velocity, whatever the solve made of it
     mixObstacleFaces(voxelsUx, voxelsUy, voxelsUz);         //the faces obstacles cut carry what crosses them all told, not the open part's alone
     obstacleGhostVelocities(voxelsUx, voxelsUy, voxelsUz);  //the faces between fluid and obstacles take the obstacles' velocity across them; the faces inside continue the fluid's
@@ -1615,7 +1668,9 @@ void Particles::copyPositionsToHost(float* xyz, cudaEvent_t copied){
     gpuErrchk(cudaEventRecord(copied, frameStream));
 }
 
-__global__ void packFrameColumns(uint numParticles, const double* px, const double* py, const double* pz, const float* vx, const float* vy, const float* vz, float* planes){
+//P and v, then where they're asked for (not nullptr) the ids, 64 bits each in two floats' place, and the ages, now less each particle's birth
+__global__ void packFrameColumns(uint numParticles, const double* px, const double* py, const double* pz, const float* vx, const float* vy, const float* vz,
+                                 const uint* ids, const float* births, double now, float* planes){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
     if(index < numParticles){
         size_t n = numParticles;
@@ -1625,30 +1680,49 @@ __global__ void packFrameColumns(uint numParticles, const double* px, const doub
         planes[3*n + index] = vx[index];
         planes[4*n + index] = vy[index];
         planes[5*n + index] = vz[index];
+        size_t next = 6*n;
+        if(ids != nullptr){     //6n floats in, so on an 8-byte boundary
+            ((unsigned long long*)(planes + next))[index] = ids[index];
+            next += 2*n;
+        }
+        if(births != nullptr){     //never negative: a birth time is a float, which can round to just after now
+            planes[next + index] = fmaxf((float)(now - births[index]), 0.0f);
+        }
     }
 }
 
 //this partition's part of a cache frame, into pinned host memory: packed on its stream (once the last frame's copy out of frameColumns is done), then
 //copied out on frameStream, so the simulation's next kernels run alongside the copy; copied is recorded once it's in
-void Particles::copyFrameColumnsToHost(float* planes, cudaEvent_t copied){
+void Particles::copyFrameColumnsToHost(float* planes, bool ids, bool ages, cudaEvent_t copied){
     makeFrameStream();
     gpuErrchk(cudaStreamWaitEvent(stream, columnsCopied, 0));
+    size_t columns = 6 + (ids ? 2 : 0) + (ages ? 1 : 0);    //in floats
     if(size > 0){
-        frameColumns.resizeAsync(6*size, stream);
-        packFrameColumns<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(), frameColumns.devPtr());
+        frameColumns.resizeAsync(columns*size, stream);
+        packFrameColumns<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(),
+            ids ? particleIds.devPtr() : nullptr, ages ? particleBirths.devPtr() : nullptr, elapsedTime, frameColumns.devPtr());
         gpuErrchk(cudaPeekAtLastError());
     }
     gpuErrchk(cudaEventRecord(framePacked, stream));
     gpuErrchk(cudaStreamWaitEvent(frameStream, framePacked, 0));
     if(size > 0){
-        gpuErrchk(cudaMemcpyAsync(planes, frameColumns.devPtr(), sizeof(float)*6*(size_t)size, cudaMemcpyDeviceToHost, frameStream));
+        gpuErrchk(cudaMemcpyAsync(planes, frameColumns.devPtr(), sizeof(float)*columns*(size_t)size, cudaMemcpyDeviceToHost, frameStream));
     }
     gpuErrchk(cudaEventRecord(columnsCopied, frameStream));
     gpuErrchk(cudaEventRecord(copied, frameStream));
 }
 
-//positions (double) then velocities, and with APIC their gradients (particleFloats' order), each a plane of every particle's value: the layout of a
-//checkpoint's state shard. Copied on this partition's own stream, so they're the state at this point, whatever the next substep does to them
+//each particle's id as the cache has it, in 64 bits
+__global__ void widenIds(uint numParticles, const uint* ids, unsigned long long* wide){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(index < numParticles){
+        wide[index] = ids[index];
+    }
+}
+
+//positions (double) then velocities, and with APIC their gradients (particleFloats' order), then the ids (64 bits) and the birth times, each a plane of
+//every particle's value: the layout of a checkpoint's state shard. Copied on this partition's own stream, so they're the state at this point, whatever
+//the next substep does to them
 void Particles::copyCheckpointToHost(char* host, cudaEvent_t copied){
     size_t count = size;
     char* at = host;
@@ -1664,7 +1738,23 @@ void Particles::copyCheckpointToHost(char* host, cudaEvent_t copied){
         }
         at += sizeof(float)*count;
     }
+    if(count > 0){
+        unsigned long long* wide;
+        gpuErrchk(cudaMallocAsync((void**)&wide, sizeof(unsigned long long)*count, stream));
+        widenIds<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, particleIds.devPtr(), wide);
+        gpuErrchk(cudaMemcpyAsync(at, wide, sizeof(unsigned long long)*count, cudaMemcpyDeviceToHost, stream));
+        gpuErrchk(cudaFreeAsync(wide, stream));
+        gpuErrchk(cudaMemcpyAsync(at + sizeof(unsigned long long)*count, particleBirths.devPtr(), sizeof(float)*count, cudaMemcpyDeviceToHost, stream));
+    }
     gpuErrchk(cudaEventRecord(copied, stream));
+}
+
+void Particles::setIdentities(const uint* ids, const float* births, unsigned long long nextId){
+    if(size > 0){   //from pageable memory, so they're copied before this returns
+        gpuErrchk(cudaMemcpyAsync(particleIds.devPtr(), ids, sizeof(uint)*size, cudaMemcpyHostToDevice, stream));
+        gpuErrchk(cudaMemcpyAsync(particleBirths.devPtr(), births, sizeof(float)*size, cudaMemcpyHostToDevice, stream));
+    }
+    nextParticleId = nextId;
 }
 
 //A checkpoint holds the particles as the end of its frame left them: its last substep had pushed them out of obstacles, deleted those in sinks, emitted,
@@ -1694,6 +1784,9 @@ Particles::~Particles(){     //with its GPU the current one
     }
     if(viscousSeen != nullptr){
         cudaFreeHost(viscousSeen);
+    }
+    for(int field = 0; field < forces.numFields; ++field){
+        freeForceVolume(forces.fields[field].volume);
     }
     gpuErrchk( cudaStreamDestroy(stream) );
 }

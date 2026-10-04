@@ -1431,34 +1431,6 @@ __device__ inline float squareInside(float c0, float c1, float c2, float c3){
     return 0.5f*segmentInside(c[0], c[1])*segmentInside(c[0], c[3]) + 0.5f*segmentInside(c[2], c[1])*segmentInside(c[2], c[3]);    //opposite, apart
 }
 
-//obstacleOpen: a near voxel's six open fractions, worked out once a substep (findSolidVoxels) for every pass to read rather than look up its corners
-//again, each a fraction of OPEN_FULL in 16 bits: 0 and 1 exactly, and nothing between closer than 1.5e-5 to either. Three words a voxel, one per axis,
-//its lower face in the low half
-static constexpr float OPEN_FULL = 65535.0f;
-
-//a voxel's faces' open fractions, in the neighbour arrays' order (-x, +x, -y, +y, -z, +z); near: whether a surface passes close enough that any could be
-//cut. Every corner of a voxel is within 0.87 of a voxel of its centre, so one farther from every surface is all open or all closed
-struct CutFaces{
-    float open[6];
-    bool near;
-    float centre;   //the centre's distance from the nearest surface, negative inside; INFINITY with no obstacles
-    float covered;  //how much of the voxel is inside obstacles (coveredFraction)
-};
-
-//a near voxel's faces as findSolidVoxels found them this substep
-__device__ inline CutFaces cachedCut(const uint* opens, uint index){
-    CutFaces cut;
-    #pragma unroll
-    for(int face = 0; face < 6; ++face){
-        uint word = opens[4*(size_t)index + face/2];
-        cut.open[face] = (face % 2 ? word >> 16 : word & 0xFFFFu) / OPEN_FULL;
-    }
-    cut.near = true;
-    cut.centre = 0.0f;
-    cut.covered = opens[4*(size_t)index + 3] / OPEN_FULL;
-    return cut;
-}
-
 //how open a cut voxel is, the mean of its faces: what scales its density correction (obstacleFaceFlux), as its row of the pressure equation is scaled.
 //Not how much fluid it holds at rest, which goes by volume (coveredFraction): for a corner a surface cuts off at x + y + z = c, the faces' mean is
 //c^2/4, the volume c^3/6
