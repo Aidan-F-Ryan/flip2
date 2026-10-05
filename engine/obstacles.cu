@@ -1348,12 +1348,27 @@ void Particles::pushOutParticles(){
     gpuErrchk(cudaPeekAtLastError());
 }
 
-__global__ void markInsideObstacles(uint numParticles, const double* px, const double* py, const double* pz, Obstacles obstacles, char* removed){
+//At the start, the fluid seeded inside an obstacle goes. With air (ids not nullptr), so does the air from a cell of the seeding lattice (spacing a
+//side, from the domain's corner) whose centre is inside one, though the particle itself landed outside. The lattice gives a cell to the fluid that
+//holds its centre: where liquid is modelled up to a wall, the cells the wall cuts through are the air's, and what they leave outside the wall is air
+//in a sliver between the liquid and the wall it was meant to touch, which then rises through the liquid from every wall
+__global__ void markInsideObstacles(uint numParticles, const double* px, const double* py, const double* pz, const uint* ids, Grid grid, double spacing, Obstacles obstacles,
+                                    char* removed){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
     if(index < numParticles){
         float distance;
         float3 normal;
-        if(nearestObstacle(obstacles, make_float3((float)px[index], (float)py[index], (float)pz[index]), distance, normal) >= 0 && distance < 0.0f){
+        bool inside = nearestObstacle(obstacles, make_float3((float)px[index], (float)py[index], (float)pz[index]), distance, normal) >= 0 && distance < 0.0f;
+        if(!inside && ids != nullptr && (ids[index] & AIR_PARTICLE)){
+            double position[3] = {px[index], py[index], pz[index]};
+            double low[3] = {grid.negX, grid.negY, grid.negZ};
+            float centre[3];
+            for(int axis = 0; axis < 3; ++axis){
+                centre[axis] = (float)(low[axis] + (floor((position[axis] - low[axis]) / spacing) + 0.5)*spacing);
+            }
+            inside = nearestObstacle(obstacles, make_float3(centre[0], centre[1], centre[2]), distance, normal) >= 0 && distance < 0.0f;
+        }
+        if(inside){
             removed[index] = 1;
         }
     }
@@ -1363,7 +1378,9 @@ void Particles::markParticlesInsideObstacles(){
     if(obstacles.count() == 0 || size == 0 || substepIndex != 0){
         return;
     }
-    markInsideObstacles<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, px.devPtr(), py.devPtr(), pz.devPtr(), obstacles.state(), removedFlags.devPtr());
+    double voxelSize = grid.cellSize / (2<<refinementLevel);
+    markInsideObstacles<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, px.devPtr(), py.devPtr(), pz.devPtr(), twoPhase.particles() ? particleIds.devPtr() : nullptr, grid,
+        voxelSize / sources.latticePerSide, obstacles.state(), removedFlags.devPtr());
     gpuErrchk(cudaPeekAtLastError());
 }
 

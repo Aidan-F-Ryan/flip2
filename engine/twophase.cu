@@ -3,8 +3,8 @@
 //Two phases (TwoPhase, particles.hu): air around the liquid, simulated with it. Experimental, after PF-FLIP (Braun, Bender and Thuerey 2025).
 //
 //The air is particles like the liquid's, each weighing 1/densityRatio of a liquid one. P2G (particles.cu) weighs every particle by its fluid, so a face's
-//velocity is its momentum over its mass, the two fluids' together, and it keeps the plain weights too. From those, or from the liquid's level set, every
-//face gets a lightness here: the liquid's density over the face's own, from 1 where it's all liquid to the density ratio where it's all air. Then:
+//velocity is its momentum over its mass, the two fluids' together, and it keeps the liquid's own weights too. From those, or from the liquid's level set,
+//every face gets a lightness here: the liquid's density over the face's own, from 1 where it's all liquid to the density ratio where it's all air. Then:
 //1. Each face of the pressure equations weighs its lightness times what it did (weighDensityFaces): the equations are the variable-density ones,
 //   div((1/rho) grad p) = div u / dt, still symmetric and positive definite, so every solver takes them as they are: the multigrid's coarse grids
 //   sum their equations from the unknowns' (multigridFunctions.cu), so they weigh what these faces do.
@@ -13,13 +13,15 @@
 //Nothing else changes: gravity accelerates both fluids alike and the pressure's answer to it differs with their densities, which is all buoyancy is.
 //
 //Where a face's lightness comes from (FaceDensity):
-//- fractions: the plain weight over the mass, which is linear in the share of the weight on the face that's the liquid's.
+//- fractions: both fluids' weight on the face over its mass, which is linear in the share of that weight that's the liquid's.
 //- phaseField: PF-FLIP's. The face's mass against what a voxel full of liquid at rest would put there, less a floor that keeps bunched-up air from
 //  reading as liquid, square-rooted and clamped to 0..1; and a face between two voxels that are both liquid by it, or both air, is all one or the other.
 //- levelSet: the share of the line between the two voxels' centres that's inside the liquid's level set (levelset.cu, built from the liquid's particles
-//  alone and smoothed as the sharp free surface's is), the ghost fluid method's face density.
+//  alone and smoothed as the sharp free surface's is), the ghost fluid method's face density. Beside an obstacle the level set is read clear of it
+//  (levelClearOfObstacles).
 //- synthetic: from where the face is and nothing else, with every particle liquid. The fluid then flows through a pattern of densities fixed in space,
 //  which means nothing physically, but hands the pressure solve the same kind of equations with no air particles needed: a test of the solve alone.
+//Whichever it is, the particles settle the faces that only one fluid's reach (settleFacesOfOneFluid): all liquid, or all air.
 //
 //Every voxel's values come from what its partition holds alike, so they're the same bit for bit however the nodes are split.
 
@@ -34,34 +36,38 @@
 
 static constexpr float PHASE_SHARPNESS = 1.0f;  //PF-FLIP's alpha: less and the phase field goes from air to liquid over less mass
 static constexpr uint PLACE_THREADS = 128;      //per node block, where a kernel needs to know where each voxel is
+static constexpr float CLEAR_OF_OBSTACLES = 1.5f;   //voxels out from an obstacle's surface where the level set is read for the voxels beside it
+                                                    //(levelClearOfObstacles): what a voxel's centre takes in from the particles reaches that far
 
 //the liquid's density over a face's, when the share theta of the face is liquid and the rest air: 1 to ratio
 __device__ inline float lightnessOf(float theta, float ratio){
     return 1.0f / (theta + (1.0f - theta)/ratio);
 }
 
-//fractions. Each stored voxel's three lower faces from P2G's sums: the plain weight over the mass is the liquid's density over the face's. A face no
-//particle reached takes what its voxel's other two faces come to together, and with nothing on those either it's air
-__global__ void lightnessFromFractions(uint numVoxels, const float* massX, const float* massY, const float* massZ, const int* plainX, const int* plainY, const int* plainZ,
-                                       float plainUnit, float ratio, float* lightX, float* lightY, float* lightZ){
+//fractions. Each stored voxel's three lower faces from P2G's sums: a face's mass is its liquid's weight and its air's over the ratio, so both fluids'
+//weight there over its mass is the liquid's density over the face's. A face no particle reached takes what its voxel's other two faces come to
+//together, and with nothing on those either it's air
+__global__ void lightnessFromFractions(uint numVoxels, const float* massX, const float* massY, const float* massZ, const int* liquidX, const int* liquidY, const int* liquidZ,
+                                       float liquidUnit, float ratio, float* lightX, float* lightY, float* lightZ){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
     if(index < numVoxels){
         const float* mass[3] = {massX, massY, massZ};
-        const int* plain[3] = {plainX, plainY, plainZ};
+        const int* liquid[3] = {liquidX, liquidY, liquidZ};
         float* light[3] = {lightX, lightY, lightZ};
-        float masses[3], plains[3];
-        float allMass = 0.0f, allPlain = 0.0f;
+        float masses[3], weights[3];
+        float allMass = 0.0f, allWeight = 0.0f;
         #pragma unroll
         for(int axis = 0; axis < 3; ++axis){
             masses[axis] = mass[axis][index];
-            plains[axis] = plain[axis][index]*plainUnit;
+            float ofLiquid = liquid[axis][index]*liquidUnit;
+            weights[axis] = ofLiquid + (masses[axis] - ofLiquid)*ratio;
             allMass += masses[axis];
-            allPlain += plains[axis];
+            allWeight += weights[axis];
         }
-        float unreached = allMass > 0.0f ? fminf(fmaxf(allPlain / allMass, 1.0f), ratio) : ratio;
+        float unreached = allMass > 0.0f ? fminf(fmaxf(allWeight / allMass, 1.0f), ratio) : ratio;
         #pragma unroll
         for(int axis = 0; axis < 3; ++axis){
-            light[axis][index] = masses[axis] > 0.0f ? fminf(fmaxf(plains[axis] / masses[axis], 1.0f), ratio) : unreached;
+            light[axis][index] = masses[axis] > 0.0f ? fminf(fmaxf(weights[axis] / masses[axis], 1.0f), ratio) : unreached;
         }
     }
 }
@@ -122,6 +128,97 @@ __global__ void lightnessFromPhases(uint numVoxels, const char* solveCodes, cons
     }
 }
 
+//a point moved out along the way out of every obstacle it's inside or within clearance of: out of an inside edge's two walls, or a corner's three, one
+//after another. Within a tenth of the clearance is out: the point is to be past the surface's reach, not at a distance to the bit
+__device__ inline float3 clearOfObstacles(const Obstacles& obstacles, float3 point, float clearance){
+    for(int wall = 0; wall < 4; ++wall){
+        float distance;
+        float3 normal;
+        if(nearestObstacle(obstacles, point, distance, normal) < 0 || distance >= 0.9f*clearance){
+            break;
+        }
+        point = point + (clearance - distance)*normal;
+    }
+    return point;
+}
+
+//the stored voxel that is a voxel of the domain, wherever its node is; NO_VOXEL where nothing is stored. cellToNode is never cleared, so an entry only
+//counts if nodeCells agrees (as loadNeighborNodes has it, particles.cu)
+__device__ inline uint storedVoxel(const VoxelPlaces& places, int3 voxel, uint numUsedGridNodes, const uint* cellToNode, const uint* interiorVoxels){
+    if(!places.inDomain(voxel)){
+        return NO_VOXEL;
+    }
+    int width = places.interiorWidth;
+    uint cell = voxel.x/width + places.grid.sizeX*(voxel.y/width + places.grid.sizeY*(voxel.z/width));
+    uint node = cellToNode[cell];
+    if(node >= numUsedGridNodes || places.nodeCells[node] != cell){
+        return NO_VOXEL;
+    }
+    return interiorVoxels[(size_t)node*width*width*width + voxel.x % width + width*(voxel.y % width + width*(voxel.z % width))];
+}
+
+//a field of the stored voxels at a point of the world, blended from the eight voxels whose centres are around it; missing where one isn't stored
+__device__ inline float fieldAt(const VoxelPlaces& places, float3 point, uint numUsedGridNodes, const uint* cellToNode, const uint* interiorVoxels, const float* field, float missing){
+    float h = places.voxelSize();
+    float at[3] = {(point.x - places.grid.negX)/h - 0.5f, (point.y - places.grid.negY)/h - 0.5f, (point.z - places.grid.negZ)/h - 0.5f};    //in voxels, from the first centre
+    int base[3];
+    float along[3];
+    #pragma unroll
+    for(int axis = 0; axis < 3; ++axis){
+        base[axis] = (int)floorf(at[axis]);
+        along[axis] = at[axis] - base[axis];
+    }
+    float sum = 0.0f;
+    #pragma unroll
+    for(int corner = 0; corner < 8; ++corner){
+        int dx = corner & 1, dy = corner >> 1 & 1, dz = corner >> 2;
+        float weight = (dx ? along[0] : 1.0f - along[0])*(dy ? along[1] : 1.0f - along[1])*(dz ? along[2] : 1.0f - along[2]);
+        if(weight != 0.0f){     //a voxel with no say isn't looked up
+            uint voxel = storedVoxel(places, make_int3(base[0] + dx, base[1] + dy, base[2] + dz), numUsedGridNodes, cellToNode, interiorVoxels);
+            sum += weight*(voxel != NO_VOXEL ? field[voxel] : missing);
+        }
+    }
+    return sum;
+}
+
+//The liquid's level set at the voxels beside an obstacle, read clear of the obstacle instead: per stored voxel, its value there, or for a voxel a
+//surface passes near (obstacleNear), what its values out from the obstacle make it. What a voxel's centre takes in from the particles reaches a voxel
+//and a half, and beside an obstacle part of that is inside it, where there's nothing to take in: the level set puts a half space of liquid there
+//(levelset.cu), which is right deep in the liquid and wrong where its surface meets the obstacle. The surface read 0.1 to 0.25 of a voxel low beside
+//a pillar standing in still water, a head the solve then moves the water to answer, and at centres inside the obstacle along the inside edges of a
+//container it read as outside altogether, so the faces there weighed as air with water on them, and a glass of still water climbed its own corners
+//to the ceiling.
+//So the voxel takes the level set from CLEAR_OF_OBSTACLES out from every obstacle's surface, along the way out from its centre, carried back to it
+//along the line through its value there and a voxel further out. Flat water then stays flat up to a wall whichever way the wall leans; a film on a
+//floor, or the air between a ceiling and water under it, is still there for the voxels against them; and where the surface meets the obstacle square
+//on, as still water meets an upright wall, both values are the same height's, so it crosses 0 beside the obstacle exactly where it does clear of it,
+//however much the level set's values are squeezed towards 0 near an obstacle (they are, for three voxels out). And its own value stands where that
+//reads deeper in the liquid: the level set errs towards outside beside an obstacle, so where it says liquid, liquid is there, and water a voxel wide
+//up the corner of a glass, which nothing a voxel and a half out sees, would otherwise weigh as air and keep climbing.
+//A block per node storing voxels
+__global__ void levelClearOfObstacles(VoxelPlaces places, Obstacles obstacles, const char* near, uint numUsedGridNodes, const uint* cellToNode, const uint* interiorVoxels,
+                                      const float* level, float* clear){
+    uint first = blockIdx.x == 0 ? 0 : places.nodeVoxelEnds[blockIdx.x - 1];
+    uint last = places.nodeVoxelEnds[blockIdx.x];
+    uint cell = places.nodeCells[blockIdx.x];
+    for(uint index = first + threadIdx.x; index < last; index += blockDim.x){
+        float value = level[index];
+        if(near[index] & NEAR_SURFACE){
+            float h = places.voxelSize();
+            float3 centre = places.point(places.voxelOf(cell, places.voxelSlots[index]), 0.5f, 0.5f, 0.5f);
+            float3 out = clearOfObstacles(obstacles, centre, CLEAR_OF_OBSTACLES*h);
+            float3 way = out - centre;
+            float far = sqrtf(dot(way, way));
+            if(far > 0.0f){
+                float there = fieldAt(places, out, numUsedGridNodes, cellToNode, interiorVoxels, level, LIQUID_BAND);
+                float further = fieldAt(places, out + (h/far)*way, numUsedGridNodes, cellToNode, interiorVoxels, level, LIQUID_BAND);
+                value = fminf(value, there + (there - further)*far/h);
+            }
+        }
+        clear[index] = value;
+    }
+}
+
 //levelSet. Each face's liquid share is how much of the line between the two voxels' centres the level set puts inside the liquid (negative inside): all
 //or none where both ends agree, and otherwise where it crosses 0 between them
 __global__ void lightnessFromLevelSet(uint numVoxels, const uint* neighborNx, const uint* neighborNy, const uint* neighborNz, const float* level, float ratio,
@@ -170,34 +267,63 @@ __global__ void lightnessFromPlace(VoxelPlaces places, TwoPhase settings, float*
     }
 }
 
-//For escaping particles (particles.hu): each stored voxel's liquid density over the density at rest, the mean over its faces of the liquid's share of
-//P2G's weight there. A face's mass is the liquid's weight and the air's over the ratio, and its plain weight is both, so the liquid's is
-//(mass - plain/ratio)/(1 - 1/ratio). An unknown has all six faces, its upper ones its upper neighbours'; anything else goes by the three it stores
-__device__ inline float liquidWeight(float mass, float plain, float ratio){
-    return fmaxf((mass - plain/ratio) / (1.0f - 1.0f/ratio), 0.0f);
+//Whichever way the faces' lightness was found, the particles settle the faces that only one fluid's reach: a face with none of the air's weight on it
+//is all liquid, and one with none of the liquid's is all air. P2G's sums say which exactly: a liquid particle adds the same number to a face's mass
+//and to the liquid's weight there, so the two are equal to the bit until an air particle adds to the mass. Away from obstacles every source says as much
+//itself, both fluids' particles reaching a voxel and a half past the surface between them. Beside an obstacle a face's mass, the phase field's measure,
+//falls with how much of its reach the obstacle takes, and reads as part air where there's only water: sealed in a full box, the water set off along
+//the walls at over 1 m/s (0.1 with this). The level set has its own answer there (levelClearOfObstacles), and the particles' word still stands
+__global__ void settleFacesOfOneFluid(uint numVoxels, const float* massX, const float* massY, const float* massZ, const int* liquidX, const int* liquidY, const int* liquidZ,
+                                      float liquidUnit, float ratio, float* lightX, float* lightY, float* lightZ){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(index < numVoxels){
+        const float* mass[3] = {massX, massY, massZ};
+        const int* liquid[3] = {liquidX, liquidY, liquidZ};
+        float* light[3] = {lightX, lightY, lightZ};
+        #pragma unroll
+        for(int axis = 0; axis < 3; ++axis){
+            float ofLiquid = liquid[axis][index]*liquidUnit;
+            if(ofLiquid > 0.0f && mass[axis][index] == ofLiquid){
+                light[axis][index] = 1.0f;
+            }
+            else if(ofLiquid == 0.0f && mass[axis][index] > 0.0f){
+                light[axis][index] = ratio;
+            }
+        }
+    }
 }
 
-__global__ void findLiquidDensity(uint numVoxels, const char* solveCodes, const uint* neighborPx, const uint* neighborPy, const uint* neighborPz, const float* massX,
-                                  const float* massY, const float* massZ, const int* plainX, const int* plainY, const int* plainZ, float plainUnit, float ratio, float rest,
-                                  float* density){
+//For escaping particles (particles.hu): each stored voxel's liquid density over the density at rest, the mean over its faces of the liquid's P2G weight
+//there. An unknown has all six faces, its upper ones its upper neighbours'; anything else goes by the three it stores. In a voxel an obstacle's surface
+//passes near (near not nullptr), part of each face's reach is inside the obstacle, and the weight a face can have at rest falls with it: there the
+//density is over what both fluids weigh on the faces instead, the room the obstacle leaves. Against the density at rest, the half voxel of water over
+//a paddle's top read as too thin for the grid, and so did the water in the voxels a pillar cuts at the waterline: droplets, falling down its side
+__global__ void findLiquidDensity(uint numVoxels, const char* solveCodes, const uint* neighborPx, const uint* neighborPy, const uint* neighborPz, const char* near,
+                                  const float* massX, const float* massY, const float* massZ, const int* liquidX, const int* liquidY, const int* liquidZ, float liquidUnit,
+                                  float ratio, float rest, float* density){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
     if(index < numVoxels){
         const uint* upper[3] = {neighborPx, neighborPy, neighborPz};
         const float* mass[3] = {massX, massY, massZ};
-        const int* plain[3] = {plainX, plainY, plainZ};
-        float sum = 0.0f;
+        const int* liquid[3] = {liquidX, liquidY, liquidZ};
+        float ofLiquid = 0.0f, ofBoth = 0.0f;
         int faces = 0;
         #pragma unroll
         for(int axis = 0; axis < 3; ++axis){
-            sum += liquidWeight(mass[axis][index], plain[axis][index]*plainUnit, ratio);
-            ++faces;
             uint above = upper[axis][index];
-            if(solveCodes[index] && above < WALL_VOXEL){
-                sum += liquidWeight(mass[axis][above], plain[axis][above]*plainUnit, ratio);
-                ++faces;
+            uint ends[2] = {index, solveCodes[index] && above < WALL_VOXEL ? above : NO_VOXEL};
+            #pragma unroll
+            for(int end = 0; end < 2; ++end){
+                if(ends[end] != NO_VOXEL){
+                    float weight = liquid[axis][ends[end]]*liquidUnit;
+                    ofLiquid += weight;
+                    ofBoth += weight + (mass[axis][ends[end]] - weight)*ratio;
+                    ++faces;
+                }
             }
         }
-        density[index] = sum / (faces*rest);
+        bool beside = near != nullptr && (near[index] & NEAR_SURFACE);
+        density[index] = beside ? (ofBoth > 0.0f ? ofLiquid / ofBoth : 0.0f) : ofLiquid / (faces*rest);
     }
 }
 
@@ -271,10 +397,11 @@ void Particles::findFaceDensities(){
     uint blocks = numVoxels / BLOCKSIZE + 1;
     float* light[3] = {faceLightness[0].devPtr(), faceLightness[1].devPtr(), faceLightness[2].devPtr()};
     float ratio = twoPhase.densityRatio;
+    bool beside = obstacles.count() > 0 && numStoredNodes > 0 && numVoxels > 0;    //the voxels beside obstacles are read with the obstacles in mind
     switch(twoPhase.faceDensity){
         case FaceDensity::fractions:
-            lightnessFromFractions<<<blocks, BLOCKSIZE, 0, stream>>>(numVoxels, voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), (const int*)plainWeights[0].devPtr(),
-                (const int*)plainWeights[1].devPtr(), (const int*)plainWeights[2].devPtr(), plainWeightUnit, ratio, light[0], light[1], light[2]);
+            lightnessFromFractions<<<blocks, BLOCKSIZE, 0, stream>>>(numVoxels, voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), (const int*)liquidWeights[0].devPtr(),
+                (const int*)liquidWeights[1].devPtr(), (const int*)liquidWeights[2].devPtr(), liquidWeightUnit, ratio, light[0], light[1], light[2]);
             break;
         case FaceDensity::phaseField:{
             char* liquid;
@@ -287,23 +414,38 @@ void Particles::findFaceDensities(){
             gpuErrchk(cudaFreeAsync(liquid, stream));
             break;
         }
-        case FaceDensity::levelSet:
-            lightnessFromLevelSet<<<blocks, BLOCKSIZE, 0, stream>>>(numVoxels, neighborNx.devPtr(), neighborNy.devPtr(), neighborNz.devPtr(), surfaceLevel.devPtr(), ratio,
-                light[0], light[1], light[2]);
+        case FaceDensity::levelSet:{
+            const float* level = surfaceLevel.devPtr();
+            float* clear = nullptr;
+            if(beside){
+                gpuErrchk(cudaMallocAsync((void**)&clear, sizeof(float)*numVoxels, stream));
+                levelClearOfObstacles<<<numStoredNodes, PLACE_THREADS, 0, stream>>>(voxelPlaces(), obstacles.state(), obstacleNear.devPtr(), numUsedGridNodes, cellToNode.devPtr(),
+                    nodeInteriorVoxels.devPtr(), level, clear);
+                level = clear;
+            }
+            lightnessFromLevelSet<<<blocks, BLOCKSIZE, 0, stream>>>(numVoxels, neighborNx.devPtr(), neighborNy.devPtr(), neighborNz.devPtr(), level, ratio, light[0], light[1], light[2]);
+            if(clear != nullptr){
+                gpuErrchk(cudaFreeAsync(clear, stream));
+            }
             break;
+        }
         case FaceDensity::synthetic:
             if(numStoredNodes > 0){
                 lightnessFromPlace<<<numStoredNodes, PLACE_THREADS, 0, stream>>>(voxelPlaces(), twoPhase, light[0], light[1], light[2]);
             }
             break;
     }
+    if(twoPhase.particles()){
+        settleFacesOfOneFluid<<<blocks, BLOCKSIZE, 0, stream>>>(numVoxels, voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), (const int*)liquidWeights[0].devPtr(),
+            (const int*)liquidWeights[1].devPtr(), (const int*)liquidWeights[2].devPtr(), liquidWeightUnit, ratio, light[0], light[1], light[2]);
+    }
     for(float* lightness : light){  //the ghosts take their owners', which read their own neighbours
         context->fillGhosts(lightness, stream);
     }
     if(twoPhase.escaping()){
-        findLiquidDensity<<<blocks, BLOCKSIZE, 0, stream>>>(numVoxels, solveCodes.devPtr(), neighborPx.devPtr(), neighborPy.devPtr(), neighborPz.devPtr(), voxelWeightsX.devPtr(),
-            voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), (const int*)plainWeights[0].devPtr(), (const int*)plainWeights[1].devPtr(), (const int*)plainWeights[2].devPtr(),
-            plainWeightUnit, ratio, (float)restParticlesPerVoxel, liquidDensity.devPtr());
+        findLiquidDensity<<<blocks, BLOCKSIZE, 0, stream>>>(numVoxels, solveCodes.devPtr(), neighborPx.devPtr(), neighborPy.devPtr(), neighborPz.devPtr(),
+            beside ? obstacleNear.devPtr() : nullptr, voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), (const int*)liquidWeights[0].devPtr(),
+            (const int*)liquidWeights[1].devPtr(), (const int*)liquidWeights[2].devPtr(), liquidWeightUnit, ratio, (float)restParticlesPerVoxel, liquidDensity.devPtr());
         context->fillGhosts(liquidDensity.devPtr(), stream);
     }
     gpuErrchk(cudaPeekAtLastError());

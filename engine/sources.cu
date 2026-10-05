@@ -323,7 +323,12 @@ __global__ void markOccupiedVoxels(uint numParticles, const double* px, const do
     }
 }
 
-//whether a lattice point becomes air: its node is in the band, its voxel holds no particle, and it isn't inside an obstacle; and where it is
+//whether a lattice point becomes air: its node is in the band, its voxel holds no particle, and it isn't inside an obstacle; and where it is. Beside
+//an obstacle an empty voxel is less to go on. At the start, a cell of the lattice that an obstacle holds the centre of leaves only a sliver outside
+//it, which is the liquid's if liquid is modelled up to the obstacle (markInsideObstacles, obstacles.cu): no air from those. After it, a voxel an
+//obstacle cuts has room for only as much of a voxel's worth of particles as it's open, and is empty every few substeps with nothing missing: topped
+//up each time, the cut voxels pumped air into the gap under a box until it pushed down into the pool below and up through the box's floor. A hole
+//in the air is an empty voxel no obstacle cuts; the cut ones fill from those beside them
 __device__ inline bool fillsBand(const EmitterLattice& lattice, const BandFill& band, const Obstacles& obstacles, unsigned long long seed, unsigned long long index, double now[3]){
     long long point[3];
     lattice.point(index, point);
@@ -345,6 +350,21 @@ __device__ inline bool fillsBand(const EmitterLattice& lattice, const BandFill& 
     }
     float distance;
     float3 normal;
+    if(band.everywhere){
+        float3 centre = make_float3((float)(lattice.origin[0] + (point[0] + 0.5)*lattice.spacing), (float)(lattice.origin[1] + (point[1] + 0.5)*lattice.spacing),
+                                    (float)(lattice.origin[2] + (point[2] + 0.5)*lattice.spacing));
+        if(nearestObstacle(obstacles, centre, distance, normal) >= 0 && distance < 0.0f){
+            return false;
+        }
+    }
+    else{
+        double voxelSize = lattice.spacing*band.perSide;
+        float3 centre = make_float3((float)(lattice.origin[0] + (voxel[0] + 0.5)*voxelSize), (float)(lattice.origin[1] + (voxel[1] + 0.5)*voxelSize),
+                                    (float)(lattice.origin[2] + (voxel[2] + 0.5)*voxelSize));
+        if(nearestObstacle(obstacles, centre, distance, normal) >= 0 && fabsf(distance) <= 0.9f*(float)voxelSize){     //as cutFaces has it (obstacles.cu)
+            return false;
+        }
+    }
     return !(nearestObstacle(obstacles, make_float3((float)now[0], (float)now[1], (float)now[2]), distance, normal) >= 0 && distance < 0.0f);
 }
 

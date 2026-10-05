@@ -933,13 +933,13 @@ void Particles::generateVoxels(){
     for(CudaVec<float>* voxelData : {&voxelsUx, &voxelsUy, &voxelsUz, &voxelsUxOld, &voxelsUyOld, &voxelsUzOld, &voxelWeightsX, &voxelWeightsY, &voxelWeightsZ, &particleCounts, &divU, &p, &residuals, &Anx, &Apx, &Any, &Apy, &Anz, &Apz, &Adiag}){
         voxelData->resizeAsync(numUsedVoxels, stream);
     }
-    if(twoPhase.on){    //each face's density, and with air particles the plain weights that go into it (twophase.cu)
+    if(twoPhase.on){    //each face's density, and with air particles the liquid's weights that go into it (twophase.cu)
         for(CudaVec<float>& lightness : faceLightness){
             lightness.resizeAsync(numUsedVoxels, stream);
         }
         if(twoPhase.particles()){
-            for(CudaVec<float>& plain : plainWeights){
-                plain.resizeAsync(numUsedVoxels, stream);
+            for(CudaVec<float>& liquid : liquidWeights){
+                liquid.resizeAsync(numUsedVoxels, stream);
             }
         }
         if(twoPhase.escaping()){
@@ -995,15 +995,16 @@ static AffineVelocities affineVelocities(CudaVec<float> (&affine)[9]){
 //first. normalizeVoxelVelocities turns them into floats. With APIC, each face takes the particle's velocity carried out to it along its gradient,
 //v + c.(x_face - x). With two PHASES (TwoPhase, particles.hu), a particle weighs as much as its fluid, air's being airMass of the liquid's: the momentum
 //and the weights are then each face's momentum and mass, so the velocity they give is the two fluids' together, and three more sums a slot keep the
-//weights with every particle counting alike, which with the masses say how much of the face is liquid (10 ints per slot: 20 KB)
+//liquid's weights alone: what's left of a face's mass is its air's, so how much of the face is liquid is exact, and so is whether either fluid
+//reaches it at all (10 ints per slot: 20 KB)
 template<bool APIC, bool PHASES>
 __global__ void scatterParticleVelsToVoxels(uint numParticleNodes, uint numParticles, uint numVoxels1D, const uint* gridNodeIndicesToFirstParticleIndex, const uint* gridPosition,
                                             const double* px, const double* py, const double* pz, const float* vx, const float* vy, const float* vz,
                                             AffineVelocities affine, float voxelSize,
                                             const uint* numVoxelsEachNode, const uint* voxelIDs, const uint* voxelOwners,
                                             int* ux, int* uy, int* uz, int* weightsX, int* weightsY, int* weightsZ, int* particleCounts, float momentumScale, float weightScale, double radius, Grid grid, uint refinementLevel,
-                                            const uint* ids, float airMass, int* plainX, int* plainY, int* plainZ){
-    extern __shared__ int fixedSums[];    //per slot: x, y, z momentum, then x, y, z weight, then particle count; with PHASES, then x, y, z plain weight
+                                            const uint* ids, float airMass, int* liquidX, int* liquidY, int* liquidZ){
+    extern __shared__ int fixedSums[];    //per slot: x, y, z momentum, then x, y, z weight, then particle count; with PHASES, then the liquid's x, y, z weight
     const int SUMS = PHASES ? 10 : 7;
     int voxels1D = numVoxels1D;
     int voxels3D = voxels1D*voxels1D*voxels1D;
@@ -1019,11 +1020,13 @@ __global__ void scatterParticleVelsToVoxels(uint numParticleNodes, uint numParti
         float3 pos = positionInNodeBlock(index, gridPosition, px, py, pz, grid, refinementLevel, apronCells);
         FaceStencil stencil(pos);
         float mass = 1.0f;
+        bool liquid = true;
         if constexpr(PHASES){
             if(ids[index] & ESCAPED_PARTICLE){
                 continue;   //off the grid: a droplet, or a bubble about to go
             }
-            mass = ids[index] & AIR_PARTICLE ? airMass : 1.0f;
+            liquid = !(ids[index] & AIR_PARTICLE);
+            mass = liquid ? 1.0f : airMass;
         }
         #pragma unroll
         for(int dim = 0; dim < 3; ++dim){
@@ -1060,7 +1063,9 @@ __global__ void scatterParticleVelsToVoxels(uint numParticleNodes, uint numParti
                         if constexpr(PHASES){
                             atomicAdd(fixedSums + dim*voxels3D + rowStart + i, __float2int_rn(weight*mass*faceVelocity*momentumScale));
                             atomicAdd(fixedSums + (3 + dim)*voxels3D + rowStart + i, __float2int_rn(weight*mass*weightScale));
-                            atomicAdd(fixedSums + (7 + dim)*voxels3D + rowStart + i, __float2int_rn(weight*weightScale));
+                            if(liquid){     //its mass is 1, so this is the very number its mass just added
+                                atomicAdd(fixedSums + (7 + dim)*voxels3D + rowStart + i, __float2int_rn(weight*weightScale));
+                            }
                         }
                         else{
                             atomicAdd(fixedSums + dim*voxels3D + rowStart + i, __float2int_rn(weight*faceVelocity*momentumScale));
@@ -1073,7 +1078,7 @@ __global__ void scatterParticleVelsToVoxels(uint numParticleNodes, uint numParti
         atomicAdd(fixedSums + 6*voxels3D + (int)pos.x + (int)pos.y*voxels1D + (int)pos.z*voxels1D*voxels1D, 1);
     }
     __syncthreads();
-    int* accumulators[10] = {ux, uy, uz, weightsX, weightsY, weightsZ, particleCounts, plainX, plainY, plainZ};
+    int* accumulators[10] = {ux, uy, uz, weightsX, weightsY, weightsZ, particleCounts, liquidX, liquidY, liquidZ};
     for(uint i = (blockIdx.x == 0 ? 0 : numVoxelsEachNode[blockIdx.x - 1]) + threadIdx.x; i < numVoxelsEachNode[blockIdx.x]; i += blockDim.x){    //coalesced over the node's voxels
         int slot = voxelIDs[i];
         uint owner = voxelOwners[i];    //itself for interior voxels, so these atomics are mostly consecutive
@@ -1168,11 +1173,11 @@ void Particles::particleVelToVoxels(){
     //P2G sums in fixed point: a face's weight sum is about the particles per voxel, so budget 128 (15x rest) and keep every sum under 2^30
     float weightScale = (1 << 30) / 128.0f;
     float momentumScale = weightScale / fmax(transferred, 1e-6);
-    bool phases = twoPhase.particles();     //air and liquid: each particle weighs as its fluid does, and the plain weights are kept beside the masses
+    bool phases = twoPhase.particles();     //air and liquid: each particle weighs as its fluid does, and the liquid's weights are kept beside the masses
     if(phases){
-        plainWeightUnit = 1.0f / weightScale;
-        for(CudaVec<float>& plain : plainWeights){
-            plain.zeroDeviceAsync(stream);
+        liquidWeightUnit = 1.0f / weightScale;
+        for(CudaVec<float>& liquid : liquidWeights){
+            liquid.zeroDeviceAsync(stream);
         }
     }
     if(numParticleNodes > 0){
@@ -1181,16 +1186,16 @@ void Particles::particleVelToVoxels(){
         scatter<<<numParticleNodes, NODE_THREADS, (phases ? 10 : 7)*sizeof(int)*numVoxelsPerNode, stream>>>(numParticleNodes, size, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(),
             affineVelocities(affine), voxelSize, nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(), voxelOwners.devPtr(), (int*)voxelsUx.devPtr(), (int*)voxelsUy.devPtr(), (int*)voxelsUz.devPtr(),
             (int*)voxelWeightsX.devPtr(), (int*)voxelWeightsY.devPtr(), (int*)voxelWeightsZ.devPtr(), (int*)particleCounts.devPtr(), momentumScale, weightScale, radius, grid, refinementLevel,
-            particleIds.devPtr(), 1.0f / twoPhase.densityRatio, (int*)plainWeights[0].devPtr(), (int*)plainWeights[1].devPtr(), (int*)plainWeights[2].devPtr());
+            particleIds.devPtr(), 1.0f / twoPhase.densityRatio, (int*)liquidWeights[0].devPtr(), (int*)liquidWeights[1].devPtr(), (int*)liquidWeights[2].devPtr());
     }
     //particles near this partition's edge reach into ghost voxels: their owners add those sums in, which in fixed point come out the same in any order
     for(CudaVec<float>* accumulator : {&voxelsUx, &voxelsUy, &voxelsUz, &voxelWeightsX, &voxelWeightsY, &voxelWeightsZ, &particleCounts}){
         context->reduceGhosts((int*)accumulator->devPtr(), stream);
     }
     if(phases){
-        for(CudaVec<float>& plain : plainWeights){
-            context->reduceGhosts((int*)plain.devPtr(), stream);
-            context->fillGhosts(plain.devPtr(), stream);    //as bits: they stay fixed point
+        for(CudaVec<float>& liquid : liquidWeights){
+            context->reduceGhosts((int*)liquid.devPtr(), stream);
+            context->fillGhosts(liquid.devPtr(), stream);   //as bits: they stay fixed point
         }
     }
     cudaNormalizeVoxelVelocities(solids, voxelWeightsX, voxelWeightsY, voxelWeightsZ, voxelsUx, voxelsUy, voxelsUz, particleCounts, momentumScale, weightScale, stream);

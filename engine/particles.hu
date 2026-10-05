@@ -498,12 +498,13 @@ private:
     CudaVec<float> liquidCurvature; //per stored voxel beside the surface: its curvature, in 1/voxels, positive where the liquid bulges
     CudaVec<float> surfaceLevel;    //per stored voxel, with the sharp free surface: the level set smoothed for the pressure solve (SURFACE_PASSES)
     TwoPhase twoPhase;
-    CudaVec<float> plainWeights[3];     //two phases: P2G's weight sums with every particle counting alike, where voxelWeights then hold each face's mass.
-                                        //Left in P2G's fixed point, plainWeightUnit to the count
-    float plainWeightUnit = 0.0f;
+    CudaVec<float> liquidWeights[3];    //two phases: P2G's weight sums of the liquid's particles alone, where voxelWeights then hold each face's mass,
+                                        //the liquid's weight and the air's over the density ratio. Left in P2G's fixed point, liquidWeightUnit to the weight
+    float liquidWeightUnit = 0.0f;
     CudaVec<float> faceLightness[3];    //two phases, per stored voxel's three lower faces: the liquid's density over the face's, 1 up to the density ratio
     CudaVec<char> bandRings;            //with an air band, per node cell of the domain: its ring, or BEYOND_BAND (findBandRings)
-    CudaVec<float> liquidDensity;       //with escaping particles, per stored voxel: the liquid's density there over its density at rest (findFaceDensities)
+    CudaVec<float> liquidDensity;       //with escaping particles, per stored voxel: the liquid's density there over its density at rest, or beside an
+                                        //obstacle over both fluids' (findLiquidDensity, twophase.cu)
     void* viscousSeen = nullptr;    //pinned: the viscous solve's state as the host last read it
     uint viscousIterations = 0;     //what the last viscous solve took, which sizes the next one's first batch
     unsigned long long substepIndex = 0;    //substeps taken, which seeds the emitters' jitter
