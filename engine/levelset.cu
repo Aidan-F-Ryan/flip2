@@ -91,7 +91,7 @@ __device__ inline void splatPoint(const float p[3], int* sums, int voxels1D, int
 //a voxel of one of the domain's walls is also there as its mirror image in the wall (and in two or three walls at once, by an edge or a corner): beside
 //a wall a centre's reach is half inside it, and with the liquid on one side only the mean would lean away from the wall, as it does at a surface. With
 //the images it reads as the liquid carrying on through the wall as it is on this side
-//With two PHASES (TwoPhase, particles.hu), only the liquid's particles make its surface: those whose ids aren't marked AIR_PARTICLE. A template, so that
+//With two PHASES (TwoPhase, particles.hu), only the liquid's particles on the grid make its surface: those whose ids aren't marked AIR_PARTICLE or ESCAPED_PARTICLE. A template, so that
 //without them the kernel is the one it always was, to the bit
 template<bool PHASES>
 __global__ void splatParticles(uint numParticleNodes, uint numParticles, const uint* firstParticles, const double* px, const double* py, const double* pz, VoxelPlaces places,
@@ -112,7 +112,7 @@ __global__ void splatParticles(uint numParticleNodes, uint numParticles, const u
     double perVoxel = 1.0 / (double)places.voxelSize();
     for(uint index = firstParticle + threadIdx.x; index < lastParticle; index += blockDim.x){    //consecutive threads, consecutive particles
         if constexpr(PHASES){
-            if(ids[index] & AIR_PARTICLE){
+            if(ids[index] & (AIR_PARTICLE | ESCAPED_PARTICLE)){     //nor its droplets, which aren't the body of the liquid
                 continue;
             }
         }

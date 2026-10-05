@@ -40,14 +40,36 @@ enum class FaceDensity{
 };
 
 //A second, lighter fluid, air, around the liquid (twophase.cu): experimental. The air is particles like the liquid's, lighter by the density ratio, and
-//the pressure solve takes each face's own density, so one solve moves both. Which a particle is, is the top bit of its id (AIR_PARTICLE), so there's
-//nothing more to carry per particle. The 31 bits below number the liquid's particles; the air's mean nothing, and air takes no numbers from the count
+//the pressure solve takes each face's own density, so one solve moves both. Which a particle is, is the top bits of its id, so there's nothing more to
+//carry per particle: AIR_PARTICLE, and ESCAPED_PARTICLE for one the grid no longer carries (below). The 30 bits under them (PARTICLE_NUMBER) number
+//the liquid's particles; the air's mean nothing, and air takes no numbers from the count
 static constexpr uint AIR_PARTICLE = 0x80000000u;
+static constexpr uint ESCAPED_PARTICLE = 0x40000000u;
+static constexpr uint PARTICLE_NUMBER = 0x3FFFFFFFu;
+
+//Escaped particles, after PF-FLIP's section 3.4. A particle on the wrong side of the interface, where the grid's voxels are the other fluid's, is too
+//small a piece of its own fluid for the grid to carry: there its momentum and its weight get smeared over a voxel of the other fluid. So it leaves the
+//grid (ESCAPED_PARTICLE), judged each substep by the liquid's density at its voxel over the density at rest (liquidDensity; PF-FLIP's phase is its
+//square root, and these are its 0.5 -/+ 0.2 and 0.5, squared):
+//- a liquid particle where that's under DROPLET_DENSITY is a droplet. It takes no part in P2G or the pressure solve, and flies under gravity and the
+//  drag of the grid's velocity where it is, the air's (so the air still carries spray, but the spray doesn't push the air). Back where the density is
+//  over REJOIN_DENSITY it's the liquid's again, with the velocity it arrives with;
+//- an air particle where it's over BUBBLE_DENSITY is a bubble smaller than a voxel, and is removed at the next initialize. That's where the air's own
+//  density is as low as a droplet's liquid, 1 - DROPLET_DENSITY, and not PF-FLIP's (0.5 + 0.2)^2 = 0.49: every voxel the surface of a bubble cuts is
+//  about half liquid, so at 0.49 the air there goes each substep, and a bubble 16 voxels across lost 60 to 87% of its air in 0.28 s.
+//What the grid resolves isn't touched: a pocket of air a few voxels across is air on the grid, and stays in the solve
+static constexpr float DROPLET_DENSITY = 0.09f;
+static constexpr float REJOIN_DENSITY = 0.25f;
+static constexpr float BUBBLE_DENSITY = 1.0f - DROPLET_DENSITY;
+
 struct TwoPhase{
     bool on = false;
     float densityRatio = 1000.0f;       //the liquid's density over the air's
     FaceDensity faceDensity = FaceDensity::fractions;
     float airFlipRatio = 0.95f;         //the air's share of FLIP in G2P, as setFlipRatio is the liquid's
+    bool escapes = true;                //whether particles on the wrong side of the interface leave the grid (ESCAPED_PARTICLE)
+    float dropletRadius = 0.0f;         //a droplet's radius for the air's drag on it, in metres; 0 for a ball of the liquid one particle stands for
+    float airViscosity = 1.5e-5f;       //the air's kinematic viscosity, m^2/s, for that drag
     int band = 0;                       //voxels of air kept around the liquid, in whole nodes; 0 keeps all of it
     int syntheticShape = 0;             //synthetic: 0 air above syntheticCentre's height (y), 1 a ball of air there, 2 balls of air on a lattice from there
     float3 syntheticCentre = {0.0f, 0.0f, 0.0f};
@@ -57,6 +79,18 @@ struct TwoPhase{
     bool particles() const{     //whether any particles are air: not when the densities are made up
         return on && faceDensity != FaceDensity::synthetic;
     }
+    bool escaping() const{
+        return particles() && escapes;
+    }
+};
+
+//what G2P needs to fly a droplet through a substep: gravity, and the air's drag on a ball of the liquid (Schiller and Naumann's)
+struct DropletFlight{
+    float3 gravity;
+    float dt;
+    float radius;           //the droplet's, in metres
+    float airViscosity;     //kinematic
+    float densityRatio;     //the liquid's density over the air's
 };
 
 //the air band (TwoPhase::band, twophase.cu): a node cell's ring is how many nodes it is from one holding liquid, and this is one no ring reached
@@ -66,6 +100,7 @@ static constexpr char BEYOND_BAND = 127;
 static const int PHASE_HEIGHT_BINS = 256;
 struct PhaseStatistics{
     unsigned long long count = 0;
+    unsigned long long escaped = 0;     //how many of them are off the grid: the liquid's droplets, or the air's bubbles about to be removed
     double positionSum[3] = {0.0, 0.0, 0.0};
     double kineticEnergy = 0.0;     //the sum of |v|^2/2
     float fastest = 0.0f;           //the largest |v|
@@ -116,6 +151,9 @@ public:
     //a frame for the cache (cacheWriter.hu), into pinned planes: float32 P x, y, z, then v x, y, z, then with ids each particle's id (64 bits), and with
     //ages how long ago it came to be, in seconds, each a plane of every particle's value, recording copied once they're there
     void copyFrameColumnsToHost(float* planes, bool ids, bool ages, cudaEvent_t copied);
+    uint idNumbers() const{     //the bits of an id that number the particle: all of them, or with air the ones under the bits that say what it is
+        return twoPhase.particles() ? PARTICLE_NUMBER : 0xFFFFFFFFu;
+    }
     //how many of this partition's particles a cache frame takes, which copyFrameColumnsToHost then packs: all of them, or with air the liquid's alone
     //(nothing that reads a frame has a use for the air). With air it counts them, waiting for the GPU
     uint countFrameParticles();
@@ -285,9 +323,9 @@ private:
     void findFaceDensities();
     void weighDensityFaces(float scale);
     void lightenFaceUpdates(float scale);
-    //the air band (twophase.cu): air only within twoPhase.band voxels of the liquid, and the open air's pressure, 0, past it. markBeyondBand finds each
-    //node cell's ring and flags the air past the band as removed; fillAirBand (in emitParticles) makes air in the band's empty voxels; floatInAir takes
-    //the air's own weight off every face, so the air hangs still with nothing past the band holding it up
+    //the air band (twophase.cu): air only within twoPhase.band voxels of the liquid, and the open air's pressure, 0, past it. findBandRings finds each
+    //node cell's ring, in every partition alike; markBeyondBand flags the air past the band as removed; emitParticles makes air in the band's empty
+    //voxels; floatInAir takes the air's own weight off every face, so the air hangs still with nothing past the band holding it up
     bool airBand() const{
         return twoPhase.particles() && twoPhase.band > 0;
     }
@@ -296,6 +334,7 @@ private:
         int rings = (twoPhase.band + interiorWidth - 1) / interiorWidth;
         return rings < BEYOND_BAND - 1 ? rings : BEYOND_BAND - 1;
     }
+    void findBandRings();
     void markBeyondBand();
     void floatInAir(float dt);
     void applySurfaceTension();
@@ -463,7 +502,8 @@ private:
                                         //Left in P2G's fixed point, plainWeightUnit to the count
     float plainWeightUnit = 0.0f;
     CudaVec<float> faceLightness[3];    //two phases, per stored voxel's three lower faces: the liquid's density over the face's, 1 up to the density ratio
-    CudaVec<char> bandRings;            //with an air band, per node cell of the domain: its ring, or BEYOND_BAND (markBeyondBand)
+    CudaVec<char> bandRings;            //with an air band, per node cell of the domain: its ring, or BEYOND_BAND (findBandRings)
+    CudaVec<float> liquidDensity;       //with escaping particles, per stored voxel: the liquid's density there over its density at rest (findFaceDensities)
     void* viscousSeen = nullptr;    //pinned: the viscous solve's state as the host last read it
     uint viscousIterations = 0;     //what the last viscous solve took, which sizes the next one's first batch
     unsigned long long substepIndex = 0;    //substeps taken, which seeds the emitters' jitter

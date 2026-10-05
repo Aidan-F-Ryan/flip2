@@ -170,6 +170,37 @@ __global__ void lightnessFromPlace(VoxelPlaces places, TwoPhase settings, float*
     }
 }
 
+//For escaping particles (particles.hu): each stored voxel's liquid density over the density at rest, the mean over its faces of the liquid's share of
+//P2G's weight there. A face's mass is the liquid's weight and the air's over the ratio, and its plain weight is both, so the liquid's is
+//(mass - plain/ratio)/(1 - 1/ratio). An unknown has all six faces, its upper ones its upper neighbours'; anything else goes by the three it stores
+__device__ inline float liquidWeight(float mass, float plain, float ratio){
+    return fmaxf((mass - plain/ratio) / (1.0f - 1.0f/ratio), 0.0f);
+}
+
+__global__ void findLiquidDensity(uint numVoxels, const char* solveCodes, const uint* neighborPx, const uint* neighborPy, const uint* neighborPz, const float* massX,
+                                  const float* massY, const float* massZ, const int* plainX, const int* plainY, const int* plainZ, float plainUnit, float ratio, float rest,
+                                  float* density){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(index < numVoxels){
+        const uint* upper[3] = {neighborPx, neighborPy, neighborPz};
+        const float* mass[3] = {massX, massY, massZ};
+        const int* plain[3] = {plainX, plainY, plainZ};
+        float sum = 0.0f;
+        int faces = 0;
+        #pragma unroll
+        for(int axis = 0; axis < 3; ++axis){
+            sum += liquidWeight(mass[axis][index], plain[axis][index]*plainUnit, ratio);
+            ++faces;
+            uint above = upper[axis][index];
+            if(solveCodes[index] && above < WALL_VOXEL){
+                sum += liquidWeight(mass[axis][above], plain[axis][above]*plainUnit, ratio);
+                ++faces;
+            }
+        }
+        density[index] = sum / (faces*rest);
+    }
+}
+
 //Each unknown's pressure equation with every face weighing its lightness too: the row over again, from scale, how open obstacles leave each face
 //(weighCutFaces' fractions) and the faces' lightness. A lower face is the unknown's own; an upper one its upper neighbour's, which is always stored
 __global__ void weighDensityFacesKernel(uint numVoxels, const char* solveCodes, const uint* neighborNx, const uint* neighborPx, const uint* neighborNy, const uint* neighborPy,
@@ -236,10 +267,7 @@ void Particles::findFaceDensities(){
         std::cerr<<"Particles: two phases don't go with the sharp free surface, viscosity or surface tension yet\n";
         exit(1);
     }
-    uint numVoxels = voxelIDsUsed.size();
-    if(numVoxels == 0){
-        return;
-    }
+    uint numVoxels = voxelIDsUsed.size();   //none in a partition the fluid hasn't reached, which still takes its turn in the ghosts' exchanges below
     uint blocks = numVoxels / BLOCKSIZE + 1;
     float* light[3] = {faceLightness[0].devPtr(), faceLightness[1].devPtr(), faceLightness[2].devPtr()};
     float ratio = twoPhase.densityRatio;
@@ -250,7 +278,7 @@ void Particles::findFaceDensities(){
             break;
         case FaceDensity::phaseField:{
             char* liquid;
-            gpuErrchk(cudaMallocAsync((void**)&liquid, numVoxels, stream));
+            gpuErrchk(cudaMallocAsync((void**)&liquid, numVoxels + 1, stream));
             phaseOfFaces<<<blocks, BLOCKSIZE, 0, stream>>>(numVoxels, voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), (float)restParticlesPerVoxel, ratio,
                 light[0], light[1], light[2]);
             tagLiquidVoxels<<<blocks, BLOCKSIZE, 0, stream>>>(numVoxels, solveCodes.devPtr(), neighborPx.devPtr(), neighborPy.devPtr(), neighborPz.devPtr(), light[0], light[1], light[2], liquid);
@@ -271,6 +299,12 @@ void Particles::findFaceDensities(){
     }
     for(float* lightness : light){  //the ghosts take their owners', which read their own neighbours
         context->fillGhosts(lightness, stream);
+    }
+    if(twoPhase.escaping()){
+        findLiquidDensity<<<blocks, BLOCKSIZE, 0, stream>>>(numVoxels, solveCodes.devPtr(), neighborPx.devPtr(), neighborPy.devPtr(), neighborPz.devPtr(), voxelWeightsX.devPtr(),
+            voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), (const int*)plainWeights[0].devPtr(), (const int*)plainWeights[1].devPtr(), (const int*)plainWeights[2].devPtr(),
+            plainWeightUnit, ratio, (float)restParticlesPerVoxel, liquidDensity.devPtr());
+        context->fillGhosts(liquidDensity.devPtr(), stream);
     }
     gpuErrchk(cudaPeekAtLastError());
 }
@@ -299,19 +333,19 @@ void Particles::lightenFaceUpdates(float scale){
 
 //The air band (TwoPhase::band): air only within band voxels of the liquid, in whole nodes, and nothing past it, where the pressure is the open air's, 0,
 //as it is past a free surface. Each initialize, once the particles have their cells:
-//- markBeyondBand counts the liquid's particles in every node cell of the domain. A cell with BAND_LIQUID_PARTICLES of them holds liquid (a few stray
+//- findBandRings counts the liquid's particles in every node cell of the domain. A cell with BAND_LIQUID_PARTICLES of them holds liquid (a few stray
 //  drops get no air of their own: they fly through nothing, as they do with no air at all), and rings spread out from those cells a node at a time.
-//  Air in a cell past the band's last ring is flagged as removed, and goes the way a sink's particles do.
-//- fillAirBand (sources.cu, in emitParticles) makes air, at rest, on the seeding lattice's points in the band's voxels that hold no particle.
+//- emitParticles (sources.cu) then makes air, at rest, on the seeding lattice's points in the band's voxels that hold no particle.
+//- markBeyondBand, at the next initialize, flags the air in a cell past the band's last ring as removed, and it goes the way a sink's particles do.
 //With nothing past the band to hold the air up, gravity would pour it out of the band's foot: floatInAir takes the air's own weight off every face, so
 //the pressure solved for is what's over the still air's, and that is 0 past the band at every height.
-//Unoptimised, and for one partition: the counts are atomics on a dense array of node cells, and the rings a sweep of that array each
+//Unoptimised: the counts are atomics on a dense array of node cells, and the rings a sweep of that array each
 
 static constexpr uint BAND_LIQUID_PARTICLES = 16;   //two voxels' worth at 8 a voxel
 
-__global__ void countLiquidInCells(uint numParticles, const uint* cells, const uint* ids, const char* removed, uint* counts){
+__global__ void countLiquidInCells(uint numParticles, const uint* cells, const uint* ids, uint* counts){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
-    if(index < numParticles && !(ids[index] & AIR_PARTICLE) && !removed[index]){
+    if(index < numParticles && !(ids[index] & (AIR_PARTICLE | ESCAPED_PARTICLE))){   //the liquid the grid carries: a droplet takes no air along
         atomicAdd(counts + cells[index], 1u);
     }
 }
@@ -354,14 +388,12 @@ __global__ void markAirBeyondBand(uint numParticles, const uint* cells, const ui
     }
 }
 
-//after alignParticlesToGrid, so every particle's cell is where it is now, and markRemovedParticles, which sized the flags
-void Particles::markBeyondBand(){
+//Each node cell's ring, from the liquid every partition holds: once each holds the particles in its own planes and no others (after exchangeParticles,
+//and the emitters), so each counts its own cells whole, and takes the other partitions' counts for theirs. The rings then come out the same in every
+//partition, and the same however the domain is split. They serve this initialize's fill, and the next one's markBeyondBand
+void Particles::findBandRings(){
     if(!airBand()){
         return;
-    }
-    if(numRanks > 1){
-        std::cerr<<"Particles: the air band is for one partition yet\n";
-        exit(1);
     }
     uint numCells = grid.sizeX*grid.sizeY*grid.sizeZ;
     uint cellBlocks = numCells / BLOCKSIZE + 1;
@@ -372,8 +404,9 @@ void Particles::markBeyondBand(){
     gpuErrchk(cudaMallocAsync((void**)&other, numCells, stream));
     gpuErrchk(cudaMemsetAsync(counts, 0, sizeof(uint)*numCells, stream));
     if(size > 0){
-        countLiquidInCells<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, gridCell.devPtr(), particleIds.devPtr(), removedFlags.devPtr(), counts);
+        countLiquidInCells<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, gridCell.devPtr(), particleIds.devPtr(), counts);
     }
+    context->gatherNodeCells(counts, sizeof(uint), stream);
     startBandRings<<<cellBlocks, BLOCKSIZE, 0, stream>>>(numCells, counts, bandRings.devPtr());
     char* from = bandRings.devPtr();
     char* to = other;
@@ -385,12 +418,19 @@ void Particles::markBeyondBand(){
     if(from != bandRings.devPtr()){
         gpuErrchk(cudaMemcpyAsync(bandRings.devPtr(), from, numCells, cudaMemcpyDeviceToDevice, stream));
     }
-    if(size > 0){
-        markAirBeyondBand<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, gridCell.devPtr(), particleIds.devPtr(), bandRings.devPtr(), (char)last,
-            removedFlags.devPtr());
-    }
     gpuErrchk(cudaFreeAsync(counts, stream));
     gpuErrchk(cudaFreeAsync(other, stream));
+    gpuErrchk(cudaPeekAtLastError());
+}
+
+//after alignParticlesToGrid, so every particle's cell is where it is now, and markRemovedParticles, which sized the flags: the air in a cell past the
+//band, by the rings the last initialize found (a substep old, which a band of whole nodes has room for; none yet at the start)
+void Particles::markBeyondBand(){
+    if(!airBand() || size == 0 || bandRings.size() != grid.sizeX*grid.sizeY*grid.sizeZ){
+        return;
+    }
+    markAirBeyondBand<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, gridCell.devPtr(), particleIds.devPtr(), bandRings.devPtr(), (char)bandRingCount(),
+        removedFlags.devPtr());
     gpuErrchk(cudaPeekAtLastError());
 }
 
@@ -422,13 +462,14 @@ void Particles::floatInAir(float dt){
 //its sums in: the doubles come out in whatever order the threads land, which a test's numbers can live with
 __global__ void sumPhases(uint numParticles, const double* px, const double* py, const double* pz, const float* vx, const float* vy, const float* vz, const uint* ids,
                           double floorY, double perBin, unsigned long long* counts, double* sums, unsigned int* fastestBits, unsigned int* heights){
-    unsigned long long count[2] = {0, 0};
+    unsigned long long count[2] = {0, 0}, escaped[2] = {0, 0};
     double sum[2][4] = {};
     float fastest[2] = {0.0f, 0.0f};
     for(uint index = threadIdx.x + blockIdx.x*blockDim.x; index < numParticles; index += blockDim.x*gridDim.x){
         int phase = ids[index] >> 31;     //AIR_PARTICLE
         float speedSquared = vx[index]*vx[index] + vy[index]*vy[index] + vz[index]*vz[index];
         ++count[phase];
+        escaped[phase] += ids[index] >> 30 & 1;     //ESCAPED_PARTICLE
         sum[phase][0] += px[index];
         sum[phase][1] += py[index];
         sum[phase][2] += pz[index];
@@ -440,6 +481,7 @@ __global__ void sumPhases(uint numParticles, const double* px, const double* py,
     for(int phase = 0; phase < 2; ++phase){
         if(count[phase] > 0){
             atomicAdd(counts + phase, count[phase]);
+            atomicAdd(counts + 2 + phase, escaped[phase]);
             for(int which = 0; which < 4; ++which){
                 atomicAdd(sums + 4*phase + which, sum[phase][which]);
             }
@@ -453,7 +495,7 @@ void Particles::phaseStatistics(PhaseStatistics& liquid, PhaseStatistics& air){
         return;
     }
     struct Totals{
-        unsigned long long counts[2];
+        unsigned long long counts[4];   //each fluid's particles, then how many of each are off the grid
         double sums[8];
         unsigned int fastestBits[2];
         unsigned int heights[2*PHASE_HEIGHT_BINS];
@@ -471,6 +513,7 @@ void Particles::phaseStatistics(PhaseStatistics& liquid, PhaseStatistics& air){
     PhaseStatistics* phases[2] = {&liquid, &air};
     for(int phase = 0; phase < 2; ++phase){
         phases[phase]->count += host.counts[phase];
+        phases[phase]->escaped += host.counts[2 + phase];
         for(int axis = 0; axis < 3; ++axis){
             phases[phase]->positionSum[axis] += host.sums[4*phase + axis];
         }

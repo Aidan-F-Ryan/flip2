@@ -161,6 +161,10 @@ struct Scene{
     std::string airFaceDensity = "fractions";   //how a face's density is found: "fractions", "phaseField", "levelSet", or "synthetic" (no air particles)
     double airFlipRatio = -1.0;     //the air's share of FLIP; negative: the liquid's
     int airBand = 0;                //voxels of air kept around the liquid; 0 keeps all of it
+    bool airEscaped = true;         //whether particles on the wrong side of the interface leave the grid: droplets fly under gravity and the air's drag, and
+                                    //bubbles smaller than a voxel are removed (particles.hu, ESCAPED_PARTICLE)
+    double airDropletRadius = 0.0;  //a droplet's radius for that drag, in metres; 0 for a ball of the liquid one particle stands for
+    double airViscosity = 1.5e-5;   //the air's kinematic viscosity, m^2/s, for the same
     std::string airSyntheticShape = "plane";    //synthetic: air above "centre"'s height ("plane"), in a "ball" there, or in "balls" on a lattice from there
     double airSyntheticCentre[3] = {0.0, 0.0, 0.0};
     double airSyntheticRadius = 0.0;

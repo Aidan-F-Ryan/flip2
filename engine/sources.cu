@@ -73,7 +73,15 @@ __global__ void killRemoved(uint numParticles, const char* removed, uint deadCel
 }
 
 bool Particles::removing() const{
-    return sources.removes() || (obstacles.count() > 0 && substepIndex == 0) || airBand();
+    return sources.removes() || (obstacles.count() > 0 && substepIndex == 0) || airBand() || twoPhase.escaping();
+}
+
+//escaped air (twoPhase.escaping()): bubbles too small for the grid, which G2P marked, go
+__global__ void markBubbles(uint numParticles, const uint* ids, char* removed){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(index < numParticles && (ids[index] & (AIR_PARTICLE | ESCAPED_PARTICLE)) == (AIR_PARTICLE | ESCAPED_PARTICLE)){
+        removed[index] = 1;
+    }
 }
 
 void Particles::markRemovedParticles(){
@@ -83,6 +91,9 @@ void Particles::markRemovedParticles(){
     removedFlags.resizeAsync(size, stream);
     double voxelSize = grid.cellSize / (2<<refinementLevel);
     markRemoved<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, px.devPtr(), py.devPtr(), pz.devPtr(), sources, grid, voxelSize, removedFlags.devPtr());
+    if(twoPhase.escaping()){
+        markBubbles<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, particleIds.devPtr(), removedFlags.devPtr());
+    }
     gpuErrchk(cudaPeekAtLastError());
     markParticlesInsideObstacles();
 }
@@ -239,14 +250,14 @@ __global__ void findFills(EmitterLattice lattice, FluidShapes fluids, int which,
 }
 
 //the new particles' ids and birth times. A liquid particle's id is firstId plus its lattice point's place among every point emitting now, in any
-//partition's planes (ranks: each point's running count of those), so it doesn't depend on which partition makes it; it keeps to the 31 bits under
-//AIR_PARTICLE. Air's particles are that bit and no number
-__global__ void identifyEmitted(unsigned long long count, const uint* own, const uint* ends, const uint* ranks, uint first, uint firstId, bool air, float birth,
-                                uint* ids, float* births){
+//partition's planes (ranks: each point's running count of those), so it doesn't depend on which partition makes it; it keeps to the bits that number
+//a particle (numbers: Particles::idNumbers). Air's particles are AIR_PARTICLE and no number
+__global__ void identifyEmitted(unsigned long long count, const uint* own, const uint* ends, const uint* ranks, uint first, uint firstId, uint numbers, bool air,
+                                float birth, uint* ids, float* births){
     unsigned long long index = threadIdx.x + (unsigned long long)blockIdx.x*blockDim.x;
     if(index < count && own[index]){
         uint particle = first + ends[index] - 1;
-        ids[particle] = air ? AIR_PARTICLE : (firstId + ranks[index] - 1) & ~AIR_PARTICLE;
+        ids[particle] = air ? AIR_PARTICLE : (firstId + ranks[index] - 1) & numbers;
         births[particle] = birth;
     }
 }
@@ -439,13 +450,13 @@ void Particles::emitParticles(){
             uint first = size;
             resizeParticleArrays(size + newParticles, size);
             place(count, own, ends, first);
-            identifyEmitted<<<(uint)(count / BLOCKSIZE + 1), BLOCKSIZE, 0, stream>>>(count, own, ends, ranks, first, (uint)nextParticleId, air, (float)elapsedTime,
+            identifyEmitted<<<(uint)(count / BLOCKSIZE + 1), BLOCKSIZE, 0, stream>>>(count, own, ends, ranks, first, (uint)nextParticleId, idNumbers(), air, (float)elapsedTime,
                 particleIds.devPtr(), particleBirths.devPtr());
             added += newParticles;
         }
         if(!air){   //air takes no numbers
-            if(nextParticleId <= 0x7FFFFFFFull && nextParticleId + counts[1] > 0x7FFFFFFFull && verbose()){
-                std::cerr<<"Particles: more than 2^31 particles have been made, and ids are 31 bits: from here on new particles repeat old ids\n";
+            if(nextParticleId <= idNumbers() && nextParticleId + counts[1] > idNumbers() && verbose()){
+                std::cerr<<"Particles: more than "<<(unsigned long long)idNumbers() + 1<<" particles have been made, more than their ids can number: from here on new particles repeat old ids\n";
             }
             nextParticleId += counts[1];
         }
@@ -483,8 +494,12 @@ void Particles::emitParticles(){
                 px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr());
         });
     }
-    if(airBand()){  //air, at rest, in the band's voxels that hold nothing (twophase.cu): every lattice point of the domain is asked, which a band of nodes
-                    //listed first would save
+    if(airBand()){  //air, at rest, in the band's voxels that hold nothing (twophase.cu): every lattice point of this partition's planes is asked, which a
+                    //band of nodes listed first would save
+        if(added > 0){  //the rings count the liquid just made too: its particles need their cells
+            alignParticlesToGrid();
+        }
+        findBandRings();
         BandFill band;
         band.rings = bandRings.devPtr();
         band.last = (char)bandRingCount();
@@ -502,11 +517,13 @@ void Particles::emitParticles(){
         if(size > 0){
             markOccupiedVoxels<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, px.devPtr(), py.devPtr(), pz.devPtr(), lattice, band, occupied);
         }
-        FluidShape everywhere;      //a box: the domain
+        FluidShape everywhere;      //a box: this partition's planes of the domain
         for(int axis = 0; axis < 3; ++axis){
             everywhere.low[axis] = lattice.low[axis];
             everywhere.high[axis] = lattice.high[axis];
         }
+        everywhere.low[2] = lattice.ownLow;
+        everywhere.high[2] = lattice.ownHigh;
         //not an emitter's seed or a fluid's, and another every substep: a voxel emptied twice doesn't fill the same way twice
         unsigned long long seed = sources.seed + 2*MAX_SOURCE_SHAPES + 0x9e3779b97f4a7c15ull*(substepIndex + 1);
         emitFrom(everywhere, true, [&](unsigned long long count, uint* emitting, uint* own){

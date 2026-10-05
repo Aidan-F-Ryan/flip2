@@ -27,8 +27,10 @@ public:
     void sumOverPartitions(long long* values, uint count, cudaStream_t stream) override;
     void sumOverPartitions(double* value, cudaStream_t stream) override;
     void gatherFirstLevel(void* cells, size_t bytesPerCell, cudaStream_t stream) override;
+    void gatherNodeCells(void* cells, size_t bytesPerCell, cudaStream_t stream) override;
 
 private:
+    void gatherRuns(void* cells, size_t bytesPerCell, size_t perNode, cudaStream_t stream);
     template <typename T>
     void fill(T* values, cudaStream_t stream);
     template <typename T>

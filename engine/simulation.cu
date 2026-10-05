@@ -221,7 +221,8 @@ void Simulation::writePhaseDiagnostics(const std::string& path, int frame){
             centroid[axis] = p.count > 0 ? p.positionSum[axis] / p.count : 0.0;
         }
         char numbers[256];
-        std::snprintf(numbers, sizeof(numbers), ",\"%s\":{\"count\":%llu,\"kineticEnergy\":%.9g,\"fastest\":%.9g,\"centroid\":", names[phase], p.count, p.kineticEnergy, p.fastest);
+        std::snprintf(numbers, sizeof(numbers), ",\"%s\":{\"count\":%llu,\"escaped\":%llu,\"kineticEnergy\":%.9g,\"fastest\":%.9g,\"centroid\":", names[phase], p.count, p.escaped,
+            p.kineticEnergy, p.fastest);
         phaseDiagnostics<<numbers<<jsonArray(centroid, 3, "%.9g")<<",\"heights\":"<<jsonArray(p.heights, PHASE_HEIGHT_BINS, "%u")<<"}";
     }
     phaseDiagnostics<<"}\n";
