@@ -13,7 +13,8 @@
 //bake runs the scene (see scene.hpp) and writes into the output directory its cache (cacheWriter.hu: cache.json, frames/NNNN/, which a DCC can read
 //while the bake runs, and checkpoints/NNNN/), and if the scene asks, N.bin (float32 x, y, z per particle) and the diagnostics file. It won't bake over a
 //cache already there unless told to with --overwrite, which deletes it first, with what was exported and meshed from it (DIR/export). The first SIGINT
-//or SIGTERM lets the frame being simulated finish, checkpoints it and exits with status 3; a second exits at once. resume carries the bake in DIR on from its newest checkpoint, exactly as if it had never
+//or SIGTERM lets the frame being simulated finish, checkpoints it and exits with status 3; a second exits at once. A pressure solve that doesn't converge
+//ends the bake there with an error (status 1), the frames before it committed, for resume to take up from the newest checkpoint. resume carries the bake in DIR on from its newest checkpoint, exactly as if it had never
 //stopped, on as many ranks as it's run with (so on more or fewer GPUs too): the frames after the checkpoint move to frames.discarded/ and are worked out
 //again. It reads the scene the cache names, which has to be unchanged unless --force, and goes on to the frame the bake was going to; --frames takes it
 //further. verify checks every
@@ -1050,6 +1051,8 @@ int main(int argc, char** argv){
     }
 
     std::vector<double> x, y, z;
+
+    size_t liquidSeeds = 0;     //with air: how many of the seeded particles are the liquid's, which come first (seedParticles)
     std::vector<float> u, v, w;
     std::vector<std::vector<float>> gradients;
     std::vector<uint> ids;
@@ -1076,7 +1079,7 @@ int main(int argc, char** argv){
         }
     }
     else{
-        seedParticles(scene, x, y, z, u, v, w);
+        seedParticles(scene, x, y, z, u, v, w, &liquidSeeds);
         bool meshFluids = std::any_of(scene.fluids.begin(), scene.fluids.end(), [](const SceneShape& fluid){ return fluid.kind == SceneShape::MESH; });
         if(x.empty() && scene.emitters.empty() && !meshFluids){
             return failure(scenePath + ": it has no fluid: its fluids are empty or outside the domain, and it has no emitters");
@@ -1135,6 +1138,26 @@ int main(int argc, char** argv){
     simulation->setContactAngle(scene.contactAngle);
     simulation->setViscousCfl(scene.viscousCfl);
     simulation->setFreeSurface(scene.freeSurface == "sharp" ? FreeSurface::sharp : FreeSurface::footprint);
+    if(scene.air){      //a second fluid (TwoPhase, particles.hu): the particles seeded after the liquid's, and any made later, are air
+        TwoPhase twoPhase;
+        twoPhase.on = true;
+        twoPhase.densityRatio = (float)(scene.density / scene.airDensity);
+        twoPhase.faceDensity = scene.airFaceDensity == "phaseField" ? FaceDensity::phaseField : scene.airFaceDensity == "levelSet" ? FaceDensity::levelSet :
+                               scene.airFaceDensity == "synthetic" ? FaceDensity::synthetic : FaceDensity::fractions;
+        twoPhase.airFlipRatio = (float)(scene.airFlipRatio < 0.0 ? scene.flipRatio : scene.airFlipRatio);
+        twoPhase.band = scene.airBand;
+        twoPhase.syntheticShape = scene.airSyntheticShape == "ball" ? 1 : scene.airSyntheticShape == "balls" ? 2 : 0;
+        twoPhase.syntheticCentre = make_float3((float)scene.airSyntheticCentre[0], (float)scene.airSyntheticCentre[1], (float)scene.airSyntheticCentre[2]);
+        twoPhase.syntheticRadius = (float)scene.airSyntheticRadius;
+        twoPhase.syntheticSpacing = (float)scene.airSyntheticSpacing;
+        if(twoPhase.particles() && !resuming){  //the seeds after the liquid's are air; a checkpoint's ids say which are which themselves
+            simulation->markAirParticles(liquidSeeds);
+        }
+        simulation->setTwoPhase(twoPhase);
+        if(printsEvents){
+            std::cerr<<"Two phases: density ratio "<<twoPhase.densityRatio<<", face densities by "<<scene.airFaceDensity<<"\n";
+        }
+    }
     std::vector<ForceField> fields;
     std::vector<std::shared_ptr<const SceneField>> volumes;     //each volume force's vectors, which every partition puts on its own GPU
     for(const SceneForce& force : scene.forces){
@@ -1212,6 +1235,9 @@ int main(int argc, char** argv){
         event(line);
         if(!diagnostics.empty()){
             simulation->writeDiagnostics(diagnostics, 0);
+            if(scene.air && scene.airFaceDensity != "synthetic"){
+                simulation->writePhaseDiagnostics(directory + "phases.jsonl", 0);
+            }
         }
         if(scene.writePositions){
             simulation->writePositionsToFile(directory + "0.bin");
@@ -1222,11 +1248,30 @@ int main(int argc, char** argv){
     }
     std::signal(SIGINT, onCancel);
     std::signal(SIGTERM, onCancel);
+    int checkpointed = resuming ? checkpoint.frame : -1;    //the newest checkpoint's frame, which resume would carry on from
     for(int frame = firstFrame; frame <= scene.frames; ++frame){
         auto frameStart = std::chrono::steady_clock::now();
         simulation->solveFrame(scene.fps);
+        std::string unsolved = simulation->solveError();
+        if(!unsolved.empty()){  //a pressure solve that didn't converge: no pressure, so no frame, and no going on. Every rank finds the same
+            std::string message = "frame " + std::to_string(frame) + ": " + unsolved;
+            if(scene.writeCache){
+                std::string error = simulation->finishCache();  //the frames before this one committed
+                if(!error.empty()){
+                    return failure(error);
+                }
+                message += ". The cache holds the frames before it; ";
+                message += checkpointed >= 0 ? "flip2 resume carries on from its checkpoint at frame " + std::to_string(checkpointed) +
+                                               " (with --force once the scene is changed, say to another solver.pressureSolver)"
+                                             : "it has no checkpoint to resume from yet";
+            }
+            return failure(message);
+        }
         if(!diagnostics.empty()){
             simulation->writeDiagnostics(diagnostics, frame);
+            if(scene.air && scene.airFaceDensity != "synthetic"){
+                simulation->writePhaseDiagnostics(directory + "phases.jsonl", frame);
+            }
         }
         if(scene.writePositions){
             simulation->writePositionsToFile(directory + std::to_string(frame) + ".bin");
@@ -1237,6 +1282,7 @@ int main(int argc, char** argv){
             simulation->writeCacheFrame(frame);
             if(stopping || last || (scene.checkpointEvery > 0 && frame % scene.checkpointEvery == 0)){
                 simulation->writeCheckpoint(frame);
+                checkpointed = frame;
             }
             std::string error = simulation->cacheError();
             if(!error.empty()){

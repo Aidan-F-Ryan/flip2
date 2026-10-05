@@ -1654,8 +1654,11 @@ __global__ void weighCutFaces(Obstacles obstacles, VoxelPlaces places, const uin
             float diagonal = 0.0f;  //summed in cudaGetA's order, so a voxel with every face open gets its value back to the bit
             for(int face = 0; face < 6; ++face){
                 if(neighbors[face][index] != WALL_VOXEL){
-                    coefficients[face][index] *= cut.open[face];
-                    diagonal += scale*cut.open[face];
+                    //the face's weight rounded on its own, never folded into the sum as a multiply-add: the diagonal then takes the very number the
+                    //coupling stores, and an unknown with no face to air has a diagonal that's its couplings' sum to the bit (Stencil::air)
+                    float weight = __fmul_rn(scale, cut.open[face]);
+                    coefficients[face][index] = coefficients[face][index] != 0.0f ? -weight : 0.0f;
+                    diagonal += weight;
                 }
             }
             Adiag[index] = diagonal;

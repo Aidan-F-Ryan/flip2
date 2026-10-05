@@ -182,6 +182,10 @@ void Simulation::solveFrame(double fps){
     lastFrameSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 }
 
+std::string Simulation::solveError(){
+    return partitions[0]->solveError();
+}
+
 //a JSON array of n numbers
 template <typename T>
 static std::string jsonArray(const T* values, int n, const char* format){
@@ -192,6 +196,36 @@ static std::string jsonArray(const T* values, int n, const char* format){
         text += (i ? "," : "") + std::string(number);
     }
     return text + "]";
+}
+
+void Simulation::writePhaseDiagnostics(const std::string& path, int frame){
+    PhaseStatistics phases[2];  //liquid, air
+    forEachPartition([&](Particles& partition){ partition.phaseStatistics(phases[0], phases[1]); });
+    if(!phaseDiagnostics.is_open()){
+        phaseDiagnostics.open(path, std::ios::trunc);
+        if(!phaseDiagnostics){
+            std::cerr<<"Simulation: can't write phase diagnostics to "<<path<<"\n";
+            exit(1);
+        }
+    }
+    const Particles& first = *partitions[0];
+    char head[256];
+    std::snprintf(head, sizeof(head), "{\"frame\":%d,\"time\":%.17g,\"substeps\":%u,\"floor\":%.9g,\"binHeight\":%.9g", frame, first.elapsedTime, first.substepsThisFrame,
+        (double)first.grid.negY, first.grid.sizeY*(double)first.grid.cellSize / PHASE_HEIGHT_BINS);
+    phaseDiagnostics<<head;
+    const char* names[2] = {"liquid", "air"};
+    for(int phase = 0; phase < 2; ++phase){
+        const PhaseStatistics& p = phases[phase];
+        double centroid[3];
+        for(int axis = 0; axis < 3; ++axis){
+            centroid[axis] = p.count > 0 ? p.positionSum[axis] / p.count : 0.0;
+        }
+        char numbers[256];
+        std::snprintf(numbers, sizeof(numbers), ",\"%s\":{\"count\":%llu,\"kineticEnergy\":%.9g,\"fastest\":%.9g,\"centroid\":", names[phase], p.count, p.kineticEnergy, p.fastest);
+        phaseDiagnostics<<numbers<<jsonArray(centroid, 3, "%.9g")<<",\"heights\":"<<jsonArray(p.heights, PHASE_HEIGHT_BINS, "%u")<<"}";
+    }
+    phaseDiagnostics<<"}\n";
+    phaseDiagnostics.flush();
 }
 
 void Simulation::writeDiagnostics(const std::string& path, int frame){
@@ -274,7 +308,14 @@ void Simulation::startCache(const std::string& directory, CacheDescription descr
 
 void Simulation::writeCacheFrame(int frame){
     bool ids = cacheWriter->writesIds(), ages = cacheWriter->writesAges();
-    int buffer = cacheWriter->acquire(CacheWriter::frameBytes(particlesHere(), ids, ages));    //emitters and sinks change the count from frame to frame
+    std::vector<uint> counts;   //each partition's particles that go into the frame: with air, the liquid's alone
+    size_t total = 0;
+    for(const std::unique_ptr<Particles>& partition : partitions){
+        gpuErrchk(cudaSetDevice(partition->device()));
+        counts.push_back(partition->countFrameParticles());
+        total += counts.back();
+    }
+    int buffer = cacheWriter->acquire(CacheWriter::frameBytes(total, ids, ages));  //emitters and sinks change the count from frame to frame
     char* host = cacheWriter->hostBuffer(buffer);
     std::vector<CacheShard> shards;
     std::vector<cudaEvent_t> copies;
@@ -283,9 +324,9 @@ void Simulation::writeCacheFrame(int frame){
         Particles& partition = *partitions[index];
         gpuErrchk(cudaSetDevice(partition.device()));
         partition.copyFrameColumnsToHost((float*)(host + offset), ids, ages, cacheCopies[index][buffer]);
-        shards.push_back({ranks[index], partition.numParticles(), offset});
+        shards.push_back({ranks[index], counts[index], offset});
         copies.push_back(cacheCopies[index][buffer]);
-        offset += CacheWriter::frameBytes(partition.numParticles(), ids, ages);
+        offset += CacheWriter::frameBytes(counts[index], ids, ages);
     }
     gpuErrchk(cudaSetDevice(partitions[0]->device()));
     cacheWriter->submit(buffer, frame, partitions[0]->elapsedTime, shards, copies);

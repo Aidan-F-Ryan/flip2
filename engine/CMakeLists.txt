@@ -44,6 +44,7 @@ add_library(particles STATIC
     levelset.cu
     viscosity.cu
     freesurface.cu
+    twophase.cu
     cacheWriter.cu
 )
 

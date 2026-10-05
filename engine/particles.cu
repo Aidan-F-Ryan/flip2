@@ -24,6 +24,14 @@ __global__ void numberParticles(uint count, uint first, uint* ids){
     }
 }
 
+//the particles numbered from first on are air
+__global__ void markAir(uint count, uint first, uint* ids){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(index < count && ids[index] >= first){
+        ids[index] |= AIR_PARTICLE;
+    }
+}
+
 Particles::Particles(uint size)
 : size(size)
 , radius(2)
@@ -925,6 +933,16 @@ void Particles::generateVoxels(){
     for(CudaVec<float>* voxelData : {&voxelsUx, &voxelsUy, &voxelsUz, &voxelsUxOld, &voxelsUyOld, &voxelsUzOld, &voxelWeightsX, &voxelWeightsY, &voxelWeightsZ, &particleCounts, &divU, &p, &residuals, &Anx, &Apx, &Any, &Apy, &Anz, &Apz, &Adiag}){
         voxelData->resizeAsync(numUsedVoxels, stream);
     }
+    if(twoPhase.on){    //each face's density, and with air particles the plain weights that go into it (twophase.cu)
+        for(CudaVec<float>& lightness : faceLightness){
+            lightness.resizeAsync(numUsedVoxels, stream);
+        }
+        if(twoPhase.particles()){
+            for(CudaVec<float>& plain : plainWeights){
+                plain.resizeAsync(numUsedVoxels, stream);
+            }
+        }
+    }
     p.zeroDeviceAsync(stream);
 
     for(CudaVec<uint>* lower : {&neighborNx, &neighborNy, &neighborNz}){   //air voxels' lower neighbours: NO_VOXEL unless an unknown below claims them
@@ -972,20 +990,24 @@ static AffineVelocities affineVelocities(CudaVec<float> (&affine)[9]){
 //It sums in 32-bit fixed point, as sm_86 has native shared integer atomics but not float ones. 7 ints per slot: 14 KB for an 8^3 block. The owners'
 //sums stay fixed point too, in the float arrays' storage: integers add up the same in any order, so the result doesn't depend on which node gets there
 //first. normalizeVoxelVelocities turns them into floats. With APIC, each face takes the particle's velocity carried out to it along its gradient,
-//v + c.(x_face - x)
-template<bool APIC>
+//v + c.(x_face - x). With two PHASES (TwoPhase, particles.hu), a particle weighs as much as its fluid, air's being airMass of the liquid's: the momentum
+//and the weights are then each face's momentum and mass, so the velocity they give is the two fluids' together, and three more sums a slot keep the
+//weights with every particle counting alike, which with the masses say how much of the face is liquid (10 ints per slot: 20 KB)
+template<bool APIC, bool PHASES>
 __global__ void scatterParticleVelsToVoxels(uint numParticleNodes, uint numParticles, uint numVoxels1D, const uint* gridNodeIndicesToFirstParticleIndex, const uint* gridPosition,
                                             const double* px, const double* py, const double* pz, const float* vx, const float* vy, const float* vz,
                                             AffineVelocities affine, float voxelSize,
                                             const uint* numVoxelsEachNode, const uint* voxelIDs, const uint* voxelOwners,
-                                            int* ux, int* uy, int* uz, int* weightsX, int* weightsY, int* weightsZ, int* particleCounts, float momentumScale, float weightScale, double radius, Grid grid, uint refinementLevel){
-    extern __shared__ int fixedSums[];    //per slot: x, y, z momentum, then x, y, z weight, then particle count
+                                            int* ux, int* uy, int* uz, int* weightsX, int* weightsY, int* weightsZ, int* particleCounts, float momentumScale, float weightScale, double radius, Grid grid, uint refinementLevel,
+                                            const uint* ids, float airMass, int* plainX, int* plainY, int* plainZ){
+    extern __shared__ int fixedSums[];    //per slot: x, y, z momentum, then x, y, z weight, then particle count; with PHASES, then x, y, z plain weight
+    const int SUMS = PHASES ? 10 : 7;
     int voxels1D = numVoxels1D;
     int voxels3D = voxels1D*voxels1D*voxels1D;
     int apronCells = floor(radius);
     uint firstParticle = gridNodeIndicesToFirstParticleIndex[blockIdx.x];
     uint lastParticle = blockIdx.x == numParticleNodes - 1 ? numParticles : gridNodeIndicesToFirstParticleIndex[blockIdx.x + 1];
-    for(int i = threadIdx.x; i < 7*voxels3D; i += blockDim.x){
+    for(int i = threadIdx.x; i < SUMS*voxels3D; i += blockDim.x){
         fixedSums[i] = 0;
     }
     __syncthreads();
@@ -993,6 +1015,10 @@ __global__ void scatterParticleVelsToVoxels(uint numParticleNodes, uint numParti
     for(uint index = firstParticle + threadIdx.x; index < lastParticle; index += blockDim.x){    //consecutive threads, consecutive particles
         float3 pos = positionInNodeBlock(index, gridPosition, px, py, pz, grid, refinementLevel, apronCells);
         FaceStencil stencil(pos);
+        float mass = 1.0f;
+        if constexpr(PHASES){
+            mass = ids[index] & AIR_PARTICLE ? airMass : 1.0f;
+        }
         #pragma unroll
         for(int dim = 0; dim < 3; ++dim){
             const Spline3& x = stencil.axis(dim, 0);
@@ -1025,8 +1051,15 @@ __global__ void scatterParticleVelsToVoxels(uint numParticleNodes, uint numParti
                         if constexpr(APIC){
                             faceVelocity += slope[0]*(start[0] + i);
                         }
-                        atomicAdd(fixedSums + dim*voxels3D + rowStart + i, __float2int_rn(weight*faceVelocity*momentumScale));
-                        atomicAdd(fixedSums + (3 + dim)*voxels3D + rowStart + i, __float2int_rn(weight*weightScale));
+                        if constexpr(PHASES){
+                            atomicAdd(fixedSums + dim*voxels3D + rowStart + i, __float2int_rn(weight*mass*faceVelocity*momentumScale));
+                            atomicAdd(fixedSums + (3 + dim)*voxels3D + rowStart + i, __float2int_rn(weight*mass*weightScale));
+                            atomicAdd(fixedSums + (7 + dim)*voxels3D + rowStart + i, __float2int_rn(weight*weightScale));
+                        }
+                        else{
+                            atomicAdd(fixedSums + dim*voxels3D + rowStart + i, __float2int_rn(weight*faceVelocity*momentumScale));
+                            atomicAdd(fixedSums + (3 + dim)*voxels3D + rowStart + i, __float2int_rn(weight*weightScale));
+                        }
                     }
                 }
             }
@@ -1034,12 +1067,12 @@ __global__ void scatterParticleVelsToVoxels(uint numParticleNodes, uint numParti
         atomicAdd(fixedSums + 6*voxels3D + (int)pos.x + (int)pos.y*voxels1D + (int)pos.z*voxels1D*voxels1D, 1);
     }
     __syncthreads();
-    int* accumulators[7] = {ux, uy, uz, weightsX, weightsY, weightsZ, particleCounts};
+    int* accumulators[10] = {ux, uy, uz, weightsX, weightsY, weightsZ, particleCounts, plainX, plainY, plainZ};
     for(uint i = (blockIdx.x == 0 ? 0 : numVoxelsEachNode[blockIdx.x - 1]) + threadIdx.x; i < numVoxelsEachNode[blockIdx.x]; i += blockDim.x){    //coalesced over the node's voxels
         int slot = voxelIDs[i];
         uint owner = voxelOwners[i];    //itself for interior voxels, so these atomics are mostly consecutive
         #pragma unroll
-        for(int sum = 0; sum < 7; ++sum){
+        for(int sum = 0; sum < SUMS; ++sum){
             int value = fixedSums[sum*voxels3D + slot];
             if(value != 0){
                 atomicAdd(accumulators[sum] + owner, value);
@@ -1129,15 +1162,30 @@ void Particles::particleVelToVoxels(){
     //P2G sums in fixed point: a face's weight sum is about the particles per voxel, so budget 128 (15x rest) and keep every sum under 2^30
     float weightScale = (1 << 30) / 128.0f;
     float momentumScale = weightScale / fmax(transferred, 1e-6);
+    bool phases = twoPhase.particles();     //air and liquid: each particle weighs as its fluid does, and the plain weights are kept beside the masses
+    if(phases){
+        plainWeightUnit = 1.0f / weightScale;
+        for(CudaVec<float>& plain : plainWeights){
+            plain.zeroDeviceAsync(stream);
+        }
+    }
     if(numParticleNodes > 0){
-        auto scatter = apic ? scatterParticleVelsToVoxels<true> : scatterParticleVelsToVoxels<false>;
-        scatter<<<numParticleNodes, NODE_THREADS, 7*sizeof(int)*numVoxelsPerNode, stream>>>(numParticleNodes, size, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(),
+        auto scatter = phases ? (apic ? scatterParticleVelsToVoxels<true, true> : scatterParticleVelsToVoxels<false, true>)
+                              : (apic ? scatterParticleVelsToVoxels<true, false> : scatterParticleVelsToVoxels<false, false>);
+        scatter<<<numParticleNodes, NODE_THREADS, (phases ? 10 : 7)*sizeof(int)*numVoxelsPerNode, stream>>>(numParticleNodes, size, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(),
             affineVelocities(affine), voxelSize, nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(), voxelOwners.devPtr(), (int*)voxelsUx.devPtr(), (int*)voxelsUy.devPtr(), (int*)voxelsUz.devPtr(),
-            (int*)voxelWeightsX.devPtr(), (int*)voxelWeightsY.devPtr(), (int*)voxelWeightsZ.devPtr(), (int*)particleCounts.devPtr(), momentumScale, weightScale, radius, grid, refinementLevel);
+            (int*)voxelWeightsX.devPtr(), (int*)voxelWeightsY.devPtr(), (int*)voxelWeightsZ.devPtr(), (int*)particleCounts.devPtr(), momentumScale, weightScale, radius, grid, refinementLevel,
+            particleIds.devPtr(), 1.0f / twoPhase.densityRatio, (int*)plainWeights[0].devPtr(), (int*)plainWeights[1].devPtr(), (int*)plainWeights[2].devPtr());
     }
     //particles near this partition's edge reach into ghost voxels: their owners add those sums in, which in fixed point come out the same in any order
     for(CudaVec<float>* accumulator : {&voxelsUx, &voxelsUy, &voxelsUz, &voxelWeightsX, &voxelWeightsY, &voxelWeightsZ, &particleCounts}){
         context->reduceGhosts((int*)accumulator->devPtr(), stream);
+    }
+    if(phases){
+        for(CudaVec<float>& plain : plainWeights){
+            context->reduceGhosts((int*)plain.devPtr(), stream);
+            context->fillGhosts(plain.devPtr(), stream);    //as bits: they stay fixed point
+        }
     }
     cudaNormalizeVoxelVelocities(solids, voxelWeightsX, voxelWeightsY, voxelWeightsZ, voxelsUx, voxelsUy, voxelsUz, particleCounts, momentumScale, weightScale, stream);
     for(CudaVec<float>* field : {&voxelsUx, &voxelsUy, &voxelsUz, &voxelWeightsX, &voxelWeightsY, &voxelWeightsZ, &particleCounts}){   //and the ghosts take the totals
@@ -1150,6 +1198,7 @@ void Particles::particleVelToVoxels(){
         buildLevelSet();
     }
     retireDryUnknowns();    //sharp, the solve's liquid is the unknowns whose centres are in it
+    findFaceDensities();    //two phases: how light each face is, for the pressure equations and the velocity update
     obstacleGhostVelocities(voxelsUx, voxelsUy, voxelsUz);      //the faces in and beside obstacles, so FLIP's change over the solve is measured from the same kind of value there
     for(auto [velocity, before] : {std::pair{&voxelsUx, &voxelsUxOld}, {&voxelsUy, &voxelsUyOld}, {&voxelsUz, &voxelsUzOld}}){    //for FLIP's velocity change over the solve
         cudaMemcpyAsync(before->devPtr(), velocity->devPtr(), sizeof(float)*velocity->size(), cudaMemcpyDeviceToDevice, stream);
@@ -1163,8 +1212,8 @@ void Particles::particleVelToVoxels(){
 void Particles::pressureSolve(){
     double density = 0.014;
     double tolerance = 0.001;   //largest residual, relative to the largest divergence
-    uint maxIterations = 16384;
-    double previousTerminatingResidual = 100;
+    //a V-cycle an iteration, the multigrid's solve takes 6 to 20 of them; the other solvers can need thousands on a large grid
+    uint maxIterations = pressureSolver == PressureSolver::multigrid ? 256 : 16384;
     double terminatingResidual;
     double voxelSize = grid.cellSize / (2<<refinementLevel);
     uint hasFreeSurface;
@@ -1173,8 +1222,9 @@ void Particles::pressureSolve(){
     cudaStreamSynchronize(stream);
     hasFreeSurface = context->anyOverPartitions(hasFreeSurface != 0);
     settleSealedPockets();
-    //divergence per unit of relative density error. Without air the fluid can't change volume, and the solve has nowhere to take a net divergence, so it's off
-    double correctionRate = hasFreeSurface && densityCorrectionTime > 0.0 ? voxelSize / densityCorrectionTime : 0.0;
+    //divergence per unit of relative density error. Without air the fluid can't change volume, and the solve has nowhere to take a net divergence, so it's off.
+    //With air particles it stays on though they fill a closed box: both fluids' particles bunch up, and the sealed pockets' balance takes the net out
+    double correctionRate = (hasFreeSurface || twoPhase.particles()) && densityCorrectionTime > 0.0 ? voxelSize / densityCorrectionTime : 0.0;
     //@TODO: need to use courant number for dt from max voxel u and voxel dimensions
     dt = getCourantDt();
     if(surfaceTension > 0.0){   //explicit surface tension holds only up to the capillary limit
@@ -1189,9 +1239,10 @@ void Particles::pressureSolve(){
     if(frameDt - elapsedTimeThisFrame < dt){
         dt = frameDt - elapsedTimeThisFrame;
     }
-    applyForces(forces, false, dt, elapsedTime, forceVoxels(), stream);
+    applyForces(forces, dt, elapsedTime, forceVoxels(), stream);
+    floatInAir(dt);     //an air band: less the still air's weight
     if(surfaceTension > 0.0){
-        applySurfaceTension(false);
+        applySurfaceTension();
     }
     cudaCalcDivU(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, voxelsUx, voxelsUy, voxelsUz, particleCounts, footprintDepth, restParticlesPerVoxel, correctionRate, divU, stream);
     addObstacleFlux();      //what obstacles' surfaces make of the flow through the faces they cut or close
@@ -1200,6 +1251,7 @@ void Particles::pressureSolve(){
     cudaGetA(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, dt/(density*voxelSize*voxelSize), stream);
     weighCutCells(dt/(density*voxelSize*voxelSize));      //the faces obstacles cut weigh as much as they're open
     weighSurfaceFaces(dt/(density*voxelSize*voxelSize));  //sharp, the liquid's faces to air as near as the surface is
+    weighDensityFaces(dt/(density*voxelSize*voxelSize));  //two phases, every face as light as what's on it
     gpuErrchk(cudaPeekAtLastError());
     uint interiorWidth = numVoxels1D - 2*(uint)std::floor(radius);
     uint3 domainVoxels = make_uint3(grid.sizeX*interiorWidth, grid.sizeY*interiorWidth, grid.sizeZ*interiorWidth);
@@ -1214,18 +1266,34 @@ void Particles::pressureSolve(){
                                                    layout, dotProductSums, numOwnVoxels, *context, stream);
             case PressureSolver::multigrid:
                 return cudaMultigridConjugateGradient(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, divU, p, residuals, tolerance, maxIterations,
-                                                      layout, dt/(density*voxelSize*voxelSize), dotProductSums, numOwnVoxels, *context, stream);
+                                                      layout, dotProductSums, numOwnVoxels, *context, stream);
             default:
                 return cudaGSiteration(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, divU, p, residuals, tolerance, maxIterations,
                                        numOwnVoxels, *context, stream);
         }
     };
+    //A solve either comes to the tolerance or there's no pressure to move the fluid by: the solver stalled, or ran out of iterations. Nothing about the
+    //substep would change that (a shorter dt only scales every equation alike), so it isn't tried again: the substep stops here, with nothing moved and
+    //the time where it was, and solveFailure says what happened (solveFrame stops on it, and flip2 bake ends there with the frames before it kept)
+    auto solved = [&](){
+        terminatingResidual = solve();
+        gpuErrchk(cudaPeekAtLastError());
+        if(terminatingResidual < tolerance){
+            return true;
+        }
+        std::ostringstream message;
+        message<<"the pressure solve ended at a residual of "<<terminatingResidual<<", over its tolerance of "<<tolerance<<", in substep "<<substepIndex + 1
+               <<" (at "<<elapsedTime<<" s)";
+        solveFailure = message.str();
+        return false;
+    };
     //Viscosity goes between two solves: the first gives the flow the forces drive once the pressure has answered them, the viscous step acts on that,
     //and the solve below takes out what divergence it leaves. Straight after the forces it would see gravity but not the pressure gradient that turns
     //gravity into a puddle spreading, which would then go on unresisted, as if the floor were slippery
-    auto viscousStep = [&](){
-        keepVelocitiesForViscosity();
-        solve();
+    if(viscosity > 0.0){
+        if(!solved()){
+            return;
+        }
         cudaVelocityUpdate(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, p, voxelsUx, voxelsUy, voxelsUz, dt/(density*voxelSize*voxelSize), stream);
         correctSurfaceFaces();
         p.zeroDeviceAsync(stream);
@@ -1234,40 +1302,9 @@ void Particles::pressureSolve(){
         addObstacleFlux();
         addSurfaceDivergence(correctionRate);
         balanceSealedPockets();
-    };
-    if(viscosity > 0.0){
-        viscousStep();
     }
-    while(previousTerminatingResidual - (terminatingResidual = solve()) > 0.0){    //while residual getting smaller
-        gpuErrchk(cudaPeekAtLastError());
-        if(terminatingResidual < tolerance){
-            break;
-        }
-        if(viscosity > 0.0){    //back to the velocities the forces left, then the forces off those: everything goes on again at the new dt
-            undoViscosity();
-        }
-        if(surfaceTension > 0.0){
-            applySurfaceTension(true);
-        }
-        applyForces(forces, true, dt, elapsedTime, forceVoxels(), stream);
-        dt /= 2.0f;
-        p.zeroDeviceAsync(stream);
-        applyForces(forces, false, dt, elapsedTime, forceVoxels(), stream);
-        if(surfaceTension > 0.0){
-            applySurfaceTension(false);
-        }
-        previousTerminatingResidual = terminatingResidual;
-        cudaCalcDivU(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, voxelsUx, voxelsUy, voxelsUz, particleCounts, footprintDepth, restParticlesPerVoxel, correctionRate, divU, stream);
-        addObstacleFlux();
-        addSurfaceDivergence(correctionRate);
-        balanceSealedPockets();
-        cudaGetA(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, dt/(density*voxelSize*voxelSize), stream);
-        weighCutCells(dt/(density*voxelSize*voxelSize));
-        weighSurfaceFaces(dt/(density*voxelSize*voxelSize));
-        if(viscosity > 0.0){
-            viscousStep();
-        }
-        gpuErrchk(cudaPeekAtLastError());
+    if(!solved()){
+        return;
     }
     elapsedTime += dt;
     elapsedTimeThisFrame += dt;
@@ -1289,6 +1326,7 @@ void Particles::updateVoxelVelocities(){
     cudaVelocityUpdate(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, p, voxelsUx, voxelsUy, voxelsUz, dt/(0.014*voxelSize*voxelSize), stream);
     gpuErrchk(cudaPeekAtLastError());
     correctSurfaceFaces();      //sharp, the liquid's faces to air with the ghost pressure past them
+    lightenFaceUpdates(dt/(0.014*voxelSize*voxelSize));     //two phases, each face pushed as its own density lets the pressure push it
     extendLiquidVelocities();   //and the faces around the liquid that particles read carry its velocity on
     pinEmitterVelocities();     //an emitter's fluid leaves at its velocity, whatever the solve made of it
     mixObstacleFaces(voxelsUx, voxelsUy, voxelsUz);         //the faces obstacles cut carry what crosses them all told, not the open part's alone
@@ -1309,7 +1347,8 @@ __global__ void gatherVoxelVelsToParticles(uint numParticleNodes, uint numPartic
                                             double* px, double* py, double* pz, float* vx, float* vy, float* vz, AffineVelocities affine, float voxelSize,
                                             const uint* numVoxelsEachNode, const uint* voxelIDs, const uint* voxelOwners, const char* solids,
                                             const float* ux, const float* uy, const float* uz, const float* oldUx, const float* oldUy, const float* oldUz,
-                                            float flipRatio, float alongWalls, double radius, Grid grid, uint refinementLevel){
+                                            float flipRatio, float alongWalls, double radius, Grid grid, uint refinementLevel,
+                                            const uint* ids, float airFlipRatio){    //two phases: the air's particles blend at their own ratio; else ids is null
     extern __shared__ float blockVelocities[];  //per slot: new x, y, z, then old x, y, z
     int voxels1D = numVoxels1D;
     int voxels3D = voxels1D*voxels1D*voxels1D;
@@ -1373,6 +1412,7 @@ __global__ void gatherVoxelVelsToParticles(uint numParticleNodes, uint numPartic
     for(uint index = firstParticle + threadIdx.x; index < lastParticle; index += blockDim.x){    //consecutive threads, consecutive particles
         float3 pos = positionInNodeBlock(index, gridPosition, px, py, pz, grid, refinementLevel, apronCells);
         FaceStencil stencil(pos);
+        float blend = ids != nullptr && (ids[index] & AIR_PARTICLE) ? airFlipRatio : flipRatio;
         #pragma unroll
         for(int dim = 0; dim < 3; ++dim){
             const Spline3& x = stencil.axis(dim, 0);
@@ -1409,7 +1449,7 @@ __global__ void gatherVoxelVelsToParticles(uint numParticleNodes, uint numPartic
                     }
                 }
             }
-            particleVelocities[dim][index] = newVelocity + flipRatio*(particleVelocities[dim][index] - oldVelocity);
+            particleVelocities[dim][index] = newVelocity + blend*(particleVelocities[dim][index] - oldVelocity);
             if constexpr(APIC){
                 #pragma unroll
                 for(int a = 0; a < 3; ++a){
@@ -1549,7 +1589,8 @@ void Particles::voxelVelsToParticles(){
     float stick = (float)wallStick();   //how far a viscous liquid's particles hold to the walls, as its faces do in the viscous solve
     auto gather = apic ? gatherVoxelVelsToParticles<true> : gatherVoxelVelsToParticles<false>;
     gather<<<numParticleNodes, NODE_THREADS, 6*sizeof(float)*numVoxelsPerNode, stream>>>(numParticleNodes, size, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(),
-        affineVelocities(affine), (float)(grid.cellSize / (2<<refinementLevel)), nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(), voxelOwners.devPtr(), solids.devPtr(), voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr(), voxelsUxOld.devPtr(), voxelsUyOld.devPtr(), voxelsUzOld.devPtr(), flipRatio, 1.0f - 2.0f*stick, radius, grid, refinementLevel);
+        affineVelocities(affine), (float)(grid.cellSize / (2<<refinementLevel)), nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(), voxelOwners.devPtr(), solids.devPtr(), voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr(), voxelsUxOld.devPtr(), voxelsUyOld.devPtr(), voxelsUzOld.devPtr(), flipRatio, 1.0f - 2.0f*stick, radius, grid, refinementLevel,
+        twoPhase.particles() ? particleIds.devPtr() : nullptr, twoPhase.airFlipRatio);
     gpuErrchk(cudaPeekAtLastError());
     uint tileWidth = 3*(numVoxels1D - 2*(uint)std::floor(radius));
     advectThroughGrid<<<numParticleNodes, NODE_THREADS, 3*sizeof(float)*tileWidth*tileWidth*tileWidth, stream>>>(numParticleNodes, size, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(),
@@ -1596,9 +1637,12 @@ void Particles::solveFrame(double fps){
     dt = frameDt / 10.0f;
     elapsedTimeThisFrame = 0.0f;
     substepsThisFrame = 0;
-    while(elapsedTimeThisFrame < frameDt){    //every step is queued on this partition's one stream, in order: the host only waits where it reads something back
+    while(elapsedTimeThisFrame < frameDt && solveFailure.empty()){    //every step is queued on this partition's one stream, in order: the host only waits where it reads something back
         particleVelToVoxels();
         pressureSolve();
+        if(!solveFailure.empty()){  //no pressure to move anything by: the frame stops where it is, in every partition alike
+            break;
+        }
         smallestDtThisFrame = substepsThisFrame == 0 ? dt : std::fmin(smallestDtThisFrame, dt);
         largestDtThisFrame = substepsThisFrame == 0 ? dt : std::fmax(largestDtThisFrame, dt);
         ++substepsThisFrame;
@@ -1614,6 +1658,7 @@ void Particles::initialize(){
         pushOutParticles();         //particles that went into one come back out
         markRemovedParticles();     //sinks and open faces, and at the start fluid inside obstacles, before rootCell reflects anything back into the domain
         alignParticlesToGrid();
+        markBeyondBand();           //two phases with an air band: the air too far from any liquid goes too
         killRemovedParticles();     //the removed particles' cell is one past the last, so the sort puts them at the end
         sortParticles();
         dropRemovedParticles();
@@ -1668,45 +1713,77 @@ void Particles::copyPositionsToHost(float* xyz, cudaEvent_t copied){
     gpuErrchk(cudaEventRecord(copied, frameStream));
 }
 
-//P and v, then where they're asked for (not nullptr) the ids, 64 bits each in two floats' place, and the ages, now less each particle's birth
+//P and v, then where they're asked for (not nullptr) the ids, 64 bits each in two floats' place, and the ages, now less each particle's birth. With air
+//(ends not nullptr) the liquid's particles alone, closed up in the order they're in: ends is how many of them there are up to each particle, and packed
+//how many in all
 __global__ void packFrameColumns(uint numParticles, const double* px, const double* py, const double* pz, const float* vx, const float* vy, const float* vz,
-                                 const uint* ids, const float* births, double now, float* planes){
+                                 const uint* ids, const float* births, double now, const uint* ends, uint packed, float* planes){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
     if(index < numParticles){
         size_t n = numParticles;
-        planes[index] = px[index];
-        planes[n + index] = py[index];
-        planes[2*n + index] = pz[index];
-        planes[3*n + index] = vx[index];
-        planes[4*n + index] = vy[index];
-        planes[5*n + index] = vz[index];
+        size_t at = index;
+        if(ends != nullptr){
+            if(ends[index] == (index == 0 ? 0 : ends[index - 1])){
+                return;     //air
+            }
+            n = packed;
+            at = ends[index] - 1;
+        }
+        planes[at] = px[index];
+        planes[n + at] = py[index];
+        planes[2*n + at] = pz[index];
+        planes[3*n + at] = vx[index];
+        planes[4*n + at] = vy[index];
+        planes[5*n + at] = vz[index];
         size_t next = 6*n;
         if(ids != nullptr){     //6n floats in, so on an 8-byte boundary
-            ((unsigned long long*)(planes + next))[index] = ids[index];
+            ((unsigned long long*)(planes + next))[at] = ids[index];
             next += 2*n;
         }
         if(births != nullptr){     //never negative: a birth time is a float, which can round to just after now
-            planes[next + index] = fmaxf((float)(now - births[index]), 0.0f);
+            planes[next + at] = fmaxf((float)(now - births[index]), 0.0f);
         }
     }
 }
 
-//this partition's part of a cache frame, into pinned host memory: packed on its stream (once the last frame's copy out of frameColumns is done), then
-//copied out on frameStream, so the simulation's next kernels run alongside the copy; copied is recorded once it's in
+__global__ void flagLiquid(uint numParticles, const uint* ids, uint* liquid){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(index < numParticles){
+        liquid[index] = !(ids[index] & AIR_PARTICLE);
+    }
+}
+
+uint Particles::countFrameParticles(){
+    frameParticles = size;
+    if(twoPhase.particles() && size > 0){
+        frameEnds.resizeAsync(size, stream);
+        flagLiquid<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, particleIds.devPtr(), frameEnds.devPtr());
+        gpuErrchk(cudaPeekAtLastError());
+        cudaParallelPrefixSum(size, frameEnds.devPtr(), stream);
+        gpuErrchk(cudaMemcpyAsync(&frameParticles, frameEnds.devPtr() + size - 1, sizeof(uint), cudaMemcpyDeviceToHost, stream));
+        gpuErrchk(cudaStreamSynchronize(stream));
+    }
+    return frameParticles;
+}
+
+//this partition's part of a cache frame, the particles countFrameParticles just counted, into pinned host memory: packed on its stream (once the last
+//frame's copy out of frameColumns is done), then copied out on frameStream, so the simulation's next kernels run alongside the copy; copied is recorded
+//once it's in
 void Particles::copyFrameColumnsToHost(float* planes, bool ids, bool ages, cudaEvent_t copied){
     makeFrameStream();
     gpuErrchk(cudaStreamWaitEvent(stream, columnsCopied, 0));
     size_t columns = 6 + (ids ? 2 : 0) + (ages ? 1 : 0);    //in floats
-    if(size > 0){
-        frameColumns.resizeAsync(columns*size, stream);
+    if(frameParticles > 0){
+        frameColumns.resizeAsync(columns*frameParticles, stream);
         packFrameColumns<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(),
-            ids ? particleIds.devPtr() : nullptr, ages ? particleBirths.devPtr() : nullptr, elapsedTime, frameColumns.devPtr());
+            ids ? particleIds.devPtr() : nullptr, ages ? particleBirths.devPtr() : nullptr, elapsedTime, twoPhase.particles() ? frameEnds.devPtr() : nullptr,
+            frameParticles, frameColumns.devPtr());
         gpuErrchk(cudaPeekAtLastError());
     }
     gpuErrchk(cudaEventRecord(framePacked, stream));
     gpuErrchk(cudaStreamWaitEvent(frameStream, framePacked, 0));
-    if(size > 0){
-        gpuErrchk(cudaMemcpyAsync(planes, frameColumns.devPtr(), sizeof(float)*columns*(size_t)size, cudaMemcpyDeviceToHost, frameStream));
+    if(frameParticles > 0){
+        gpuErrchk(cudaMemcpyAsync(planes, frameColumns.devPtr(), sizeof(float)*columns*(size_t)frameParticles, cudaMemcpyDeviceToHost, frameStream));
     }
     gpuErrchk(cudaEventRecord(columnsCopied, frameStream));
     gpuErrchk(cudaEventRecord(copied, frameStream));
@@ -1747,6 +1824,14 @@ void Particles::copyCheckpointToHost(char* host, cudaEvent_t copied){
         gpuErrchk(cudaMemcpyAsync(at + sizeof(unsigned long long)*count, particleBirths.devPtr(), sizeof(float)*count, cudaMemcpyDeviceToHost, stream));
     }
     gpuErrchk(cudaEventRecord(copied, stream));
+}
+
+void Particles::markAirParticles(uint first){
+    if(size > 0){
+        markAir<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, first, particleIds.devPtr());
+        gpuErrchk(cudaPeekAtLastError());
+    }
+    nextParticleId = first;
 }
 
 void Particles::setIdentities(const uint* ids, const float* births, unsigned long long nextId){

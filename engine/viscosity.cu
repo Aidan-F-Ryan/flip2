@@ -539,18 +539,6 @@ __global__ void stickToObstacles(Obstacles obstacles, VoxelPlaces places, const 
 
 // ---- the steps pressureSolve takes ----
 
-//the face velocities as the forces left them, kept for undoViscosity: before the first of pressureSolve's two solves around the viscous step
-void Particles::keepVelocitiesForViscosity(){
-    uint numVoxels = voxelIDsUsed.size();
-    CudaVec<float>* velocities[3] = {&voxelsUx, &voxelsUy, &voxelsUz};
-    for(int dim = 0; dim < 3; ++dim){
-        if(viscousBefore[dim].size() != numVoxels){
-            viscousBefore[dim].resizeAsync(numVoxels, stream);
-        }
-        gpuErrchk(cudaMemcpyAsync(viscousBefore[dim].devPtr(), velocities[dim]->devPtr(), sizeof(float)*numVoxels, cudaMemcpyDeviceToDevice, stream));
-    }
-}
-
 //one viscous step of dt on the face velocities, in place, once the first solve's pressure is on them
 void Particles::applyViscosity(){
     uint numVoxels = voxelIDsUsed.size();
@@ -662,12 +650,4 @@ void Particles::applyViscosity(){
     gpuErrchk(cudaFreeAsync(solve, stream));
     gpuErrchk(cudaFreeAsync(sum, stream));
     gpuErrchk(cudaPeekAtLastError());
-}
-
-//the face velocities as keepVelocitiesForViscosity kept them: pressureSolve's retry takes the forces back off those, and does it all again at half the dt
-void Particles::undoViscosity(){
-    CudaVec<float>* velocities[3] = {&voxelsUx, &voxelsUy, &voxelsUz};
-    for(int dim = 0; dim < 3; ++dim){
-        gpuErrchk(cudaMemcpyAsync(velocities[dim]->devPtr(), viscousBefore[dim].devPtr(), sizeof(float)*velocities[dim]->size(), cudaMemcpyDeviceToDevice, stream));
-    }
 }

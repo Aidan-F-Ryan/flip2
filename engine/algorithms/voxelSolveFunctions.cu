@@ -1,6 +1,7 @@
 //Copyright 2023 Aberrant Behavior LLC
 
 #include "voxelSolveFunctions.hu"
+#include "multigridFunctions.hu"    //Stencil: an unknown's row, and its product
 #include <cmath>
 
 __global__ void applyGravityKernel(uint numUsedVoxelsInGrid, const float dt, const char* solids, float* voxelsUz){
@@ -258,7 +259,8 @@ __global__ void pressureResiduals(uint numUsedVoxels, const char* solveCodes, co
                                     const float* Anx, const float* Apx, const float* Any, const float* Apy, const float* Anz, const float* Apz, const float* Adiag, const float* divU, const float* p, float* residuals){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
     if(index < numUsedVoxels){
-        residuals[index] = solveCodes[index] ? -divU[index] - Adiag[index]*p[index] - offDiagonalSum(index, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, p) : 0.0f;
+        Stencil A = {{neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz}, {Anx, Apx, Any, Apy, Anz, Apz}, Adiag};
+        residuals[index] = solveCodes[index] ? -divU[index] - A.rowTimes(index, p) : 0.0f;    //the row as differences across its faces, as CG takes it
     }
 }
 
@@ -274,6 +276,7 @@ float cudaGSiteration(const CudaVec<char>& solveCodes, const CudaVec<uint>& neig
         return 0.0f;
     }
     float maxResidual = 1.0f;
+    SolveProgress progress;
     for(uint iteration = 1; iteration <= maxIterations; ++iteration){
         for(char color = 1; color <= 2; ++color){  //red, then black
             GSiteration<<<numUsedVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numUsedVoxels, solveCodes.devPtr(), color, neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(), neighborPy.devPtr(), neighborNz.devPtr(), neighborPz.devPtr(),
@@ -283,9 +286,8 @@ float cudaGSiteration(const CudaVec<char>& solveCodes, const CudaVec<uint>& neig
         if(iteration % batchCheckEvery == 0){
             pressureResiduals<<<numUsedVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numUsedVoxels, solveCodes.devPtr(), neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(), neighborPy.devPtr(), neighborNz.devPtr(), neighborPz.devPtr(),
                 Anx.devPtr(), Apx.devPtr(), Any.devPtr(), Apy.devPtr(), Anz.devPtr(), Apz.devPtr(), Adiag.devPtr(), divU.devPtr(), p.devPtr(), residuals.devPtr());
-            float previousResidual = maxResidual;
             maxResidual = (float)context.maxOverPartitions(std::abs(residuals.getMax(stream, true, numOwnVoxels))) / maxDivergence;   //a float division, as before
-            if(maxResidual < tolerance || std::abs(previousResidual - maxResidual) < tolerance / 1000){  //converged, or stalled
+            if(progress.done(maxResidual, tolerance)){  //converged, or stalled
                 break;
             }
         }

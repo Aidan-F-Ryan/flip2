@@ -91,8 +91,12 @@ __device__ inline void splatPoint(const float p[3], int* sums, int voxels1D, int
 //a voxel of one of the domain's walls is also there as its mirror image in the wall (and in two or three walls at once, by an edge or a corner): beside
 //a wall a centre's reach is half inside it, and with the liquid on one side only the mean would lean away from the wall, as it does at a surface. With
 //the images it reads as the liquid carrying on through the wall as it is on this side
+//With two PHASES (TwoPhase, particles.hu), only the liquid's particles make its surface: those whose ids aren't marked AIR_PARTICLE. A template, so that
+//without them the kernel is the one it always was, to the bit
+template<bool PHASES>
 __global__ void splatParticles(uint numParticleNodes, uint numParticles, const uint* firstParticles, const double* px, const double* py, const double* pz, VoxelPlaces places,
-                               int3 domainVoxels, const uint* voxelOwners, int* weights, int* offsetsX, int* offsetsY, int* offsetsZ){
+                               int3 domainVoxels, const uint* voxelOwners, int* weights, int* offsetsX, int* offsetsY, int* offsetsZ,
+                               const uint* ids){
     extern __shared__ int sums[];   //per slot: the weights, then the weighted offsets along x, y and z, in voxels
     int voxels1D = places.interiorWidth + 2*places.apronCells;
     int voxels3D = voxels1D*voxels1D*voxels1D;
@@ -107,6 +111,11 @@ __global__ void splatParticles(uint numParticleNodes, uint numParticles, const u
     int size[3] = {domainVoxels.x, domainVoxels.y, domainVoxels.z};
     double perVoxel = 1.0 / (double)places.voxelSize();
     for(uint index = firstParticle + threadIdx.x; index < lastParticle; index += blockDim.x){    //consecutive threads, consecutive particles
+        if constexpr(PHASES){
+            if(ids[index] & AIR_PARTICLE){
+                continue;
+            }
+        }
         float p[3] = {(float)((px[index] - places.grid.negX)*perVoxel - origin.x), (float)((py[index] - places.grid.negY)*perVoxel - origin.y),
                       (float)((pz[index] - places.grid.negZ)*perVoxel - origin.z)};     //in the block, in voxels
         float image[3];     //its mirror image along each axis, where a wall is within a voxel of it: past that, no centre inside is in the image's reach
@@ -618,8 +627,9 @@ void Particles::buildLevelSet(){
     gpuErrchk(cudaMallocAsync((void**)&raw, bytes, stream));
     int3 domainVoxels = make_int3(grid.sizeX*interiorWidth, grid.sizeY*interiorWidth, grid.sizeZ*interiorWidth);
     if(numParticleNodes > 0){
-        splatParticles<<<numParticleNodes, SPLAT_THREADS, 4*sizeof(int)*numVoxelsPerNode, stream>>>(numParticleNodes, size, gridNodeIndicesToFirstParticleIndex.devPtr(), px.devPtr(), py.devPtr(),
-            pz.devPtr(), voxelPlaces(), domainVoxels, voxelOwners.devPtr(), sums[0], sums[1], sums[2], sums[3]);
+        auto splat = twoPhase.particles() ? splatParticles<true> : splatParticles<false>;
+        splat<<<numParticleNodes, SPLAT_THREADS, 4*sizeof(int)*numVoxelsPerNode, stream>>>(numParticleNodes, size, gridNodeIndicesToFirstParticleIndex.devPtr(), px.devPtr(), py.devPtr(),
+            pz.devPtr(), voxelPlaces(), domainVoxels, voxelOwners.devPtr(), sums[0], sums[1], sums[2], sums[3], particleIds.devPtr());
     }
     for(int* sum : sums){   //particles near this partition's edge reach into ghost voxels: their owners add those sums in
         context->reduceGhosts(sum, stream);
@@ -636,7 +646,7 @@ void Particles::buildLevelSet(){
             raw, liquidLevel.devPtr());
     }
     context->fillGhosts(liquidLevel.devPtr(), stream);
-    if(freeSurfaceMode == FreeSurface::sharp){  //the pressure solve's surface: smoothed a little, so particles' unevenness doesn't become pressure (freesurface.cu)
+    if(needsSurfaceLevel()){    //the pressure solve's surface: smoothed a little, so particles' unevenness doesn't become pressure (freesurface.cu, twophase.cu)
         surfaceLevel.resizeAsync(numVoxels, stream);
         if(numVoxels > 0){
             fillLevels<<<numVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numVoxels, LIQUID_BAND, surfaceLevel.devPtr());
@@ -669,9 +679,9 @@ void Particles::buildLevelSet(){
     gpuErrchk(cudaPeekAtLastError());
 }
 
-//adds dt of surface tension to the faces the surface crosses, or takes it back off, as pressureSolve's retry does with every force when it halves dt.
-//The ghosts' faces take their owners'. The sharp free surface has none of this: the solve itself holds the surface's pressure (freesurface.cu)
-void Particles::applySurfaceTension(bool takeBack){
+//adds dt of surface tension to the faces the surface crosses. The ghosts' faces take their owners'. The sharp free surface has none of this: the solve
+//itself holds the surface's pressure (freesurface.cu)
+void Particles::applySurfaceTension(){
     if(freeSurfaceMode == FreeSurface::sharp){
         return;
     }
@@ -679,7 +689,7 @@ void Particles::applySurfaceTension(bool takeBack){
     float scale = (float)(dt*surfaceTension / (voxelSize*voxelSize));
     if(numOwnVoxels > 0){
         surfaceTensionFaces<<<numOwnVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numOwnVoxels, solveCodes.devPtr(), neighborNx.devPtr(), neighborNy.devPtr(), neighborNz.devPtr(),
-            liquidLevel.devPtr(), liquidCurvature.devPtr(), takeBack ? -scale : scale, voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr());
+            liquidLevel.devPtr(), liquidCurvature.devPtr(), scale, voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr());
         gpuErrchk(cudaPeekAtLastError());
     }
     for(CudaVec<float>* velocity : {&voxelsUx, &voxelsUy, &voxelsUz}){

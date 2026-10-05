@@ -7,10 +7,32 @@
     #include "../typedefs.h"
     #include "../cudaVec.hu"
     #include "../partitionContext.hu"
+    #include <cmath>
 
     #define NO_VOXEL 0xFFFFFFFFu    //neighbour arrays: nothing is stored there, so it's air (p = 0, face velocity 0)
     #define WALL_VOXEL 0xFFFFFFFEu  //neighbour arrays: outside the domain, no flow through the shared face
     #define CORRECTION_DEPTH 5      //how deep inside the fluid's footprint a voxel has to be for the density correction to measure it
+    #define STALLED_CHECKS 8        //a solve has stalled when it goes this many checks of its residual without beating the best it has had
+
+    //When a solve stops, asked each time it finds its largest residual (relative to the largest divergence): once that's under the tolerance, or once it
+    //has stalled, which a residual that isn't a number does too. The largest residual doesn't fall at every check while a solve converges: it can sit at
+    //one voxel until the solve gets to it, and CG's bounces on its way down. So two checks that agree mean nothing, and calling that stalled ended
+    //solves that were converging; a solve has stalled when no check for a while has found it better off than it has been
+    struct SolveProgress{
+        float best = INFINITY;
+        uint checksSinceBest = 0;
+
+        bool done(float residual, float tolerance){
+            if(residual < best){
+                best = residual;
+                checksSinceBest = 0;
+            }
+            else{
+                ++checksSinceBest;
+            }
+            return residual < tolerance || checksSinceBest == STALLED_CHECKS;
+        }
+    };
 
     __device__ inline float calcSubCellWidth(const uint& refinementLevel, const Grid& grid){
         return grid.cellSize / (2<<refinementLevel);

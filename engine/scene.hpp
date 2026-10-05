@@ -108,6 +108,8 @@ struct SceneShape{
     double centre[3] = {0.0, 0.0, 0.0};     //a sphere's
     double radius = 0.0;
     double velocity[3] = {0.0, 0.0, 0.0};   //what its fluid starts with
+    bool air = false;                       //a fluid's "phase": "air": it's the scene's air (Scene::air), not its liquid. Air comes after every liquid fluid
+    bool carve = false;                     //an air fluid's "carve": true: it takes its space out of the liquid (a bubble); otherwise liquid has what both hold
     SceneObstacle mesh;                     //a mesh's, and where it is (friction and thickness unused)
 
     bool contains(const double point[3]) const;     //never, for a mesh
@@ -153,6 +155,16 @@ struct Scene{
     double viscosity = 0.0;         //dynamic, Pa s
     double surfaceTension = 0.0;    //N/m
     double contactAngle = 60.0;     //degrees, through the liquid, where its surface meets the domain's walls
+    //"air": {...}: a second, lighter fluid simulated with the liquid (TwoPhase, particles.hu; experimental). Fluids with "phase": "air" are seeded as it
+    bool air = false;
+    double airDensity = 1.2;        //kg/m^3: with the liquid's, the density ratio
+    std::string airFaceDensity = "fractions";   //how a face's density is found: "fractions", "phaseField", "levelSet", or "synthetic" (no air particles)
+    double airFlipRatio = -1.0;     //the air's share of FLIP; negative: the liquid's
+    int airBand = 0;                //voxels of air kept around the liquid; 0 keeps all of it
+    std::string airSyntheticShape = "plane";    //synthetic: air above "centre"'s height ("plane"), in a "ball" there, or in "balls" on a lattice from there
+    double airSyntheticCentre[3] = {0.0, 0.0, 0.0};
+    double airSyntheticRadius = 0.0;
+    double airSyntheticSpacing = 0.0;
     int particlesPerVoxel = 8;
     unsigned long long seed = 1;
     std::vector<SceneShape> fluids;
@@ -189,6 +201,8 @@ void loadNpyMesh(const std::string& verticesPath, const std::string& trianglesPa
 
 //the fluid the scene starts with: particlesPerVoxel per voxel, on a lattice of 1, 2 or 3 per side, each jittered within its lattice cell by a hash of
 //the seed and its place in the domain, so the same scene always seeds the same particles. Where shapes overlap, the earlier one's velocity wins
-void seedParticles(const Scene& scene, std::vector<double>& x, std::vector<double>& y, std::vector<double>& z, std::vector<float>& u, std::vector<float>& v, std::vector<float>& w);
+//Fluids are seeded in the order the scene lists them, so with air, which comes last, the liquid's particles are the first *liquid of them
+void seedParticles(const Scene& scene, std::vector<double>& x, std::vector<double>& y, std::vector<double>& z, std::vector<float>& u, std::vector<float>& v, std::vector<float>& w,
+                   size_t* liquid = nullptr);
 
 #endif

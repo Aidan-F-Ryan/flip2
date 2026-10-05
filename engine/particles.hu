@@ -31,6 +31,47 @@ enum class FreeSurface{
     sharp       //the liquid is what the level set finds, and the pressure is 0 (or the surface tension's) at the surface itself: the ghost fluid method
 };
 
+//how a face's density is found when there are two phases (twophase.cu)
+enum class FaceDensity{
+    fractions,  //from the share of the face's P2G weight that's liquid: linear between the two densities
+    phaseField, //from the face's mass alone, compressed and clamped: PF-FLIP's phase field (Braun, Bender and Thuerey 2025, equation 7)
+    levelSet,   //from where the liquid's level set crosses between the two voxels' centres: the ghost fluid method's (Kang, Fedkiw and Liu 2000)
+    synthetic   //from where the face is, whatever the particles are: for testing the pressure solve on its own
+};
+
+//A second, lighter fluid, air, around the liquid (twophase.cu): experimental. The air is particles like the liquid's, lighter by the density ratio, and
+//the pressure solve takes each face's own density, so one solve moves both. Which a particle is, is the top bit of its id (AIR_PARTICLE), so there's
+//nothing more to carry per particle. The 31 bits below number the liquid's particles; the air's mean nothing, and air takes no numbers from the count
+static constexpr uint AIR_PARTICLE = 0x80000000u;
+struct TwoPhase{
+    bool on = false;
+    float densityRatio = 1000.0f;       //the liquid's density over the air's
+    FaceDensity faceDensity = FaceDensity::fractions;
+    float airFlipRatio = 0.95f;         //the air's share of FLIP in G2P, as setFlipRatio is the liquid's
+    int band = 0;                       //voxels of air kept around the liquid, in whole nodes; 0 keeps all of it
+    int syntheticShape = 0;             //synthetic: 0 air above syntheticCentre's height (y), 1 a ball of air there, 2 balls of air on a lattice from there
+    float3 syntheticCentre = {0.0f, 0.0f, 0.0f};
+    float syntheticRadius = 0.0f;
+    float syntheticSpacing = 0.0f;      //between the lattice's balls
+
+    bool particles() const{     //whether any particles are air: not when the densities are made up
+        return on && faceDensity != FaceDensity::synthetic;
+    }
+};
+
+//the air band (TwoPhase::band, twophase.cu): a node cell's ring is how many nodes it is from one holding liquid, and this is one no ring reached
+static constexpr char BEYOND_BAND = 127;
+
+//one fluid's particles, for two phases' tests (Particles::phaseStatistics)
+static const int PHASE_HEIGHT_BINS = 256;
+struct PhaseStatistics{
+    unsigned long long count = 0;
+    double positionSum[3] = {0.0, 0.0, 0.0};
+    double kineticEnergy = 0.0;     //the sum of |v|^2/2
+    float fastest = 0.0f;           //the largest |v|
+    unsigned int heights[PHASE_HEIGHT_BINS] = {};   //how many are at each height (y), in PHASE_HEIGHT_BINS equal bins from the domain's floor to its ceiling
+};
+
 //The particles in one partition of the domain, and the grid they need: the nodes they occupy, the empty nodes their stencils reach into, and, when the
 //domain is split between partitions, copies of the neighbouring partitions' nodes next to its own (ghost nodes, with the same sparse voxels their owners
 //store). A partition owns the node planes [partitionPlanes[rank], partitionPlanes[rank + 1]) along z. On its own, a partition is the whole domain
@@ -59,7 +100,12 @@ public:
 
     void advectParticles();
 
+    //a frame of substeps. It stops short if a pressure solve doesn't come to its tolerance: there's then no pressure to move the fluid by, nothing in that
+    //substep has moved, and solveError says what happened (and stays set: the simulation goes no further)
     void solveFrame(double fps);
+    const std::string& solveError() const{  //empty unless a solve failed. The residual is every partition's together, so they all say the same
+        return solveFailure;
+    }
 
     void initialize();
     
@@ -70,6 +116,9 @@ public:
     //a frame for the cache (cacheWriter.hu), into pinned planes: float32 P x, y, z, then v x, y, z, then with ids each particle's id (64 bits), and with
     //ages how long ago it came to be, in seconds, each a plane of every particle's value, recording copied once they're there
     void copyFrameColumnsToHost(float* planes, bool ids, bool ages, cudaEvent_t copied);
+    //how many of this partition's particles a cache frame takes, which copyFrameColumnsToHost then packs: all of them, or with air the liquid's alone
+    //(nothing that reads a frame has a use for the air). With air it counts them, waiting for the GPU
+    uint countFrameParticles();
     //this partition's whole state for a checkpoint, into pinned host memory (CacheWriter::checkpointBytes), recording copied once it's there
     void copyCheckpointToHost(char* host, cudaEvent_t copied);
     //carries on from a checkpoint taken at time, after substep substeps, in place of initialize: its particles set as setParticles does
@@ -172,6 +221,16 @@ public:
         freeSurfaceMode = mode;
     }
 
+    //air as well as liquid (see TwoPhase): before initialize. Not with the sharp free surface, viscosity, surface tension or emitters yet
+    void setTwoPhase(const TwoPhase& settings){
+        twoPhase = settings;
+    }
+    //at a bake's start, before initialize: the particles given from first on are air (a scene's air is seeded after its liquid), and the liquid's next id
+    //is first. A checkpoint's ids say which is which themselves
+    void markAirParticles(uint first);
+    //this partition's liquid and air particles added into liquid and air: for tests. It waits for the GPU
+    void phaseStatistics(PhaseStatistics& liquid, PhaseStatistics& air);
+
     //the force fields besides gravity, up to MAX_FORCE_FIELDS of them (see forces.hu). volumes holds, for each field that's a volume, its vectors (and
     //nothing for the others, or for any past its end): they go onto this partition's GPU
     void setForceFields(const std::vector<ForceField>& fields, const std::vector<std::shared_ptr<const SceneField>>& volumes = {});
@@ -216,9 +275,30 @@ private:
     }
     void buildLevelSet();           //the liquid's surface, for viscosity, surface tension and the sharp free surface (levelset.cu): each substep, if any is on
     bool needsLevelSet() const{
-        return viscosity > 0.0 || surfaceTension > 0.0 || freeSurfaceMode == FreeSurface::sharp;
+        return viscosity > 0.0 || surfaceTension > 0.0 || needsSurfaceLevel();
     }
-    void applySurfaceTension(bool takeBack);
+    bool needsSurfaceLevel() const{     //the level set smoothed for the pressure solve: the sharp free surface's, or two phases' face densities from it
+        return freeSurfaceMode == FreeSurface::sharp || (twoPhase.on && twoPhase.faceDensity == FaceDensity::levelSet);
+    }
+    //two phases (twophase.cu): each face's density, from P2G's sums, the level set or where it is; the pressure equations' faces weighed by them; and the
+    //velocity update's faces likewise
+    void findFaceDensities();
+    void weighDensityFaces(float scale);
+    void lightenFaceUpdates(float scale);
+    //the air band (twophase.cu): air only within twoPhase.band voxels of the liquid, and the open air's pressure, 0, past it. markBeyondBand finds each
+    //node cell's ring and flags the air past the band as removed; fillAirBand (in emitParticles) makes air in the band's empty voxels; floatInAir takes
+    //the air's own weight off every face, so the air hangs still with nothing past the band holding it up
+    bool airBand() const{
+        return twoPhase.particles() && twoPhase.band > 0;
+    }
+    int bandRingCount() const{  //the band in nodes
+        int interiorWidth = 2<<refinementLevel;
+        int rings = (twoPhase.band + interiorWidth - 1) / interiorWidth;
+        return rings < BEYOND_BAND - 1 ? rings : BEYOND_BAND - 1;
+    }
+    void markBeyondBand();
+    void floatInAir(float dt);
+    void applySurfaceTension();
     //the sharp free surface (freesurface.cu): the unknowns whose centres are outside the liquid retired; the pressure equations' faces to air weighed by
     //how near the surface is; on the divergence, the surface tension's pressure and the density correction for packed voxels near the surface; the
     //velocity update's faces to air weighed as the equations are; and the liquid's velocities carried out into the voxels around it
@@ -232,9 +312,7 @@ private:
         double voxelSize = grid.cellSize / (2<<refinementLevel);
         return viscousCfl*viscousCfl*voxelSize*voxelSize / viscosity;
     }
-    void keepVelocitiesForViscosity();  //viscosity.cu
-    void applyViscosity();
-    void undoViscosity();
+    void applyViscosity();      //viscosity.cu
     void receiveParticleNodes(uint maskWords);
     void orderNodes(uint maskWords);
     void checkGhostRuns();
@@ -380,10 +458,16 @@ private:
     CudaVec<float> liquidLevel;     //per stored voxel: the liquid's signed distance at its centre, in voxels, negative inside, to LIQUID_BAND either way (levelset.cu)
     CudaVec<float> liquidCurvature; //per stored voxel beside the surface: its curvature, in 1/voxels, positive where the liquid bulges
     CudaVec<float> surfaceLevel;    //per stored voxel, with the sharp free surface: the level set smoothed for the pressure solve (SURFACE_PASSES)
-    CudaVec<float> viscousBefore[3];    //the face velocities as the forces left them, which pressureSolve's retry goes back to
+    TwoPhase twoPhase;
+    CudaVec<float> plainWeights[3];     //two phases: P2G's weight sums with every particle counting alike, where voxelWeights then hold each face's mass.
+                                        //Left in P2G's fixed point, plainWeightUnit to the count
+    float plainWeightUnit = 0.0f;
+    CudaVec<float> faceLightness[3];    //two phases, per stored voxel's three lower faces: the liquid's density over the face's, 1 up to the density ratio
+    CudaVec<char> bandRings;            //with an air band, per node cell of the domain: its ring, or BEYOND_BAND (markBeyondBand)
     void* viscousSeen = nullptr;    //pinned: the viscous solve's state as the host last read it
     uint viscousIterations = 0;     //what the last viscous solve took, which sizes the next one's first batch
     unsigned long long substepIndex = 0;    //substeps taken, which seeds the emitters' jitter
+    std::string solveFailure;       //what a pressure solve that didn't converge left for solveError
     double restParticlesPerVoxel = 8.0;
     double densityCorrectionTime = 0.1;
     Grid grid;
@@ -403,6 +487,8 @@ private:
 
     CudaVec<float> framePositions;          //a frame's x, y, z, packed for the copy to the host
     CudaVec<float> frameColumns;            //a frame's P and v planes, packed for the cache's copy to the host
+    CudaVec<uint> frameEnds;                //with air, per particle: how many of the particles up to and including it are the liquid's (countFrameParticles)
+    uint frameParticles = 0;                //and how many there are in all
     cudaStream_t frameStream = nullptr;     //copies frames to the host alongside the simulation
     cudaEvent_t framePacked = nullptr;
     cudaEvent_t frameCopied = nullptr;      //framePositions has been copied out, so it can take the next frame

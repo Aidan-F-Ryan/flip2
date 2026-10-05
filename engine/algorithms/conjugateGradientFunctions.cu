@@ -326,6 +326,7 @@ static float conjugateGradient(const CudaVec<char>& solveCodes, Stencil A, const
     turnDirection<<<blocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, z, d, dots);
     nextIteration<<<1, 1, 0, stream>>>(dots);
     float maxResidual = 1.0f;
+    SolveProgress progress;
     for(uint iteration = 1; iteration <= maxIterations; ++iteration){
         multiplyByA<<<blocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, numOwnVoxels, solveCodes.devPtr(), A, d, q, partials);
         dotProduct(d, q, &dots->dq);
@@ -336,9 +337,8 @@ static float conjugateGradient(const CudaVec<char>& solveCodes, Stencil A, const
         turnDirection<<<blocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, z, d, dots);
         nextIteration<<<1, 1, 0, stream>>>(dots);
         if(iteration % checkEvery == 0){    //the SOR's stopping rule: the largest residual, relative to the largest divergence
-            float previousResidual = maxResidual;
             maxResidual = (float)context.maxOverPartitions(std::abs(residuals.getMax(stream, true, numOwnVoxels))) / maxDivergence;
-            if(maxResidual < tolerance || std::abs(previousResidual - maxResidual) < tolerance / 1000){  //converged, or stalled
+            if(progress.done(maxResidual, tolerance)){  //converged, or stalled
                 break;
             }
         }
@@ -400,11 +400,11 @@ float cudaJacobiConjugateGradient(const CudaVec<char>& solveCodes, const CudaVec
 
 float cudaMultigridConjugateGradient(const CudaVec<char>& solveCodes, const CudaVec<uint>& neighborNx, const CudaVec<uint>& neighborPx, const CudaVec<uint>& neighborNy, const CudaVec<uint>& neighborPy, const CudaVec<uint>& neighborNz, const CudaVec<uint>& neighborPz,
     const CudaVec<float>& Anx, const CudaVec<float>& Apx, const CudaVec<float>& Any, const CudaVec<float>& Apy, const CudaVec<float>& Anz, const CudaVec<float>& Apz, const CudaVec<float>& Adiag,
-    CudaVec<float>& divU, CudaVec<float>& p, CudaVec<float>& residuals, float tolerance, uint maxIterations, const VoxelLayout& layout, float scale, DotProductSums sums, uint numOwnVoxels,
+    CudaVec<float>& divU, CudaVec<float>& p, CudaVec<float>& residuals, float tolerance, uint maxIterations, const VoxelLayout& layout, DotProductSums sums, uint numOwnVoxels,
     PartitionContext& context, cudaStream_t stream){
     uint numUsedVoxels = p.size();
     Stencil A = makeStencil(neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag);
-    Multigrid multigrid = buildMultigrid(A, solveCodes.devPtr(), numUsedVoxels, layout, scale, context, stream);
+    Multigrid multigrid = buildMultigrid(A, solveCodes.devPtr(), numUsedVoxels, layout, context, stream);
     float* z;
     DotProducts* dots;
     gpuErrchk(cudaMallocAsync((void**)&z, sizeof(float)*numUsedVoxels, stream));

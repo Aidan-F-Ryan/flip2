@@ -24,18 +24,46 @@
             return sum;
         }
 
-        __device__ float rowTimes(uint index, const float* x) const{     //(A*x) at an unknown, the same row the SOR relaxes
-            return Adiag[index]*x[index] + offDiagonalTimes(index, x);
+        //What the unknown's own coefficient holds past its couplings to its neighbours: its faces to air, where the pressure is 0. Whatever makes the
+        //coefficients (cudaGetA, weighCutCells, weighDensityFaces) sums the own one face by face, in this order, from the couplings as they're stored
+        //and the faces to air, so an unknown with no face to air gets exactly 0 here, and any other something that's never negative
+        __device__ float air(uint index) const{
+            float coupled = 0.0f;
+            #pragma unroll
+            for(int face = 0; face < 6; ++face){
+                coupled -= A[face][index];
+            }
+            return Adiag[index] - coupled;
+        }
+
+        //(A*x) at an unknown, the same row the SOR relaxes, as each coupling times the difference across its face, plus the faces to air times x. The
+        //own coefficient times x less the neighbours' times theirs is the same sum, but x can sit far from 0 next to how much it varies (in a closed
+        //box nothing fixes the pressure's level, and a pocket of air has its own), and then that's two large products whose rounding outweighs their
+        //difference: by the thousand where one fluid is a thousand times lighter than the other. A difference of two nearby floats is exact
+        __device__ float rowTimes(uint index, const float* x) const{
+            float here = x[index];
+            float sum = air(index)*here;
+            #pragma unroll
+            for(int face = 0; face < 6; ++face){
+                if(A[face][index] != 0.0f){
+                    sum += A[face][index]*(x[neighbors[face][index]] - here);
+                }
+            }
+            return sum;
         }
     };
 
-    //one of the V-cycle's grids below the unknowns: a dense grid over the whole domain, each cell 2x2x2 of the grid above
+    //one of the V-cycle's grids below the unknowns: a dense grid over the whole domain, each cell 2x2x2 of the grid above, its equation its children's summed
     struct CoarseLevel{
         uint3 cells;        //along x, y and z
-        float coupling;     //the coefficient between neighbouring cells: twice the finer grid's, as a coarse face is 4 finer faces at twice the spacing
-        char* fluid;        //whether the cell's an unknown (all its children are); else it's air, pinned at 0. Walls are the domain's edges
+        char* fluid;        //whether the cell's an unknown: any of its children is, and something holds them (its diagonal isn't 0). Walls are the domain's edges
         float* b;           //its right-hand side: the finer grid's leftover residual, summed over its children
         float* z;           //its correction
+        float* diagonal;    //its own coefficient
+        float* toX;         //its coupling to the next cell along x, y and z (0 where there's none)
+        float* toY;
+        float* toZ;
+        float* anchor;      //the share of its own coefficient that couples it to nothing: its children's faces to air, where the pressure is 0
     };
 
     //where the unknowns sit in the domain, which the coarse grids are laid over. The first coarse grid's cells are 2x2x2 voxels, so each lies inside one node
@@ -60,8 +88,8 @@
                                     //filled in by every partition and then solved alike in each
     };
 
-    //the coarse grids for this solve, from which unknowns there are
-    Multigrid buildMultigrid(Stencil A, const char* solveCodes, uint numUsedVoxels, const VoxelLayout& layout, float scale, PartitionContext& context, cudaStream_t stream);
+    //the coarse grids for this solve, and their equations, from the unknowns'
+    Multigrid buildMultigrid(Stencil A, const char* solveCodes, uint numUsedVoxels, const VoxelLayout& layout, PartitionContext& context, cudaStream_t stream);
 
     //z = M^-1*r: one V-cycle, an approximate solve of A*z = r
     void vCycle(const Multigrid& multigrid, const float* r, float* z, cudaStream_t stream);

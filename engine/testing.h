@@ -78,6 +78,13 @@ public:
         simulation.forEachPartition([&](Particles& partition){ partition.setFreeSurface(mode); });
     }
 
+    void setTwoPhase(const TwoPhase& settings){
+        simulation.forEachPartition([&](Particles& partition){ partition.setTwoPhase(settings); });
+    }
+    void markAirParticles(size_t first){
+        simulation.forEachPartition([&](Particles& partition){ partition.markAirParticles((uint)first); });
+    }
+
     void setObstacles(const std::vector<SceneObstacle>& obstacles){
         simulation.forEachPartition([&](Particles& partition){ partition.setObstacles(obstacles); });
     }
@@ -258,6 +265,9 @@ public:
     void solveFrame(double fps){
         simulation.solveFrame(fps);
     }
+    std::string solveError(){
+        return simulation.solveError();
+    }
 
     void writePositionsToFile(const std::string& fileName){
         simulation.writePositionsToFile(fileName);
@@ -269,6 +279,10 @@ public:
 
     void writeDiagnostics(const std::string& path, int frame){
         simulation.writeDiagnostics(path, frame);
+    }
+
+    void writePhaseDiagnostics(const std::string& path, int frame){
+        simulation.writePhaseDiagnostics(path, frame);
     }
 
     void startCache(const std::string& directory, const CacheDescription& description, int committedBefore, std::function<void(const char*, int)> done){
