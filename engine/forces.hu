@@ -68,6 +68,11 @@ struct ForceVoxels{
 //any force
 void applyForces(const Forces& forces, float dt, double time, const ForceVoxels& voxels, cudaStream_t stream);
 
+//The most a field can accelerate a face along an axis, for the timestep (Particles::getCourantDt), added to steady, m/s^2, and drag, per second: a
+//field that pushes gives its strength at its strongest, and one that pulls the fluid towards a velocity (wind, a volume of velocities) gives its drag
+//times how far the fluid's velocity is from its own, at most its drag times its own speed and the fluid's. longest: a volume's longest vector
+void addFieldLimits(const ForceField& field, float longest, double& steady, double& drag);
+
 //a volume's vectors (volumes.hpp's loadVectorField) onto the current GPU, for a ForceField's volume; and its memory given back
 SolidSDF uploadForceVolume(const SceneField& field, cudaStream_t stream);
 void freeForceVolume(SolidSDF& volume);

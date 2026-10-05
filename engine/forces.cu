@@ -2,6 +2,7 @@
 
 #include "forces.hu"
 #include <algorithm>
+#include <cmath>
 
 //Gravity, as applyGravity and removeGravity did it on y, on whichever axes it has. The same expressions, so the same bits
 __global__ void addGravity(uint numVoxels, float3 gravity, float dt, const char* solids, float* ux, float* uy, float* uz){
@@ -91,6 +92,13 @@ __device__ float3 curlNoise(float3 p, uint seed){
     float3 gz = noiseGradient(make_float3(p.x - 27.1f, p.y + 82.8f, p.z - 18.3f), seed*3 + 0x3456789u);
     return make_float3(gz.y - gy.z, gx.z - gz.x, gy.x - gx.y);
 }
+
+//The most a component of curlNoise can be, whatever gradients the hash deals the corners. One noise's derivative along an axis is linear in its eight
+//corner gradients, each any of the 12 edge vectors, so at a point of the cell the most it can be is, summed over the corners, the two largest
+//components of what multiplies that corner's gradient: 3.75 at most, at the cell's middle. A component of the curl is the difference of two noises'
+//derivatives, sampled the potentials' fixed offsets apart, which keeps both from their worst at once: 6.473 at most. (Its components' rms is 1, and
+//the largest over 2e8 points and 48 seeds was 5.13)
+static constexpr float CURL_NOISE_MOST = 6.48f;
 
 // ---- the fields ----
 
@@ -218,6 +226,30 @@ void applyForces(const Forces& forces, float dt, double time, const ForceVoxels&
     if(forces.numFields > 0 && voxels.numNodes > 0){
         addForceFields<<<voxels.numNodes, 128, 0, stream>>>(forces, dt, (float)time, voxels);
         gpuErrchk(cudaPeekAtLastError());
+    }
+}
+
+void addFieldLimits(const ForceField& field, float longest, double& steady, double& drag){
+    switch(field.kind){
+        case FORCE_POINT:
+        case FORCE_VORTEX:
+            steady += std::abs(field.strength);
+            break;
+        case FORCE_TURBULENCE:
+            steady += std::abs(field.strength)*CURL_NOISE_MOST;
+            break;
+        case FORCE_VOLUME:
+            if(field.mode == VOLUME_FORCE){
+                steady += std::abs(field.strength)*longest;
+            }
+            else{
+                steady += field.drag*std::abs(field.strength)*longest;
+                drag += field.drag;
+            }
+            break;
+        default:    //FORCE_WIND
+            steady += field.drag*std::max({std::abs(field.velocity.x), std::abs(field.velocity.y), std::abs(field.velocity.z)});
+            drag += field.drag;
     }
 }
 
