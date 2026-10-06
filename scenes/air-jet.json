@@ -1,0 +1,62 @@
+{
+ "schema": "flip2.scene/1",
+ "fps": 24,
+ "frames": 20,
+ "domain": {
+  "min": [
+   -0.25,
+   0,
+   -0.25
+  ],
+  "max": [
+   0.25,
+   0.5,
+   0.25
+  ],
+  "voxelSize": 0.0078125
+ },
+ "fluids": [
+  {
+   "shape": "box",
+   "min": [
+    -0.25,
+    0,
+    -0.25
+   ],
+   "max": [
+    0.25,
+    0.1,
+    0.25
+   ]
+  }
+ ],
+ "air": {
+  "density": 1.0,
+  "band": 8
+ },
+ "emitters": [
+  {
+   "shape": "box",
+   "min": [
+    -0.03125,
+    0.40625,
+    -0.03125
+   ],
+   "max": [
+    0.03125,
+    0.4375,
+    0.03125
+   ],
+   "velocity": [
+    0,
+    -2,
+    0
+   ]
+  }
+ ],
+ "output": {
+  "dir": "air-jet",
+  "diagnostics": "diagnostics.jsonl",
+  "positions": false
+ }
+}

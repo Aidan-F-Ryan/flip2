@@ -1,0 +1,53 @@
+{
+ "schema": "flip2.scene/1",
+ "fps": 24,
+ "frames": 20,
+ "domain": {
+  "min": [
+   0,
+   0,
+   0
+  ],
+  "max": [
+   0.25,
+   0.25,
+   0.25
+  ],
+  "voxelSize": 0.00390625
+ },
+ "fluids": [
+  {
+   "shape": "box",
+   "min": [
+    0,
+    0,
+    0
+   ],
+   "max": [
+    0.25,
+    0.125,
+    0.25
+   ]
+  }
+ ],
+ "air": {
+  "density": 1.0,
+  "band": 8
+ },
+ "obstacles": [
+  {
+   "shape": "sphere",
+   "centre": [
+    0.125,
+    0.08333333333333333,
+    0.125
+   ],
+   "radius": 0.03125
+  }
+ ],
+ "output": {
+  "dir": "air-sphere",
+  "diagnostics": "diagnostics.jsonl",
+  "positions": false
+ }
+}
