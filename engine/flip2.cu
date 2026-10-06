@@ -655,6 +655,7 @@ struct Checkpoint{
     bool apic = false;
     unsigned long long particles = 0;
     bool hasNextId = false;     //one from before particles had ids has none
+    double acceleration = 0.0;  //the most its last substep accelerated a face at; one from before that was kept has 0, and the next substep goes by the forces alone
     unsigned long long nextId = 0;
     std::string sceneHash;
     std::vector<uint> planes;   //its ranks' first node planes, and the last one's end
@@ -708,6 +709,9 @@ static bool newestCheckpoint(const std::string& directory, Checkpoint& out, std:
         if(const Json* nextId = record.find("nextId")){
             out.hasNextId = true;
             out.nextId = (unsigned long long)nextId->number;
+        }
+        if(const Json* acceleration = record.find("acceleration")){
+            out.acceleration = acceleration->number;
         }
         out.sceneHash = need("sceneXxh64")->text;
         for(const Json& plane : need("partitionPlanes")->items){
@@ -1149,6 +1153,9 @@ int main(int argc, char** argv){
         twoPhase.escapes = scene.airEscaped && twoPhase.densityRatio > 1.0f;   //with no difference in density there's no telling the liquid's weight on a face
         twoPhase.dropletRadius = (float)scene.airDropletRadius;
         twoPhase.airViscosity = (float)scene.airViscosity;
+        twoPhase.bubbleRadius = (float)scene.airBubbleRadius;
+        twoPhase.liquidViscosity = (float)(scene.airLiquidViscosity / scene.density);
+        twoPhase.surfaceTension = (float)(scene.airSurfaceTension / scene.density);
         twoPhase.syntheticShape = scene.airSyntheticShape == "ball" ? 1 : scene.airSyntheticShape == "balls" ? 2 : 0;
         twoPhase.syntheticCentre = make_float3((float)scene.airSyntheticCentre[0], (float)scene.airSyntheticCentre[1], (float)scene.airSyntheticCentre[2]);
         twoPhase.syntheticRadius = (float)scene.airSyntheticRadius;
@@ -1220,7 +1227,7 @@ int main(int argc, char** argv){
         if(!diagnostics.empty()){
             simulation->continueDiagnostics(diagnostics, checkpoint.frame);
         }
-        simulation->resume(checkpoint.time, checkpoint.substep);
+        simulation->resume(checkpoint.time, checkpoint.substep, checkpoint.acceleration);
         std::snprintf(line, sizeof(line), "{\"event\":\"start\",\"particles\":%llu,\"frames\":%d,\"nodes\":[%u,%u,%u],\"voxelSize\":%.9g,\"ranks\":%d,\"resumedFrom\":%d}",
                       checkpoint.particles, scene.frames, scene.nodes[0], scene.nodes[1], scene.nodes[2], scene.voxelSize(), ranks, checkpoint.frame);
         event(line);

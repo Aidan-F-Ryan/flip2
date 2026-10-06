@@ -32,9 +32,11 @@ __global__ void rootCell(double* px, double* py, double* pz, uint numParticles, 
         px[index] = reflectOffWalls(px[index], grid.negX, grid.sizeX, grid.cellSize);
         py[index] = reflectOffWalls(py[index], grid.negY, grid.sizeY, grid.cellSize);
         pz[index] = reflectOffWalls(pz[index], grid.negZ, grid.sizeZ, grid.cellSize);
-        uint x = floorf((px[index] - grid.negX) / grid.cellSize);
-        uint y = floorf((py[index] - grid.negY) / grid.cellSize);
-        uint z = floorf((pz[index] - grid.negZ) / grid.cellSize);
+        //in double, as the positions are: rounded to a float first, a position a few nanometres under a cell's boundary lands in the cell above it, and
+        //ownPoint (sources.cu), which decides which partition makes a particle by the same expression, has to find the same cell
+        uint x = floor((px[index] - grid.negX) / grid.cellSize);
+        uint y = floor((py[index] - grid.negY) / grid.cellSize);
+        uint z = floor((pz[index] - grid.negZ) / grid.cellSize);
         gridPosition[index] = min(x, grid.sizeX - 1) + min(y, grid.sizeY - 1)*grid.sizeX + min(z, grid.sizeZ - 1)*grid.sizeX*grid.sizeY;  //positions clamped onto the max face would otherwise index one cell past the end
     }
 }

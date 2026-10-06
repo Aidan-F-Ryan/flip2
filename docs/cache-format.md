@@ -135,7 +135,7 @@ A particle's order within a shard changes from frame to frame, so match particle
 ## ckpt.json
 
 ```json
-{"flip2":"checkpoint","version":1,"frame":40,"time":1.6666666666666667,"substep":152,"apic":false,"nextId":1240000,"particles":1240000,
+{"flip2":"checkpoint","version":1,"frame":40,"time":1.6666666666666667,"substep":152,"apic":false,"nextId":1240000,"acceleration":23.5,"particles":1240000,
  "worldSize":3,"partitionPlanes":[0,10,20,32],"sceneXxh64":"0e648f55050d9cfa","build":"a68ccce",
  "states":[{"file":"state.r000.f2p","rank":0,"particles":413000,"bytes":12582912,"xxh64":"...","low":[...],"high":[...]}, ...]}
 ```
@@ -146,6 +146,7 @@ A particle's order within a shard changes from frame to frame, so match particle
 | `substep` | Substeps taken so far; it seeds the emitters' jitter. |
 | `apic` | Whether the states carry `c`. |
 | `nextId` | The id the next new particle gets. A checkpoint from before ids existed has none, and a resume from it numbers the particles afresh. |
+| `acceleration` | The most the last substep accelerated the fluid at, in m/s², which bounds the next substep's length. A checkpoint from before it was kept has none, and the substep after a resume from it goes by the forces alone. |
 | `partitionPlanes` | The checkpoint's split, as in `cache.json`. A resume can use a different split. |
 | `states` | The state shards in rank order, listed like a commit record's `shards`. |
 

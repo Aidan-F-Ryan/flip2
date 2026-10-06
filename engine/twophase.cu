@@ -293,30 +293,53 @@ __global__ void settleFacesOfOneFluid(uint numVoxels, const float* massX, const 
     }
 }
 
+//how much of a face's reach along an axis lies past a wall that many half voxels from it: P2G's quadratic B-spline reaches a voxel and a half each way
+__device__ inline float pastWall(int halfVoxels){
+    return halfVoxels == 0 ? 0.5f : halfVoxels == 1 ? 1.0f/6.0f : halfVoxels == 2 ? 1.0f/48.0f : 0.0f;
+}
+
 //For escaping particles (particles.hu): each stored voxel's share of liquid: the liquid's density there over the density at rest, the mean over its
 //faces of the liquid's P2G weight on them. An unknown has all six faces, its upper ones its upper neighbours'; anything else goes by the three it
-//stores. In a voxel an obstacle's surface passes near (near not nullptr), part of each face's reach is inside the obstacle, and the weight a face can
-//have at rest falls with it: there it's over what both fluids weigh on the faces instead, the room the obstacle leaves. Against the density at rest,
-//the half voxel of water over a paddle's top read as too thin for the grid, and so did the water in the voxels a pillar cuts at the waterline:
-//droplets, falling down its side.
+//stores. The weight a face can have at rest is less beside a wall of the domain, where part of its reach has no particles to it: half of it for a face
+//on the wall, a sixth across a face half a voxel off, a 48th a voxel off. Each face counts for what's left, or water against a wall would read as
+//four fifths water, two thirds along an edge and half in a corner: air there would never be a bubble, and a bubble that came there would stop being
+//one. In a voxel an obstacle's surface passes near (near not nullptr), part of each face's reach is inside the obstacle the same way, with no telling
+//how much: there it's over what both fluids weigh on the faces instead, the room the obstacle leaves. Against the density at rest, the half voxel of
+//water over a paddle's top read as too thin for the grid, and so did the water in the voxels a pillar cuts at the waterline: droplets, falling down its
+//side. A voxel obstacles close has no room for either fluid, and no share (closed not nullptr): what isn't liquid there isn't air.
 //And none at all in a voxel whose faces the pressure solve has as air, every one: the grid carries no liquid there, however much of it is there. The
 //level set's faces are all air around liquid too thin or too small for it to show, a sheet or a blob under two voxels or so across, and liquid on such
 //faces weighs what air does and goes where the air's pressure sends it, while by its density it's liquid still: a mist that renders as water. In a dam
 //break at 25 mm voxels, 2 s in, 1,900 particles hung in the air like that, gaining 0.06 m/s downwards a frame where the droplets beside them gained
 //free fall's 0.41. (By how much of the faces is liquid, and not whether any is, the top of still water turned to droplets wherever it lay within half
 //a voxel under a layer of voxels' centres, and air left every bubble's skin: the level set's smoothing draws that a third of a voxel inside the air)
-__global__ void findLiquidShare(uint numVoxels, const char* solveCodes, const uint* neighborPx, const uint* neighborPy, const uint* neighborPz, const char* near,
+__global__ void findLiquidShare(uint numVoxels, const char* solveCodes, const uint* neighborNx, const uint* neighborPx, const uint* neighborNy, const uint* neighborPy,
+                                const uint* neighborNz, const uint* neighborPz, const char* near, const char* closed,
                                 const float* massX, const float* massY, const float* massZ, const int* liquidX, const int* liquidY, const int* liquidZ, float liquidUnit,
                                 const float* lightX, const float* lightY, const float* lightZ, float ratio, float rest, float* share){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
     if(index < numVoxels){
+        const uint* lower[3] = {neighborNx, neighborNy, neighborNz};
         const uint* upper[3] = {neighborPx, neighborPy, neighborPz};
         const float* mass[3] = {massX, massY, massZ};
         const int* liquid[3] = {liquidX, liquidY, liquidZ};
         const float* light[3] = {lightX, lightY, lightZ};
+        float inside[3][3];     //along each axis, how much of the reach of the voxel's lower face, of its centre and of its upper face is inside the walls
+        #pragma unroll
+        for(int axis = 0; axis < 3; ++axis){
+            int low = 2, high = 2;  //the voxels between this one and the wall below it, and above: 2 for any more, which no face's reach crosses
+            if(solveCodes[index]){
+                uint below = lower[axis][index], above = upper[axis][index];
+                low = below == WALL_VOXEL ? 0 : below < WALL_VOXEL && lower[axis][below] == WALL_VOXEL ? 1 : 2;
+                high = above == WALL_VOXEL ? 0 : above < WALL_VOXEL && upper[axis][above] == WALL_VOXEL ? 1 : 2;
+            }
+            inside[axis][0] = 1.0f - pastWall(2*low) - pastWall(2*high + 2);
+            inside[axis][1] = 1.0f - pastWall(2*low + 1) - pastWall(2*high + 1);
+            inside[axis][2] = 1.0f - pastWall(2*low + 2) - pastWall(2*high);
+        }
         float allAir = fminf(lightnessOf(0.0f, ratio), ratio);    //what a face with no liquid to it has, from any of the sources or from settleFacesOfOneFluid
         float ofLiquid = 0.0f, ofBoth = 0.0f;
-        int faces = 0;
+        float room = 0.0f;      //what the faces can weigh at rest, in faces away from the walls
         bool carried = !(1.0f < allAir);    //whether any face has liquid to it; with the two fluids as dense as each other the faces can't say
         #pragma unroll
         for(int axis = 0; axis < 3; ++axis){
@@ -329,12 +352,12 @@ __global__ void findLiquidShare(uint numVoxels, const char* solveCodes, const ui
                     ofLiquid += weight;
                     ofBoth += weight + (mass[axis][ends[end]] - weight)*ratio;
                     carried = carried || light[axis][ends[end]] < allAir;
-                    ++faces;
+                    room += inside[axis][2*end]*inside[(axis + 1) % 3][1]*inside[(axis + 2) % 3][1];
                 }
             }
         }
         bool beside = near != nullptr && (near[index] & NEAR_SURFACE);
-        share[index] = !carried ? 0.0f : beside ? (ofBoth > 0.0f ? ofLiquid / ofBoth : 0.0f) : ofLiquid / (faces*rest);
+        share[index] = closed != nullptr && closed[index] ? nanf("") : !carried ? 0.0f : beside ? (ofBoth > 0.0f ? ofLiquid / ofBoth : 0.0f) : ofLiquid / (room*rest);
     }
 }
 
@@ -454,8 +477,8 @@ void Particles::findFaceDensities(){
         context->fillGhosts(lightness, stream);
     }
     if(twoPhase.escaping()){    //from the faces as the ghosts' exchange left them: a voxel's upper faces are its neighbours'
-        findLiquidShare<<<blocks, BLOCKSIZE, 0, stream>>>(numVoxels, solveCodes.devPtr(), neighborPx.devPtr(), neighborPy.devPtr(), neighborPz.devPtr(),
-            beside ? obstacleNear.devPtr() : nullptr, voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), (const int*)liquidWeights[0].devPtr(),
+        findLiquidShare<<<blocks, BLOCKSIZE, 0, stream>>>(numVoxels, solveCodes.devPtr(), neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(), neighborPy.devPtr(),
+            neighborNz.devPtr(), neighborPz.devPtr(), beside ? obstacleNear.devPtr() : nullptr, beside ? obstacleSolids.devPtr() : nullptr, voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), (const int*)liquidWeights[0].devPtr(),
             (const int*)liquidWeights[1].devPtr(), (const int*)liquidWeights[2].devPtr(), liquidWeightUnit, light[0], light[1], light[2], ratio, (float)restParticlesPerVoxel,
             liquidShare.devPtr());
         context->fillGhosts(liquidShare.devPtr(), stream);

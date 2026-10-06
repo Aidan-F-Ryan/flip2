@@ -438,10 +438,12 @@ void CacheWriter::process(const Job& job){
     for(const CacheShard& shard : job.shards){
         ShardRecord record;
         fine = fine && writeShard(place + "/" + shardName(base, shard.rank, "f2p"), job.frame, shard, hostBuffers[job.buffer] + shard.offset, layout, record);
+        record.acceleration = job.checkpoint ? job.state.acceleration : 0.0;
         if(fine && !commits){   //rank 0, in another process, commits it from this record
             std::string why;
             std::string text = "{\"rank\":" + std::to_string(record.rank) + ",\"particles\":" + std::to_string(record.particles) + ",\"bytes\":" +
-                               std::to_string(record.bytes) + ",\"xxh64\":\"" + hex(record.hash) + "\",\"low\":" + triple(record.low) + ",\"high\":" + triple(record.high) + "}\n";
+                               std::to_string(record.bytes) + ",\"xxh64\":\"" + hex(record.hash) + "\",\"low\":" + triple(record.low) + ",\"high\":" + triple(record.high) +
+                               (job.checkpoint ? ",\"acceleration\":" + number(record.acceleration) : std::string()) + "}\n";
             if(!replaceFile(place + "/" + shardName(base, record.rank, "json"), text, why, false)){   //only for rank 0 to read: it needn't survive a crash
                 fail(why);
                 fine = false;
@@ -689,6 +691,9 @@ bool CacheWriter::readRecord(const std::string& path, int rank, ShardRecord& rec
             record.low[axis] = (float)low->items[axis].number;
             record.high[axis] = (float)high->items[axis].number;
         }
+        if(const Json* acceleration = json.find("acceleration")){
+            record.acceleration = acceleration->number;
+        }
         return true;
     }
     catch(const std::exception&){
@@ -741,8 +746,12 @@ bool CacheWriter::commitCheckpoint(const std::string& checkpointDirectory, const
     for(size_t i = 0; i < description.partitionPlanes.size(); ++i){
         planes += (i ? "," : "") + std::to_string(description.partitionPlanes[i]);
     }
+    double acceleration = 0.0;  //every rank's largest, as the next substep takes it
+    for(const ShardRecord& record : records){
+        acceleration = std::max(acceleration, record.acceleration);
+    }
     std::string text = "{\"flip2\":\"checkpoint\",\"version\":1,\"frame\":" + std::to_string(job.frame) + ",\"time\":" + number(job.state.time) + ",\"substep\":" +
-                       std::to_string(job.state.substep) + ",\"apic\":" + (job.state.apic ? "true" : "false") + ",\"nextId\":" + std::to_string(job.state.nextId) +
+                       std::to_string(job.state.substep) + ",\"apic\":" + (job.state.apic ? "true" : "false") + ",\"nextId\":" + std::to_string(job.state.nextId) + ",\"acceleration\":" + number(acceleration) +
                        ",\"particles\":" + std::to_string(total) +
                        ",\n \"worldSize\":" + std::to_string(description.worldSize) + ",\"partitionPlanes\":[" + planes + "],\"sceneXxh64\":\"" + description.sceneHash +
                        "\",\"build\":" + quoted(FLIP2_BUILD_ID) + ",\n \"states\":[" + shardsJson(records, "state") + "]}\n";

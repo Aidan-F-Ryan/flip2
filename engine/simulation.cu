@@ -340,6 +340,7 @@ void Simulation::writeCheckpoint(int frame){
     std::vector<CacheShard> shards;
     std::vector<cudaEvent_t> copies;
     size_t offset = 0;
+    CheckpointState state;
     for(int index = 0; index < numPartitions(); ++index){
         Particles& partition = *partitions[index];
         gpuErrchk(cudaSetDevice(partition.device()));
@@ -347,9 +348,9 @@ void Simulation::writeCheckpoint(int frame){
         shards.push_back({ranks[index], partition.numParticles(), offset});
         copies.push_back(cacheCopies[index][buffer]);
         offset += CacheWriter::checkpointBytes(partition.numParticles(), apic);
+        state.acceleration = std::max(state.acceleration, partition.acceleration());    //this rank's partitions' largest; the record takes every rank's
     }
     gpuErrchk(cudaSetDevice(partitions[0]->device()));
-    CheckpointState state;
     state.time = partitions[0]->elapsedTime;
     state.substep = partitions[0]->substepIndex;
     state.apic = apic;
@@ -357,8 +358,8 @@ void Simulation::writeCheckpoint(int frame){
     cacheWriter->submitCheckpoint(buffer, frame, state, shards, copies);
 }
 
-void Simulation::resume(double time, unsigned long long substep){
-    inLockstep([time, substep](Particles& partition){ partition.resume(time, substep); });
+void Simulation::resume(double time, unsigned long long substep, double acceleration){
+    inLockstep([time, substep, acceleration](Particles& partition){ partition.resume(time, substep, acceleration); });
 }
 
 bool Simulation::anyRank(bool mine){

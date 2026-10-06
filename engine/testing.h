@@ -305,8 +305,8 @@ public:
         simulation.writeCheckpoint(frame);
     }
 
-    void resume(double time, unsigned long long substep){
-        simulation.resume(time, substep);
+    void resume(double time, unsigned long long substep, double acceleration){
+        simulation.resume(time, substep, acceleration);
     }
 
     bool anyRank(bool mine){

@@ -73,15 +73,7 @@ __global__ void killRemoved(uint numParticles, const char* removed, uint deadCel
 }
 
 bool Particles::removing() const{
-    return sources.removes() || (obstacles.count() > 0 && substepIndex == 0) || airBand() || twoPhase.escaping();
-}
-
-//escaped air (twoPhase.escaping()): bubbles too small for the grid, which G2P marked, go
-__global__ void markBubbles(uint numParticles, const uint* ids, char* removed){
-    uint index = threadIdx.x + blockIdx.x*blockDim.x;
-    if(index < numParticles && (ids[index] & (AIR_PARTICLE | ESCAPED_PARTICLE)) == (AIR_PARTICLE | ESCAPED_PARTICLE)){
-        removed[index] = 1;
-    }
+    return sources.removes() || (obstacles.count() > 0 && substepIndex == 0) || airBand();
 }
 
 void Particles::markRemovedParticles(){
@@ -91,9 +83,6 @@ void Particles::markRemovedParticles(){
     removedFlags.resizeAsync(size, stream);
     double voxelSize = grid.cellSize / (2<<refinementLevel);
     markRemoved<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, px.devPtr(), py.devPtr(), pz.devPtr(), sources, grid, voxelSize, removedFlags.devPtr());
-    if(twoPhase.escaping()){
-        markBubbles<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, particleIds.devPtr(), removedFlags.devPtr());
-    }
     gpuErrchk(cudaPeekAtLastError());
     markParticlesInsideObstacles();
 }
@@ -160,6 +149,8 @@ struct EmitterLattice{
     double low[3];              //the domain
     double high[3];
     double ownLow, ownHigh;     //and along z, this partition's node planes: where its own particles can go
+    double cellSize;            //a node plane's thickness, and which planes are this partition's: for ownPoint, which finds a point's plane as rootCell
+    uint planeLo, planeHi;      //(particleToGridFunctions.cu) finds its cell
 
     __host__ __device__ unsigned long long count() const{
         return (unsigned long long)extent[0]*extent[1]*extent[2];
@@ -207,9 +198,13 @@ __global__ void constrainEmitterVelocities(uint numParticles, const double* px, 
     }
 }
 
-//whether a point that emits does so in this partition's planes: the particle is this partition's to make
+//whether a point that emits does so in this partition's planes: the particle is this partition's to make. Its plane is found exactly as rootCell
+//(particleToGridFunctions.cu) finds the particle's cell, the same expression in double, so the two can't disagree: by the position against the
+//planes' heights, a point a few nanometres under a plane's boundary was one partition's to make, and its cell, found through a float, the next
+//partition's; the partitions then built their node tables apart (the band's air in a 2-way jet, 2026-10-05)
 __device__ inline bool ownPoint(const EmitterLattice& lattice, const double now[3]){
-    return now[2] >= lattice.ownLow && now[2] < lattice.ownHigh;
+    double plane = floor((now[2] - lattice.origin[2]) / lattice.cellSize);
+    return plane >= lattice.planeLo && plane < lattice.planeHi;
 }
 
 //per lattice point: whether it emits (emitting), and whether it does in this partition's planes (own; the same array as emitting in a lone partition)
@@ -416,6 +411,9 @@ void Particles::emitParticles(){
     }
     lattice.ownLow = origin[2] + (double)boxLo*grid.cellSize;
     lattice.ownHigh = origin[2] + (double)boxHi*grid.cellSize;
+    lattice.cellSize = grid.cellSize;
+    lattice.planeLo = boxLo;
+    lattice.planeHi = boxHi;
     uint added = 0;
     //Of the lattice points that can be inside the shape now, or have swept through it this substep, the ones find marks become particles, made by place.
     //Every partition looks at all of them, not only those in its own planes: each new particle's id is its point's place among all that emit, and the

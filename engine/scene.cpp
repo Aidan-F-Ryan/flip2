@@ -397,7 +397,7 @@ Scene loadScene(const std::string& path){
         }
     }
     if(const Json* air = read.object(root, "air", "the scene")){     //a second, lighter fluid simulated with the liquid (experimental)
-        read.checkKeys(*air, "air", {"density", "faceDensity", "flipRatio", "band", "escaped", "dropletRadius", "viscosity", "synthetic"});
+        read.checkKeys(*air, "air", {"density", "faceDensity", "flipRatio", "band", "escaped", "dropletRadius", "viscosity", "bubbleRadius", "liquidViscosity", "surfaceTension", "synthetic"});
         scene.air = true;
         scene.airDensity = read.number(*air, "density", "air", scene.airDensity);
         scene.airFaceDensity = read.text(*air, "faceDensity", "air", scene.airFaceDensity);
@@ -406,8 +406,11 @@ Scene loadScene(const std::string& path){
         scene.airEscaped = read.flag(*air, "escaped", "air", scene.airEscaped);
         scene.airDropletRadius = read.number(*air, "dropletRadius", "air", scene.airDropletRadius);
         scene.airViscosity = read.number(*air, "viscosity", "air", scene.airViscosity);
-        if(scene.airDropletRadius < 0.0 || scene.airViscosity <= 0.0){
-            read.fail("air", "dropletRadius has to be at least 0 (0 for a particle's worth of liquid), and viscosity positive");
+        scene.airBubbleRadius = read.number(*air, "bubbleRadius", "air", scene.airBubbleRadius);
+        scene.airLiquidViscosity = read.number(*air, "liquidViscosity", "air", scene.airLiquidViscosity);
+        scene.airSurfaceTension = read.number(*air, "surfaceTension", "air", scene.airSurfaceTension);
+        if(scene.airDropletRadius < 0.0 || scene.airBubbleRadius < 0.0 || scene.airViscosity <= 0.0 || scene.airLiquidViscosity <= 0.0 || scene.airSurfaceTension <= 0.0){
+            read.fail("air", "dropletRadius and bubbleRadius have to be at least 0 (0 for a particle's worth of the fluid), and viscosity, liquidViscosity and surfaceTension positive");
         }
         if(scene.airFaceDensity != "fractions" && scene.airFaceDensity != "phaseField" && scene.airFaceDensity != "levelSet" && scene.airFaceDensity != "synthetic"){
             read.fail("air.faceDensity", "is fractions, phaseField, levelSet or synthetic");
