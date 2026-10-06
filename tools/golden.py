@@ -61,8 +61,13 @@ SCENES = {   #main's arguments after the frame count (and any environment it run
     "linear-volume": "scenes/linear-volume.json",   #accelerations that change across the drop, each component by another axis: where the volume is, and which way round
     "patch-volume": "scenes/patch-volume.json",     #a drop crossing the part of a velocity VDB that isn't active, which does nothing, into the part that is
     "strain-volume": "scenes/strain-volume.json",   #accelerations from a staggered VDB, each component changing along its own axis, where its faces are
+    "air-dam": "scenes/air-dam.json",               #two phases (engine/twophase.cu): a dam break in a cube with an 8-voxel band of air, droplets and bubbles escaping
+    "air-jet": "scenes/air-jet.json",               #an emitter's jet into a pool with the band: emission, splashes, entrained bubbles
+    "air-sphere": "scenes/air-sphere.json",         #a half-full cube with a sphere obstacle in it and the band: obstacles with air
+    "air-bubble": "scenes/air-bubble.json",         #a ball of air carved out of a full tank, rising: bubbles rejoining the air, air everywhere
+    "air-everywhere": "scenes/air-everywhere.json", #the dam break with air filling the rest of the cube: no band, sealed
 }
-DEFAULT_SCENES = ["dam16", "tank", "swirl", "swirl-apic", "nozzle", "drain", "forces", "tank-box", "paddle", "tank-meshsphere", "tank-pulse", "mesh-sources", "tank-vdbspin", "sealed-pulse", "sealed-box", "tension-drop", "tension-sessile", "viscous-dam", "dam16-sharp", "tank-sharp", "tension-drop-sharp", "tank-box-sharp", "viscous-dam-sharp", "force-volume", "velocity-volume", "linear-volume", "patch-volume", "strain-volume"]
+DEFAULT_SCENES = ["dam16", "tank", "swirl", "swirl-apic", "nozzle", "drain", "forces", "tank-box", "paddle", "tank-meshsphere", "tank-pulse", "mesh-sources", "tank-vdbspin", "sealed-pulse", "sealed-box", "tension-drop", "tension-sessile", "viscous-dam", "dam16-sharp", "tank-sharp", "tension-drop-sharp", "tank-box-sharp", "viscous-dam-sharp", "force-volume", "velocity-volume", "linear-volume", "patch-volume", "strain-volume", "air-dam", "air-jet", "air-sphere", "air-bubble", "air-everywhere"]
 
 EXACT = ["particles", "hash", "occupiedVoxels", "perVoxel", "core", "substeps", "time", "dtMin", "dtMax", "lowest", "highest", "fastest"]
 SUMS = ["kineticEnergy", "momentum", "angularMomentum", "centroid"]
