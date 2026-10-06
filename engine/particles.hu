@@ -49,19 +49,20 @@ static constexpr uint PARTICLE_NUMBER = 0x3FFFFFFFu;
 
 //Escaped particles, after PF-FLIP's section 3.4. A particle on the wrong side of the interface, where the grid's voxels are the other fluid's, is too
 //small a piece of its own fluid for the grid to carry: there its momentum and its weight get smeared over a voxel of the other fluid. So it leaves the
-//grid (ESCAPED_PARTICLE), judged each substep by the liquid's density at its voxel over the density at rest (liquidDensity; PF-FLIP's phase is its
-//square root, and these are its 0.5 -/+ 0.2 and 0.5, squared):
-//- a liquid particle where that's under DROPLET_DENSITY is a droplet. It takes no part in P2G or the pressure solve, and flies under gravity and the
-//  drag of the grid's velocity where it is, the air's (so the air still carries spray, but the spray doesn't push the air). Back where the density is
-//  over REJOIN_DENSITY it's the liquid's again, with the velocity it arrives with: where a substep finds it (G2P), and where its flight during one
+//grid (ESCAPED_PARTICLE), judged each substep by the liquid's share of its voxel (liquidShare): its density there over its density at rest, and none
+//where the pressure solve has every face of the voxel as air (findLiquidShare, twophase.cu). PF-FLIP's phase is the square root of that density, and
+//the numbers are its 0.5 -/+ 0.2 and 0.5, squared:
+//- a liquid particle where that's under DROPLET_SHARE is a droplet. It takes no part in P2G or the pressure solve, and flies under gravity and the
+//  drag of the grid's velocity where it is, the air's (so the air still carries spray, but the spray doesn't push the air). Back where the share is
+//  over REJOIN_SHARE it's the liquid's again, with the velocity it arrives with: where a substep finds it (G2P), and where its flight during one
 //  takes it into such a voxel (flyDroplets), which is where the flight ends;
-//- an air particle where it's over BUBBLE_DENSITY is a bubble smaller than a voxel, and is removed at the next initialize. That's where the air's own
-//  density is as low as a droplet's liquid, 1 - DROPLET_DENSITY, and not PF-FLIP's (0.5 + 0.2)^2 = 0.49: every voxel the surface of a bubble cuts is
+//- an air particle where it's over BUBBLE_SHARE is a bubble smaller than a voxel, and is removed at the next initialize. That's where the air's own
+//  share is as low as a droplet's liquid, 1 - DROPLET_SHARE, and not PF-FLIP's (0.5 + 0.2)^2 = 0.49: every voxel the surface of a bubble cuts is
 //  about half liquid, so at 0.49 the air there goes each substep, and a bubble 16 voxels across lost 60 to 87% of its air in 0.28 s.
 //What the grid resolves isn't touched: a pocket of air a few voxels across is air on the grid, and stays in the solve
-static constexpr float DROPLET_DENSITY = 0.09f;
-static constexpr float REJOIN_DENSITY = 0.25f;
-static constexpr float BUBBLE_DENSITY = 1.0f - DROPLET_DENSITY;
+static constexpr float DROPLET_SHARE = 0.09f;
+static constexpr float REJOIN_SHARE = 0.25f;
+static constexpr float BUBBLE_SHARE = 1.0f - DROPLET_SHARE;
 
 struct TwoPhase{
     bool on = false;
@@ -505,8 +506,8 @@ private:
     float liquidWeightUnit = 0.0f;
     CudaVec<float> faceLightness[3];    //two phases, per stored voxel's three lower faces: the liquid's density over the face's, 1 up to the density ratio
     CudaVec<char> bandRings;            //with an air band, per node cell of the domain: its ring, or BEYOND_BAND (findBandRings)
-    CudaVec<float> liquidDensity;       //with escaping particles, per stored voxel: the liquid's density there over its density at rest, or beside an
-                                        //obstacle over both fluids' (findLiquidDensity, twophase.cu)
+    CudaVec<float> liquidShare;         //with escaping particles, per stored voxel: the liquid's density there over its density at rest (beside an
+                                        //obstacle over both fluids'), and 0 where the pressure solve's faces are all air (findLiquidShare, twophase.cu)
     void* viscousSeen = nullptr;    //pinned: the viscous solve's state as the host last read it
     uint viscousIterations = 0;     //what the last viscous solve took, which sizes the next one's first batch
     unsigned long long substepIndex = 0;    //substeps taken, which seeds the emitters' jitter

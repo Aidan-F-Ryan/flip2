@@ -293,21 +293,31 @@ __global__ void settleFacesOfOneFluid(uint numVoxels, const float* massX, const 
     }
 }
 
-//For escaping particles (particles.hu): each stored voxel's liquid density over the density at rest, the mean over its faces of the liquid's P2G weight
-//there. An unknown has all six faces, its upper ones its upper neighbours'; anything else goes by the three it stores. In a voxel an obstacle's surface
-//passes near (near not nullptr), part of each face's reach is inside the obstacle, and the weight a face can have at rest falls with it: there the
-//density is over what both fluids weigh on the faces instead, the room the obstacle leaves. Against the density at rest, the half voxel of water over
-//a paddle's top read as too thin for the grid, and so did the water in the voxels a pillar cuts at the waterline: droplets, falling down its side
-__global__ void findLiquidDensity(uint numVoxels, const char* solveCodes, const uint* neighborPx, const uint* neighborPy, const uint* neighborPz, const char* near,
-                                  const float* massX, const float* massY, const float* massZ, const int* liquidX, const int* liquidY, const int* liquidZ, float liquidUnit,
-                                  float ratio, float rest, float* density){
+//For escaping particles (particles.hu): each stored voxel's share of liquid: the liquid's density there over the density at rest, the mean over its
+//faces of the liquid's P2G weight on them. An unknown has all six faces, its upper ones its upper neighbours'; anything else goes by the three it
+//stores. In a voxel an obstacle's surface passes near (near not nullptr), part of each face's reach is inside the obstacle, and the weight a face can
+//have at rest falls with it: there it's over what both fluids weigh on the faces instead, the room the obstacle leaves. Against the density at rest,
+//the half voxel of water over a paddle's top read as too thin for the grid, and so did the water in the voxels a pillar cuts at the waterline:
+//droplets, falling down its side.
+//And none at all in a voxel whose faces the pressure solve has as air, every one: the grid carries no liquid there, however much of it is there. The
+//level set's faces are all air around liquid too thin or too small for it to show, a sheet or a blob under two voxels or so across, and liquid on such
+//faces weighs what air does and goes where the air's pressure sends it, while by its density it's liquid still: a mist that renders as water. In a dam
+//break at 25 mm voxels, 2 s in, 1,900 particles hung in the air like that, gaining 0.06 m/s downwards a frame where the droplets beside them gained
+//free fall's 0.41. (By how much of the faces is liquid, and not whether any is, the top of still water turned to droplets wherever it lay within half
+//a voxel under a layer of voxels' centres, and air left every bubble's skin: the level set's smoothing draws that a third of a voxel inside the air)
+__global__ void findLiquidShare(uint numVoxels, const char* solveCodes, const uint* neighborPx, const uint* neighborPy, const uint* neighborPz, const char* near,
+                                const float* massX, const float* massY, const float* massZ, const int* liquidX, const int* liquidY, const int* liquidZ, float liquidUnit,
+                                const float* lightX, const float* lightY, const float* lightZ, float ratio, float rest, float* share){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
     if(index < numVoxels){
         const uint* upper[3] = {neighborPx, neighborPy, neighborPz};
         const float* mass[3] = {massX, massY, massZ};
         const int* liquid[3] = {liquidX, liquidY, liquidZ};
+        const float* light[3] = {lightX, lightY, lightZ};
+        float allAir = fminf(lightnessOf(0.0f, ratio), ratio);    //what a face with no liquid to it has, from any of the sources or from settleFacesOfOneFluid
         float ofLiquid = 0.0f, ofBoth = 0.0f;
         int faces = 0;
+        bool carried = !(1.0f < allAir);    //whether any face has liquid to it; with the two fluids as dense as each other the faces can't say
         #pragma unroll
         for(int axis = 0; axis < 3; ++axis){
             uint above = upper[axis][index];
@@ -318,12 +328,13 @@ __global__ void findLiquidDensity(uint numVoxels, const char* solveCodes, const 
                     float weight = liquid[axis][ends[end]]*liquidUnit;
                     ofLiquid += weight;
                     ofBoth += weight + (mass[axis][ends[end]] - weight)*ratio;
+                    carried = carried || light[axis][ends[end]] < allAir;
                     ++faces;
                 }
             }
         }
         bool beside = near != nullptr && (near[index] & NEAR_SURFACE);
-        density[index] = beside ? (ofBoth > 0.0f ? ofLiquid / ofBoth : 0.0f) : ofLiquid / (faces*rest);
+        share[index] = !carried ? 0.0f : beside ? (ofBoth > 0.0f ? ofLiquid / ofBoth : 0.0f) : ofLiquid / (faces*rest);
     }
 }
 
@@ -442,11 +453,12 @@ void Particles::findFaceDensities(){
     for(float* lightness : light){  //the ghosts take their owners', which read their own neighbours
         context->fillGhosts(lightness, stream);
     }
-    if(twoPhase.escaping()){
-        findLiquidDensity<<<blocks, BLOCKSIZE, 0, stream>>>(numVoxels, solveCodes.devPtr(), neighborPx.devPtr(), neighborPy.devPtr(), neighborPz.devPtr(),
+    if(twoPhase.escaping()){    //from the faces as the ghosts' exchange left them: a voxel's upper faces are its neighbours'
+        findLiquidShare<<<blocks, BLOCKSIZE, 0, stream>>>(numVoxels, solveCodes.devPtr(), neighborPx.devPtr(), neighborPy.devPtr(), neighborPz.devPtr(),
             beside ? obstacleNear.devPtr() : nullptr, voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), (const int*)liquidWeights[0].devPtr(),
-            (const int*)liquidWeights[1].devPtr(), (const int*)liquidWeights[2].devPtr(), liquidWeightUnit, ratio, (float)restParticlesPerVoxel, liquidDensity.devPtr());
-        context->fillGhosts(liquidDensity.devPtr(), stream);
+            (const int*)liquidWeights[1].devPtr(), (const int*)liquidWeights[2].devPtr(), liquidWeightUnit, light[0], light[1], light[2], ratio, (float)restParticlesPerVoxel,
+            liquidShare.devPtr());
+        context->fillGhosts(liquidShare.devPtr(), stream);
     }
     gpuErrchk(cudaPeekAtLastError());
 }
