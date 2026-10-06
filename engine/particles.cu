@@ -945,7 +945,7 @@ void Particles::generateVoxels(){
         for(CudaVec<float>& lightness : faceLightness){
             lightness.resizeAsync(numUsedVoxels, stream);
         }
-        if(twoPhase.particles()){
+        if(twoPhase.on){
             for(CudaVec<float>& liquid : liquidWeights){
                 liquid.resizeAsync(numUsedVoxels, stream);
             }
@@ -1196,7 +1196,7 @@ void Particles::particleVelToVoxels(){
     //P2G sums in fixed point: a face's weight sum is about the particles per voxel, so budget 128 (15x rest) and keep every sum under 2^30
     float weightScale = (1 << 30) / 128.0f;
     float momentumScale = weightScale / fmax(transferred, 1e-6);
-    bool phases = twoPhase.particles();     //air and liquid: each particle weighs as its fluid does, and the liquid's weights are kept beside the masses
+    bool phases = twoPhase.on;     //air and liquid: each particle weighs as its fluid does, and the liquid's weights are kept beside the masses
     if(phases){
         liquidWeightUnit = 1.0f / weightScale;
         for(CudaVec<float>& liquid : liquidWeights){
@@ -1258,7 +1258,7 @@ void Particles::pressureSolve(){
     settleSealedPockets();
     //divergence per unit of relative density error. Without air the fluid can't change volume, and the solve has nowhere to take a net divergence, so it's off.
     //With air particles it stays on though they fill a closed box: both fluids' particles bunch up, and the sealed pockets' balance takes the net out
-    double correctionRate = (hasFreeSurface || twoPhase.particles()) && densityCorrectionTime > 0.0 ? voxelSize / densityCorrectionTime : 0.0;
+    double correctionRate = (hasFreeSurface || twoPhase.on) && densityCorrectionTime > 0.0 ? voxelSize / densityCorrectionTime : 0.0;
     //@TODO: need to use courant number for dt from max voxel u and voxel dimensions
     substepStart = elapsedTime;
     dt = getCourantDt();
@@ -1963,7 +1963,7 @@ void Particles::voxelVelsToParticles(){
         exit(1);
     }
     float stick = (float)wallStick();   //how far a viscous liquid's particles hold to the walls, as its faces do in the viscous solve
-    bool phases = twoPhase.particles();
+    bool phases = twoPhase.on;
     accelerationBits.zeroDeviceAsync(stream);   //the most any particle's velocity changes by this substep, per second: G2P's update and the escaped ones' flights, for the next substep's timestep (getCourantDt)
     auto gather = phases ? (apic ? gatherVoxelVelsToParticles<true, true> : gatherVoxelVelsToParticles<false, true>)
                          : (apic ? gatherVoxelVelsToParticles<true, false> : gatherVoxelVelsToParticles<false, false>);
@@ -2155,7 +2155,7 @@ __global__ void flagLiquid(uint numParticles, const uint* ids, uint* liquid){
 
 uint Particles::countFrameParticles(){
     frameParticles = size;
-    if(twoPhase.particles() && size > 0){
+    if(twoPhase.on && size > 0){
         frameEnds.resizeAsync(size, stream);
         flagLiquid<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, particleIds.devPtr(), frameEnds.devPtr());
         gpuErrchk(cudaPeekAtLastError());
@@ -2176,7 +2176,7 @@ void Particles::copyFrameColumnsToHost(float* planes, bool ids, bool ages, cudaE
     if(frameParticles > 0){
         frameColumns.resizeAsync(columns*frameParticles, stream);
         packFrameColumns<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(),
-            ids ? particleIds.devPtr() : nullptr, idNumbers(), ages ? particleBirths.devPtr() : nullptr, elapsedTime, twoPhase.particles() ? frameEnds.devPtr() : nullptr,
+            ids ? particleIds.devPtr() : nullptr, idNumbers(), ages ? particleBirths.devPtr() : nullptr, elapsedTime, twoPhase.on ? frameEnds.devPtr() : nullptr,
             frameParticles, frameColumns.devPtr());
         gpuErrchk(cudaPeekAtLastError());
     }

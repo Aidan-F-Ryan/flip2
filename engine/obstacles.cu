@@ -1379,7 +1379,7 @@ void Particles::markParticlesInsideObstacles(){
         return;
     }
     double voxelSize = grid.cellSize / (2<<refinementLevel);
-    markInsideObstacles<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, px.devPtr(), py.devPtr(), pz.devPtr(), twoPhase.particles() ? particleIds.devPtr() : nullptr, grid,
+    markInsideObstacles<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, px.devPtr(), py.devPtr(), pz.devPtr(), twoPhase.on ? particleIds.devPtr() : nullptr, grid,
         voxelSize / sources.latticePerSide, obstacles.state(), removedFlags.devPtr());
     gpuErrchk(cudaPeekAtLastError());
 }

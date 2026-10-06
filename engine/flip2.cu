@@ -1146,8 +1146,6 @@ int main(int argc, char** argv){
         TwoPhase twoPhase;
         twoPhase.on = true;
         twoPhase.densityRatio = (float)(scene.density / scene.airDensity);
-        twoPhase.faceDensity = scene.airFaceDensity == "phaseField" ? FaceDensity::phaseField : scene.airFaceDensity == "levelSet" ? FaceDensity::levelSet :
-                               scene.airFaceDensity == "synthetic" ? FaceDensity::synthetic : FaceDensity::fractions;
         twoPhase.airFlipRatio = (float)(scene.airFlipRatio < 0.0 ? scene.flipRatio : scene.airFlipRatio);
         twoPhase.band = scene.airBand;
         twoPhase.escapes = scene.airEscaped && twoPhase.densityRatio > 1.0f;   //with no difference in density there's no telling the liquid's weight on a face
@@ -1156,16 +1154,12 @@ int main(int argc, char** argv){
         twoPhase.bubbleRadius = (float)scene.airBubbleRadius;
         twoPhase.liquidViscosity = (float)(scene.airLiquidViscosity / scene.density);
         twoPhase.surfaceTension = (float)(scene.airSurfaceTension / scene.density);
-        twoPhase.syntheticShape = scene.airSyntheticShape == "ball" ? 1 : scene.airSyntheticShape == "balls" ? 2 : 0;
-        twoPhase.syntheticCentre = make_float3((float)scene.airSyntheticCentre[0], (float)scene.airSyntheticCentre[1], (float)scene.airSyntheticCentre[2]);
-        twoPhase.syntheticRadius = (float)scene.airSyntheticRadius;
-        twoPhase.syntheticSpacing = (float)scene.airSyntheticSpacing;
-        if(twoPhase.particles() && !resuming){  //the seeds after the liquid's are air; a checkpoint's ids say which are which themselves
+        if(!resuming){  //the seeds after the liquid's are air; a checkpoint's ids say which are which themselves
             simulation->markAirParticles(liquidSeeds);
         }
         simulation->setTwoPhase(twoPhase);
         if(printsEvents){
-            std::cerr<<"Two phases: density ratio "<<twoPhase.densityRatio<<", face densities by "<<scene.airFaceDensity<<"\n";
+            std::cerr<<"Two phases: density ratio "<<twoPhase.densityRatio<<"\n";
         }
     }
     std::vector<ForceField> fields;
@@ -1245,7 +1239,7 @@ int main(int argc, char** argv){
         event(line);
         if(!diagnostics.empty()){
             simulation->writeDiagnostics(diagnostics, 0);
-            if(scene.air && scene.airFaceDensity != "synthetic"){
+            if(scene.air){
                 simulation->writePhaseDiagnostics(directory + "phases.jsonl", 0);
             }
         }
@@ -1279,7 +1273,7 @@ int main(int argc, char** argv){
         }
         if(!diagnostics.empty()){
             simulation->writeDiagnostics(diagnostics, frame);
-            if(scene.air && scene.airFaceDensity != "synthetic"){
+            if(scene.air){
                 simulation->writePhaseDiagnostics(directory + "phases.jsonl", frame);
             }
         }

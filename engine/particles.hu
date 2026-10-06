@@ -31,14 +31,6 @@ enum class FreeSurface{
     sharp       //the liquid is what the level set finds, and the pressure is 0 (or the surface tension's) at the surface itself: the ghost fluid method
 };
 
-//how a face's density is found when there are two phases (twophase.cu)
-enum class FaceDensity{
-    fractions,  //from the share of the face's P2G weight that's liquid: linear between the two densities
-    phaseField, //from the face's mass alone, compressed and clamped: PF-FLIP's phase field (Braun, Bender and Thuerey 2025, equation 7)
-    levelSet,   //from where the liquid's level set crosses between the two voxels' centres: the ghost fluid method's (Kang, Fedkiw and Liu 2000)
-    synthetic   //from where the face is, whatever the particles are: for testing the pressure solve on its own
-};
-
 //A second, lighter fluid, air, around the liquid (twophase.cu): experimental. The air is particles like the liquid's, lighter by the density ratio, and
 //the pressure solve takes each face's own density, so one solve moves both. Which a particle is, is the top bits of its id, so there's nothing more to
 //carry per particle: AIR_PARTICLE, and ESCAPED_PARTICLE for one the grid no longer moves (below). The 30 bits under them (PARTICLE_NUMBER) number
@@ -67,7 +59,6 @@ static constexpr float REJOIN_SHARE = 0.25f;
 struct TwoPhase{
     bool on = false;
     float densityRatio = 1000.0f;       //the liquid's density over the air's
-    FaceDensity faceDensity = FaceDensity::fractions;
     float airFlipRatio = 0.95f;         //the air's share of FLIP in G2P, as setFlipRatio is the liquid's
     bool escapes = true;                //whether particles on the wrong side of the interface move on their own (ESCAPED_PARTICLE)
     float dropletRadius = 0.0f;         //a droplet's radius for the air's drag on it, in metres; 0 for a ball of the liquid one particle stands for
@@ -77,16 +68,9 @@ struct TwoPhase{
     float surfaceTension = 7.2e-5f;     //between the two, over the liquid's density, m^3/s^2: how far a bubble flattens as it rises, which is most of
                                         //the drag on a large one
     int band = 0;                       //voxels of air kept around the liquid, in whole nodes; 0 keeps all of it
-    int syntheticShape = 0;             //synthetic: 0 air above syntheticCentre's height (y), 1 a ball of air there, 2 balls of air on a lattice from there
-    float3 syntheticCentre = {0.0f, 0.0f, 0.0f};
-    float syntheticRadius = 0.0f;
-    float syntheticSpacing = 0.0f;      //between the lattice's balls
 
-    bool particles() const{     //whether any particles are air: not when the densities are made up
-        return on && faceDensity != FaceDensity::synthetic;
-    }
     bool escaping() const{
-        return particles() && escapes;
+        return on && escapes;
     }
 };
 
@@ -158,7 +142,7 @@ public:
     //ages how long ago it came to be, in seconds, each a plane of every particle's value, recording copied once they're there
     void copyFrameColumnsToHost(float* planes, bool ids, bool ages, cudaEvent_t copied);
     uint idNumbers() const{     //the bits of an id that number the particle: all of them, or with air the ones under the bits that say what it is
-        return twoPhase.particles() ? PARTICLE_NUMBER : 0xFFFFFFFFu;
+        return twoPhase.on ? PARTICLE_NUMBER : 0xFFFFFFFFu;
     }
     //how many of this partition's particles a cache frame takes, which copyFrameColumnsToHost then packs: all of them, or with air the liquid's alone
     //(nothing that reads a frame has a use for the air). With air it counts them, waiting for the GPU
@@ -323,8 +307,8 @@ private:
     bool needsLevelSet() const{
         return viscosity > 0.0 || surfaceTension > 0.0 || needsSurfaceLevel();
     }
-    bool needsSurfaceLevel() const{     //the level set smoothed for the pressure solve: the sharp free surface's, or two phases' face densities from it
-        return freeSurfaceMode == FreeSurface::sharp || (twoPhase.on && twoPhase.faceDensity == FaceDensity::levelSet);
+    bool needsSurfaceLevel() const{     //the level set smoothed for the pressure solve: the sharp free surface's
+        return freeSurfaceMode == FreeSurface::sharp;
     }
     //two phases (twophase.cu): each face's density, from P2G's sums, the level set or where it is; the pressure equations' faces weighed by them; and the
     //velocity update's faces likewise
@@ -335,7 +319,7 @@ private:
     //node cell's ring, in every partition alike; markBeyondBand flags the air past the band as removed; emitParticles makes air in the band's empty
     //voxels; floatInAir takes the air's own weight off every face, so the air hangs still with nothing past the band holding it up
     bool airBand() const{
-        return twoPhase.particles() && twoPhase.band > 0;
+        return twoPhase.on && twoPhase.band > 0;
     }
     int bandRingCount() const{  //the band in nodes
         int interiorWidth = 2<<refinementLevel;

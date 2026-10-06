@@ -397,10 +397,9 @@ Scene loadScene(const std::string& path){
         }
     }
     if(const Json* air = read.object(root, "air", "the scene")){     //a second, lighter fluid simulated with the liquid (experimental)
-        read.checkKeys(*air, "air", {"density", "faceDensity", "flipRatio", "band", "escaped", "dropletRadius", "viscosity", "bubbleRadius", "liquidViscosity", "surfaceTension", "synthetic"});
+        read.checkKeys(*air, "air", {"density", "flipRatio", "band", "escaped", "dropletRadius", "viscosity", "bubbleRadius", "liquidViscosity", "surfaceTension"});
         scene.air = true;
         scene.airDensity = read.number(*air, "density", "air", scene.airDensity);
-        scene.airFaceDensity = read.text(*air, "faceDensity", "air", scene.airFaceDensity);
         scene.airFlipRatio = read.number(*air, "flipRatio", "air", scene.airFlipRatio);
         scene.airBand = (int)read.number(*air, "band", "air", scene.airBand);
         scene.airEscaped = read.flag(*air, "escaped", "air", scene.airEscaped);
@@ -412,24 +411,8 @@ Scene loadScene(const std::string& path){
         if(scene.airDropletRadius < 0.0 || scene.airBubbleRadius < 0.0 || scene.airViscosity <= 0.0 || scene.airLiquidViscosity <= 0.0 || scene.airSurfaceTension <= 0.0){
             read.fail("air", "dropletRadius and bubbleRadius have to be at least 0 (0 for a particle's worth of the fluid), and viscosity, liquidViscosity and surfaceTension positive");
         }
-        if(scene.airFaceDensity != "fractions" && scene.airFaceDensity != "phaseField" && scene.airFaceDensity != "levelSet" && scene.airFaceDensity != "synthetic"){
-            read.fail("air.faceDensity", "is fractions, phaseField, levelSet or synthetic");
-        }
         if(scene.airDensity <= 0.0 || scene.airDensity > scene.density || scene.airFlipRatio > 1.0 || scene.airBand < 0){
             read.fail("air", "density has to be positive and no more than the liquid's, flipRatio at most 1, and band at least 0");
-        }
-        if(const Json* synthetic = read.object(*air, "synthetic", "air")){
-            read.checkKeys(*synthetic, "air.synthetic", {"shape", "centre", "center", "radius", "spacing"});
-            scene.airSyntheticShape = read.text(*synthetic, "shape", "air.synthetic", scene.airSyntheticShape);
-            read.vector3(*synthetic, synthetic->find("centre") ? "centre" : "center", "air.synthetic", scene.airSyntheticCentre);
-            scene.airSyntheticRadius = read.number(*synthetic, "radius", "air.synthetic", scene.airSyntheticRadius);
-            scene.airSyntheticSpacing = read.number(*synthetic, "spacing", "air.synthetic", scene.airSyntheticSpacing);
-            if(scene.airSyntheticShape != "plane" && scene.airSyntheticShape != "ball" && scene.airSyntheticShape != "balls"){
-                read.fail("air.synthetic.shape", "is plane, ball or balls");
-            }
-            if((scene.airSyntheticShape != "plane" && scene.airSyntheticRadius <= 0.0) || (scene.airSyntheticShape == "balls" && scene.airSyntheticSpacing <= 0.0)){
-                read.fail("air.synthetic", "a ball needs a positive radius, and balls a positive spacing too");
-            }
         }
     }
     scene.particlesPerVoxel = (int)read.number(root, "particlesPerVoxel", "the scene", scene.particlesPerVoxel);
@@ -670,13 +653,11 @@ Scene loadScene(const std::string& path){
             }
         }
     }
-    if(airFluids && (!scene.air || scene.airFaceDensity == "synthetic")){
-        read.fail("fluids", "\"phase\": \"air\" needs an \"air\" block, with a faceDensity other than synthetic");
+    if(airFluids && !scene.air){
+        read.fail("fluids", "\"phase\": \"air\" needs an \"air\" block");
     }
-    if(scene.air && scene.airFaceDensity != "synthetic"){
-        if(scene.freeSurface == "sharp" || scene.viscosity > 0.0 || scene.surfaceTension > 0.0){
-            read.fail("air", "doesn't go with the sharp free surface, viscosity or surface tension yet");
-        }
+    if(scene.air && (scene.freeSurface == "sharp" || scene.viscosity > 0.0 || scene.surfaceTension > 0.0)){
+        read.fail("air", "doesn't go with the sharp free surface, viscosity or surface tension yet");
     }
     if(scene.emitters.size() > 16 || scene.sinks.size() > 16){
         read.fail("the scene", "can have up to 16 emitters and 16 sinks");

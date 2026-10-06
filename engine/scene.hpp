@@ -158,7 +158,6 @@ struct Scene{
     //"air": {...}: a second, lighter fluid simulated with the liquid (TwoPhase, particles.hu; experimental). Fluids with "phase": "air" are seeded as it
     bool air = false;
     double airDensity = 1.2;        //kg/m^3: with the liquid's, the density ratio
-    std::string airFaceDensity = "fractions";   //how a face's density is found: "fractions", "phaseField", "levelSet", or "synthetic" (no air particles)
     double airFlipRatio = -1.0;     //the air's share of FLIP; negative: the liquid's
     int airBand = 0;                //voxels of air kept around the liquid; 0 keeps all of it
     bool airEscaped = true;         //whether particles on the wrong side of the interface move on their own: droplets fly under gravity and the air's drag,
@@ -168,10 +167,6 @@ struct Scene{
     double airBubbleRadius = 0.0;   //a bubble's radius for the liquid's drag on it, in metres; 0 for a ball of the air one particle stands for
     double airLiquidViscosity = 0.001;  //the liquid's viscosity for that drag, Pa s as "liquid"'s is, which doesn't go with air yet (water 0.001)
     double airSurfaceTension = 0.072;   //between the two fluids, N/m (water and air 0.072): how far a bubble flattens as it rises, and so how fast a large one does
-    std::string airSyntheticShape = "plane";    //synthetic: air above "centre"'s height ("plane"), in a "ball" there, or in "balls" on a lattice from there
-    double airSyntheticCentre[3] = {0.0, 0.0, 0.0};
-    double airSyntheticRadius = 0.0;
-    double airSyntheticSpacing = 0.0;
     int particlesPerVoxel = 8;
     unsigned long long seed = 1;
     std::vector<SceneShape> fluids;

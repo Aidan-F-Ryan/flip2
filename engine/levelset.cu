@@ -627,7 +627,7 @@ void Particles::buildLevelSet(){
     gpuErrchk(cudaMallocAsync((void**)&raw, bytes, stream));
     int3 domainVoxels = make_int3(grid.sizeX*interiorWidth, grid.sizeY*interiorWidth, grid.sizeZ*interiorWidth);
     if(numParticleNodes > 0){
-        auto splat = twoPhase.particles() ? splatParticles<true> : splatParticles<false>;
+        auto splat = twoPhase.on ? splatParticles<true> : splatParticles<false>;
         splat<<<numParticleNodes, SPLAT_THREADS, 4*sizeof(int)*numVoxelsPerNode, stream>>>(numParticleNodes, size, gridNodeIndicesToFirstParticleIndex.devPtr(), px.devPtr(), py.devPtr(),
             pz.devPtr(), voxelPlaces(), domainVoxels, voxelOwners.devPtr(), sums[0], sums[1], sums[2], sums[3], particleIds.devPtr());
     }
