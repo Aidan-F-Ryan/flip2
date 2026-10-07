@@ -96,6 +96,7 @@ def create_render(node):
     camera.parm("focalLength").set(FOCAL_LENGTH)
     camera.parmTuple("t").set((centre[0], centre[1] + 0.45*size[1], centre[2] + distance))
     camera.parmTuple("r").set((-math.degrees(math.atan(0.5*size[1] / distance)), 0.0, 0.0))
+    camera.parmTuple("clippingRange").set((0.001*distance, 1.0e6))     #USD's near plane is 1 m by default: a scene under a metre across rendered nothing
     sky = stage.createNode("karmaphysicalsky", prefix + "_sky")
     sky.setInput(0, camera)
     sky.parm("solar_altitude").set(50.0)

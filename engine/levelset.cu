@@ -36,7 +36,7 @@
 //still, and only the curvature's changes along the surface move anything. Nothing about the pressure equations changes. It's explicit, so the timestep
 //can't pass the time the shortest capillary wave takes to cross a voxel (Particles::capillaryDt), which only applies with surface tension on. The sharp
 //free surface takes the same curvature as the pressure at its surface instead, inside the solve (freesurface.cu), and none of this force. Nor does
-//the liquid with air around it (TwoPhase): there the force comes from the two fluids' particles themselves (twophase.cu), and no curvature is found.
+//the liquid with air around it (TwoPhase): there the force is the slope of an energy of the two fluids' shares of the voxels (twophase.cu), and no curvature is found.
 
 #include "particles.hu"
 #include "liquidTile.hu"
@@ -659,7 +659,7 @@ void Particles::buildLevelSet(){
         }
         context->fillGhosts(surfaceLevel.devPtr(), stream);
     }
-    if(surfaceTension > 0.0 && !twoPhase.on){   //with air, the force is the particles' own (tensionOnMixture, twophase.cu)
+    if(surfaceTension > 0.0 && !twoPhase.on){   //with air, the force comes from the two fluids' shares (tensionOnMixture, twophase.cu)
         liquidCurvature.resizeAsync(numVoxels, stream);
         liquidCurvature.zeroDeviceAsync(stream);    //0 wherever it isn't worked out
         if(numOwnNodes > 0 && numVoxels > 0){   //the smoothed level set goes where the particles' field was: every voxel a tile reads gets one
@@ -686,7 +686,7 @@ void Particles::applySurfaceTension(){
     if(freeSurfaceMode == FreeSurface::sharp){
         return;
     }
-    if(twoPhase.on){    //with air, the surface is both fluids' particles together, and the force is the slope of its energy at them (twophase.cu)
+    if(twoPhase.on){    //with air, the surface is both fluids' shares of the voxels, and the force is the slope of its energy, on the faces (twophase.cu)
         tensionOnMixture();
         return;
     }

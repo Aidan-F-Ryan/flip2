@@ -407,19 +407,27 @@ void Particles::floatInAir(float dt){
 //a curved surface what's left of mu is the curvature's, sigma kappa in all: the pressure a drop holds. And a surface the two fluids have spread
 //across, a finger of one into the other, a stray particle near it, are all away from that rest, and cost.
 //
-//The force is the one that energy gives, in the form that leaves the air alone (Jamet, Torres and Brackbill 2002): each of the liquid's particles
-//is pushed down mu's slope where it is, -(sigma dx / particles a voxel) grad mu, and the air's not at all. Summed over what's in a voxel that's
-//-c grad mu, which differs from the energy's own slope with where the fluid is, mu grad c, by a gradient: the pressure's to take. So the push lands
-//on the faces by how much liquid is on them, and a face of nearly all air, a thousand times as easy to move, gets next to none; where mu is level
-//there's none at all. Each particle's push goes onto the faces by the weights advection moves it with (tensionOfParticles, particles.cu), as
-//momentum, and each face's velocity changes by that over its mass.
+//The force is the one that energy gives: on each face, -c grad mu, with c the liquid's share as the particles made it (not blurred: that share is
+//what the flow carries, so the force's work is exactly what E loses) and mu's step across the face, the pressure solve's own difference
+//(pushFacesByPotential). -c grad mu is the energy's slope with where the fluid is, mu grad c, less a gradient, the pressure's to take; written so,
+//the force is nothing where mu is level, so deep in either fluid, and for a ball at rest, where c and mu are both the surface's, it's a gradient
+//to the solve's own operators and comes off exactly: nothing moves (Jamet, Torres and Brackbill 2002). It changes each face's velocity by that
+//over the liquid's density, whatever is on the face (Yokoi 2014's density-scaled force): over the face's own mass, a face of nearly all air took
+//whatever the force isn't a gradient by a thousandfold, and the air flew. Pushing the liquid's particles one by one down mu's slope instead,
+//summed onto the faces they move with, was built first: that force is -grad mu on every face with a liquid particle and nothing on the next, a
+//step along the particles' ragged edge whose curl the solve can't take off, and a ball at rest shed its outermost particles there, 137 of 137k
+//in 5 s, against 4 from the faces.
 //
-//Measured, a ball of liquid 16 voxels in radius in air, in zero gravity: at rest it stays at rest for 5 s, its particles' rms speed 0.010 m/s where
-//the capillary speed is 0.32 (the liquid's own force with no air leaves the same), the air's 0.009; stretched and let go, it swings at 3% under
-//Lamb's frequency and loses 5 to 6% of its swing each half period (with no air, 11% under and 19%). The blur is what that takes: unblurred, the
-//particles' own unevenness shows in c, and a swing is spent on it within two periods; blurred twice, the frequency and the loss are no better and
-//the liquid at the surface's edge is held more loosely. Half a ball of water 5 mm in radius, thick enough to settle, comes to rest on the floor
-//under gravity within 13% of Young and Laplace's height and 4% of its base's radius at 60, 90 and 120 degrees (with no air, 14% and 21%).
+//Measured, a ball of liquid 16 voxels in radius in air, in zero gravity: at rest, in 5 s it sheds 4 of its 137k particles (with the force summed
+//from the particles, 137; judged by its voxel's share instead of its own, 1,625), and what moves in it, 0.013 m/s rms against a capillary speed
+//of 0.32, is its own ringing from where its particles started, which isn't quite the energy's rest (its quadrupole moment stays under 0.003 of
+//the radius; with no tension nothing moves, 0.0004 m/s; with 0.5 Pa s it's down to 0.006 within 0.3 s). Stretched and let go, it swings 0.3%
+//under Lamb's frequency, and +0.4%, -0.4% and -1.6% as the stretch goes 4, 8 and 16% (a finite swing is slower than the linear one: Tsamopoulos
+//and Brown 1983), losing 4 to 5% of its swing each half period; with no air, 11% under and 18% a half period. The blur is what the particles'
+//own unevenness takes: unblurred it shows in c and a swing is spent on it within two periods, and blurred twice the surface's edge is held more
+//loosely (measured with the force summed from the particles). Half a ball of water 5 mm in radius, thick enough to settle, comes to rest on the
+//floor under gravity within 10% of Young and Laplace's height and 9% of its base's radius at 60, 90 and 120 degrees (with no air, 14% and 21%),
+//shedding nothing.
 
 static constexpr int TENSION_BLUR = 1;      //passes of the 1 2 1 blur over c, along each axis
 
@@ -485,31 +493,17 @@ static double surfaceEnergyPerFace(int passes){
 }
 
 //Each unknown's share of liquid, c, from both fluids' weight on its six faces: its three lower ones and its upper neighbours' lower ones, where
-//those are stored (a wall's and an obstacle's closed face are no one's). And 1 over what those faces weigh at rest, which is less beside a wall,
-//where part of each face's reach has no particles to it (as findLiquidShare has it). Anything else stored is past the solve, and air: 0 for both
-__global__ void shareOfVoxels(uint numVoxels, const char* solveCodes, const uint* neighborNx, const uint* neighborPx, const uint* neighborNy, const uint* neighborPy,
-                              const uint* neighborNz, const uint* neighborPz, const float* massX, const float* massY, const float* massZ, const int* liquidX,
-                              const int* liquidY, const int* liquidZ, float liquidUnit, float ratio, float rest, float* share, float* perRest){
+//those are stored (a wall's and an obstacle's closed face are no one's). Anything else stored is past the solve, and air: 0
+__global__ void shareOfVoxels(uint numVoxels, const char* solveCodes, const uint* neighborPx, const uint* neighborPy, const uint* neighborPz, const float* massX, const float* massY,
+                              const float* massZ, const int* liquidX, const int* liquidY, const int* liquidZ, float liquidUnit, float ratio, float* share){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
     if(index < numVoxels){
-        float c = 0.0f, perWeight = 0.0f;
+        float c = 0.0f;
         if(solveCodes[index]){
-            const uint* lower[3] = {neighborNx, neighborNy, neighborNz};
             const uint* upper[3] = {neighborPx, neighborPy, neighborPz};
             const float* mass[3] = {massX, massY, massZ};
             const int* liquid[3] = {liquidX, liquidY, liquidZ};
-            float inside[3][3];     //along each axis, how much of the reach of the voxel's lower face, of its centre and of its upper face is inside the walls
-            #pragma unroll
-            for(int axis = 0; axis < 3; ++axis){
-                uint below = lower[axis][index], above = upper[axis][index];
-                int low = below == WALL_VOXEL ? 0 : below < WALL_VOXEL && lower[axis][below] == WALL_VOXEL ? 1 : 2;
-                int high = above == WALL_VOXEL ? 0 : above < WALL_VOXEL && upper[axis][above] == WALL_VOXEL ? 1 : 2;
-                inside[axis][0] = 1.0f - pastWall(2*low) - pastWall(2*high + 2);
-                inside[axis][1] = 1.0f - pastWall(2*low + 1) - pastWall(2*high + 1);
-                inside[axis][2] = 1.0f - pastWall(2*low + 2) - pastWall(2*high);
-            }
             float ofLiquid = 0.0f, ofBoth = 0.0f;
-            float room = 0.0f;      //what the faces weigh at rest, in faces away from the walls
             #pragma unroll
             for(int axis = 0; axis < 3; ++axis){
                 uint above = upper[axis][index];
@@ -520,15 +514,12 @@ __global__ void shareOfVoxels(uint numVoxels, const char* solveCodes, const uint
                         float weight = liquid[axis][ends[end]]*liquidUnit;
                         ofLiquid += weight;
                         ofBoth += weight + (mass[axis][ends[end]] - weight)*ratio;
-                        room += inside[axis][2*end]*inside[(axis + 1) % 3][1]*inside[(axis + 2) % 3][1];
                     }
                 }
             }
             c = ofBoth > 0.0f ? fminf(ofLiquid / ofBoth, 1.0f) : 0.0f;
-            perWeight = room > 0.0f ? 1.0f / (room*rest) : 0.0f;
         }
         share[index] = c;
-        perRest[index] = perWeight;
     }
 }
 
@@ -551,12 +542,24 @@ __global__ void blurAlong(uint numVoxels, const char* solveCodes, const uint* lo
     }
 }
 
-//mu, the energy's slope with each unknown's (blurred) c: W'(c) less the sum of c's steps to its six neighbours, over K; through a wall there's no
-//step, and past what the solve holds is air, c = 0. Each of its faces on one of the domain's walls takes off the wall's part: the wetting, the
-//cosine of the angle the liquid meets it at, times 6 c (1 - c), the slope of c^2 (3 - 2 c), so only where the surface meets the wall; a face an
-//obstacle closes (near, not nullptr with none) is a wall with no angle of its own, square on. Kept as what it's over its value deep in the liquid,
-//where W' is atLiquid: only its slope pushes, and deep in the liquid, where nothing should, it's then exactly nothing, however the walls cut into
-//a particle's reach. W' at all air and at all liquid are given, as most voxels are one or the other
+//The energy's second sum, a change in c from voxel to voxel, weighs the steps to the 6 neighbours a face away by TENSION_FACE and the 12 an edge away
+//by TENSION_EDGE. With faces alone the energy of a surface depends on which way it faces, 1.7% more along a voxel's long diagonal than along an axis,
+//and so does mu along a curved surface: that pulled the liquid along the surface of a ball at rest, which never came to rest. These weights are the
+//ones for which the energy's leading error with the voxel size is the same whichever way the surface faces (the fourth power of a wave's number, not
+//its components' fourth powers separately): 6 TENSION_EDGE + 12 x (the corners' weight) = 1, with the corners left out. A surface facing an axis
+//has the same steps to its edge neighbours as to its face neighbours, so with TENSION_FACE + 4 TENSION_EDGE = 1 its energy, K and W are as with
+//faces alone; facing other ways the energy is within 0.1 to 0.2% of that
+static constexpr float TENSION_FACE = 1.0f/3.0f;
+static constexpr float TENSION_EDGE = 1.0f/6.0f;
+
+//mu, the energy's slope with each unknown's (blurred) c: W'(c) less the weighed sum of c's steps to its 18 neighbours, over K; through a wall there's
+//no step (the field carries on square to the wall: a neighbour past it is the mirror image, which for an edge neighbour is the face neighbour on the
+//other axis), and past what the solve holds is air, c = 0. Each of its faces on one of the domain's walls takes off the wall's part: the wetting,
+//the cosine of the angle the liquid meets it at, times 6 c (1 - c), the slope of c^2 (3 - 2 c), so only where the surface meets the wall; a face
+//an obstacle closes (near, not nullptr with none) is a wall with no angle of its own, square on. Kept as what it's over its value deep in the
+//liquid, where W' is atLiquid: only its slope pushes, and deep in the liquid, where nothing should, it's then exactly nothing, however the walls
+//cut into a particle's reach. W' at all air and at all liquid are given, as most voxels are one or the other. An owned voxel's neighbours' neighbours
+//are inside its node's apron, so what it finds is the same in every partition
 __global__ void potentialOfVoxels(uint numVoxels, const char* solveCodes, const uint* neighborNx, const uint* neighborPx, const uint* neighborNy, const uint* neighborPy,
                                   const uint* neighborNz, const uint* neighborPz, const char* near, const float* share, int passes, float atAir, float atLiquid, float perFace,
                                   float wetting, float* potential){
@@ -566,6 +569,7 @@ __global__ void potentialOfVoxels(uint numVoxels, const char* solveCodes, const 
         if(solveCodes[index]){
             const uint* neighbors[6] = {neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz};
             float c = share[index];
+            auto at = [&](uint voxel){ return voxel < WALL_VOXEL && solveCodes[voxel] ? share[voxel] : 0.0f; };   //c at a stored voxel, or outside
             float steps = 0.0f;
             int walls = 0;
             #pragma unroll
@@ -575,7 +579,30 @@ __global__ void potentialOfVoxels(uint numVoxels, const char* solveCodes, const 
                     walls += near == nullptr || !(near[index] & CLOSED_FACE << face);
                     continue;
                 }
-                steps += (neighbor != NO_VOXEL && solveCodes[neighbor] ? share[neighbor] : 0.0f) - c;
+                steps += TENSION_FACE*(at(neighbor) - c);
+            }
+            #pragma unroll
+            for(int a = 0; a < 3; ++a){
+                #pragma unroll
+                for(int b = a + 1; b < 3; ++b){
+                    #pragma unroll
+                    for(int way = 0; way < 4; ++way){
+                        uint first = neighbors[2*a + (way & 1)][index];
+                        uint second;
+                        if(first == WALL_VOXEL){            //mirrored back along a: the neighbour along b of this voxel
+                            second = neighbors[2*b + (way >> 1)][index];
+                            second = second == WALL_VOXEL ? index : second;
+                        }
+                        else if(first == NO_VOXEL || !solveCodes[first]){
+                            second = NO_VOXEL;      //past the solve already, and so is anything beyond (only an unknown's upper neighbours are written)
+                        }
+                        else{
+                            second = neighbors[2*b + (way >> 1)][first];
+                            second = second == WALL_VOXEL ? first : second;     //mirrored back along b
+                        }
+                        steps += TENSION_EDGE*(at(second) - c);
+                    }
+                }
             }
             float well = c >= 1.0f ? atLiquid : c <= 0.0f ? atAir : wellSlope(c, passes);
             value = (well - steps - atLiquid)*perFace - wetting*walls*6.0f*c*(1.0f - c);
@@ -584,62 +611,40 @@ __global__ void potentialOfVoxels(uint numVoxels, const char* solveCodes, const 
     }
 }
 
-//What the liquid's particles take from each stored voxel's three lower faces: mu at the voxel the face is the lower face of and at the unknown below
-//it, whose upper face it is, each over what that voxel's faces weigh at rest. Summed over the faces by a particle's weights on them, that's mu
-//where the particle is, over the particles a voxel holds
-__global__ void potentialOfFaces(uint numVoxels, const char* solveCodes, const uint* neighborNx, const uint* neighborNy, const uint* neighborNz, const float* potential,
-                                 const float* perRest, float* ofX, float* ofY, float* ofZ){
+//each of this partition's own voxels' three lower faces, by the force on it, -c grad mu: the mean of the two voxels' c times mu's step between them,
+//the pressure solve's own difference, so that where c and mu are both the surface's (a ball at rest) the force is a gradient, which the solve takes
+//off exactly, and only a change of mu along the surface moves anything. Each face's velocity changes by that over the liquid's density, whatever is
+//on the face (scale is -dt (sigma/rho) / dx^2): over its own mass, a face of nearly all air took what the force isn't a gradient by a thousandfold
+//and the air flew (2.7 m/s in a drop at rest, then nan). That's the density-scaled force (Yokoi 2014), and it holds the same pressure in the drop,
+//as the force sits at the band's inner edge, where the face is all liquid. The wall's part of mu takes the same form: with c moved by the faces'
+//fluxes, -c grad mu is the one force whose work is what the energy loses, every term of it; written as mu grad c instead, the wall's part pressed a
+//drop onto a wall it should leave and lifted one off a wall it should wet (puddles at 120 and 60 degrees 13% too wide and 8% too tall). A wall's
+//faces stay at rest, and a face with no mass has nothing on it to move
+__global__ void pushFacesByPotential(uint numOwnVoxels, const char* solveCodes, const char* solids, const uint* neighborNx, const uint* neighborNy, const uint* neighborNz,
+                                     const float* share, const float* potential, const float* massX, const float* massY, const float* massZ, float scale,
+                                     float* ux, float* uy, float* uz){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
-    if(index < numVoxels){
+    if(index < numOwnVoxels && !solids[index]){
         const uint* lower[3] = {neighborNx, neighborNy, neighborNz};
-        float* ofFaces[3] = {ofX, ofY, ofZ};
-        float own = solveCodes[index] ? potential[index]*perRest[index] : 0.0f;
+        const float* mass[3] = {massX, massY, massZ};
+        float* velocities[3] = {ux, uy, uz};
+        bool unknown = solveCodes[index];
+        float cHere = unknown ? share[index] : 0.0f, muHere = unknown ? potential[index] : 0.0f;
         #pragma unroll
         for(int axis = 0; axis < 3; ++axis){
             uint below = lower[axis][index];
-            ofFaces[axis][index] = own + (below < WALL_VOXEL && solveCodes[below] ? potential[below]*perRest[below] : 0.0f);
-        }
-    }
-}
-
-//The particles' forces as they landed on the faces (tensionOfParticles), 64-bit fixed-point sums, as two 32-bit parts the partitions can add up
-//(reduceGhosts takes ints): the low 20 bits and the rest. A sum of a few partitions' low parts stays well inside an int
-static constexpr int TENSION_LOW_BITS = 20;
-
-__global__ void splitTensionSums(uint numVoxels, const long long* sumX, const long long* sumY, const long long* sumZ, int* high, int* low){
-    uint index = threadIdx.x + blockIdx.x*blockDim.x;
-    if(index < numVoxels){
-        const long long* sums[3] = {sumX, sumY, sumZ};
-        #pragma unroll
-        for(int dim = 0; dim < 3; ++dim){
-            long long value = sums[dim][index];
-            high[(size_t)dim*numVoxels + index] = (int)(value >> TENSION_LOW_BITS);
-            low[(size_t)dim*numVoxels + index] = (int)(value & ((1ll << TENSION_LOW_BITS) - 1));
-        }
-    }
-}
-
-//each of this partition's own faces' velocity, changed by the force on it over its mass: scale is -dt (sigma/rho) / dx^2 times the particles a voxel
-//holds at rest, over the fixed point's unit. A wall's faces stay at rest, and a face with no mass has no particle near enough to have pushed it
-__global__ void pushFacesByTension(uint numOwnVoxels, uint numVoxels, const char* solids, const int* high, const int* low, const float* massX, const float* massY, const float* massZ,
-                                   float scale, float* ux, float* uy, float* uz){
-    uint index = threadIdx.x + blockIdx.x*blockDim.x;
-    if(index < numOwnVoxels && !solids[index]){
-        const float* mass[3] = {massX, massY, massZ};
-        float* velocities[3] = {ux, uy, uz};
-        #pragma unroll
-        for(int dim = 0; dim < 3; ++dim){
-            long long value = ((long long)high[(size_t)dim*numVoxels + index] << TENSION_LOW_BITS) + low[(size_t)dim*numVoxels + index];
-            if(value != 0 && mass[dim][index] > 0.0f){
-                velocities[dim][index] += scale*(float)value / mass[dim][index];
+            if(below == WALL_VOXEL || !(mass[axis][index] > 0.0f)){
+                continue;
             }
+            bool belowUnknown = below != NO_VOXEL && solveCodes[below];
+            float cBelow = belowUnknown ? share[below] : 0.0f, muBelow = belowUnknown ? potential[below] : 0.0f;
+            velocities[axis][index] += scale*0.5f*(cHere + cBelow)*(muHere - muBelow);
         }
     }
 }
 
 //adds dt of the two fluids' surface tension to the faces (pressureSolve, in applySurfaceTension's place). Every voxel's values come from its own
-//neighbours as their owners hold them, the ghosts take their owners' after each step, and the particles' forces are summed in fixed point, so the
-//result is the same however the nodes are split
+//neighbours as their owners hold them, and the ghosts take their owners' after each step, so the result is the same however the nodes are split
 void Particles::tensionOnMixture(){
     uint numVoxels = voxelIDsUsed.size();
     uint blocks = numVoxels / BLOCKSIZE + 1;
@@ -647,24 +652,14 @@ void Particles::tensionOnMixture(){
     double voxelSize = grid.cellSize / (2<<refinementLevel);
     const int passes = TENSION_BLUR;
     static const double perFace = 1.0 / surfaceEnergyPerFace(passes);
-    float* fields[7];       //share, perRest, potential, a spare for the blur, then the faces' potentials: x, y and z
+    float* fields[4];       //the liquid's share of each voxel as the particles made it, the same blurred, mu, and a spare for the blur
     for(float*& field : fields){
         gpuErrchk(cudaMallocAsync((void**)&field, sizeof(float)*count, stream));
     }
     float* share = fields[0];
-    float* perRest = fields[1];
+    float* blurred = fields[1];
     float* potential = fields[2];
     float* spare = fields[3];
-    float* ofFaces[3] = {fields[4], fields[5], fields[6]};
-    long long* sums[3];
-    int* high;
-    int* low;
-    for(long long*& sum : sums){
-        gpuErrchk(cudaMallocAsync((void**)&sum, sizeof(long long)*count, stream));
-        gpuErrchk(cudaMemsetAsync(sum, 0, sizeof(long long)*count, stream));
-    }
-    gpuErrchk(cudaMallocAsync((void**)&high, 3*sizeof(int)*count, stream));
-    gpuErrchk(cudaMallocAsync((void**)&low, 3*sizeof(int)*count, stream));
     const char* near = obstacles.count() > 0 ? obstacleNear.devPtr() : nullptr;
     const uint* lowers[3] = {neighborNx.devPtr(), neighborNy.devPtr(), neighborNz.devPtr()};
     const uint* uppers[3] = {neighborPx.devPtr(), neighborPy.devPtr(), neighborPz.devPtr()};
@@ -676,20 +671,22 @@ void Particles::tensionOnMixture(){
         context->fillGhosts(field, stream);
     };
     if(numVoxels > 0){
-        shareOfVoxels<<<blocks, BLOCKSIZE, 0, stream>>>(numVoxels, solveCodes.devPtr(), neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(), neighborPy.devPtr(),
-            neighborNz.devPtr(), neighborPz.devPtr(), voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), (const int*)liquidWeights[0].devPtr(),
-            (const int*)liquidWeights[1].devPtr(), (const int*)liquidWeights[2].devPtr(), liquidWeightUnit, twoPhase.densityRatio, (float)restParticlesPerVoxel, share, perRest);
+        shareOfVoxels<<<blocks, BLOCKSIZE, 0, stream>>>(numVoxels, solveCodes.devPtr(), neighborPx.devPtr(), neighborPy.devPtr(), neighborPz.devPtr(), voxelWeightsX.devPtr(),
+            voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), (const int*)liquidWeights[0].devPtr(), (const int*)liquidWeights[1].devPtr(), (const int*)liquidWeights[2].devPtr(),
+            liquidWeightUnit, twoPhase.densityRatio, share);
     }
     context->fillGhosts(share, stream);
-    context->fillGhosts(perRest, stream);
+    if(numVoxels > 0){
+        gpuErrchk(cudaMemcpyAsync(blurred, share, sizeof(float)*numVoxels, cudaMemcpyDeviceToDevice, stream));
+    }
     for(int pass = 0; pass < passes; ++pass){
         for(int axis = 0; axis < 3; ++axis){
-            blur(axis, share, 0.0f);
+            blur(axis, blurred, 0.0f);
         }
     }
     if(numVoxels > 0){
         potentialOfVoxels<<<blocks, BLOCKSIZE, 0, stream>>>(numVoxels, solveCodes.devPtr(), neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(), neighborPy.devPtr(),
-            neighborNz.devPtr(), neighborPz.devPtr(), near, share, passes, wellSlope(0.0f, passes), wellSlope(1.0f, passes), (float)perFace, (float)wallWetting, potential);
+            neighborNz.devPtr(), neighborPz.devPtr(), near, blurred, passes, wellSlope(0.0f, passes), wellSlope(1.0f, passes), (float)perFace, (float)wallWetting, potential);
     }
     context->fillGhosts(potential, stream);
     for(int pass = 0; pass < passes; ++pass){   //mu, the slope with the blurred c, back onto the c the particles made: the blur's passes again, last first
@@ -697,34 +694,14 @@ void Particles::tensionOnMixture(){
             blur(axis, potential, 0.0f);
         }
     }
-    if(numVoxels > 0){
-        potentialOfFaces<<<blocks, BLOCKSIZE, 0, stream>>>(numVoxels, solveCodes.devPtr(), neighborNx.devPtr(), neighborNy.devPtr(), neighborNz.devPtr(), potential, perRest,
-            ofFaces[0], ofFaces[1], ofFaces[2]);
-    }
-    for(float* ofFace : ofFaces){
-        context->fillGhosts(ofFace, stream);
-    }
-    tensionOfParticles(ofFaces, sums);  //each of the liquid's particles down mu's slope, onto the faces it moves with (particles.cu)
-    if(numVoxels > 0){
-        splitTensionSums<<<blocks, BLOCKSIZE, 0, stream>>>(numVoxels, sums[0], sums[1], sums[2], high, low);
-    }
-    for(int dim = 0; dim < 3; ++dim){   //particles near this partition's edge reach into ghost voxels: their owners add those sums in
-        context->reduceGhosts(high + (size_t)dim*numVoxels, stream);
-        context->reduceGhosts(low + (size_t)dim*numVoxels, stream);
-    }
     if(numOwnVoxels > 0){
-        float scale = (float)(-dt*surfaceTension / (voxelSize*voxelSize)*restParticlesPerVoxel / TENSION_UNIT);
-        pushFacesByTension<<<numOwnVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numOwnVoxels, numVoxels, solids.devPtr(), high, low, voxelWeightsX.devPtr(), voxelWeightsY.devPtr(),
-            voxelWeightsZ.devPtr(), scale, voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr());
+        float scale = (float)(-dt*surfaceTension / (voxelSize*voxelSize));
+        pushFacesByPotential<<<numOwnVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numOwnVoxels, solveCodes.devPtr(), solids.devPtr(), neighborNx.devPtr(), neighborNy.devPtr(),
+            neighborNz.devPtr(), share, potential, voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), scale, voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr());
     }
-    for(float* field : {share, perRest, potential, spare, ofFaces[0], ofFaces[1], ofFaces[2]}){
+    for(float* field : fields){
         gpuErrchk(cudaFreeAsync(field, stream));
     }
-    for(long long* sum : sums){
-        gpuErrchk(cudaFreeAsync(sum, stream));
-    }
-    gpuErrchk(cudaFreeAsync(high, stream));
-    gpuErrchk(cudaFreeAsync(low, stream));
     gpuErrchk(cudaPeekAtLastError());
     for(CudaVec<float>* velocity : {&voxelsUx, &voxelsUy, &voxelsUz}){
         context->fillGhosts(velocity->devPtr(), stream);

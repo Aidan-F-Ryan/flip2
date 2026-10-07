@@ -54,10 +54,6 @@ static constexpr uint PARTICLE_NUMBER = 0x3FFFFFFFu;
 //  as PF-FLIP has it, and a ball of air 16 voxels across lost 29 to 54% of its air in 0.6 s as it rose: each substep took the air its surface had
 //  mixed into the liquid.
 //What the grid resolves isn't touched: a pocket of air a few voxels across is air on the grid, and stays in the solve
-//the fixed point the particles' surface tension pushes are summed onto the faces in (tensionOfParticles): units per unit of push. 64-bit sums, so
-//there's room for any push and nothing is lost to speak of from the least
-static constexpr float TENSION_UNIT = 4294967296.0f;
-
 static constexpr float ESCAPE_SHARE = 0.09f;
 static constexpr float REJOIN_SHARE = 0.25f;
 
@@ -336,10 +332,9 @@ private:
     void markBeyondBand();
     void floatInAir(float dt);
     void applySurfaceTension();
-    //two phases' surface tension, from the energy of the surface between them: its slope with the liquid's share of each voxel (twophase.cu), and
-    //each of the liquid's particles pushed down that slope, the pushes summed onto the faces in fixed point (particles.cu)
+    //two phases' surface tension, from the energy of the surface between them: its slope with the liquid's share of each voxel, and each face
+    //pushed by the liquid on it down that slope (twophase.cu)
     void tensionOnMixture();
-    void tensionOfParticles(float* const* ofFaces, long long* const* sums);
     //the sharp free surface (freesurface.cu): the unknowns whose centres are outside the liquid retired; the pressure equations' faces to air weighed by
     //how near the surface is; on the divergence, the surface tension's pressure and the density correction for packed voxels near the surface; the
     //velocity update's faces to air weighed as the equations are; and the liquid's velocities carried out into the voxels around it
