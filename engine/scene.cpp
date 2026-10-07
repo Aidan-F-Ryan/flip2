@@ -406,10 +406,14 @@ Scene loadScene(const std::string& path){
         scene.airDropletRadius = read.number(*air, "dropletRadius", "air", scene.airDropletRadius);
         scene.airViscosity = read.number(*air, "viscosity", "air", scene.airViscosity);
         scene.airBubbleRadius = read.number(*air, "bubbleRadius", "air", scene.airBubbleRadius);
-        scene.airLiquidViscosity = read.number(*air, "liquidViscosity", "air", scene.airLiquidViscosity);
-        scene.airSurfaceTension = read.number(*air, "surfaceTension", "air", scene.airSurfaceTension);
+        //the liquid has one viscosity and one surface tension: where "liquid" gives them, the bubbles' drag takes those, and water's where it doesn't
+        scene.airLiquidViscosity = read.number(*air, "liquidViscosity", "air", scene.viscosity > 0.0 ? scene.viscosity : scene.airLiquidViscosity);
+        scene.airSurfaceTension = read.number(*air, "surfaceTension", "air", scene.surfaceTension > 0.0 ? scene.surfaceTension : scene.airSurfaceTension);
         if(scene.airDropletRadius < 0.0 || scene.airBubbleRadius < 0.0 || scene.airViscosity <= 0.0 || scene.airLiquidViscosity <= 0.0 || scene.airSurfaceTension <= 0.0){
             read.fail("air", "dropletRadius and bubbleRadius have to be at least 0 (0 for a particle's worth of the fluid), and viscosity, liquidViscosity and surfaceTension positive");
+        }
+        if((scene.viscosity > 0.0 && scene.airLiquidViscosity != scene.viscosity) || (scene.surfaceTension > 0.0 && scene.airSurfaceTension != scene.surfaceTension)){
+            read.fail("air", "liquidViscosity and surfaceTension are the liquid's own where \"liquid\" gives it a viscosity or a surfaceTension: leave them out");
         }
         if(scene.airDensity <= 0.0 || scene.airDensity > scene.density || scene.airFlipRatio > 1.0 || scene.airBand < 0){
             read.fail("air", "density has to be positive and no more than the liquid's, flipRatio at most 1, and band at least 0");
@@ -656,8 +660,8 @@ Scene loadScene(const std::string& path){
     if(airFluids && !scene.air){
         read.fail("fluids", "\"phase\": \"air\" needs an \"air\" block");
     }
-    if(scene.air && (scene.freeSurface == "sharp" || scene.viscosity > 0.0 || scene.surfaceTension > 0.0)){
-        read.fail("air", "doesn't go with the sharp free surface, viscosity or surface tension yet");
+    if(scene.air && scene.freeSurface == "sharp"){     //its pressure is 0 on the liquid's surface, and with air that's solved for
+        read.fail("air", "doesn't go with the sharp free surface yet");
     }
     if(scene.emitters.size() > 16 || scene.sinks.size() > 16){
         read.fail("the scene", "can have up to 16 emitters and 16 sinks");

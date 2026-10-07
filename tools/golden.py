@@ -66,8 +66,10 @@ SCENES = {   #main's arguments after the frame count (and any environment it run
     "air-sphere": "scenes/air-sphere.json",         #a half-full cube with a sphere obstacle in it and the band: obstacles with air
     "air-bubble": "scenes/air-bubble.json",         #a ball of air carved out of a full tank, rising: bubbles rejoining the air, air everywhere
     "air-everywhere": "scenes/air-everywhere.json", #the dam break with air filling the rest of the cube: no band, sealed
+    "air-viscous-dam": "scenes/air-viscous-dam.json",   #viscous-dam with the band: the viscous step on both fluids' faces, the walls holding the liquid's particles alone
+    "air-tension-drop": "scenes/air-tension-drop.json", #tension-drop with the band: surface tension from the energy of the surface between the two fluids
 }
-DEFAULT_SCENES = ["dam16", "tank", "swirl", "swirl-apic", "nozzle", "drain", "forces", "tank-box", "paddle", "tank-meshsphere", "tank-pulse", "mesh-sources", "tank-vdbspin", "sealed-pulse", "sealed-box", "tension-drop", "tension-sessile", "viscous-dam", "dam16-sharp", "tank-sharp", "tension-drop-sharp", "tank-box-sharp", "viscous-dam-sharp", "force-volume", "velocity-volume", "linear-volume", "patch-volume", "strain-volume", "air-dam", "air-jet", "air-sphere", "air-bubble", "air-everywhere"]
+DEFAULT_SCENES = ["dam16", "tank", "swirl", "swirl-apic", "nozzle", "drain", "forces", "tank-box", "paddle", "tank-meshsphere", "tank-pulse", "mesh-sources", "tank-vdbspin", "sealed-pulse", "sealed-box", "tension-drop", "tension-sessile", "viscous-dam", "dam16-sharp", "tank-sharp", "tension-drop-sharp", "tank-box-sharp", "viscous-dam-sharp", "force-volume", "velocity-volume", "linear-volume", "patch-volume", "strain-volume", "air-dam", "air-jet", "air-sphere", "air-bubble", "air-everywhere", "air-viscous-dam", "air-tension-drop"]
 
 EXACT = ["particles", "hash", "occupiedVoxels", "perVoxel", "core", "substeps", "time", "dtMin", "dtMax", "lowest", "highest", "fastest"]
 SUMS = ["kineticEnergy", "momentum", "angularMomentum", "centroid"]

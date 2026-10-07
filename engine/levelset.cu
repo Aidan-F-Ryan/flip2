@@ -35,7 +35,8 @@
 //liquid's unknowns and 0 everywhere the pressure is 0, so wherever kappa is constant a pressure of sigma*kappa cancels it exactly: a still drop stays
 //still, and only the curvature's changes along the surface move anything. Nothing about the pressure equations changes. It's explicit, so the timestep
 //can't pass the time the shortest capillary wave takes to cross a voxel (Particles::capillaryDt), which only applies with surface tension on. The sharp
-//free surface takes the same curvature as the pressure at its surface instead, inside the solve (freesurface.cu), and none of this force.
+//free surface takes the same curvature as the pressure at its surface instead, inside the solve (freesurface.cu), and none of this force. Nor does
+//the liquid with air around it (TwoPhase): there the force comes from the two fluids' particles themselves (twophase.cu), and no curvature is found.
 
 #include "particles.hu"
 #include "liquidTile.hu"
@@ -658,7 +659,7 @@ void Particles::buildLevelSet(){
         }
         context->fillGhosts(surfaceLevel.devPtr(), stream);
     }
-    if(surfaceTension > 0.0){
+    if(surfaceTension > 0.0 && !twoPhase.on){   //with air, the force is the particles' own (tensionOnMixture, twophase.cu)
         liquidCurvature.resizeAsync(numVoxels, stream);
         liquidCurvature.zeroDeviceAsync(stream);    //0 wherever it isn't worked out
         if(numOwnNodes > 0 && numVoxels > 0){   //the smoothed level set goes where the particles' field was: every voxel a tile reads gets one
@@ -685,6 +686,10 @@ void Particles::applySurfaceTension(){
     if(freeSurfaceMode == FreeSurface::sharp){
         return;
     }
+    if(twoPhase.on){    //with air, the surface is both fluids' particles together, and the force is the slope of its energy at them (twophase.cu)
+        tensionOnMixture();
+        return;
+    }
     double voxelSize = grid.cellSize / (2<<refinementLevel);
     float scale = (float)(dt*surfaceTension / (voxelSize*voxelSize));
     if(numOwnVoxels > 0){
@@ -700,9 +705,9 @@ void Particles::applySurfaceTension(){
 //the longest timestep explicit surface tension holds for: the shortest capillary wave the grid carries mustn't cross a voxel in one (Brackbill, Kothe
 //and Zemach 1992), sqrt(rho dx^3 / (2 pi sigma)) with rho the mean of the densities either side of the surface. The footprint's surface has unknowns as
 //heavy as liquid on both sides, so that's the liquid's. The sharp surface has air on one, half of it: at the footprint's limit a drop at rest on a wall
-//loses a couple of particles in every thousand over 5 s, and at this one none
+//loses a couple of particles in every thousand over 5 s, and at this one none. With two phases the air is there, as light as it is
 double Particles::capillaryDt() const{
     double voxelSize = grid.cellSize / (2<<refinementLevel);
-    double sides = freeSurfaceMode == FreeSurface::sharp ? 0.5 : 1.0;
+    double sides = freeSurfaceMode == FreeSurface::sharp ? 0.5 : twoPhase.on ? 0.5*(1.0 + 1.0 / twoPhase.densityRatio) : 1.0;
     return std::sqrt(sides*voxelSize*voxelSize*voxelSize / (2.0*M_PI*surfaceTension));
 }

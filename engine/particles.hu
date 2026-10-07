@@ -42,17 +42,22 @@ static constexpr uint PARTICLE_NUMBER = 0x3FFFFFFFu;
 //Escaped particles, after PF-FLIP's section 3.4. A particle on the wrong side of the interface, where the grid's voxels are the other fluid's, is too
 //small a piece of its own fluid for the grid to move: the grid's velocity there is the other fluid's, and by it a drop of water in air would have no
 //weight of its own and a bubble under water no lift. So it's marked (ESCAPED_PARTICLE) and moves as what it is, a ball of its fluid in the other
-//(flyEscaped, particles.cu). It's judged each substep by its own fluid's share of its voxel: the liquid's is the liquid's density there over its
-//density at rest (liquidShare; none where the pressure solve has every face of the voxel as air: findLiquidShare, twophase.cu), and the air's is
-//what's left of the voxel. Where its fluid's share is under ESCAPE_SHARE a particle escapes, and back where it's over REJOIN_SHARE it's the grid's
-//again, with the velocity it arrives with: where a substep finds it (G2P), and where its flight during one takes it into such a voxel, which is
-//where the flight ends. PF-FLIP's phase is the square root of the density, and the two numbers are its 0.5 - 0.2 and 0.5, squared.
+//(flyEscaped, particles.cu). It's judged each substep by its own fluid's share where it is: the liquid's is the liquid's density over its density
+//at rest, found per voxel (liquidShare; none where the pressure solve has every face of the voxel as air: findLiquidShare, twophase.cu) and weighed
+//at the particle by its own weights on the voxels (shareAround, particles.cu), and the air's is what's left. Where its fluid's share is under
+//ESCAPE_SHARE a particle escapes, and back where it's over REJOIN_SHARE it's the grid's again, with the velocity it arrives with: where a substep
+//finds it (G2P), and where its flight during one takes it to such a place, which is where the flight ends. PF-FLIP's phase is the square root of
+//the density, and the two numbers are its 0.5 - 0.2 and 0.5, squared.
 //- A droplet, liquid in air, takes no part in P2G or the pressure solve: the air still carries spray, but the spray doesn't push the air.
 //- A bubble, air in liquid, stays in P2G with its weight and its room: the liquid it's in is that much lighter, which is all a bubble does to the
 //  liquid around it (the lift on it comes back as the weight the liquid is short of), and no liquid closes in where it is. It was removed instead,
 //  as PF-FLIP has it, and a ball of air 16 voxels across lost 29 to 54% of its air in 0.6 s as it rose: each substep took the air its surface had
 //  mixed into the liquid.
 //What the grid resolves isn't touched: a pocket of air a few voxels across is air on the grid, and stays in the solve
+//the fixed point the particles' surface tension pushes are summed onto the faces in (tensionOfParticles): units per unit of push. 64-bit sums, so
+//there's room for any push and nothing is lost to speak of from the least
+static constexpr float TENSION_UNIT = 4294967296.0f;
+
 static constexpr float ESCAPE_SHARE = 0.09f;
 static constexpr float REJOIN_SHARE = 0.25f;
 
@@ -64,9 +69,9 @@ struct TwoPhase{
     float dropletRadius = 0.0f;         //a droplet's radius for the air's drag on it, in metres; 0 for a ball of the liquid one particle stands for
     float airViscosity = 1.5e-5f;       //the air's kinematic viscosity, m^2/s, for that drag
     float bubbleRadius = 0.0f;          //a bubble's radius for the liquid's drag on it, in metres; 0 for a ball of the air one particle stands for
-    float liquidViscosity = 1.0e-6f;    //the liquid's kinematic viscosity, m^2/s, for that drag (the liquid's own viscosity doesn't go with air yet)
+    float liquidViscosity = 1.0e-6f;    //the liquid's kinematic viscosity, m^2/s, for that drag: the liquid's own (setViscosity) where it has one
     float surfaceTension = 7.2e-5f;     //between the two, over the liquid's density, m^3/s^2: how far a bubble flattens as it rises, which is most of
-                                        //the drag on a large one
+                                        //the drag on a large one. The liquid's own (setSurfaceTension) where it has one
     int band = 0;                       //voxels of air kept around the liquid, in whole nodes; 0 keeps all of it
 
     bool escaping() const{
@@ -251,7 +256,7 @@ public:
         freeSurfaceMode = mode;
     }
 
-    //air as well as liquid (see TwoPhase): before initialize. Not with the sharp free surface, viscosity, surface tension or emitters yet
+    //air as well as liquid (see TwoPhase): before initialize. Not with the sharp free surface yet
     void setTwoPhase(const TwoPhase& settings){
         twoPhase = settings;
     }
@@ -297,15 +302,16 @@ private:
     //move with the grid's velocity carried on to it, both of which let the last half voxel slide: with thick liquid, a film creeps along the floor
     //ahead of the rest. So the images' tangential components and the velocity at the wall go to 1 - 2 stick and 1 - stick of the last faces' (G2P and
     //advection), and obstacles' friction is at least stick (obstacleGhostVelocities). It doesn't go by the substep, so the faces before and after a
-    //solve are held alike, whatever dt turns out to be. With no viscosity it's 0, and nothing changes
+    //solve are held alike, whatever dt turns out to be. With no viscosity it's 0, and nothing changes. With air (TwoPhase) the walls hold the liquid's
+    //particles and let the air's slide; an obstacle's friction holds both, as the friction it's given does
     double wallStick() const{
         double voxelSize = grid.cellSize / (2<<refinementLevel);
         double c = viscosity / (24.0*voxelSize*voxelSize);
         return c / (1.0 + c);
     }
     void buildLevelSet();           //the liquid's surface, for viscosity, surface tension and the sharp free surface (levelset.cu): each substep, if any is on
-    bool needsLevelSet() const{
-        return viscosity > 0.0 || surfaceTension > 0.0 || needsSurfaceLevel();
+    bool needsLevelSet() const{     //with air, surface tension goes by the particles and needs none (tensionOnMixture)
+        return viscosity > 0.0 || (surfaceTension > 0.0 && !twoPhase.on) || needsSurfaceLevel();
     }
     bool needsSurfaceLevel() const{     //the level set smoothed for the pressure solve: the sharp free surface's
         return freeSurfaceMode == FreeSurface::sharp;
@@ -330,6 +336,10 @@ private:
     void markBeyondBand();
     void floatInAir(float dt);
     void applySurfaceTension();
+    //two phases' surface tension, from the energy of the surface between them: its slope with the liquid's share of each voxel (twophase.cu), and
+    //each of the liquid's particles pushed down that slope, the pushes summed onto the faces in fixed point (particles.cu)
+    void tensionOnMixture();
+    void tensionOfParticles(float* const* ofFaces, long long* const* sums);
     //the sharp free surface (freesurface.cu): the unknowns whose centres are outside the liquid retired; the pressure equations' faces to air weighed by
     //how near the surface is; on the divergence, the surface tension's pressure and the density correction for packed voxels near the surface; the
     //velocity update's faces to air weighed as the equations are; and the liquid's velocities carried out into the voxels around it

@@ -165,8 +165,9 @@ struct Scene{
     double airDropletRadius = 0.0;  //a droplet's radius for that drag, in metres; 0 for a ball of the liquid one particle stands for
     double airViscosity = 1.5e-5;   //the air's kinematic viscosity, m^2/s, for the same
     double airBubbleRadius = 0.0;   //a bubble's radius for the liquid's drag on it, in metres; 0 for a ball of the air one particle stands for
-    double airLiquidViscosity = 0.001;  //the liquid's viscosity for that drag, Pa s as "liquid"'s is, which doesn't go with air yet (water 0.001)
-    double airSurfaceTension = 0.072;   //between the two fluids, N/m (water and air 0.072): how far a bubble flattens as it rises, and so how fast a large one does
+    double airLiquidViscosity = 0.001;  //the liquid's viscosity for that drag, Pa s: "liquid"'s where that gives one, water's (0.001) where it gives none
+    double airSurfaceTension = 0.072;   //between the two fluids, N/m: how far a bubble flattens as it rises, and so how fast a large one does. "liquid"'s
+                                        //where that gives one, water's and air's (0.072) where it gives none
     int particlesPerVoxel = 8;
     unsigned long long seed = 1;
     std::vector<SceneShape> fluids;

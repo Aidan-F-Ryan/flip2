@@ -33,6 +33,11 @@
 //pressure's push of one substep, and a thread a few voxels across folds from side to side rather than coiling until c is under about 40: so the
 //timestep keeps c under 36 by default (Particles::setViscousCfl).
 //
+//With air around the liquid (TwoPhase, particles.hu) the faces near the surface hold the two fluids' velocity together, and each face's inertia is then
+//its own density's, as the pressure solve has it (weighFacesAsHeld). The stretches and shears are still weighed by the liquid alone: the air's own
+//viscosity would carry its velocity under a tenth of a voxel in a substep, and it has none here. The viscous step still goes between two solves, both
+//of them the two-phase solve.
+//
 //The sums CG needs are added up exactly, per node and then across partitions, as the pressure CG's are (conjugateGradientFunctions.cu), so the result
 //is the same bit for bit however the nodes are stored or split. Its iterations are queued in batches sized from the last substep's count, and each
 //kernel does nothing once the residual is small enough, which the GPU decides: the host waits once a substep, for whether the batch got there.
@@ -278,12 +283,26 @@ __device__ inline bool viscousFaceFree(const ViscousTile& s, int slot, int dim, 
     int slot = tile.slot(t); \
     int3 global = tile.global(t);
 
+//With two phases (TwoPhase, particles.hu) a face's inertia is what's on it, not the liquid the level set finds around it: its own density over the
+//liquid's, 1 over its lightness, the density the pressure solve pushes it by (twophase.cu). The stretches and shears keep the level set's liquid, so
+//the air has no viscosity, and a face with no liquid around it keeps the velocity it has: its equation is only its inertia. But the air's faces beside
+//the surface, which the liquid's last stretches and shears reach, now answer with the air's weight rather than with none. (At a thousand to one that
+//weight is next to none: a dam of syrup's front came out the same to four figures with the level set's fractions for the inertia.)
+__device__ inline void weighFacesAsHeld(const float* lightX, const float* lightY, const float* lightZ, uint voxel, float mass[3]){
+    mass[0] = 1.0f / lightX[voxel];
+    mass[1] = 1.0f / lightY[voxel];
+    mass[2] = 1.0f / lightZ[voxel];
+}
+
 // ---- the solve ----
 
 //the start, a block per node of this partition's own: which of its faces the solve moves, each one's own coefficient, and the residual of the starting
-//guess u*, r = V u* - (V u* + c L(u*)) = -c L(u*). The first direction is that, preconditioned. The faces it doesn't move keep 0 in all three
+//guess u*, r = V u* - (V u* + c L(u*)) = -c L(u*). The first direction is that, preconditioned. The faces it doesn't move keep 0 in all three.
+//A template on two PHASES (weighFacesAsHeld), so that without them the kernel is the one it always was
+template<bool PHASES>
 __global__ void startViscosity(uint numUsedGridNodes, const uint* nodeCells, const uint* cellToNode, const uint* interiorVoxels, Grid grid, const float* levels, const char* live,
-                               const char* solid, const char* near, uint numVoxels, const float* ux, const float* uy, const float* uz, float c, float* r, float* diagonal, float* d){
+                               const char* solid, const char* near, uint numVoxels, const float* ux, const float* uy, const float* uz, float c, float* r, float* diagonal, float* d,
+                               const float* lightX, const float* lightY, const float* lightZ){
     const float* const faces[3] = {ux, uy, uz};
     VISCOUS_TILE(faces)
     if(voxel == NO_VOXEL){
@@ -291,6 +310,9 @@ __global__ void startViscosity(uint numUsedGridNodes, const uint* nodeCells, con
     }
     float stress[3], own[3], mass[3];
     viscousRows(s, slot, global, tile.domainVoxels, stress, own, mass);
+    if constexpr(PHASES){
+        weighFacesAsHeld(lightX, lightY, lightZ, voxel, mass);
+    }
     #pragma unroll
     for(int dim = 0; dim < 3; ++dim){
         float coefficient = mass[dim] + c*own[dim];
@@ -305,8 +327,10 @@ __global__ void startViscosity(uint numUsedGridNodes, const uint* nodeCells, con
 }
 
 //q = A*d over the faces the solve moves, a block per node of this partition's own. d is 0 on every other face, so the walls and obstacles hold
+template<bool PHASES>
 __global__ void multiplyViscosity(uint numUsedGridNodes, const uint* nodeCells, const uint* cellToNode, const uint* interiorVoxels, Grid grid, const float* levels, const char* live,
-                                  const char* solid, const char* near, uint numVoxels, const float* diagonal, const float* d, float c, const ViscousSolve* solve, float* q){
+                                  const char* solid, const char* near, uint numVoxels, const float* diagonal, const float* d, float c, const ViscousSolve* solve, float* q,
+                                  const float* lightX, const float* lightY, const float* lightZ){
     if(solve->done){
         return;
     }
@@ -317,6 +341,9 @@ __global__ void multiplyViscosity(uint numUsedGridNodes, const uint* nodeCells, 
     }
     float stress[3], own[3], mass[3];
     viscousRows(s, slot, global, tile.domainVoxels, stress, own, mass);
+    if constexpr(PHASES){
+        weighFacesAsHeld(lightX, lightY, lightZ, voxel, mass);
+    }
     #pragma unroll
     for(int dim = 0; dim < 3; ++dim){
         size_t at = (size_t)dim*numVoxels + voxel;
@@ -596,9 +623,13 @@ void Particles::applyViscosity(){
             context->fillGhosts(d + (size_t)dim*numVoxels, stream);
         }
     };
+    bool phases = twoPhase.on;     //each face then weighs what's on it (weighFacesAsHeld)
+    const float* light[3] = {phases ? faceLightness[0].devPtr() : nullptr, phases ? faceLightness[1].devPtr() : nullptr, phases ? faceLightness[2].devPtr() : nullptr};
+    auto start = phases ? startViscosity<true> : startViscosity<false>;
+    auto multiply = phases ? multiplyViscosity<true> : multiplyViscosity<false>;
     if(mine){
-        startViscosity<<<numOwnNodes, VISCOUS_THREADS, 0, stream>>>(numUsedGridNodes, nodeCells.devPtr(), cellToNode.devPtr(), nodeInteriorVoxels.devPtr(), grid, liquidLevel.devPtr(), live,
-            solid, near, numVoxels, voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr(), c, r, diagonal, d);
+        start<<<numOwnNodes, VISCOUS_THREADS, 0, stream>>>(numUsedGridNodes, nodeCells.devPtr(), cellToNode.devPtr(), nodeInteriorVoxels.devPtr(), grid, liquidLevel.devPtr(), live,
+            solid, near, numVoxels, voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr(), c, r, diagonal, d, light[0], light[1], light[2]);
     }
     dotProduct(r, nullptr, diagonal, &solve->rzNext);
     beginViscosity<<<1, 1, 0, stream>>>(solve);
@@ -609,8 +640,8 @@ void Particles::applyViscosity(){
     while(true){
         for(uint iteration = 0; iteration < batch; ++iteration){
             if(mine){
-                multiplyViscosity<<<numOwnNodes, VISCOUS_THREADS, 0, stream>>>(numUsedGridNodes, nodeCells.devPtr(), cellToNode.devPtr(), nodeInteriorVoxels.devPtr(), grid,
-                    liquidLevel.devPtr(), live, solid, near, numVoxels, diagonal, d, c, solve, q);
+                multiply<<<numOwnNodes, VISCOUS_THREADS, 0, stream>>>(numUsedGridNodes, nodeCells.devPtr(), cellToNode.devPtr(), nodeInteriorVoxels.devPtr(), grid,
+                    liquidLevel.devPtr(), live, solid, near, numVoxels, diagonal, d, c, solve, q, light[0], light[1], light[2]);
             }
             dotProduct(d, q, nullptr, &solve->dq);
             if(numVoxels > 0){
