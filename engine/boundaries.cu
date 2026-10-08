@@ -11,31 +11,20 @@
 //A liquid voxel on a boundary that lets go is then in one of two states (Batty, Bertails and Bridson 2007, whose cut cells the obstacles' are: the
 //pressure there is the boundary's push). Held, it keeps its volume as every unknown does, and its pressure isn't under the air's. Let go, its pressure
 //is the air's, and it's opening: more flows out of it than in, with the boundary's own faces still closed, which is the liquid leaving the boundary
-//with the gap inside the voxel. The states that satisfy both everywhere are found by solving, and solving again (Particles::pressureSolve):
+//with the gap inside the voxel. The states that satisfy both everywhere are found in two solves at most (Particles::pressureSolve):
 //  1. with every voxel held, which is the solve there always was. Voxels the boundary would have to pull on come out under the air's pressure. If
 //     there are none, that's the answer, to the bit;
-//  2. those of them that air can reach are let go: their pressure is the air's, as an air voxel's is, and the rest are solved for again;
-//  3. a voxel let go that this leaves being squeezed, more flowing in than out, is held again; then back to 2, until none is.
-//Why that ends, and at the answer: the matrix's off-diagonal coefficients are all negative, so its inverse has no negative entry, and raising any
-//pressure that's given (letting go of a voxel under the air's pressure) or holding a voxel that's being squeezed (whose pressure then rises from
-//the air's) can only raise every other pressure. So nothing held ever needs letting go after step 1, a voxel squeezed stays squeezed however much
-//the pressures rise from there, the voxels let go only dwindle, and where they stop no voxel is pulled on and none let go is squeezed.
+//  2. those of them that air can reach (below) are solved for again with the rest, from those pressures, by a solver that keeps them from going
+//     under the air's pressure: each ends at it, let go, or over it, held after all (conjugateGradientFunctions.cu's boundedConjugateGradient, or
+//     the SOR with its sweeps stopped there). Letting go of a voxel that was pulling on its neighbours leaves some of them pressed on the boundary
+//     instead, and which are which is part of what's solved for.
+//The first solve can't be spared: where air gets in is judged on it. The second is about another solve's work, the pressures everywhere changing
+//with what's let go. On a dam break with every wall and its pillar letting go: 12.0 V-cycles a substep against 6.7 with everything held. (Until the
+//solvers could keep to a bound it was done as whole solves, each followed by taking hold again of the voxels it left squeezed, 16.2 V-cycles and
+//sweeps of relaxation besides.)
 //
-//Done as written that's five solves a substep in a dam break with every boundary letting go: letting go of a voxel that was pulling on its
-//neighbours leaves some of them squeezed, holding those squeezes others, and each solve finds one round of it. But the same argument makes the
-//pressures at any point in it a lower bound on the answer's, and relaxation from a lower bound (every unknown in turn given the pressure its own
-//equation asks for, and a voxel let go given it only if that's over the air's) raises them towards the answer and never past it. A voxel that
-//gets a pressure over the air's from a lower bound has one in the answer: it's held. So before each solve a few sweeps of that (relaxLetGo) hold
-//the voxels a voxel or two of liquid decides, and the solve is for the rest, and for the pressures: 3.25 solves a substep on that dam break, 1.24
-//with its ceiling alone letting go. More sweeps find more and cost as much as the solves they save. What's left is the method's own. The first
-//solve can't be spared: where air gets in is judged on it (below), and where nothing is pulled on it's the answer. Each solve after it starts from
-//the last one's pressures and takes four V-cycles where the first takes seven.
-//
-//A voxel that is let go is no unknown while the solves and the velocity update run: the solvers and the update take it for air, with no change to
-//either. What they need for that is the couplings to it gone from its neighbours' equations, which then have the air's pressure across those faces
-//as they have across any face to air (followLetGo). Its own equation stays where it is, unused by the solve: it's what says whether it's being
-//squeezed. The sweeps want every equation whole, so after a solve that leaves any squeezed the equations are made again as they were with every
-//voxel held (Particles::pressureSolve), and afterwards every voxel is an unknown again for everything else in the substep (takeHoldAgain).
+//A voxel that's let go is an unknown like any other afterwards, at the air's pressure: the velocity update gives its faces what an air voxel's
+//would get, and its faces on the boundary stay closed.
 //
 //A voxel may be let go if it's on something solid and everything solid it's on lets go: one in the corner between a wall that holds and one that
 //doesn't is held. And only if air can get to it: letting go is air coming in behind the liquid, and under water, with no way in for it, a boundary
@@ -55,8 +44,7 @@
 #include "algorithms/multigridFunctions.hu"
 #include "algorithms/voxelSolveFunctions.hu"
 
-static const uint LET_GO_THREADS = 64;      //per node block in findPulled and holdSqueezed
-static const int LET_GO_SWEEPS = 8;         //of relaxation before each solve with voxels let go: more find more of the voxels to hold, fewer leave them to another solve
+static const uint LET_GO_THREADS = 64;      //per node block in findPulled
 
 //what tells whether a voxel is on a boundary that lets go
 struct Boundaries{
@@ -174,80 +162,11 @@ __global__ void holdPulled(uint numVoxels, char* letGo){
     }
 }
 
-//Once a solve with voxels let go is done, a block per node of this partition's: a voxel let go whose own equation says more flows into it than
-//out, with the pressures the solve found around it and the air's in it, is held again
-__global__ void holdSqueezed(VoxelPlaces places, Stencil A, const float* divU, const float* p, char* letGo, uint* changed){
-    uint node = blockIdx.x;
-    uint start = node == 0 ? 0 : places.nodeVoxelEnds[node - 1];
-    uint end = places.nodeVoxelEnds[node];
-    uint mine = 0;
-    for(uint index = start + threadIdx.x; index < end; index += blockDim.x){
-        if(letGo[index] && divU[index] + A.rowTimes(index, p) < 0.0f){
-            letGo[index] = HELD;
-            ++mine;
-        }
-    }
-    if(mine > 0){
-        atomicAdd(changed, mine);
-    }
-}
-
-//A half sweep of relaxation, with every voxel's equation whole: each unknown of one colour takes the pressure its own equation asks for, from its
-//neighbours', which are all the other colour's. One that's let go takes it only if it's over the air's, and otherwise stays at the air's
-__global__ void relaxLetGo(uint numVoxels, const char* solveCodes, char color, const char* letGo, Stencil A, const float* divU, float* p){
+//after the solve that keeps the voxels air reached from going under its pressure: the ones it left at it are let go, the ones over it held
+__global__ void keepLetGo(uint numVoxels, const float* p, char* letGo){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
-    if(index < numVoxels && solveCodes[index] == color){
-        float asked = (-divU[index] - A.offDiagonalTimes(index, p)) / A.Adiag[index];
-        p[index] = letGo[index] && !(asked > 0.0f) ? 0.0f : asked;
-    }
-}
-
-//after the sweeps: a voxel let go that they've given a pressure over the air's is held
-__global__ void holdPressed(uint numVoxels, const float* p, char* letGo){
-    uint index = threadIdx.x + blockIdx.x*blockDim.x;
-    if(index < numVoxels && letGo[index] && p[index] > 0.0f){
+    if(index < numVoxels && letGo[index] && p[index] != 0.0f){
         letGo[index] = HELD;
-    }
-}
-
-//The codes, the pressures and the equations as the voxels let go have them, from the equations whole: one let go is no unknown, with the air's
-//pressure, and its neighbours' couplings to it are gone, which leaves their own coefficients holding those faces as faces to air. Each thread writes
-//its own voxel's
-__global__ void followLetGo(uint numVoxels, const char* letGo, char* solveCodes, const uint* neighborNx, const uint* neighborPx, const uint* neighborNy, const uint* neighborPy,
-                            const uint* neighborNz, const uint* neighborPz, float* Anx, float* Apx, float* Any, float* Apy, float* Anz, float* Apz, float* p){
-    uint index = threadIdx.x + blockIdx.x*blockDim.x;
-    if(index < numVoxels){
-        if(letGo[index]){
-            solveCodes[index] = 0;
-            p[index] = 0.0f;
-        }
-        else if(solveCodes[index]){
-            const uint* neighbors[6] = {neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz};
-            float* A[6] = {Anx, Apx, Any, Apy, Anz, Apz};
-            #pragma unroll
-            for(int face = 0; face < 6; ++face){
-                uint neighbor = neighbors[face][index];
-                if(neighbor < WALL_VOXEL && letGo[neighbor]){
-                    A[face][index] = 0.0f;
-                }
-            }
-        }
-    }
-}
-
-//after the velocity update, which took the voxels let go for air: their faces on walls carry no flow, as an unknown's are left
-__global__ void closeLetGoFaces(uint numVoxels, const char* letGo, const uint* neighborNx, const uint* neighborNy, const uint* neighborNz, float* ux, float* uy, float* uz){
-    uint index = threadIdx.x + blockIdx.x*blockDim.x;
-    if(index < numVoxels && letGo[index]){
-        if(neighborNx[index] == WALL_VOXEL){
-            ux[index] = 0.0f;
-        }
-        if(neighborNy[index] == WALL_VOXEL){
-            uy[index] = 0.0f;
-        }
-        if(neighborNz[index] == WALL_VOXEL){
-            uz[index] = 0.0f;
-        }
     }
 }
 
@@ -311,88 +230,18 @@ bool Particles::letGoOfSuction(){
         gpuErrchk(cudaPeekAtLastError());
     }
     if(any){
-        if(numVoxels > 0){      //every voxel's code as it is with all of them held, to give back
-            gpuErrchk(cudaMemcpyAsync(heldCodes.devPtr(), solveCodes.devPtr(), numVoxels, cudaMemcpyDeviceToDevice, stream));
-        }
         context->fillGhosts(letGo.devPtr(), stream);
         anyLetGo = true;
     }
     return any;
 }
 
-//Once a solve with voxels let go is done: takes hold again of those it left squeezed, and says whether there were any, in any partition. It waits for
-//the GPU for that answer
-bool Particles::holdSqueezed(){
-    uint numVoxels = voxelIDsUsed.size();
-    uint count = 0;
-    if(numOwnNodes > 0 && numVoxels > 0){
-        uint* changed;
-        gpuErrchk(cudaMallocAsync((void**)&changed, sizeof(uint), stream));
-        gpuErrchk(cudaMemsetAsync(changed, 0, sizeof(uint), stream));
-        ::holdSqueezed<<<numOwnNodes, LET_GO_THREADS, 0, stream>>>(voxelPlaces(), stencilOf(neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag),
-                                                               divU.devPtr(), p.devPtr(), letGo.devPtr(), changed);
-        gpuErrchk(cudaMemcpyAsync(&count, changed, sizeof(uint), cudaMemcpyDeviceToHost, stream));
-        gpuErrchk(cudaFreeAsync(changed, stream));
-        gpuErrchk(cudaStreamSynchronize(stream));
-    }
-    bool any = context->anyOverPartitions(count > 0);
-    if(any){
-        context->fillGhosts(letGo.devPtr(), stream);
-    }
-    return any;
-}
-
-//Before a solve with voxels let go, with every equation whole: sweeps of relaxation over the unknowns, red then black, the ghosts taking their
-//owners' pressures after each colour as the SOR has them, the voxels let go kept from going under the air's pressure. From pressures that are too
-//low or right everywhere, which they are after the solve with every voxel held and after any solve since, each sweep raises them towards the
-//answer and not past it, so a voxel let go that comes out of them over the air's pressure is held
-void Particles::relaxLetGo(){
-    uint numVoxels = voxelIDsUsed.size();
-    if(numVoxels == 0){
-        return;
-    }
-    Stencil A = stencilOf(neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag);
-    for(int sweep = 0; sweep < LET_GO_SWEEPS; ++sweep){
-        for(char color = 1; color <= 2; ++color){
-            ::relaxLetGo<<<numVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numVoxels, solveCodes.devPtr(), color, letGo.devPtr(), A, divU.devPtr(), p.devPtr());
-            context->fillGhosts(p.devPtr(), stream);
-        }
-    }
-    holdPressed<<<numVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numVoxels, p.devPtr(), letGo.devPtr());   //the ghosts too, from their owners' pressures
-    gpuErrchk(cudaPeekAtLastError());
-}
-
-//then, for the solve: the voxels still let go are no unknowns, and their neighbours' equations have the air there (followLetGo), in the ghosts too
-void Particles::followLetGo(){
+//Once the solve that keeps them from going under the air's pressure is done: of the voxels it was given, the ones still at the air's pressure are
+//the ones let go, and the rest are held again. The ghosts' come out as their owners', from their owners' pressures
+void Particles::keepLetGo(){
     uint numVoxels = voxelIDsUsed.size();
     if(numVoxels > 0){
-        ::followLetGo<<<numVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numVoxels, letGo.devPtr(), solveCodes.devPtr(), neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(),
-            neighborPy.devPtr(), neighborNz.devPtr(), neighborPz.devPtr(), Anx.devPtr(), Apx.devPtr(), Any.devPtr(), Apy.devPtr(), Anz.devPtr(), Apz.devPtr(), p.devPtr());
+        ::keepLetGo<<<numVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numVoxels, p.devPtr(), letGo.devPtr());
         gpuErrchk(cudaPeekAtLastError());
     }
-}
-
-//after a solve that left voxels let go squeezed: every voxel is an unknown again, for the equations to be made whole
-void Particles::unknownsAgain(){
-    uint numVoxels = voxelIDsUsed.size();
-    if(anyLetGo && numVoxels > 0){
-        gpuErrchk(cudaMemcpyAsync(solveCodes.devPtr(), heldCodes.devPtr(), numVoxels, cudaMemcpyDeviceToDevice, stream));
-    }
-}
-
-//After the velocity update: the voxels let go are unknowns again, for everything the rest of the substep does with the liquid's voxels, and their
-//faces on walls are closed. Returns whether there were any: their neighbours' equations are short of them until they're assembled again
-bool Particles::takeHoldAgain(){
-    uint numVoxels = voxelIDsUsed.size();
-    if(!anyLetGo){
-        return false;
-    }
-    unknownsAgain();
-    if(numVoxels > 0){
-        closeLetGoFaces<<<numVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numVoxels, letGo.devPtr(), neighborNx.devPtr(), neighborNy.devPtr(), neighborNz.devPtr(), voxelsUx.devPtr(),
-            voxelsUy.devPtr(), voxelsUz.devPtr());
-        gpuErrchk(cudaPeekAtLastError());
-    }
-    anyLetGo = false;
-    return true;
 }

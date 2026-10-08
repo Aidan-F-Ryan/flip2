@@ -26,6 +26,7 @@ public:
     bool anyOverPartitions(bool value) override;
     void sumOverPartitions(long long* values, uint count, cudaStream_t stream) override;
     void sumOverPartitions(double* value, cudaStream_t stream) override;
+    void leastOverPartitions(float* value, cudaStream_t stream) override;
     void gatherFirstLevel(void* cells, size_t bytesPerCell, cudaStream_t stream) override;
     void gatherNodeCells(void* cells, size_t bytesPerCell, cudaStream_t stream) override;
 

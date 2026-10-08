@@ -26,6 +26,15 @@ __global__ void addInRankOrder(const T* gathered, int ranks, uint count, T* sum)
     }
 }
 
+//every rank's value, in rank order: the least of them
+__global__ void leastOfRanks(const float* gathered, int ranks, float* least){
+    float found = gathered[0];
+    for(int rank = 1; rank < ranks; ++rank){
+        found = fminf(found, gathered[rank]);
+    }
+    *least = found;
+}
+
 PartitionExchange::~PartitionExchange(){
     for(void* allocated : buffers){
         cudaFree(allocated);
@@ -138,6 +147,16 @@ void PartitionExchange::sumOverPartitions(long long* values, uint count, cudaStr
 
 void PartitionExchange::sumOverPartitions(double* value, cudaStream_t stream){
     sum(value, 1u, stream);
+}
+
+void PartitionExchange::leastOverPartitions(float* value, cudaStream_t stream){
+    if(transport.size() == 1){
+        return;
+    }
+    float* gathered = (float*)buffer(2, sizeof(float)*transport.size(), stream);
+    transport.allGather(value, gathered, sizeof(float), stream);
+    leastOfRanks<<<1, 1, 0, stream>>>(gathered, transport.size(), value);
+    gpuErrchk(cudaPeekAtLastError());
 }
 
 //a dense grid over the domain with perNode cells along a node's side: a node plane holds perNode of its planes, and a partition's cells are one run of

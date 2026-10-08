@@ -32,6 +32,8 @@ public:
     //sums on the device over every partition, in place: 64-bit integers, which add up the same in any order, or a double, added in partition order
     virtual void sumOverPartitions(long long* values, uint count, cudaStream_t stream){}
     virtual void sumOverPartitions(double* value, cudaStream_t stream){}
+    //and the least of a float on the device over every partition, in place
+    virtual void leastOverPartitions(float* value, cudaStream_t stream){}
 
     //the multigrid's first coarse grid is dense over the whole domain, and each partition fills in the cells in its own node planes: take the rest from
     //the partitions they belong to

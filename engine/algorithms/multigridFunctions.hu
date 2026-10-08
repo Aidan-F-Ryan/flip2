@@ -79,6 +79,7 @@
     struct Multigrid{
         Stencil A;                  //the finest grid, the pressure unknowns themselves
         const char* colors;         //their red/black colours (the solveCodes)
+        bool some;                  //whether the colours leave out unknowns the stencil couples to: those are at the air's pressure, as nothing is
         VoxelLayout layout;
         uint numUsedVoxels;
         float* residual;            //the unknowns' leftover residual, r - A*z, on its way to the first coarse grid
@@ -88,8 +89,12 @@
                                     //filled in by every partition and then solved alike in each
     };
 
-    //the coarse grids for this solve, and their equations, from the unknowns'
-    Multigrid buildMultigrid(Stencil A, const char* solveCodes, uint numUsedVoxels, const VoxelLayout& layout, PartitionContext& context, cudaStream_t stream);
+    //the coarse grids for this solve, and their equations, from the unknowns'. some: the colours name only some of the stencil's unknowns, the rest
+    //being held at the air's pressure (boundedConjugateGradient)
+    Multigrid buildMultigrid(Stencil A, const char* solveCodes, uint numUsedVoxels, const VoxelLayout& layout, PartitionContext& context, cudaStream_t stream, bool some = false);
+
+    //the grids' equations again, once which of the unknowns the colours name has changed
+    void coarsenMultigrid(const Multigrid& multigrid, cudaStream_t stream);
 
     //z = M^-1*r: one V-cycle, an approximate solve of A*z = r
     void vCycle(const Multigrid& multigrid, const float* r, float* z, cudaStream_t stream);

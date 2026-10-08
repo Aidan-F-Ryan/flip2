@@ -944,7 +944,6 @@ void Particles::generateVoxels(){
     }
     if(lettingGo()){    //which voxels boundaries have let go of, a solve at a time (boundaries.cu)
         letGo.resizeAsync(numUsedVoxels, stream);
-        heldCodes.resizeAsync(numUsedVoxels, stream);
     }
     p.zeroDeviceAsync(stream);
 
@@ -1307,38 +1306,35 @@ void Particles::pressureSolve(){
     addObstacleFlux();      //what obstacles' surfaces make of the flow through the faces they cut or close
     addSurfaceDivergence(correctionRate);   //sharp: the surface tension's pressure, and spreading what's packed near the surface
     balanceSealedPockets(); //and fluid no air reaches can't change its volume
-    auto assemble = [&](){
-        cudaGetA(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, dt/(density*voxelSize*voxelSize), stream);
-        weighCutCells(dt/(density*voxelSize*voxelSize));      //the faces obstacles cut weigh as much as they're open
-        weighSurfaceFaces(dt/(density*voxelSize*voxelSize));  //sharp, the liquid's faces to air as near as the surface is
-        weighDensityFaces(dt/(density*voxelSize*voxelSize));  //two phases, every face as light as what's on it
-    };
-    assemble();
+    cudaGetA(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, dt/(density*voxelSize*voxelSize), stream);
+    weighCutCells(dt/(density*voxelSize*voxelSize));      //the faces obstacles cut weigh as much as they're open
+    weighSurfaceFaces(dt/(density*voxelSize*voxelSize));  //sharp, the liquid's faces to air as near as the surface is
+    weighDensityFaces(dt/(density*voxelSize*voxelSize));  //two phases, every face as light as what's on it
     gpuErrchk(cudaPeekAtLastError());
     uint interiorWidth = numVoxels1D - 2*(uint)std::floor(radius);
     uint3 domainVoxels = make_uint3(grid.sizeX*interiorWidth, grid.sizeY*interiorWidth, grid.sizeZ*interiorWidth);
     VoxelLayout layout = {nodeCells.devPtr(), nodeInteriorVoxels.devPtr(), coarseCells.devPtr(), numOwnNodes, interiorWidth, domainVoxels};   //the nodes this partition solves for
-    auto solve = [&](){
+    auto solve = [&](const char* bounded){   //bounded: the voxels to keep from going under the air's pressure, from the pressures the last solve left (boundaries.cu)
         switch(pressureSolver){
             case PressureSolver::cg:
                 return cudaConjugateGradient(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, divU, p, residuals, tolerance, maxIterations,
-                                             layout, dotProductSums, numOwnVoxels, *context, stream);
+                                             layout, dotProductSums, numOwnVoxels, *context, stream, bounded);
             case PressureSolver::jacobi:
                 return cudaJacobiConjugateGradient(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, divU, p, residuals, tolerance, maxIterations,
-                                                   layout, dotProductSums, numOwnVoxels, *context, stream);
+                                                   layout, dotProductSums, numOwnVoxels, *context, stream, bounded);
             case PressureSolver::multigrid:
                 return cudaMultigridConjugateGradient(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, divU, p, residuals, tolerance, maxIterations,
-                                                      layout, dotProductSums, numOwnVoxels, *context, stream);
+                                                      layout, dotProductSums, numOwnVoxels, *context, stream, bounded);
             default:
                 return cudaGSiteration(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, divU, p, residuals, tolerance, maxIterations,
-                                       numOwnVoxels, *context, stream);
+                                       numOwnVoxels, *context, stream, bounded);
         }
     };
     //A solve either comes to the tolerance or there's no pressure to move the fluid by: the solver stalled, or ran out of iterations. Nothing about the
     //substep would change that (a shorter dt only scales every equation alike), so it isn't tried again: the substep stops here, with nothing moved and
     //the time where it was, and solveFailure says what happened (solveFrame stops on it, and flip2 bake ends there with the frames before it kept)
-    auto solved = [&](){
-        terminatingResidual = solve();
+    auto solved = [&](const char* bounded){
+        terminatingResidual = solve(bounded);
         gpuErrchk(cudaPeekAtLastError());
         if(terminatingResidual < tolerance){
             return true;
@@ -1349,31 +1345,21 @@ void Particles::pressureSolve(){
         solveFailure = message.str();
         return false;
     };
-    //With boundaries that let go of the liquid (boundaries.cu), a solve is done once none of their voxels is left pulled on, or let go and squeezed.
-    //The voxels the solve leaves pulled on, that air can reach, are let go; sweeps of relaxation hold again the ones that letting go of the others
-    //leaves pressed on, and the rest are solved for. If that leaves any of those let go squeezed they're held, and it's swept and solved again,
-    //until a solve leaves none. Without such boundaries, or where none pulls on anything, it's the one solve
+    //With boundaries that let go of the liquid (boundaries.cu): the voxels on them that the solve leaves pulled on, and that air can reach, are solved
+    //for again with the rest, each ending either held or let go, at the air's pressure. Without such boundaries, or where none pulls on anything
+    //that air reaches, it's the one solve
     auto settled = [&](){
         holdEverything();
-        if(!solved()){
+        if(!solved(nullptr)){
             return false;
         }
         if(!lettingGo() || !letGoOfSuction()){
             return true;
         }
-        for(bool more = true; more;){
-            relaxLetGo();
-            followLetGo();
-            if(!solved()){
-                takeHoldAgain();
-                return false;
-            }
-            more = holdSqueezed();
-            if(more){   //the equations whole again, for the sweeps
-                unknownsAgain();
-                assemble();
-            }
+        if(!solved(letGo.devPtr())){
+            return false;
         }
+        keepLetGo();
         return true;
     };
     //Viscosity goes between two solves: the first gives the flow the forces drive once the pressure has answered them, the viscous step acts on that,
@@ -1384,9 +1370,6 @@ void Particles::pressureSolve(){
             return;
         }
         cudaVelocityUpdate(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, p, voxelsUx, voxelsUy, voxelsUz, dt/(density*voxelSize*voxelSize), stream);
-        if(takeHoldAgain()){    //the equations are whole again for the solve below
-            assemble();
-        }
         correctSurfaceFaces();
         lightenFaceUpdates(dt/(density*voxelSize*voxelSize));   //two phases, as updateVoxelVelocities has it: the viscous step acts on the flow the first solve leaves
         p.zeroDeviceAsync(stream);
@@ -1418,14 +1401,13 @@ void Particles::updateVoxelVelocities(){
     double voxelSize = grid.cellSize / (2<<refinementLevel);
     cudaVelocityUpdate(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, p, voxelsUx, voxelsUy, voxelsUz, dt/(0.014*voxelSize*voxelSize), stream);
     gpuErrchk(cudaPeekAtLastError());
-    bool released = takeHoldAgain();    //the voxels boundaries let go of are the liquid's again
     correctSurfaceFaces();      //sharp, the liquid's faces to air with the ghost pressure past them
     lightenFaceUpdates(dt/(0.014*voxelSize*voxelSize));     //two phases, each face pushed as its own density lets the pressure push it
     extendLiquidVelocities();   //and the faces around the liquid that particles read carry its velocity on
     pinEmitterVelocities();     //an emitter's fluid leaves at its velocity, whatever the solve made of it
     mixObstacleFaces(voxelsUx, voxelsUy, voxelsUz);         //the faces obstacles cut carry what crosses them all told, not the open part's alone
     obstacleGhostVelocities(voxelsUx, voxelsUy, voxelsUz);  //the faces between fluid and obstacles take the obstacles' velocity across them; the faces inside continue the fluid's
-    if(released && obstacles.lettingGo()){  //but the liquid's, where an obstacle let go of it; and in FLIP's old velocities, set before the solve said where
+    if(anyLetGo && obstacles.lettingGo()){  //but the liquid's, where an obstacle let go of it; and in FLIP's old velocities, set before the solve said where
         carryLetGoFaces(voxelsUx, voxelsUy, voxelsUz);
         carryLetGoFaces(voxelsUxOld, voxelsUyOld, voxelsUzOld);
         for(CudaVec<float>* velocity : {&voxelsUxOld, &voxelsUyOld, &voxelsUzOld}){

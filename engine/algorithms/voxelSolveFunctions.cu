@@ -289,29 +289,38 @@ __device__ inline float offDiagonalSum(uint index, const uint* neighborNx, const
          + facePressure(index, Anz, neighborNz, p) + facePressure(index, Apz, neighborPz, p);
 }
 
-//one red or black SOR half-sweep over the unknowns. Same-coloured voxels never share a face, so updating in place is race free
+//one red or black SOR half-sweep over the unknowns. Same-coloured voxels never share a face, so updating in place is race free. With bounded, the
+//unknowns it names stop at the air's pressure, 0, rather than go under it: projected SOR (Cryer 1971), which converges to the inequality's answer
+//(boundedConjugateGradient) as the SOR does to the equations'
 __global__ void GSiteration(uint numUsedVoxels, const char* solveCodes, char color, const uint* neighborNx, const uint* neighborPx, const uint* neighborNy, const uint* neighborPy, const uint* neighborNz, const uint* neighborPz,
-                            const float* Anx, const float* Apx, const float* Any, const float* Apy, const float* Anz, const float* Apz, const float* Adiag, const float* divU, float* p, float w){
+                            const float* Anx, const float* Apx, const float* Any, const float* Apy, const float* Anz, const float* Apz, const float* Adiag, const float* divU, float* p, float w,
+                            const char* bounded){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
     if(index < numUsedVoxels && solveCodes[index] == color){
         float sum = offDiagonalSum(index, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, p);
         p[index] += w*((-divU[index] - sum)/(Adiag[index] + 0.000000001f) - p[index]);
+        if(bounded != nullptr && bounded[index] && p[index] < 0.0f){
+            p[index] = 0.0f;
+        }
     }
 }
 
+//with bounded, what counts of an unknown at the air's pressure is only being squeezed (r > 0): short the other way, it's let go, and opening
 __global__ void pressureResiduals(uint numUsedVoxels, const char* solveCodes, const uint* neighborNx, const uint* neighborPx, const uint* neighborNy, const uint* neighborPy, const uint* neighborNz, const uint* neighborPz,
-                                    const float* Anx, const float* Apx, const float* Any, const float* Apy, const float* Anz, const float* Apz, const float* Adiag, const float* divU, const float* p, float* residuals){
+                                    const float* Anx, const float* Apx, const float* Any, const float* Apy, const float* Anz, const float* Apz, const float* Adiag, const float* divU, const float* p, float* residuals,
+                                    const char* bounded){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
     if(index < numUsedVoxels){
         Stencil A = {{neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz}, {Anx, Apx, Any, Apy, Anz, Apz}, Adiag};
-        residuals[index] = solveCodes[index] ? -divU[index] - A.rowTimes(index, p) : 0.0f;    //the row as differences across its faces, as CG takes it
+        float residual = solveCodes[index] ? -divU[index] - A.rowTimes(index, p) : 0.0f;    //the row as differences across its faces, as CG takes it
+        residuals[index] = bounded != nullptr && bounded[index] && p[index] == 0.0f ? fmaxf(residual, 0.0f) : residual;
     }
 }
 
 //red/black SOR until the largest residual is below tolerance times the largest divergence; returns that relative residual
 float cudaGSiteration(const CudaVec<char>& solveCodes, const CudaVec<uint>& neighborNx, const CudaVec<uint>& neighborPx, const CudaVec<uint>& neighborNy, const CudaVec<uint>& neighborPy, const CudaVec<uint>& neighborNz, const CudaVec<uint>& neighborPz,
     const CudaVec<float>& Anx, const CudaVec<float>& Apx, const CudaVec<float>& Any, const CudaVec<float>& Apy, const CudaVec<float>& Anz, const CudaVec<float>& Apz, const CudaVec<float>& Adiag,
-    CudaVec<float>& divU, CudaVec<float>& p, CudaVec<float>& residuals, float tolerance, uint maxIterations, uint numOwnVoxels, PartitionContext& context, cudaStream_t stream){
+    CudaVec<float>& divU, CudaVec<float>& p, CudaVec<float>& residuals, float tolerance, uint maxIterations, uint numOwnVoxels, PartitionContext& context, cudaStream_t stream, const char* bounded){
     float w = 1.9f;
     uint batchCheckEvery = 16;
     uint numUsedVoxels = p.size();
@@ -324,12 +333,12 @@ float cudaGSiteration(const CudaVec<char>& solveCodes, const CudaVec<uint>& neig
     for(uint iteration = 1; iteration <= maxIterations; ++iteration){
         for(char color = 1; color <= 2; ++color){  //red, then black
             GSiteration<<<numUsedVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numUsedVoxels, solveCodes.devPtr(), color, neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(), neighborPy.devPtr(), neighborNz.devPtr(), neighborPz.devPtr(),
-                Anx.devPtr(), Apx.devPtr(), Any.devPtr(), Apy.devPtr(), Anz.devPtr(), Apz.devPtr(), Adiag.devPtr(), divU.devPtr(), p.devPtr(), w);
+                Anx.devPtr(), Apx.devPtr(), Any.devPtr(), Apy.devPtr(), Anz.devPtr(), Apz.devPtr(), Adiag.devPtr(), divU.devPtr(), p.devPtr(), w, bounded);
             context.fillGhosts(p.devPtr(), stream);     //the other colour's next half-sweep reads the ghosts' pressures
         }
         if(iteration % batchCheckEvery == 0){
             pressureResiduals<<<numUsedVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numUsedVoxels, solveCodes.devPtr(), neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(), neighborPy.devPtr(), neighborNz.devPtr(), neighborPz.devPtr(),
-                Anx.devPtr(), Apx.devPtr(), Any.devPtr(), Apy.devPtr(), Anz.devPtr(), Apz.devPtr(), Adiag.devPtr(), divU.devPtr(), p.devPtr(), residuals.devPtr());
+                Anx.devPtr(), Apx.devPtr(), Any.devPtr(), Apy.devPtr(), Anz.devPtr(), Apz.devPtr(), Adiag.devPtr(), divU.devPtr(), p.devPtr(), residuals.devPtr(), bounded);
             maxResidual = (float)context.maxOverPartitions(std::abs(residuals.getMax(stream, true, numOwnVoxels))) / maxDivergence;   //a float division, as before
             if(progress.done(maxResidual, tolerance)){  //converged, or stalled
                 break;

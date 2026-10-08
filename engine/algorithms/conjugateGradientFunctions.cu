@@ -25,6 +25,7 @@
 #include "multigridFunctions.hu"
 #include "voxelSolveFunctions.hu"     //NO_VOXEL
 #include <cmath>
+#include <cstring>
 
 struct DotProducts{     //doubles: float sums over a million voxels would lose the precision the step sizes need
     double rz;          //r*z of the current residual
@@ -354,6 +355,307 @@ static float conjugateGradient(const CudaVec<char>& solveCodes, Stencil A, const
     return maxResidual;
 }
 
+// ---- kept from going under the air's pressure ----
+//
+//Boundaries that let go of the liquid (boundaries.cu) leave the solve an inequality. Of the unknowns they name (bounded), each ends up held, its
+//equation met and its pressure over the air's, or let go, at the air's pressure, 0, with its equation left short the way that opens it (r <= 0: more
+//flows out of it than in). That's the lowest point of the same energy f(p) among the pressures with p >= 0 on those unknowns, and CG finds it by
+//staying on that side (MPRGP: Dostal and Schoberl 2005; Dostal, Optimal Quadratic Programming Algorithms, 2009, algorithm 5.8). The bounded unknowns
+//at 0 are active, everything else free, and the residual is in two parts: the free unknowns' own, and at the active ones what they're squeezed by
+//(chopped: r > 0 there, the equation asking for a pressure over the air's). At the answer both are 0. Each iteration is one of two steps:
+//  - while the chopped residual is small beside the free one (PROPORTION), a step of CG over the free unknowns, preconditioned for them alone, the
+//    active ones staying at 0. If it would take bounded unknowns under 0, those stop at 0, active from here on, and CG starts afresh (expansion);
+//  - otherwise a step along the chopped residual, which takes hold again of the squeezed ones (proportioning), and CG starts afresh over what's
+//    free then.
+//The method's proof of ending at the answer wants every step to lower the energy by a known share of what a plain step down the free residual would
+//(of a length nothing can overshoot by, stepBound, anything it would take under 0 stopping there; the free residual cut short where that happens is
+//the one the test above weighs). A step of CG does, and a proportioning step; one of CG stopped at 0 where it crosses usually does, by far more,
+//and is checked: where it doesn't, the plain step is taken in its place. The book's own expansion goes along CG's step only as far as the first
+//unknown to reach 0 and then takes the plain step, which lets go of the unknowns one an iteration: on a dam break with every boundary letting go
+//that's 8.1 iterations of CG a solve and up to 34, against 5.9 and up to 12 stopping them all at once.
+//
+//Which of the two steps comes next is decided here, from sums the GPU is waited on for, each iteration: with CG's own stopping test that's one wait
+//an iteration where the plain solve has one every other. What a step of CG does at the bounds is decided on the device.
+
+static const double PROPORTION = 0.1;   //Gamma: CG goes on while chopped*chopped <= PROPORTION^2 * free*(free cut short). Measured on that dam break: 7.0 iterations
+                                        //of CG a solve at 1, 6.2 at 0.25, 5.9 at 0.1 and below, where it's only more proportioning steps
+
+struct BoundedState{    //an iteration's numbers, on the device
+    DotProducts dots;   //the CG step's
+    double chopped;     //the chopped residual's square
+    double freed;       //the free residual times itself cut short
+    double gain;        //twice what a step of CG stopped at the bounds lowers the energy by
+    float feasible;     //how far along d the first bounded unknown reaches 0
+    float alpha;        //CG's step
+    uint largest;       //the largest magnitude in the two parts of the residual, as a float's bits (they order as the floats do)
+    uint expanded;      //whether the last step of CG reached a bound
+    uint fellBack;      //and whether the plain step was taken in its place
+};
+
+static float floatOfBits(uint bits){
+    float value;
+    memcpy(&value, &bits, sizeof(float));
+    return value;
+}
+
+//the largest magnitude among the first count values, as a float's bits, into largest (which starts at 0)
+__global__ void largestOf(uint count, const float* values, uint* largest){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(index < count){
+        uint bits = __float_as_uint(fabsf(values[index]));
+        if(bits > *largest){
+            atomicMax(largest, bits);
+        }
+    }
+}
+
+//the start: a bounded unknown under the air's pressure is at it
+__global__ void raiseToBounds(uint numUsedVoxels, const char* bounded, float* p){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(index < numUsedVoxels && bounded[index] && p[index] < 0.0f){
+        p[index] = 0.0f;
+    }
+}
+
+//The residual's two parts: chopped, what an active unknown is squeezed by, and reduced, a free one's residual, cut short where a step of stepBound
+//down it would take a bounded one past 0 (perStepBound is 1 over it). Each is 0 where the other isn't. largest takes the greatest magnitude in them
+//before the cutting short, over this partition's own unknowns
+__global__ void splitResidual(uint numUsedVoxels, uint numOwnVoxels, const char* solveCodes, const char* bounded, const float* p, const float* r, float perStepBound,
+                              float* chopped, float* reduced, uint* largest){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(index < numUsedVoxels){
+        float squeezed = 0.0f, free = 0.0f, size = 0.0f;
+        if(solveCodes[index]){
+            if(bounded[index] && p[index] == 0.0f){
+                squeezed = fmaxf(r[index], 0.0f);
+                size = squeezed;
+            }
+            else{
+                free = bounded[index] ? fmaxf(r[index], -p[index]*perStepBound) : r[index];
+                size = fabsf(r[index]);
+            }
+        }
+        chopped[index] = squeezed;
+        reduced[index] = free;
+        uint bits = __float_as_uint(size);
+        if(index < numOwnVoxels && bits > *largest){
+            atomicMax(largest, bits);
+        }
+    }
+}
+
+//proportioning steps along the chopped residual by chopped*chopped / chopped*A*chopped: stepDownhill's alpha, with this in place of r*z
+__global__ void stepByChopped(BoundedState* state){
+    state->dots.rz = state->chopped;
+}
+
+//the unknowns CG steps over: all of them but the active
+__global__ void freeUnknowns(uint numUsedVoxels, const char* solveCodes, const char* bounded, const float* p, char* free){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(index < numUsedVoxels){
+        free[index] = bounded[index] && p[index] == 0.0f ? 0 : solveCodes[index];
+    }
+}
+
+//preconditionByDiagonal for the free unknowns alone: z = r / each one's own coefficient (or r, with no diagonal), and 0 at the active
+__global__ void preconditionFree(uint numUsedVoxels, const char* free, const float* r, const float* diagonal, float* z){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(index < numUsedVoxels){
+        z[index] = !free[index] ? 0.0f : diagonal != nullptr && diagonal[index] != 0.0f ? r[index] / diagonal[index] : r[index];
+    }
+}
+
+__global__ void noBoundYet(BoundedState* state){
+    state->feasible = INFINITY;
+}
+
+//how far along d this partition's bounded unknowns can go before the first reaches 0: the least, as a float's bits
+__global__ void findFeasible(uint numOwnVoxels, const char* bounded, const float* p, const float* d, uint* feasible){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(index < numOwnVoxels && bounded[index] && d[index] < 0.0f){
+        uint bits = __float_as_uint(p[index] / -d[index]);
+        if(bits < *feasible){
+            atomicMin(feasible, bits);
+        }
+    }
+}
+
+//CG's step, r*z / d*q, and whether it takes any bounded unknown to 0 or past it
+__global__ void boundStep(BoundedState* state){
+    state->alpha = state->dots.dq != 0.0 ? state->dots.rz / state->dots.dq : 0.0;
+    state->expanded = !(state->alpha < state->feasible);
+}
+
+//a step that reaches a bound, tried: the pressures it would leave, the bounded unknowns it takes under 0 stopping there
+__global__ void tryToBounds(uint numUsedVoxels, const char* bounded, const float* p, const float* d, float* tried, const BoundedState* state){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(state->expanded && index < numUsedVoxels){
+        float stepped = p[index] + state->alpha*d[index];
+        tried[index] = bounded[index] && stepped < 0.0f ? 0.0f : stepped;
+    }
+}
+
+//startDownhill, if the flag is set: the residual at x
+__global__ void residualIf(uint numUsedVoxels, const char* solveCodes, Stencil A, const float* divU, const float* x, float* r, const uint* flag){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(*flag && index < numUsedVoxels){
+        r[index] = solveCodes[index] ? -divU[index] - A.rowTimes(index, x) : 0.0f;
+    }
+}
+
+//What the step tried lowers the energy by is half of (tried - p)*(r + its residual), summed over the unknowns: the two factors, in d and q, which a
+//step that reaches a bound has no more use for (CG starts afresh after it)
+__global__ void weighTried(uint numUsedVoxels, const float* p, const float* tried, const float* r, const float* triedResidual, float* d, float* q, const BoundedState* state){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(state->expanded && index < numUsedVoxels){
+        d[index] = tried[index] - p[index];
+        q[index] = r[index] + triedResidual[index];
+    }
+}
+
+//the step tried stands if it lowers the energy by as much as the plain step is sure to: half of stepBound times the free residual times itself cut short
+__global__ void judgeTried(BoundedState* state, float stepBound){
+    state->fellBack = state->expanded && !(state->gain >= stepBound*state->freed);
+}
+
+//stepDownhill by CG's step; or, where that reaches a bound, to the pressures tried and their residual; or nowhere, where the plain step takes its place
+__global__ void stepToBounds(uint numUsedVoxels, const char* bounded, const float* d, const float* q, const float* tried, const float* triedResidual, float* p, float* r,
+                             const BoundedState* state){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(index < numUsedVoxels){
+        if(!state->expanded){
+            float stepped = p[index] + state->alpha*d[index];
+            p[index] = bounded[index] && stepped < 0.0f ? 0.0f : stepped;   //nothing gets here but by rounding
+            r[index] -= state->alpha*q[index];
+        }
+        else if(!state->fellBack){
+            p[index] = tried[index];
+            r[index] = triedResidual[index];
+        }
+    }
+}
+
+//the plain step: this partition's free unknowns go stepBound down their residual, a bounded one no further than 0
+__global__ void stepDownResidual(uint numOwnVoxels, const char* solveCodes, const char* bounded, const float* r, float* p, float stepBound, const BoundedState* state){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(state->fellBack && index < numOwnVoxels && solveCodes[index] && !(bounded[index] && p[index] == 0.0f)){
+        float stepped = p[index] + stepBound*r[index];
+        p[index] = bounded[index] ? fmaxf(stepped, 0.0f) : stepped;
+    }
+}
+
+//From the pressures the solve with every unknown held came to, and with the same stopping rule, on what's left of the residual's two parts: it has
+//stalled once it has gone as many iterations without beating its best as the plain solve does (checkEvery of them a check).
+//precondition(r, z) leaves z = M^-1*r over the free unknowns, which free names (0 for the active), and 0 at the active; refree() is called once
+//free has changed, before the next of them. The sums are the exact ones whatever the plain solve's are
+template <typename Precondition, typename Refree>
+static float boundedConjugateGradient(const CudaVec<char>& solveCodes, Stencil A, const VoxelLayout& layout, CudaVec<float>& divU, CudaVec<float>& p, CudaVec<float>& residuals, const char* bounded,
+                                       char* free, float tolerance, uint maxIterations, uint checkEvery, uint numOwnVoxels, PartitionContext& context, cudaStream_t stream, float* z,
+                                       Precondition precondition, Refree refree){
+    uint numUsedVoxels = p.size();
+    uint blocks = numUsedVoxels / BLOCKSIZE + 1;
+    float* r = residuals.devPtr();
+    float* d;           //the search direction
+    float* q;           //A*d; and the chopped residual
+    float* tried;       //the pressures a step that reaches a bound would leave
+    BoundedState* state;
+    ExactSum* exact;
+    gpuErrchk(cudaMallocAsync((void**)&d, sizeof(float)*numUsedVoxels, stream));
+    gpuErrchk(cudaMallocAsync((void**)&q, sizeof(float)*numUsedVoxels, stream));
+    gpuErrchk(cudaMallocAsync((void**)&tried, sizeof(float)*numUsedVoxels, stream));
+    gpuErrchk(cudaMallocAsync((void**)&state, sizeof(BoundedState), stream));
+    gpuErrchk(cudaMallocAsync((void**)&exact, sizeof(ExactSum), stream));
+    cudaMemsetAsync(state, 0, sizeof(BoundedState), stream);
+    BoundedState seen;
+    //the largest divergence, as the plain solve has it, and the largest of the unknowns' own coefficients (in state's two integers, for the one
+    //wait): the matrix's norm is no more than twice that, as a row's other coefficients come to no more than its own, and a step down the residual
+    //of 1 over the norm lowers the energy by half its length times the residual times itself cut short, at the least
+    largestOf<<<numOwnVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numOwnVoxels, divU.devPtr(), &state->largest);
+    largestOf<<<numOwnVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numOwnVoxels, A.Adiag, &state->expanded);
+    gpuErrchk(cudaMemcpyAsync(&seen, state, sizeof(BoundedState), cudaMemcpyDeviceToHost, stream));
+    gpuErrchk(cudaStreamSynchronize(stream));
+    float maxDivergence = (float)context.maxOverPartitions(floatOfBits(seen.largest));
+    float maxDiagonal = (float)context.maxOverPartitions(floatOfBits(seen.expanded));
+    float maxResidual = 0.0f;
+    if(maxDivergence != 0.0f && maxDiagonal != 0.0f){
+        float stepBound = 0.5f / maxDiagonal;
+        auto dotProduct = [&](const float* a, const float* b, double* total){
+            exactDotProduct(layout, solveCodes.devPtr(), a, b, exact, total, context, stream);
+        };
+        cudaMemsetAsync(state, 0, sizeof(BoundedState), stream);
+        cudaMemsetAsync(d, 0, sizeof(float)*numUsedVoxels, stream);
+        raiseToBounds<<<blocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, bounded, p.devPtr());
+        startDownhill<<<blocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, solveCodes.devPtr(), A, divU.devPtr(), p.devPtr(), r);
+        bool changed = true;    //which unknowns are free, since refree last knew
+        bool afresh = true;     //CG's next direction has no last one to keep any of
+        float best = INFINITY;
+        uint sinceBest = 0;
+        maxResidual = 1.0f;
+        for(uint iteration = 1; iteration <= maxIterations; ++iteration){
+            cudaMemsetAsync(&state->largest, 0, sizeof(uint), stream);
+            splitResidual<<<blocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, numOwnVoxels, solveCodes.devPtr(), bounded, p.devPtr(), r, 1.0f / stepBound, q, z, &state->largest);
+            dotProduct(q, q, &state->chopped);
+            dotProduct(r, z, &state->freed);
+            gpuErrchk(cudaMemcpyAsync(&seen, state, sizeof(BoundedState), cudaMemcpyDeviceToHost, stream));
+            gpuErrchk(cudaStreamSynchronize(stream));
+            maxResidual = (float)context.maxOverPartitions(floatOfBits(seen.largest)) / maxDivergence;
+            sinceBest = maxResidual < best ? 0 : sinceBest + 1;
+            best = fminf(best, maxResidual);
+            if(maxResidual < tolerance || sinceBest >= STALLED_CHECKS*checkEvery){   //converged, or stalled
+                break;
+            }
+            if(seen.expanded){
+                changed = afresh = true;
+            }
+            if(seen.chopped > PROPORTION*PROPORTION*seen.freed){    //proportioning: q is the chopped residual, and z takes A times it
+                context.fillGhosts(q, stream);
+                multiplyByA<<<blocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, numOwnVoxels, solveCodes.devPtr(), A, q, z, nullptr);
+                dotProduct(q, z, &state->dots.dq);
+                stepByChopped<<<1, 1, 0, stream>>>(state);
+                stepDownhill<<<blocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, q, z, p.devPtr(), r, &state->dots);
+                cudaMemsetAsync(&state->expanded, 0, sizeof(uint), stream);
+                changed = afresh = true;
+                continue;
+            }
+            if(changed){
+                freeUnknowns<<<blocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, solveCodes.devPtr(), bounded, p.devPtr(), free);
+                refree();
+                changed = false;
+            }
+            precondition(r, z);
+            context.fillGhosts(z, stream);
+            dotProduct(r, z, &state->dots.rzNext);
+            if(afresh){
+                cudaMemsetAsync(&state->dots.rz, 0, sizeof(double), stream);    //turnDirection keeps none of the last direction
+                afresh = false;
+            }
+            turnDirection<<<blocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, z, d, &state->dots);
+            nextIteration<<<1, 1, 0, stream>>>(&state->dots);
+            multiplyByA<<<blocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, numOwnVoxels, solveCodes.devPtr(), A, d, q, nullptr);
+            dotProduct(d, q, &state->dots.dq);
+            noBoundYet<<<1, 1, 0, stream>>>(state);
+            findFeasible<<<numOwnVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numOwnVoxels, bounded, p.devPtr(), d, (uint*)&state->feasible);
+            context.leastOverPartitions(&state->feasible, stream);
+            boundStep<<<1, 1, 0, stream>>>(state);
+            tryToBounds<<<blocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, bounded, p.devPtr(), d, tried, state);
+            residualIf<<<blocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, solveCodes.devPtr(), A, divU.devPtr(), tried, z, &state->expanded);
+            weighTried<<<blocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, p.devPtr(), tried, r, z, d, q, state);
+            dotProduct(d, q, &state->gain);     //d*q again, and nothing reads it, after a step that reached no bound
+            judgeTried<<<1, 1, 0, stream>>>(state, stepBound);
+            stepToBounds<<<blocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, bounded, d, q, tried, z, p.devPtr(), r, state);
+            stepDownResidual<<<numOwnVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numOwnVoxels, solveCodes.devPtr(), bounded, r, p.devPtr(), stepBound, state);
+            context.fillGhosts(p.devPtr(), stream);
+            residualIf<<<blocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, solveCodes.devPtr(), A, divU.devPtr(), p.devPtr(), r, &state->fellBack);
+        }
+    }
+    cudaFreeAsync(d, stream);
+    cudaFreeAsync(q, stream);
+    cudaFreeAsync(tried, stream);
+    cudaFreeAsync(state, stream);
+    cudaFreeAsync(exact, stream);
+    return maxResidual;
+}
+
 static Stencil makeStencil(const CudaVec<uint>& neighborNx, const CudaVec<uint>& neighborPx, const CudaVec<uint>& neighborNy, const CudaVec<uint>& neighborPy, const CudaVec<uint>& neighborNz, const CudaVec<uint>& neighborPz,
     const CudaVec<float>& Anx, const CudaVec<float>& Apx, const CudaVec<float>& Any, const CudaVec<float>& Apy, const CudaVec<float>& Anz, const CudaVec<float>& Apz, const CudaVec<float>& Adiag){
     return {{neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(), neighborPy.devPtr(), neighborNz.devPtr(), neighborPz.devPtr()},
@@ -362,8 +664,21 @@ static Stencil makeStencil(const CudaVec<uint>& neighborNx, const CudaVec<uint>&
 
 //with no preconditioner (z = r) or Jacobi's (z = r / the unknown's own coefficient)
 static float diagonallyPreconditioned(bool jacobi, const CudaVec<char>& solveCodes, Stencil A, const VoxelLayout& layout, DotProductSums sums, CudaVec<float>& divU, CudaVec<float>& p,
-                                      CudaVec<float>& residuals, float tolerance, uint maxIterations, uint numOwnVoxels, PartitionContext& context, cudaStream_t stream){
+                                      CudaVec<float>& residuals, float tolerance, uint maxIterations, uint numOwnVoxels, PartitionContext& context, cudaStream_t stream, const char* bounded){
     uint numUsedVoxels = p.size();
+    if(bounded != nullptr){
+        float* preconditioned;
+        char* free;
+        gpuErrchk(cudaMallocAsync((void**)&preconditioned, sizeof(float)*numUsedVoxels, stream));
+        gpuErrchk(cudaMallocAsync((void**)&free, numUsedVoxels, stream));
+        float residual = boundedConjugateGradient(solveCodes, A, layout, divU, p, residuals, bounded, free, tolerance, maxIterations, 16, numOwnVoxels, context, stream, preconditioned,
+            [&](const float* r, float* z){
+                preconditionFree<<<numUsedVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numUsedVoxels, free, r, jacobi ? A.Adiag : nullptr, z);
+            }, [](){});
+        cudaFreeAsync(preconditioned, stream);
+        cudaFreeAsync(free, stream);
+        return residual;
+    }
     float* z = residuals.devPtr();  //with none, z is r itself
     DotProducts* dots;
     gpuErrchk(cudaMallocAsync((void**)&dots, sizeof(DotProducts), stream));
@@ -385,29 +700,51 @@ static float diagonallyPreconditioned(bool jacobi, const CudaVec<char>& solveCod
 float cudaConjugateGradient(const CudaVec<char>& solveCodes, const CudaVec<uint>& neighborNx, const CudaVec<uint>& neighborPx, const CudaVec<uint>& neighborNy, const CudaVec<uint>& neighborPy, const CudaVec<uint>& neighborNz, const CudaVec<uint>& neighborPz,
     const CudaVec<float>& Anx, const CudaVec<float>& Apx, const CudaVec<float>& Any, const CudaVec<float>& Apy, const CudaVec<float>& Anz, const CudaVec<float>& Apz, const CudaVec<float>& Adiag,
     CudaVec<float>& divU, CudaVec<float>& p, CudaVec<float>& residuals, float tolerance, uint maxIterations, const VoxelLayout& layout, DotProductSums sums, uint numOwnVoxels,
-    PartitionContext& context, cudaStream_t stream){
+    PartitionContext& context, cudaStream_t stream, const char* bounded){
     return diagonallyPreconditioned(false, solveCodes, makeStencil(neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag), layout, sums, divU, p, residuals,
-                                    tolerance, maxIterations, numOwnVoxels, context, stream);
+                                    tolerance, maxIterations, numOwnVoxels, context, stream, bounded);
 }
 
 float cudaJacobiConjugateGradient(const CudaVec<char>& solveCodes, const CudaVec<uint>& neighborNx, const CudaVec<uint>& neighborPx, const CudaVec<uint>& neighborNy, const CudaVec<uint>& neighborPy, const CudaVec<uint>& neighborNz, const CudaVec<uint>& neighborPz,
     const CudaVec<float>& Anx, const CudaVec<float>& Apx, const CudaVec<float>& Any, const CudaVec<float>& Apy, const CudaVec<float>& Anz, const CudaVec<float>& Apz, const CudaVec<float>& Adiag,
     CudaVec<float>& divU, CudaVec<float>& p, CudaVec<float>& residuals, float tolerance, uint maxIterations, const VoxelLayout& layout, DotProductSums sums, uint numOwnVoxels,
-    PartitionContext& context, cudaStream_t stream){
+    PartitionContext& context, cudaStream_t stream, const char* bounded){
     return diagonallyPreconditioned(true, solveCodes, makeStencil(neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag), layout, sums, divU, p, residuals,
-                                    tolerance, maxIterations, numOwnVoxels, context, stream);
+                                    tolerance, maxIterations, numOwnVoxels, context, stream, bounded);
 }
 
 float cudaMultigridConjugateGradient(const CudaVec<char>& solveCodes, const CudaVec<uint>& neighborNx, const CudaVec<uint>& neighborPx, const CudaVec<uint>& neighborNy, const CudaVec<uint>& neighborPy, const CudaVec<uint>& neighborNz, const CudaVec<uint>& neighborPz,
     const CudaVec<float>& Anx, const CudaVec<float>& Apx, const CudaVec<float>& Any, const CudaVec<float>& Apy, const CudaVec<float>& Anz, const CudaVec<float>& Apz, const CudaVec<float>& Adiag,
     CudaVec<float>& divU, CudaVec<float>& p, CudaVec<float>& residuals, float tolerance, uint maxIterations, const VoxelLayout& layout, DotProductSums sums, uint numOwnVoxels,
-    PartitionContext& context, cudaStream_t stream){
+    PartitionContext& context, cudaStream_t stream, const char* bounded){
     uint numUsedVoxels = p.size();
     Stencil A = makeStencil(neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag);
-    Multigrid multigrid = buildMultigrid(A, solveCodes.devPtr(), numUsedVoxels, layout, context, stream);
     float* z;
-    DotProducts* dots;
     gpuErrchk(cudaMallocAsync((void**)&z, sizeof(float)*numUsedVoxels, stream));
+    if(bounded != nullptr){     //the V-cycle's grids are the free unknowns', and their equations are made again whenever which those are changes
+        char* free;
+        gpuErrchk(cudaMallocAsync((void**)&free, numUsedVoxels, stream));
+        Multigrid multigrid = {};
+        float residual = boundedConjugateGradient(solveCodes, A, layout, divU, p, residuals, bounded, free, tolerance, maxIterations, 2, numOwnVoxels, context, stream, z,
+            [&](const float* r, float* preconditioned){
+                vCycle(multigrid, r, preconditioned, stream);
+            }, [&](){
+                if(multigrid.numLevels == 0){
+                    multigrid = buildMultigrid(A, free, numUsedVoxels, layout, context, stream, true);
+                }
+                else{
+                    coarsenMultigrid(multigrid, stream);
+                }
+            });
+        if(multigrid.numLevels != 0){
+            freeMultigrid(multigrid, stream);
+        }
+        cudaFreeAsync(z, stream);
+        cudaFreeAsync(free, stream);
+        return residual;
+    }
+    Multigrid multigrid = buildMultigrid(A, solveCodes.devPtr(), numUsedVoxels, layout, context, stream);
+    DotProducts* dots;
     gpuErrchk(cudaMallocAsync((void**)&dots, sizeof(DotProducts), stream));
     //a V-cycle costs dozens of plain iterations and it should take few of them, so it checks sooner
     float residual = conjugateGradient(solveCodes, A, layout, sums, divU, p, residuals, tolerance, maxIterations, 2, numOwnVoxels, context, stream, z, dots, [&](const float* r, float* preconditioned, float* partials){

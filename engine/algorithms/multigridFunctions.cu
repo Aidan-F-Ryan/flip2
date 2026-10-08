@@ -114,29 +114,42 @@ __device__ inline uint childOf(uint3 cell, int child, uint3 fineCells){    //chi
 //cells' unknowns, and their anchors, what each one's own coefficient holds past all its couplings (its faces to air: Stencil::air). Between air and water the
 //couplings inside a pocket of air are a thousand times the ones that hold it to the water around it, and the difference of the two big sums came out
 //wrong by more than the small one is worth, which leaves a coarse grid that isn't positive definite, and CG then diverges. Summed this way a cell whose
-//children couple only to each other, sealed in it, comes to exactly 0, and that alone is what has no equation
-__global__ void coarsenFromVoxels(VoxelLayout layout, Stencil A, const char* colors, CoarseLevel first){
+//children couple only to each other, sealed in it, comes to exactly 0, and that alone is what has no equation.
+//
+//With some, the colours leave out unknowns the stencil couples to: the voxels a solve is holding at the air's pressure (boundedConjugateGradient). A
+//coupling to one of those holds its unknown as a face to air does, and is summed with the anchors, loose
+__global__ void coarsenFromVoxels(VoxelLayout layout, Stencil A, const char* colors, bool some, CoarseLevel first){
     uint index;
     uint children[8];
     if(firstLevelCell(threadIdx.x + blockIdx.x*blockDim.x, layout, first.cells, index, children)){
-        float outside = 0.0f, anchor = 0.0f;
+        float outside = 0.0f, anchor = 0.0f, loose = 0.0f;
         float across[3] = {0.0f, 0.0f, 0.0f};
         for(int child = 0; child < 8; ++child){
             uint voxel = children[child];
             if(voxel != NO_VOXEL && colors[voxel]){
                 #pragma unroll
                 for(int axis = 0; axis < 3; ++axis){    //its couplings to its neighbours along axis: 0 where one's no unknown
+                    float lower = A.A[2*axis][voxel], upper = A.A[2*axis + 1][voxel];
+                    if(some && lower != 0.0f && !colors[A.neighbors[2*axis][voxel]]){
+                        loose -= lower;
+                        lower = 0.0f;
+                    }
+                    if(some && upper != 0.0f && !colors[A.neighbors[2*axis + 1][voxel]]){
+                        loose -= upper;
+                        upper = 0.0f;
+                    }
                     if(child >> axis & 1){      //its lower neighbour is the child beside it, its upper one the next cell's
-                        across[axis] -= A.A[2*axis + 1][voxel];
-                        outside -= A.A[2*axis + 1][voxel];
+                        across[axis] -= upper;
+                        outside -= upper;
                     }
                     else{
-                        outside -= A.A[2*axis][voxel];
+                        outside -= lower;
                     }
                 }
                 anchor += A.air(voxel);
             }
         }
+        anchor += loose;
         float own = 0.5f*(outside + anchor);
         first.diagonal[index] = own;
         first.anchor[index] = 0.5f*anchor;
@@ -285,8 +298,8 @@ static uint firstLevelThreads(const VoxelLayout& layout){  //a thread per first-
     return layout.numNodes*perAxis*perAxis*perAxis;
 }
 
-Multigrid buildMultigrid(Stencil A, const char* solveCodes, uint numUsedVoxels, const VoxelLayout& layout, PartitionContext& context, cudaStream_t stream){
-    Multigrid multigrid = {A, solveCodes, layout, numUsedVoxels, nullptr, {}, 0, &context};
+Multigrid buildMultigrid(Stencil A, const char* solveCodes, uint numUsedVoxels, const VoxelLayout& layout, PartitionContext& context, cudaStream_t stream, bool some){
+    Multigrid multigrid = {A, solveCodes, some, layout, numUsedVoxels, nullptr, {}, 0, &context};
     gpuErrchk(cudaMallocAsync((void**)&multigrid.residual, sizeof(float)*numUsedVoxels, stream));
     uint3 cells = make_uint3(layout.domainVoxels.x / 2, layout.domainVoxels.y / 2, layout.domainVoxels.z / 2);
     while(true){    //halve until the grid fits one block, or can't halve further
@@ -302,14 +315,20 @@ Multigrid buildMultigrid(Stencil A, const char* solveCodes, uint numUsedVoxels, 
         }
         cells = make_uint3(cells.x / 2, cells.y / 2, cells.z / 2);
     }
-    //the grids' equations: the first one's from the unknowns' (this partition's own nodes' cells, then the other partitions', so every partition has the
-    //whole grid), each coarser one's from the one above's
-    CoarseLevel& first = multigrid.levels[0];
+    coarsenMultigrid(multigrid, stream);
+    return multigrid;
+}
+
+//the grids' equations: the first one's from the unknowns' (this partition's own nodes' cells, then the other partitions', so every partition has the
+//whole grid), each coarser one's from the one above's
+void coarsenMultigrid(const Multigrid& multigrid, cudaStream_t stream){
+    const CoarseLevel& first = multigrid.levels[0];
+    PartitionContext& context = *multigrid.context;
     cudaMemsetAsync(first.fluid, 0, numCellsOf(first), stream);
     for(float* coefficients : {first.diagonal, first.toX, first.toY, first.toZ, first.anchor}){
         cudaMemsetAsync(coefficients, 0, sizeof(float)*numCellsOf(first), stream);
     }
-    coarsenFromVoxels<<<firstLevelThreads(layout) / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(layout, A, solveCodes, first);
+    coarsenFromVoxels<<<firstLevelThreads(multigrid.layout) / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(multigrid.layout, multigrid.A, multigrid.colors, multigrid.some, first);
     context.gatherFirstLevel(first.fluid, sizeof(char), stream);
     for(float* coefficients : {first.diagonal, first.toX, first.toY, first.toZ, first.anchor}){
         context.gatherFirstLevel(coefficients, sizeof(float), stream);
@@ -317,7 +336,6 @@ Multigrid buildMultigrid(Stencil A, const char* solveCodes, uint numUsedVoxels, 
     for(int level = 1; level < multigrid.numLevels; ++level){
         coarsenLevel<<<numCellsOf(multigrid.levels[level]) / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(multigrid.levels[level - 1], multigrid.levels[level]);
     }
-    return multigrid;
 }
 
 static void relaxLevel(const CoarseLevel& level, int firstColor, cudaStream_t stream){

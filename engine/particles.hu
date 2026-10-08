@@ -331,13 +331,9 @@ private:
     void creditObstacleVolume();
     bool lettingGo() const;         //boundaries that let go of the liquid (boundaries.cu): whether there are any, which there aren't with the air simulated
     void holdEverything();          //before a solve
-    bool letGoOfSuction();          //after it: whether any voxel on them is let go, so that the rest are solved for again
-    void relaxLetGo();              //before that solve: sweeps of relaxation, which hold again the voxels they find pressed on
-    void followLetGo();             //and then the codes and the equations as the solve wants the voxels let go
-    bool holdSqueezed();            //after it: whether it left any of them squeezed, which are held, so that it's solved again
-    void unknownsAgain();           //and for that every voxel's an unknown, for the equations to be made whole
-    bool takeHoldAgain();           //after the velocity update
-    void carryLetGoFaces(CudaVec<float>& ux, CudaVec<float>& uy, CudaVec<float>& uz);   //then, after the obstacles' ghost velocities, of the new face velocities and FLIP's old
+    bool letGoOfSuction();          //after it: whether air reaches any voxel on them that it left pulled on, so that it's solved again with those kept from going under the air's pressure
+    void keepLetGo();               //after that solve: the ones it left at the air's pressure are let go
+    void carryLetGoFaces(CudaVec<float>& ux, CudaVec<float>& uy, CudaVec<float>& uz);   //after the velocity update and the obstacles' ghost velocities, of the new face velocities and FLIP's old
     void findSealedPockets();       //fluid no air reaches (pockets.cu): labelled once a substep, settled across partitions, its divergence balanced before each solve
     void settleSealedPockets();
     void balanceSealedPockets();
@@ -573,9 +569,8 @@ private:
     WhitewaterSettings whitewater;
     WhitewaterPool whitewaterPool;
     unsigned int wallsLetGo = 0;    //the domain's walls that let go of the liquid, a bit each (boundaries.cu)
-    CudaVec<char> letGo;            //with boundaries that let go, per stored voxel: whether the solve under way has let it go
-    CudaVec<char> heldCodes;        //and every voxel's solve code as it is with all of them held, while any are let go
-    bool anyLetGo = false;          //whether any is
+    CudaVec<char> letGo;            //with boundaries that let go, per stored voxel: whether the substep's solve has let it go
+    bool anyLetGo = false;          //whether it had any to let go
     void* viscousSeen = nullptr;    //pinned: the viscous solve's state as the host last read it
     uint viscousIterations = 0;     //what the last viscous solve took, which sizes the next one's first batch
     unsigned long long substepIndex = 0;    //substeps taken, which seeds the emitters' jitter
