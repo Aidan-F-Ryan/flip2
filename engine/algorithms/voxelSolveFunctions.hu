@@ -12,6 +12,8 @@
     #define NO_VOXEL 0xFFFFFFFFu    //neighbour arrays: nothing is stored there, so it's air (p = 0, face velocity 0)
     #define WALL_VOXEL 0xFFFFFFFEu  //neighbour arrays: outside the domain, no flow through the shared face
     #define CORRECTION_DEPTH 5      //how deep inside the fluid's footprint a voxel has to be for the density correction to measure it
+    #define MOMENTUM_DIGIT 28       //P2G's momentum sums, 64 bits, as the voxels hold them between it and normalizeVoxelVelocities: these low bits in one
+                                    //32-bit array and the rest in another. Also the bits of a velocity in them: the fastest is 2^MOMENTUM_DIGIT units
     #define STALLED_CHECKS 8        //a solve has stalled when it goes this many checks of its residual without beating the best it has had
 
     //When a solve stops, asked each time it finds its largest residual (relative to the largest divergence): once that's under the tolerance, or once it
@@ -41,9 +43,10 @@
     void applyGravity(const CudaVec<char>& solids, CudaVec<float>& voxelsUz, float dt, cudaStream_t stream);
     void removeGravity(const CudaVec<char>& solids, CudaVec<float>& voxelsUz, float dt, cudaStream_t stream);
 
-    //P2G's fixed-point sums (momentumScale and weightScale per unit) to float weights, counts and face velocities
+    //P2G's fixed-point sums (velocityScale and weightScale per unit) to float weights, counts and face velocities. The momentum sums' high digits are
+    //where the velocities go, and their low digits in lowX, lowY and lowZ
     void cudaNormalizeVoxelVelocities(const CudaVec<char>& solids, CudaVec<float>& voxelWeightsX, CudaVec<float>& voxelWeightsY, CudaVec<float>& voxelWeightsZ, CudaVec<float>& voxelsUx, CudaVec<float>& voxelsUy, CudaVec<float>& voxelsUz,
-        CudaVec<float>& particleCounts, float momentumScale, float weightScale, cudaStream_t stream);
+        const CudaVec<float>& lowX, const CudaVec<float>& lowY, const CudaVec<float>& lowZ, CudaVec<float>& particleCounts, float velocityScale, float weightScale, cudaStream_t stream);
 
     void cudaExtrapolateUnreachedFaces(const CudaVec<char>& solveCodes, const CudaVec<uint>& neighborNx, const CudaVec<uint>& neighborPx, const CudaVec<uint>& neighborNy, const CudaVec<uint>& neighborPy, const CudaVec<uint>& neighborNz, const CudaVec<uint>& neighborPz,
         const CudaVec<float>& voxelWeightsX, const CudaVec<float>& voxelWeightsY, const CudaVec<float>& voxelWeightsZ, CudaVec<float>& voxelsUx, CudaVec<float>& voxelsUy, CudaVec<float>& voxelsUz,

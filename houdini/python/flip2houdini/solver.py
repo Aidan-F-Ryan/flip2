@@ -138,9 +138,33 @@ def _interface(node):
                                                       "them, and a pool shallower than a few millimetres pulls back from a dry patch. Collisions don't have "
                                                       "one yet: liquid beads on them a little"))
     group.append(liquid)
+    walls = hou.FolderParmTemplate("walls", "Walls", folder_type=hou.folderType.Tabs)
+    for index, face in enumerate(FACES):    #what each closed side of the domain does to the liquid on it
+        open_side = "{ closed%d == 0 }" % index
+        walls.addParmTemplate(hou.ToggleParmTemplate("wallhold%d" % index, "%s Holds Liquid" % face.upper(), default_value=True, join_with_next=True,
+                                                     disable_when=open_side,
+                                                     help="On, the wall pulls on the liquid as well as pushing it, as a sealed tank's does: with no air "
+                                                          "simulated nothing can get in behind the liquid, so a splash that reaches the ceiling hangs "
+                                                          "there. Off, the wall lets the liquid go wherever air can reach it, as anything standing in "
+                                                          "open air does. Letting go costs more pressure solves in the substeps where liquid is pulling "
+                                                          "on the wall: about a tenth more bake time for a ceiling, and up to twice the time with every "
+                                                          "wall and collision letting go"))
+        walls.addParmTemplate(hou.FloatParmTemplate("wallfriction%d" % index, "Friction", 1, default_value=(0.0,), min=0.0, max=1.0, join_with_next=True,
+                                                    disable_when=open_side,
+                                                    help="As a collision's: 0, the liquid slides along the wall freely; 1, the liquid touching it is at rest"))
+        walls.addParmTemplate(hou.FloatParmTemplate("wallangle%d" % index, "Contact Angle", 1, default_value=(60.0,), default_expression=('ch("contactangle")',),
+                                                    default_expression_language=(hou.scriptLanguage.Hscript,), min=0.0, max=180.0,
+                                                    disable_when="{ closed%d == 0 } { surfacetension == 0 }" % index,
+                                                    help="Degrees between the liquid's surface and this wall where they meet. It follows the Liquid tab's "
+                                                         "Contact Angle until it's given a value of its own: a floor the liquid beads on under walls it "
+                                                         "climbs"))
+    group.append(walls)
     collisions = hou.FolderParmTemplate("collisions", "Collisions", folder_type=hou.folderType.Tabs)
     collisions.addParmTemplate(hou.FloatParmTemplate("friction", "Friction", 1, default_value=(0.0,), min=0.0, max=1.0,
                                                      help="0: the fluid slips along collisions freely; 1: the fluid touching them moves with them"))
+    collisions.addParmTemplate(hou.ToggleParmTemplate("collisionhold", "Hold Liquid", default_value=True,
+                                                      help="As a wall's Holds Liquid, for every collision object: off, liquid leaves them wherever air "
+                                                           "can reach it, rather than clinging to their undersides"))
     collisions.addParmTemplate(hou.FloatParmTemplate("thickness", "Thickness", 1, default_value=(0.0,), min=0.0,
                                                      help="0 for closed surfaces; for open ones, like a ground plane, the thickness of the shell around them"))
     group.append(collisions)
@@ -210,9 +234,9 @@ def _interface(node):
                                                    help="How finely it's drawn: the particles a voxel's volume of whitewater becomes. 27 is a third of a voxel "
                                                         "apart, as Houdini's own whitewater is set up; 64 is finer and makes 2.4 times as many. Their pscale "
                                                         "follows, half their spacing"))
-    whitewater.addParmTemplate(hou.FloatParmTemplate("wwfoamlife", "Foam Life", 1, default_value=(2.0,), min=0.05, max=60.0, disable_when="{ whitewater == 0 }",
-                                                     help="Seconds a bubble lasts at the surface, on average: each bursts at the same rate whatever its age, so "
-                                                          "a patch thins evenly. Fresh water's foam is gone in under a second, the sea's lasts several"))
+    whitewater.addParmTemplate(hou.FloatParmTemplate("wwfoamlife", "Foam Life", 1, default_value=(0.5,), min=0.05, max=60.0, disable_when="{ whitewater == 0 }",
+                                                     help="Seconds a bubble lasts once it has reached the surface, on average: each bursts at the same rate whatever "
+                                                          "its age, so a patch thins evenly. Half a second is fresh water's; the sea's foam lasts 3 or 4"))
     whitewater.addParmTemplate(hou.FloatParmTemplate("wwmaxparticles", "Max Particles (millions)", 1, default_value=(16.0,), min=0.01, max=1000.0,
                                                      disable_when="{ whitewater == 0 }",
                                                      help="The most there can be at once, on each GPU. With less room than the surface would fill, what it "
@@ -643,6 +667,22 @@ def write_scene(node):
                    "attributes": [name for name in ("id", "age") if node.parm("write" + name) is None or node.evalParm("write" + name)],
                    "checkpoints": {"every": node.evalParm("checkpoints"), "keep": 2}},
     }
+    walls = {}      #what each wall does to the liquid on it, where that isn't the engine's default (a node from before the Walls tab says nothing)
+    for index, face in enumerate(FACES):
+        if node.parm("wallhold%d" % index) is None:
+            continue
+        wall = {}
+        if not node.evalParm("wallhold%d" % index):
+            wall["hold"] = False
+        if node.evalParm("wallfriction%d" % index) != 0.0:
+            wall["friction"] = node.evalParm("wallfriction%d" % index)
+        if node.evalParm("wallangle%d" % index) != scene["liquid"]["contactAngle"]:
+            wall["contactAngle"] = node.evalParm("wallangle%d" % index)
+        if wall:
+            walls[face] = wall
+    if walls:
+        scene["domain"]["walls"] = walls
+    holds = node.parm("collisionhold") is None or bool(node.evalParm("collisionhold"))     #whether collisions hold the liquid on them, as walls do
     if node.parm("whitewater") is not None and node.evalParm("whitewater"):    #a node from before the Whitewater tab bakes none
         scene["whitewater"] = {"amount": node.evalParm("wwamount"), "spray": node.evalParm("wwspray"), "bubbles": node.evalParm("wwbubbles"),
                                "perVoxel": node.evalParm("wwpervoxel"), "foamLife": node.evalParm("wwfoamlife"),
@@ -676,6 +716,8 @@ def write_scene(node):
             elif role == "collision":
                 entry["friction"] = node.evalParm("friction")
                 entry["thickness"] = node.evalParm("thickness")
+                if not holds:
+                    entry["hold"] = False
                 scene["obstacles"].append(entry)
             elif role == "source":
                 entry["velocity"] = _emission_velocity(node, samples)
@@ -686,6 +728,8 @@ def write_scene(node):
         node.node("COLLISION_VOLUMES").geometryAtFrame(frames[0]).saveToFile(os.path.join(geo_dir, VOLUME_FILE))
     for volume in volumes:
         entry = {"vdb": "geo/" + VOLUME_FILE, "grid": volume["name"], "friction": node.evalParm("friction")}
+        if not holds:
+            entry["hold"] = False
         if volume["velocity"]:
             entry["velocityGrid"] = volume["velocity"]
         if volume["transforms"]:

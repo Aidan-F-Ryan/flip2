@@ -29,61 +29,93 @@ void removeGravity(const CudaVec<char>& solids, CudaVec<float>& voxelsUy, float 
     removeGravityKernel<<<voxelsUy.size() / WORKSIZE + 1, WORKSIZE, 0, stream>>>(voxelsUy.size(), dt, solids.devPtr(), voxelsUy.devPtr());
 }
 
-//P2G accumulated weighted velocities and weights into each owning voxel; turn them into velocities, walls stay at rest
-//P2G leaves 32-bit fixed-point sums in these arrays' storage: turn the weights and counts into floats, and each face's momentum into its velocity
-__global__ void normalizeVoxelVelocities(uint numUsedVoxels, const char* solids, float* weightsX, float* weightsY, float* weightsZ, float* ux, float* uy, float* uz, float* particleCounts,
-                                         float unscaleMomentum, float unscaleWeight){
+//P2G accumulated weights and weighted velocities into each owning voxel; turn them into velocities, walls stay at rest
+//P2G leaves 32-bit fixed-point sums in these arrays' storage: turn the weights and counts into floats, and each face's momentum into its velocity.
+//The momentum is each particle's whole share of the weight times its velocity in whole units, so over the weight it's the mean of their velocities
+//exactly, and the division keeps that: the whole units first, in integers, then what's left over. (A double holds neither sum of a heavy face
+//exactly, and their quotient alone would come out a rounding either side of the mean; and a double's division is slower here than a 64-bit
+//integer's: 71 us for this kernel against 52, at 370k particles.) A face every particle reaches at one velocity gets that velocity, to the bit,
+//whatever its weight; one no share reaches has none (0, until it's extrapolated)
+__global__ void normalizeVoxelVelocities(uint numUsedVoxels, const char* solids, float* weightsX, float* weightsY, float* weightsZ, float* ux, float* uy, float* uz,
+                                         const unsigned int* lowX, const unsigned int* lowY, const unsigned int* lowZ, float* particleCounts, double unscaleVelocity,
+                                         float unscaleWeight){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
     if(index < numUsedVoxels){
         float* weights[3] = {weightsX, weightsY, weightsZ};
         float* velocities[3] = {ux, uy, uz};
+        const unsigned int* lows[3] = {lowX, lowY, lowZ};
         #pragma unroll
         for(int dim = 0; dim < 3; ++dim){
-            float weight = ((int*)weights[dim])[index]*unscaleWeight;
-            float momentum = ((int*)velocities[dim])[index]*unscaleMomentum;
-            weights[dim][index] = weight;
-            velocities[dim][index] = solids[index] ? 0.0f : momentum / (weight + 0.0000001f);
+            int shares = ((int*)weights[dim])[index];
+            long long momentum = ((int*)velocities[dim])[index]*(1LL << MOMENTUM_DIGIT) + lows[dim][index];
+            float velocity = 0.0f;
+            if(shares > 0 && !solids[index]){
+                long long whole = momentum / shares;
+                velocity = (float)(((double)whole + (double)(momentum - whole*shares) / shares)*unscaleVelocity);
+            }
+            weights[dim][index] = shares*unscaleWeight;
+            velocities[dim][index] = velocity;
         }
         particleCounts[index] = ((int*)particleCounts)[index];
     }
 }
 
 void cudaNormalizeVoxelVelocities(const CudaVec<char>& solids, CudaVec<float>& voxelWeightsX, CudaVec<float>& voxelWeightsY, CudaVec<float>& voxelWeightsZ, CudaVec<float>& voxelsUx, CudaVec<float>& voxelsUy, CudaVec<float>& voxelsUz,
-    CudaVec<float>& particleCounts, float momentumScale, float weightScale, cudaStream_t stream){
+    const CudaVec<float>& lowX, const CudaVec<float>& lowY, const CudaVec<float>& lowZ, CudaVec<float>& particleCounts, float velocityScale, float weightScale, cudaStream_t stream){
     normalizeVoxelVelocities<<<solids.size() / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(solids.size(), solids.devPtr(), voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr(),
-        particleCounts.devPtr(), 1.0f/momentumScale, 1.0f/weightScale);
+        (const unsigned int*)lowX.devPtr(), (const unsigned int*)lowY.devPtr(), (const unsigned int*)lowZ.devPtr(), particleCounts.devPtr(), 1.0/(double)velocityScale, 1.0f/weightScale);
 }
 
 //P2G leaves the faces no particle reaches at 0, and on the edge of the fluid the pressure solve would then drag on every surface moving outward, speeding
-//those faces back up each step. Give an unknown's unreached face the average of the reached faces of the same component around it; then an unreached face
-//on top of an unknown, which an air voxel stores, takes the unknown's own face value (extrapolateAirFaces, once the unknowns are done). Only unreached
-//faces are written and only reached ones read by other threads, so the first pass is race free
-__device__ inline void extrapolateFace(uint index, const uint* const neighbors[6], const float* weights, float* u){
-    if(weights[index] == 0.0f){
-        float sum = 0.0f;
-        int count = 0;
+//those faces back up each step. Give an unknown's unreached face the average of the faces of the same component around it that have a velocity: the
+//reached ones, and then, in the passes after the first, the ones the passes before it filled. The unknowns are every voxel of the 3^3 round a
+//particle's own, which is further than its weights go: a face of one can be three steps, one along each axis, from the nearest face any particle
+//reaches, so it takes EXTRAPOLATION_PASSES to give every one a velocity. (One pass left 7 to 14 faces round a ball 8 voxels across at rest each
+//substep, each a voxel's worth of divergence to the solve: the ball's particles' velocities spread by half a percent of its speed in a quarter of
+//a second.) Then an unreached face on top of an unknown, which an air voxel stores, takes the unknown's own face value (extrapolateAirFaces, once
+//the unknowns are done).
+//marks says which faces have a velocity, two bits a component: 1 for one that has, 2 for one this pass has just given one, which settleFaceMarks
+//makes 1 for the next. A thread writes its own voxel's faces and marks, and reads only faces marked 1, which nothing is writing
+static const int EXTRAPOLATION_PASSES = 3;
+
+__global__ void extrapolateUnreachedFaces(uint numUsedVoxels, const char* solveCodes, const uint* neighborNx, const uint* neighborPx, const uint* neighborNy, const uint* neighborPy, const uint* neighborNz, const uint* neighborPz,
+                                            const float* weightsX, const float* weightsY, const float* weightsZ, bool first, unsigned char* marks, float* ux, float* uy, float* uz){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(index < numUsedVoxels){
+        const uint* const neighbors[6] = {neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz};
+        const float* weights[3] = {weightsX, weightsY, weightsZ};
+        float* velocities[3] = {ux, uy, uz};
+        unsigned char mine = first ? 0 : marks[index];
         #pragma unroll
-        for(int face = 0; face < 6; ++face){
-            uint neighbor = neighbors[face][index];
-            if(neighbor < WALL_VOXEL && weights[neighbor] > 0.0f){
-                sum += u[neighbor];
-                ++count;
+        for(int dim = 0; dim < 3; ++dim){
+            if(first && weights[dim][index] > 0.0f){
+                mine |= 1 << 2*dim;
+            }
+            if(solveCodes[index] && !(mine >> 2*dim & 3)){
+                float sum = 0.0f;
+                int count = 0;
+                #pragma unroll
+                for(int face = 0; face < 6; ++face){
+                    uint neighbor = neighbors[face][index];
+                    if(neighbor < WALL_VOXEL && (first ? weights[dim][neighbor] > 0.0f : (marks[neighbor] >> 2*dim & 3) == 1)){
+                        sum += velocities[dim][neighbor];
+                        ++count;
+                    }
+                }
+                if(count){
+                    velocities[dim][index] = sum / count;
+                    mine |= 2 << 2*dim;
+                }
             }
         }
-        if(count){
-            u[index] = sum / count;
-        }
+        marks[index] = mine;
     }
 }
 
-__global__ void extrapolateUnreachedFaces(uint numUsedVoxels, const char* solveCodes, const uint* neighborNx, const uint* neighborPx, const uint* neighborNy, const uint* neighborPy, const uint* neighborNz, const uint* neighborPz,
-                                            const float* weightsX, const float* weightsY, const float* weightsZ, float* ux, float* uy, float* uz){
+__global__ void settleFaceMarks(uint numUsedVoxels, unsigned char* marks){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
-    if(index < numUsedVoxels && solveCodes[index]){
-        const uint* const neighbors[6] = {neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz};
-        extrapolateFace(index, neighbors, weightsX, ux);
-        extrapolateFace(index, neighbors, weightsY, uy);
-        extrapolateFace(index, neighbors, weightsZ, uz);
+    if(index < numUsedVoxels){
+        marks[index] = (marks[index] | marks[index] >> 1) & 0x15;
     }
 }
 
@@ -109,11 +141,23 @@ __global__ void extrapolateAirFaces(uint numUsedVoxels, const char* solveCodes, 
 void cudaExtrapolateUnreachedFaces(const CudaVec<char>& solveCodes, const CudaVec<uint>& neighborNx, const CudaVec<uint>& neighborPx, const CudaVec<uint>& neighborNy, const CudaVec<uint>& neighborPy, const CudaVec<uint>& neighborNz, const CudaVec<uint>& neighborPz,
     const CudaVec<float>& voxelWeightsX, const CudaVec<float>& voxelWeightsY, const CudaVec<float>& voxelWeightsZ, CudaVec<float>& voxelsUx, CudaVec<float>& voxelsUy, CudaVec<float>& voxelsUz,
     PartitionContext& context, cudaStream_t stream){
-    extrapolateUnreachedFaces<<<solveCodes.size() / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(solveCodes.size(), solveCodes.devPtr(), neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(), neighborPy.devPtr(), neighborNz.devPtr(), neighborPz.devPtr(),
-        voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr());
-    for(CudaVec<float>* velocity : {&voxelsUx, &voxelsUy, &voxelsUz}){
-        context.fillGhosts(velocity->devPtr(), stream);
+    if(solveCodes.size() == 0){
+        return;
     }
+    unsigned char* marks;
+    gpuErrchk(cudaMallocAsync((void**)&marks, solveCodes.size(), stream));
+    for(int pass = 0; pass < EXTRAPOLATION_PASSES; ++pass){
+        extrapolateUnreachedFaces<<<solveCodes.size() / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(solveCodes.size(), solveCodes.devPtr(), neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(), neighborPy.devPtr(), neighborNz.devPtr(), neighborPz.devPtr(),
+            voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), pass == 0, marks, voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr());
+        for(CudaVec<float>* velocity : {&voxelsUx, &voxelsUy, &voxelsUz}){
+            context.fillGhosts(velocity->devPtr(), stream);
+        }
+        if(pass + 1 < EXTRAPOLATION_PASSES){    //and the ghosts' marks, as their owners have them, for the next pass
+            settleFaceMarks<<<solveCodes.size() / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(solveCodes.size(), marks);
+            context.fillGhosts((char*)marks, stream);
+        }
+    }
+    gpuErrchk(cudaFreeAsync(marks, stream));
     extrapolateAirFaces<<<solveCodes.size() / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(solveCodes.size(), solveCodes.devPtr(), neighborNx.devPtr(), neighborNy.devPtr(), neighborNz.devPtr(),
         voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr());
     for(CudaVec<float>* velocity : {&voxelsUx, &voxelsUy, &voxelsUz}){

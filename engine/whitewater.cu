@@ -33,12 +33,15 @@
 //liquid, whose velocities P2G blends over a voxel or two, somewhat less.
 //
 //How much. Past that, the surface makes whitewater at a speed in proportion to how far past it is, a volume of AIR_FOLDED (w - w0) of bubbles and
-//SPRAY_THROWN (w - w0) of spray per unit of its area and time. The first is an order of magnitude's: a 3 m/s jet plunging into a pool takes down
-//a tenth of its own flow in air with 2.5 cm voxels and a thirtieth with voxels half that (Bin 1993 reviews what such jets are measured to take),
-//less the finer the voxels, since the ring it's drawn down through is as wide as the voxels show it. The second is the look's: set so that a dam
-//break against a pillar throws the fan of spray an artist expects of it, several times what the liquid really sheds, since each particle is drawn
-//far larger than the droplets it stands for. WhitewaterSettings scales both. A voxel's share of the surface is the liquid's share's slope across
-//it (the slope adds up to one across a surface, whichever way it faces), so no voxel has to be called a surface voxel.
+//SPRAY_THROWN (w - w0) of spray per unit of its area and time. The grid shows a front a voxel thick, and closing for as long as it takes to cross
+//one, however thin the layer of air that's really caught under it: so the air's volume is taken in the proportion of what's folded in, d0 across
+//(or a voxel, if that's finer), to the voxel. Without that, liquid landing on liquid took a voxel's depth of air down with it over all the area
+//it landed on: a dam break's water was a quarter air by volume two seconds in, and looked it. The constant is an order of magnitude's: a 3 m/s
+//jet plunging into a pool takes down some percent of its own flow in air (Bin 1993 reviews what such jets are measured to take). The second is
+//the look's: set so that a dam break against a pillar throws the fan of spray an artist expects of it, several times what the liquid really
+//sheds, since each particle is drawn far larger than the droplets it stands for. WhitewaterSettings scales both. A voxel's share of the surface is
+//the liquid's share's slope across it (the slope adds up to one across a surface, whichever way it faces), so no voxel has to be called a
+//surface voxel.
 //
 //What sizes. Each particle stands for the same volume, so its size is drawn by volume: the size a litre of spray is mostly in, not the size most
 //droplets are. What breaks off at the breakup scale d0 shatters, the finer the further past breaking it is: into pieces d0 over the square root of
@@ -91,6 +94,7 @@ struct WhitewaterGrid{
     Grid grid;
     int interiorWidth;
     float voxelSize;
+    const char* letGo;          //the voxels boundaries let go of in this substep's solve (boundaries.cu), or nullptr with none that can
 };
 
 //the particles a kernel moves
@@ -103,7 +107,7 @@ struct WhitewaterParticles{
     float* w;
     const uint* cells;
     float* lives;
-    const float* radii;
+    float* radii;
     const float* births;
     char* kinds;
     const unsigned long long* ids;
@@ -118,7 +122,16 @@ struct WhitewaterFluids{
     float airViscosity;
     float liquidViscosity;
     bool phases;            //whether the grid carries the air too: its velocity is then what a droplet flies through
+    float scale;            //metres: the size of what breaks off the surface (Particles::whitewaterScale)
+    float breaks;           //m/s: the difference in speed it takes to break it
+    float dropletScale;     //droplets' radii against what the model gives
 };
+
+//the radius of a droplet shed by liquid breaking up at a speed, by a normal number: the splash's rim's size at that speed (see the top), spread
+//log-normally, and no larger than what breaks off whole
+__device__ inline float dropletRadius(float tension, float scale, float speed, float normal, float dropletScale){
+    return fminf(0.5f*sqrtf(BREAKUP_WEBER*tension*scale) / speed*expf(SIZE_SPREAD*normal), 0.5f*scale)*dropletScale;
+}
 
 //the flight (EscapedPath, gridSampling.hu) of a droplet of this radius in air, or of a bubble of it in the liquid. A bubble flattens as it rises, the
 //more the larger it is against the surface tension that rounds it, and its drag levels where Tomiyama et al. (1998) have it, by its Eotvos number
@@ -159,8 +172,8 @@ __device__ inline float mixingAt(const float* tile, int width, float3 point, int
     #pragma unroll
     for(int b = 0; b < 3; ++b){
         float3 half = make_float3(b == 0 ? 0.5f : 0.0f, b == 1 ? 0.5f : 0.0f, b == 2 ? 0.5f : 0.0f);
-        float3 ahead = sampleVelocity(tile, width, point + half, origin, domainVoxels, around, 0.0f);
-        float3 behind = sampleVelocity(tile, width, point - half, origin, domainVoxels, around, 0.0f);
+        float3 ahead = sampleVelocity(tile, width, point + half, origin, domainVoxels, around, WallStick());
+        float3 behind = sampleVelocity(tile, width, point - half, origin, domainVoxels, around, WallStick());
         gradient[0][b] = ahead.x - behind.x;
         gradient[1][b] = ahead.y - behind.y;
         gradient[2][b] = ahead.z - behind.z;
@@ -216,9 +229,17 @@ __device__ inline float3 shareSlope(const float* shares, int width, float3 point
 //and gives each thread a particle.
 //First what it is now, by the liquid's share where it is: a droplet in the liquid has landed, and is foam where it did, unless it's still on its way
 //out of it (moving, against the liquid, the way the liquid thins: it was born at the surface, with the surface's liquid around it); a bubble at the
-//surface is foam; foam drawn under is a bubble, and foam the liquid has left is spray. Then its flight: a droplet's through the air (at rest, unless the grid carries the air)
-//or a bubble's through the liquid, by the grid's velocity where the substep finds it and what that changed by over the substep; or, for foam, the
-//liquid's own path through the grid, as the fluid's particles take it, with its life running down.
+//surface is foam; foam drawn well under is a bubble, and foam the liquid has left is spray: a droplet, of the size liquid breaking up at its speed
+//sheds, and no longer the bubble's it was (a fine bubble's radius makes a droplet that hangs in the air for seconds, where the liquid left it).
+//Then its flight: a droplet's through the air (at rest, unless the grid carries the air) or a bubble's through the liquid, by the grid's velocity
+//where the substep finds it and what that changed by over the substep; or, for foam at the surface, the liquid's own path through the grid, as the
+//fluid's particles take it. Foam under the surface, short of deep enough to be a bubble again, takes a bubble's flight: it's as light as it was,
+//and comes back up through any flow a bubble would.
+//Its life is how long it lasts once it has reached the surface, and from the first time it's foam it runs, whatever it is after: a bubble that
+//has come up bursts, and being drawn a centimetre under meanwhile doesn't save it. (Run only while it was foam, it stood still for most of
+//every particle's time: the surface's own motion takes foam under the share that makes it a bubble again within a sixth of a second, and it's a
+//sixth of a second more before it's back. Two thirds of a dam break's bubbles reached the surface within a second, and nine in ten of them
+//were still there two seconds on.)
 //A bubble is also carried about by the eddies smaller than a voxel, which the grid's velocity has nothing of: without them, the bubbles of one splash
 //stay a sheet a particle thick for as long as they last, drawn out into a line round whatever vortex took them down. Those eddies mix what the liquid
 //carries (mixingAt), so each substep the bubble takes a step drawn for that much mixing over dt, by numbers that are its own and the substep's (key)
@@ -261,6 +282,34 @@ __global__ void flyWhitewater(WhitewaterGrid g, WhitewaterFluids fluids, Whitewa
         tile[3*slots + slot] = voxel != NO_VOXEL ? g.share[voxel] : nanf("");
     }
     __syncthreads();
+    if(g.letGo != nullptr){     //where a wall has let go of a voxel its own face there carries the liquid's velocity on, as the fluid's particles have it (loadTile)
+        const int strides[3] = {1, place.width, place.width*place.width};
+        const int size[3] = {place.domainVoxels.x, place.domainVoxels.y, place.domainVoxels.z};
+        for(int slot = threadIdx.x; slot < slots; slot += blockDim.x){
+            int3 t = place.at(slot);
+            uint voxel = place.inDomain(t) ? place.voxel(t, nodes, g.numUsedGridNodes, g.interiorVoxels) : NO_VOXEL;
+            if(voxel == NO_VOXEL || !g.letGo[voxel]){
+                continue;
+            }
+            int3 global = place.global(t);
+            const int at[3] = {global.x, global.y, global.z};
+            #pragma unroll
+            for(int dim = 0; dim < 3; ++dim){
+                int along = slot / strides[dim] % place.width;
+                #pragma unroll
+                for(int plane = 0; plane < 2; ++plane){     //the new velocities, and the ones before
+                    float* faces = tile + (4*plane + dim)*slots;
+                    if(at[dim] == 0 && along + 1 < place.width){
+                        faces[slot] = faces[slot + strides[dim]];
+                    }
+                    if(at[dim] == size[dim] - 1 && along + 1 < place.width){
+                        faces[slot + strides[dim]] = faces[slot];
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
     const Grid& grid = g.grid;
     float step = dt / g.voxelSize;
     float3 rest = make_float3(0.0f, 0.0f, 0.0f);
@@ -270,7 +319,8 @@ __global__ void flyWhitewater(WhitewaterGrid g, WhitewaterFluids fluids, Whitewa
         float3 own = make_float3(p.u[index], p.v[index], p.w[index]);
         float liquid = shareAround(tile + 3*slots, place.width, point, place.origin, place.domainVoxels);
         liquid = isnan(liquid) ? 0.0f : liquid;
-        float3 around = sampleVelocity(tile, place.width, point, place.origin, place.domainVoxels, rest, 0.0f);
+        float3 around = sampleVelocity(tile, place.width, point, place.origin, place.domainVoxels, rest, WallStick());
+        unsigned long long mine = mixBits64(key ^ p.ids[index]);    //its own numbers for this substep
         char kind = p.kinds[index];
         if(kind == WHITEWATER_SPRAY){
             if(liquid > SURFACE_SHARE && dot(own - around, shareSlope(tile + 3*slots, place.width, point)) >= 0.0f){
@@ -282,20 +332,33 @@ __global__ void flyWhitewater(WhitewaterGrid g, WhitewaterFluids fluids, Whitewa
                 kind = WHITEWATER_FOAM;
             }
         }
-        else{
-            kind = liquid > SUNK_SHARE ? WHITEWATER_BUBBLE : liquid < BARE_SHARE ? WHITEWATER_SPRAY : WHITEWATER_FOAM;
+        else if(liquid > SUNK_SHARE){
+            kind = WHITEWATER_BUBBLE;
         }
+        else if(liquid < BARE_SHARE){
+            kind = WHITEWATER_SPRAY;
+            float3 through = fluids.phases ? own - around : own;    //against the air, which is at rest unless the grid carries it
+            float normal = sqrtf(-2.0f*logf(fmaxf(whitewaterChance(mine, 6), 1.0e-7f)))*cosf(6.2831853f*whitewaterChance(mine, 7));     //Box and Muller's
+            p.radii[index] = fmaxf(dropletRadius(fluids.tension, fluids.scale, fmaxf(sqrtf(dot(through, through)), fluids.breaks), normal, fluids.dropletScale), 1.0e-5f);
+        }
+        float life = p.lives[index];    //over 0 until it's first at the surface; from then, less than 0 by what's left of it, and 0 once that's run out
+        if(kind == WHITEWATER_FOAM && life > 0.0f){
+            life = -life;
+        }
+        if(life < 0.0f){
+            life = fminf(life + dt, 0.0f);
+        }
+        p.lives[index] = life;
         double moved[3];
         float arrives[3];
-        if(kind == WHITEWATER_FOAM){
-            float3 velocity = velocityThrough(tile, place.width, point, place.origin, place.domainVoxels, own, step, true, 0.0f);
+        if(kind == WHITEWATER_FOAM && !(liquid > SURFACE_SHARE)){
+            float3 velocity = velocityThrough(tile, place.width, point, place.origin, place.domainVoxels, own, step, true, WallStick());
             moved[0] = (double)dt*velocity.x;
             moved[1] = (double)dt*velocity.y;
             moved[2] = (double)dt*velocity.z;
             arrives[0] = velocity.x;
             arrives[1] = velocity.y;
             arrives[2] = velocity.z;
-            p.lives[index] -= dt;
         }
         else{
             bool droplet = kind == WHITEWATER_SPRAY;
@@ -304,7 +367,7 @@ __global__ void flyWhitewater(WhitewaterGrid g, WhitewaterFluids fluids, Whitewa
                 around = rest;      //the grid's velocity is the liquid's, and the air around a droplet is at rest
             }
             else{
-                float3 was = sampleVelocity(tile + 4*slots, place.width, point, place.origin, place.domainVoxels, rest, 0.0f);
+                float3 was = sampleVelocity(tile + 4*slots, place.width, point, place.origin, place.domainVoxels, rest, WallStick());
                 acceleration = make_float3((around.x - was.x)/dt, (around.y - was.y)/dt, (around.z - was.z)/dt);
             }
             EscapedPath path(own, around, acceleration, whitewaterFlight(fluids, droplet, p.radii[index]), dt);
@@ -313,7 +376,6 @@ __global__ void flyWhitewater(WhitewaterGrid g, WhitewaterFluids fluids, Whitewa
                 //A step of variance 2 D dt along each axis, D the mixing: sqrt(2 D dt) times a normal number. Where D changes from place to place it's
                 //the D where the step ends that sizes it (found from where the step by this place's D would end): steps sized by where they start
                 //gather what they carry wherever the mixing is weak, which mixing doesn't
-                unsigned long long mine = mixBits64(key ^ p.ids[index]);
                 float normal[3];
                 #pragma unroll
                 for(int axis = 0; axis < 3; ++axis){    //Box and Muller's
@@ -348,7 +410,7 @@ struct WhitewaterEnds{
 };
 
 //Every particle, once flyWhitewater has moved the ones in this partition's nodes. One in a cell with no node of this partition's has no grid around it
-//and so no liquid: it's a droplet, whatever it was, and flies through air at rest. Then, for all of them, what ends one: foam whose life has run out;
+//and so no liquid: it's a droplet, whatever it was, and flies through air at rest. Then, for all of them, what ends one: its life at the surface run out;
 //any past its age; any in a sink, or at an open face; a droplet that has reached a wall or an obstacle, which it wets. A bubble or foam that has
 //crossed a wall or gone into an obstacle is put back just inside or outside it, as the fluid's particles are, without the velocity that took it there
 __global__ void finishWhitewater(WhitewaterGrid g, WhitewaterFluids fluids, WhitewaterParticles p, uint count, float dt, WhitewaterEnds ends, Sources sources, Obstacles obstacles){
@@ -378,7 +440,7 @@ __global__ void finishWhitewater(WhitewaterGrid g, WhitewaterFluids fluids, Whit
     }
     double* position[3] = {p.x + index, p.y + index, p.z + index};
     float* velocity[3] = {p.u + index, p.v + index, p.w + index};
-    bool gone = (kind == WHITEWATER_FOAM && !(p.lives[index] > 0.0f)) || !(ends.now - p.births[index] < ends.maxAge);
+    bool gone = p.lives[index] == 0.0f || !(ends.now - p.births[index] < ends.maxAge);
     #pragma unroll
     for(int axis = 0; axis < 3; ++axis){
         double at = *position[axis];
@@ -698,7 +760,7 @@ __global__ void emitWhitewater(VoxelPlaces places, WhitewaterGrid g, WhitewaterB
             float radius;
             if(droplet){
                 float normal = sqrtf(-2.0f*logf(fmaxf(whitewaterChance(key, 7), 1.0e-7f)))*cosf(6.2831853f*whitewaterChance(key, 8));     //Box and Muller's
-                radius = fminf(0.5f*sqrtf(BREAKUP_WEBER*b.tension*b.scale) / speed*expf(SIZE_SPREAD*normal), 0.5f*b.scale)*b.dropletScale;
+                radius = dropletRadius(b.tension, b.scale, speed, normal, b.dropletScale);
             }
             else{   //by volume: r^(3/2) of it per unit of radius below Hinze's size, r^(-1/3) above, up to the pocket's own
                 float hinze = fminf(0.5f*HINZE*powf(b.tension, 0.6f)*powf(b.scale / (speed*speed*speed), 0.4f), 0.5f*b.scale);
@@ -707,7 +769,7 @@ __global__ void emitWhitewater(VoxelPlaces places, WhitewaterGrid g, WhitewaterB
                 radius = hinze*(pick < below ? powf(pick / below, 0.4f) : powf(1.0f + (pick - below) / 1.5f, 1.5f))*b.bubbleScale;
             }
             radii[particle] = fmaxf(radius, 1.0e-5f);
-            lives[particle] = -b.foamLife*logf(fmaxf(1.0f - whitewaterChance(key, 9), 1.0e-7f));
+            lives[particle] = fmaxf(-b.foamLife*logf(fmaxf(1.0f - whitewaterChance(key, 9), 1.0e-7f)), 1.0e-6f);    //over 0: it hasn't been at the surface yet
             births[particle] = b.now;
             ids[particle] = 0;      //until the sort has placed it (nameWhitewater)
             kinds[particle] = droplet ? WHITEWATER_SPRAY : WHITEWATER_BUBBLE;
@@ -951,7 +1013,7 @@ void Particles::findWhitewater(){
     s.rest = (float)restParticlesPerVoxel;
     s.across = (float)voxelSize;
     s.breaks = (float)std::sqrt(BREAKUP_WEBER*sigma / scale + 2.0*pull*scale);
-    s.perSpeed = (float)(whitewater.amount*whitewater.bubbles*AIR_FOLDED*whitewater.perVoxel / voxelSize);
+    s.perSpeed = (float)(whitewater.amount*whitewater.bubbles*AIR_FOLDED*whitewater.perVoxel / voxelSize*(scale / voxelSize));
     s.sprayPerSpeed = (float)(whitewater.amount*whitewater.spray*SPRAY_THROWN*whitewater.perVoxel / voxelSize);
     s.key = whitewaterKey(whitewater.seed, substepIndex);
     int tileWidth = interiorWidth + 2;
@@ -987,7 +1049,7 @@ WhitewaterGrid Particles::whitewaterGrid(){
     return {numUsedGridNodes, numOwnNodes, nodeCells.devPtr(), cellToNode.devPtr(), nodeInteriorVoxels.devPtr(),
             {voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr()}, {voxelsUxOld.devPtr(), voxelsUyOld.devPtr(), voxelsUzOld.devPtr()},
             {voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr()}, liquidShare.devPtr(), grid, 2<<refinementLevel,
-            (float)(grid.cellSize / (2<<refinementLevel))};
+            (float)(grid.cellSize / (2<<refinementLevel)), lettingGo() ? letGo.devPtr() : nullptr};
 }
 
 void Particles::stepWhitewater(){
@@ -1012,8 +1074,10 @@ void Particles::stepWhitewater(){
     int apronCells = (int)std::floor(radius);
     WhitewaterGrid g = whitewaterGrid();
     double pull = std::sqrt((double)forces.gravity.x*forces.gravity.x + (double)forces.gravity.y*forces.gravity.y + (double)forces.gravity.z*forces.gravity.z);
+    double breakup = whitewaterScale();
     WhitewaterFluids fluids = {forces.gravity, (float)pull, whitewater.surfaceTension, twoPhase.on ? 1.0f / twoPhase.densityRatio : whitewater.airDensity,
-                               twoPhase.on ? twoPhase.airViscosity : whitewater.airViscosity, whitewater.liquidViscosity, twoPhase.on};
+                               twoPhase.on ? twoPhase.airViscosity : whitewater.airViscosity, whitewater.liquidViscosity, twoPhase.on, (float)breakup,
+                               (float)std::sqrt(BREAKUP_WEBER*whitewater.surfaceTension / breakup + 2.0*pull*breakup), whitewater.dropletScale};
     WhitewaterParticles p = {pool.position[0], pool.position[1], pool.position[2], pool.velocity[0], pool.velocity[1], pool.velocity[2], pool.cells, pool.lives, pool.radii,
                              pool.births, pool.kinds, pool.ids};
     unsigned long long key = whitewaterKey(whitewater.seed, substepIndex);

@@ -1254,7 +1254,10 @@ int main(int argc, char** argv){
     simulation->setGravity(make_float3((float)scene.gravity[0], (float)scene.gravity[1], (float)scene.gravity[2]));
     simulation->setViscosity(scene.viscosity / scene.density);
     simulation->setSurfaceTension(scene.surfaceTension / scene.density);
-    simulation->setContactAngle(scene.contactAngle);
+    for(int face = 0; face < 6; ++face){
+        simulation->setWallContactAngle(face, scene.wallContactAngle[face]);
+        simulation->setWallFriction(face, scene.wallFriction[face]);
+    }
     simulation->setViscousCfl(scene.viscousCfl);
     simulation->setFreeSurface(scene.freeSurface == "sharp" ? FreeSurface::sharp : FreeSurface::footprint);
     if(scene.air){      //a second fluid (TwoPhase, particles.hu): the particles seeded after the liquid's, and any made later, are air
@@ -1338,6 +1341,11 @@ int main(int argc, char** argv){
         simulation->setSourceMeshes(sourceMeshes, fluids);      //after setDomain and setSources
     }
     simulation->setObstacles(scene.obstacles);      //after setDomain: they're voxelized at its voxel size
+    unsigned int wallsLetGo = 0;    //the walls that let go of the liquid, a bit each
+    for(int face = 0; face < 6; ++face){
+        wallsLetGo |= scene.wallHold[face] ? 0u : 1u << face;
+    }
+    simulation->setWallsLetGo(wallsLetGo);
     if(scene.writeCache){
         CacheDescription description;
         std::error_code resolved;

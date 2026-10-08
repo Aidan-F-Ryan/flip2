@@ -520,7 +520,16 @@ static bool writePointsBgeo(const std::string& path, const std::vector<const Sha
                         json.raw(narrow.data(), 4*shard->particles);
                     }
                     endVector(json);
-                    scalar("life", false);
+                    beginAttribute(json, "life", points, 1, false, nullptr);    //what it has left at the surface: the shards hold that below 0 once it has been there
+                    for(const ShardData* shard : shards){
+                        const float* plane = (const float*)planeOf(*shard, "life", 1);
+                        tuples.resize(shard->particles);
+                        for(uint64_t particle = 0; particle < shard->particles; ++particle){
+                            tuples[particle] = std::fabs(plane[particle]);
+                        }
+                        json.raw(tuples.data(), 4*shard->particles);
+                    }
+                    endVector(json);
                     beginAttribute(json, "pscale", points, 1, false, nullptr);
                     for(const ShardData* shard : shards){
                         tuples.assign(shard->particles, pscale);

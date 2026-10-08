@@ -70,6 +70,14 @@ public:
         simulation.forEachPartition([&](Particles& partition){ partition.setContactAngle(degrees); });
     }
 
+    void setWallContactAngle(int wall, double degrees){
+        simulation.forEachPartition([&](Particles& partition){ partition.setWallContactAngle(wall, degrees); });
+    }
+
+    void setWallFriction(int wall, double friction){
+        simulation.forEachPartition([&](Particles& partition){ partition.setWallFriction(wall, friction); });
+    }
+
     void setViscousCfl(double voxels){
         simulation.forEachPartition([&](Particles& partition){ partition.setViscousCfl(voxels); });
     }
@@ -93,6 +101,10 @@ public:
     }
     void markAirParticles(size_t first){
         simulation.forEachPartition([&](Particles& partition){ partition.markAirParticles((uint)first); });
+    }
+
+    void setWallsLetGo(unsigned int walls){
+        simulation.forEachPartition([&](Particles& partition){ partition.setWallsLetGo(walls); });
     }
 
     void setObstacles(const std::vector<SceneObstacle>& obstacles){

@@ -320,8 +320,9 @@ Scene loadScene(const std::string& path){
         read.fail("the scene", "fps has to be positive and frames at least 0");
     }
 
+    double wallAngles[6] = {-1.0, -1.0, -1.0, -1.0, -1.0, -1.0};    //each wall's own contact angle, where it's given one
     if(const Json* domain = read.object(root, "domain", "the scene")){
-        read.checkKeys(*domain, "domain", {"min", "max", "voxelSize", "open"});
+        read.checkKeys(*domain, "domain", {"min", "max", "voxelSize", "open", "walls"});
         double low[3], high[3];
         read.vector3(*domain, "min", "domain", low, true);
         read.vector3(*domain, "max", "domain", high, true);
@@ -350,6 +351,28 @@ Scene loadScene(const std::string& path){
                     read.fail("domain.open", "lists faces, each \"-x\", \"+x\", \"-y\", \"+y\", \"-z\" or \"+z\"");
                 }
                 scene.openFaces |= 1u << bit;
+            }
+        }
+        if(const Json* walls = read.object(*domain, "walls", "domain")){    //what the walls do to the liquid on them: all of them, then any that differ
+            const char* faces[6] = {"-x", "+x", "-y", "+y", "-z", "+z"};
+            read.checkKeys(*walls, "domain.walls", {"hold", "friction", "contactAngle", "-x", "+x", "-y", "+y", "-z", "+z"});
+            bool hold = read.flag(*walls, "hold", "domain.walls", true);
+            double friction = read.number(*walls, "friction", "domain.walls", 0.0);
+            double contactAngle = read.number(*walls, "contactAngle", "domain.walls", -1.0);    //none: the liquid's
+            for(int face = 0; face < 6; ++face){
+                scene.wallHold[face] = hold;
+                scene.wallFriction[face] = friction;
+                wallAngles[face] = contactAngle;
+                std::string where = std::string("domain.walls[\"") + faces[face] + "\"]";
+                if(const Json* wall = read.object(*walls, faces[face], "domain.walls")){
+                    read.checkKeys(*wall, where, {"hold", "friction", "contactAngle"});
+                    scene.wallHold[face] = read.flag(*wall, "hold", where, hold);
+                    scene.wallFriction[face] = read.number(*wall, "friction", where, friction);
+                    wallAngles[face] = read.number(*wall, "contactAngle", where, contactAngle);
+                }
+                if(scene.wallFriction[face] < 0.0 || scene.wallFriction[face] > 1.0 || wallAngles[face] > 180.0 || (wallAngles[face] < 0.0 && wallAngles[face] != -1.0)){
+                    read.fail(where, "friction is between 0 and 1, and contactAngle from 0 to 180 degrees");
+                }
             }
         }
     }
@@ -395,6 +418,9 @@ Scene loadScene(const std::string& path){
         if(!(scene.density > 0.0) || !(scene.viscosity >= 0.0) || !(scene.surfaceTension >= 0.0) || !(scene.contactAngle >= 0.0 && scene.contactAngle <= 180.0)){
             read.fail("liquid", "density has to be positive, viscosity and surfaceTension at least 0, and contactAngle from 0 to 180 degrees");
         }
+    }
+    for(int face = 0; face < 6; ++face){    //a wall with no contact angle of its own has the liquid's
+        scene.wallContactAngle[face] = wallAngles[face] < 0.0 ? scene.contactAngle : wallAngles[face];
     }
     if(const Json* air = read.object(root, "air", "the scene")){     //a second, lighter fluid simulated with the liquid (experimental)
         read.checkKeys(*air, "air", {"density", "flipRatio", "band", "escaped", "dropletRadius", "viscosity", "bubbleRadius", "liquidViscosity", "surfaceTension"});
@@ -702,7 +728,7 @@ Scene loadScene(const std::string& path){
                 read.fail(where, "should be an object, {...}");
             }
             read.checkKeys(item, where, {"mesh", "vertices", "triangles", "vdb", "grid", "velocityGrid", "shape", "min", "max", "center", "centre", "radius", "transform", "keyframes",
-                                         "deforming", "friction", "thickness"});
+                                         "deforming", "friction", "thickness", "hold"});
             SceneObstacle obstacle;
             bool deforms = item.find("deforming") != nullptr;
             if(deforms && item.find("shape")){
@@ -735,6 +761,7 @@ Scene loadScene(const std::string& path){
             readPlacement(item, where, obstacle);
             obstacle.friction = read.number(item, "friction", where, obstacle.friction);
             obstacle.thickness = read.number(item, "thickness", where, obstacle.thickness);
+            obstacle.hold = read.flag(item, "hold", where, obstacle.hold);
             if(obstacle.friction < 0.0 || obstacle.friction > 1.0 || obstacle.thickness < 0.0){
                 read.fail(where, "friction is between 0 and 1, and thickness can't be negative");
             }

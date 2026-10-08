@@ -11,7 +11,16 @@
 //    "schema": "flip2.scene/1",
 //    "fps": 24, "frames": 120,
 //    "domain": {"min": [-0.5, -0.5, -0.5], "max": [0.5, 0.5, 0.5], "voxelSize": 0.0078125,     //rounded up to whole nodes of 4^3 voxels
-//               "open": []},                                               //faces that delete the fluid reaching them: "-x", "+x", "-y", "+y", "-z", "+z"
+//               "open": [],                                                //faces that delete the fluid reaching them: "-x", "+x", "-y", "+y", "-z", "+z"
+//               "walls": {"hold": true, "friction": 0, "contactAngle": 60,  //what the walls do to the liquid on them, all of them, and then any that
+//                         "+y": {"hold": false, "friction": 0.5}}},        //differ, by face. hold: a wall that holds pulls on the liquid as well as
+//                                                                           //pushing it, as a sealed tank's do, so a splash hangs from the ceiling;
+//                                                                           //one that doesn't lets it go wherever air can get in behind it, as
+//                                                                           //anything in open air does (boundaries.cu). With "air" simulated the air
+//                                                                           //gets behind the liquid itself, and every wall holds. friction: as an
+//                                                                           //obstacle's, 0 for the liquid sliding freely along the wall to 1.
+//                                                                           //contactAngle: the angle the liquid's surface meets this wall at,
+//                                                                           //where it isn't the liquid's own (below)
 //    "solver": {"flipRatio": 0.95, "cfl": 4, "densityCorrectionTime": 0.1, "pressureSolver": "multigrid", "advection": "rk3", "dotProducts": "exact",
 //               "transfer": "flip",                                        //or "apic": particles carry their velocity's gradient; flipRatio 0 for pure APIC
 //               "viscousCfl": 6,                                           //with viscosity: voxels it may spread across in a substep; 0 for no limit
@@ -29,7 +38,8 @@
 //               {"mesh": "blob.obj", "transform": [...], "velocity": [0, 0, 0]}],         //fluids, emitters and sinks can be meshes, placed as obstacles are
 //    "emitters": [{"shape": "box", "min": [...], "max": [...], "velocity": [0, 0, 2]}],   //inflow: keeps its shape full of fluid moving at velocity
 //    "sinks": [{"shape": "sphere", "center": [...], "radius": 0.1}],                       //outflow: deletes the fluid inside it
-//    "obstacles": [{"mesh": "rock.obj", "friction": 0, "thickness": 0,                   //or "vertices": "v.npy", "triangles": "t.npy"; or a box or sphere;
+//    "obstacles": [{"mesh": "rock.obj", "friction": 0, "thickness": 0, "hold": true,     //or "vertices": "v.npy", "triangles": "t.npy"; or a box or sphere;
+//                                                                                         //hold: as a wall's
 //                                                                                         //or "vdb": "rock.vdb", "grid": "surface", "velocityGrid": "vel"
 //                   "transform": [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1],                    //its own space to the world: row-major, acting on column vectors
 //                   "keyframes": [{"time": 0, "transform": [...]}, ...],                 //instead of a transform, it moves: linearly, rotations by slerp
@@ -91,6 +101,7 @@ struct SceneObstacle{
     std::vector<double> keyTimes;                       //empty: it stays where transforms[0] puts it
     std::vector<std::array<double, 16>> transforms;     //own space to world, row-major, acting on column vectors (translation in elements 3, 7, 11)
     double friction = 0.0;      //0: the fluid slips past freely; 1: the fluid touching it moves with it
+    bool hold = true;           //whether it can pull on the liquid as well as push it: false, the liquid leaves it freely (boundaries.cu)
     double thickness = 0.0;     //mesh: 0 for a closed surface; for an open one, like a ground plane, the shell's thickness around it
     std::vector<double> sampleTimes;                    //deforming: when each sample is; empty: it doesn't deform
     std::shared_ptr<const std::vector<float>> samples;  //deforming: each sample's vertices in turn, x, y, z each, in the world (shared by the scene's copies)
@@ -177,7 +188,7 @@ struct Scene{
     double whitewaterBubbles = 1.0;
     int whitewaterPerVoxel = 27;            //the particles a voxel's volume of whitewater is drawn as
     double whitewaterMaxParticles = 1.6e7;  //the most at once, in each partition: with less room than the surface would fill, what it makes thins evenly
-    double whitewaterFoamLife = 2.0;        //seconds a bubble lasts at the surface, on average
+    double whitewaterFoamLife = 0.5;        //seconds a bubble lasts once it has reached the surface, on average
     double whitewaterMaxAge = 30.0;         //seconds after which any of it is gone
     double whitewaterDropletScale = 1.0;    //droplets' radii against what the model gives, and bubbles'
     double whitewaterBubbleScale = 1.0;
@@ -187,6 +198,10 @@ struct Scene{
     std::vector<SceneShape> emitters;
     std::vector<SceneShape> sinks;
     unsigned int openFaces = 0;     //bits: -x, +x, -y, +y, -z, +z
+    //"domain": {"walls": {...}}: what each wall does to the liquid on it, in the same order
+    bool wallHold[6] = {true, true, true, true, true, true};    //whether it can pull on the liquid as well as push it; false, the liquid leaves it freely
+    double wallFriction[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};    //0: the fluid slides along it freely; 1: the fluid touching it is at rest, as on an obstacle
+    double wallContactAngle[6] = {60.0, 60.0, 60.0, 60.0, 60.0, 60.0};  //degrees: its own, or the liquid's contactAngle where it has none
     std::vector<SceneObstacle> obstacles;
     std::vector<SceneForce> forces;
     int partitions = 1;

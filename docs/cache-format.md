@@ -150,7 +150,7 @@ A scene with a `whitewater` block bakes spray, foam and bubbles as a second set 
 | `v` | float32 | 3 | velocity in metres per second |
 | `id` | uint64 | 1 | the particle's id, kept for as long as it exists |
 | `age` | float32 | 1 | seconds since it was made |
-| `life` | float32 | 1 | seconds it has left as foam; it only runs down while the particle is foam |
+| `life` | float32 | 1 | seconds it lasts once it has reached the surface. Positive until it first does. From then it is negative, counting up to 0, and the particle is gone at 0. `flip2 export` writes its size, the time left |
 | `radius` | float32 | 1 | the radius of the droplet or bubble it moves as, in metres |
 | `kind` | float32 | 1 | `0` spray, `1` foam, `2` bubble |
 

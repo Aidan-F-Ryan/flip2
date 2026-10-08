@@ -25,6 +25,7 @@
 
 #include "particles.hu"
 #include "gridSampling.hu"
+#include "liquidTile.hu"   //WallWetting
 #include "algorithms/voxelSolveFunctions.hu"   //NO_VOXEL, WALL_VOXEL
 #include <cmath>
 #include <cstdlib>
@@ -550,7 +551,7 @@ static constexpr float TENSION_EDGE = 1.0f/6.0f;
 
 //mu, the energy's slope with each unknown's (blurred) c: W'(c) less the weighed sum of c's steps to its 18 neighbours, over K; through a wall there's
 //no step (the field carries on square to the wall: a neighbour past it is the mirror image, which for an edge neighbour is the face neighbour on the
-//other axis), and past what the solve holds is air, c = 0. Each of its faces on one of the domain's walls takes off the wall's part: the wetting,
+//other axis), and past what the solve holds is air, c = 0. Each of its faces on one of the domain's walls takes off the wall's part: its wetting,
 //the cosine of the angle the liquid meets it at, times 6 c (1 - c), the slope of c^2 (3 - 2 c), so only where the surface meets the wall; a face
 //an obstacle closes (near, not nullptr with none) is a wall with no angle of its own, square on. Kept as what it's over its value deep in the
 //liquid, where W' is atLiquid: only its slope pushes, and deep in the liquid, where nothing should, it's then exactly nothing, however the walls
@@ -558,7 +559,7 @@ static constexpr float TENSION_EDGE = 1.0f/6.0f;
 //are inside its node's apron, so what it finds is the same in every partition
 __global__ void potentialOfVoxels(uint numVoxels, const char* solveCodes, const uint* neighborNx, const uint* neighborPx, const uint* neighborNy, const uint* neighborPy,
                                   const uint* neighborNz, const uint* neighborPz, const char* near, const float* share, int passes, float atAir, float atLiquid, float perFace,
-                                  float wetting, float* potential){
+                                  WallWetting wetting, float* potential){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
     if(index < numVoxels){
         float value = 0.0f;
@@ -567,12 +568,14 @@ __global__ void potentialOfVoxels(uint numVoxels, const char* solveCodes, const 
             float c = share[index];
             auto at = [&](uint voxel){ return voxel < WALL_VOXEL && solveCodes[voxel] ? share[voxel] : 0.0f; };   //c at a stored voxel, or outside
             float steps = 0.0f;
-            int walls = 0;
+            float wet = 0.0f;   //its faces on the domain's walls: their wettings, added up
             #pragma unroll
             for(int face = 0; face < 6; ++face){
                 uint neighbor = neighbors[face][index];
                 if(neighbor == WALL_VOXEL){
-                    walls += near == nullptr || !(near[index] & CLOSED_FACE << face);
+                    if(near == nullptr || !(near[index] & CLOSED_FACE << face)){
+                        wet += wetting.cosine[face];
+                    }
                     continue;
                 }
                 steps += TENSION_FACE*(at(neighbor) - c);
@@ -601,7 +604,7 @@ __global__ void potentialOfVoxels(uint numVoxels, const char* solveCodes, const 
                 }
             }
             float well = c >= 1.0f ? atLiquid : c <= 0.0f ? atAir : wellSlope(c, passes);
-            value = (well - steps - atLiquid)*perFace - wetting*walls*6.0f*c*(1.0f - c);
+            value = (well - steps - atLiquid)*perFace - wet*6.0f*c*(1.0f - c);
         }
         potential[index] = value;
     }
@@ -682,7 +685,7 @@ void Particles::tensionOnMixture(){
     }
     if(numVoxels > 0){
         potentialOfVoxels<<<blocks, BLOCKSIZE, 0, stream>>>(numVoxels, solveCodes.devPtr(), neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(), neighborPy.devPtr(),
-            neighborNz.devPtr(), neighborPz.devPtr(), near, blurred, passes, wellSlope(0.0f, passes), wellSlope(1.0f, passes), (float)perFace, (float)wallWetting, potential);
+            neighborNz.devPtr(), neighborPz.devPtr(), near, blurred, passes, wellSlope(0.0f, passes), wellSlope(1.0f, passes), (float)perFace, wallWettings(), potential);
     }
     context->fillGhosts(potential, stream);
     for(int pass = 0; pass < passes; ++pass){   //mu, the slope with the blurred c, back onto the c the particles made: the blur's passes again, last first

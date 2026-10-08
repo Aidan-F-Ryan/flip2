@@ -16,7 +16,8 @@
 //- a bubble, air in the liquid: the same flight for a ball of air, lifted by the liquid's weight and dragged along by its flow. A small one follows
 //  the liquid wherever it goes; a large one rises through it
 //- foam, a bubble that has come up to the surface: it rides the liquid's velocity there until it bursts, which each does at the same rate whatever
-//  its age, so a patch thins evenly rather than vanishing at once
+//  its age, so a patch thins evenly rather than vanishing at once. Once it has been at the surface it bursts when its time comes wherever it is
+//  by then: drawn under again meanwhile, it's as light as it was, and on its way back up
 //A droplet that lands on the liquid is foam where it landed; a bubble that reaches the surface is foam; foam the liquid closes over is a bubble
 //again, and foam the liquid falls away from is spray.
 //
@@ -30,7 +31,7 @@ struct WhitewaterSettings{
     float bubbles = 1.0f;
     int perVoxel = 27;              //the particles a voxel's volume of whitewater is drawn as: more is finer, and that many times as many
     uint capacity = 16000000;       //the most a partition is to hold. With less room than the surface would fill, what it makes thins evenly (thinWhitewater)
-    float foamLife = 2.0f;          //how long a bubble lasts at the surface, on average, seconds: fresh water's foam is gone in under one, the sea's in several
+    float foamLife = 0.5f;          //how long a bubble lasts once it's reached the surface, on average, seconds: fresh water's foam is gone in under one, the sea's in several
     float maxAge = 30.0f;           //seconds after which any of it is gone, wherever it is
     float surfaceTension = 7.2e-5f; //the liquid's, over its density, m^3/s^2: with gravity, how hard its surface is to break, and what sizes it breaks into
     float airDensity = 1.2e-3f;     //the air's density over the liquid's
@@ -59,7 +60,7 @@ struct WhitewaterPool{
     uint* cells = nullptr;              //each one's node cell
     unsigned long long* ids = nullptr;  //which it keeps for as long as it exists: numbered from 0 as they're made (Particles::nameWhitewater)
     float* births = nullptr;            //when it came to be, seconds from the start
-    float* lives = nullptr;             //how much longer it lasts as foam, seconds
+    float* lives = nullptr;             //how long it lasts once it has reached the surface, seconds: over 0 until it first does, then less than 0 by what's left
     float* radii = nullptr;             //the droplet's or the bubble's, metres
     char* kinds = nullptr;              //WhitewaterKind
     //the sort's working space: a second array for the keys and one for the order the sorted come from (the sort goes back and forth between each and

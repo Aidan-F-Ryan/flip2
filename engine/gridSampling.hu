@@ -106,11 +106,25 @@ __device__ inline float sampleTile(const float* tile, int tileWidth, int dim, fl
     return sum;
 }
 
+//How far each of the domain's walls holds what moves along it, in the neighbours' order (-x, +x, -y, +y, -z, +z): 0, it slides freely, up to 1, at
+//rest on the wall. A viscous liquid holds to every wall by Particles::wallStick, and a wall with friction holds whatever is on it by half its
+//friction, which is what an obstacle of that friction does (the faces inside it carry 1 - friction of the fluid's velocity along it, so its surface,
+//halfway to them, 1 - friction/2): the larger of the two (Particles::wallSticks). G2P's mirror images past a wall carry along() of the faces inside
+//it, and advection's velocity falls to 1 - stick of the last faces' on the wall itself (sampleVelocity). All 0, the default, where nothing holds
+struct WallStick{
+    float stick[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    bool any = false;   //whether any wall holds at all
+
+    __host__ __device__ float along(int wall) const{
+        return 1.0f - 2.0f*stick[wall];
+    }
+};
+
 //the grid's velocity at a point of the tile, any component with no velocity there taking fallback's. Each component's point is first kept inside the
 //walls: a wall's own faces hold its no-flow condition, and beside a wall the tangential velocity carries on to it unchanged, like G2P's mirrored ghosts.
-//With stick (Particles::wallStick), a liquid viscous enough to hold to the walls, it falls off instead over the half voxel between the last faces and
-//the wall, to 1 - stick of theirs on the wall itself
-__device__ inline float3 sampleVelocity(const float* tile, int tileWidth, float3 point, int3 tileOrigin, int3 domainVoxels, float3 fallback, float stick){
+//Beside a wall that holds (WallStick) it falls off instead over the half voxel between the last faces and the wall, to 1 - stick of theirs on the
+//wall itself
+__device__ inline float3 sampleVelocity(const float* tile, int tileWidth, float3 point, int3 tileOrigin, int3 domainVoxels, float3 fallback, const WallStick& stick){
     int origin[3] = {tileOrigin.x, tileOrigin.y, tileOrigin.z};
     int size[3] = {domainVoxels.x, domainVoxels.y, domainVoxels.z};
     float fallbacks[3] = {fallback.x, fallback.y, fallback.z};
@@ -124,13 +138,14 @@ __device__ inline float3 sampleVelocity(const float* tile, int tileWidth, float3
             coordinates[axis] = fminf(fmaxf(coordinates[axis], inset - origin[axis]), size[axis] - inset - origin[axis]);
         }
         float v = sampleTile(tile + dim*tileWidth*tileWidth*tileWidth, tileWidth, dim, make_float3(coordinates[0], coordinates[1], coordinates[2]));
-        if(stick > 0.0f){
+        if(stick.any){
             float along[3] = {point.x, point.y, point.z};
             #pragma unroll
             for(int axis = 0; axis < 3; ++axis){
-                float fromWall = fminf(along[axis] + origin[axis], size[axis] - origin[axis] - along[axis]);    //the nearer of the two across this axis, in voxels
+                float fromLower = along[axis] + origin[axis], fromUpper = size[axis] - origin[axis] - along[axis];
+                float fromWall = fminf(fromLower, fromUpper);   //the nearer of the two across this axis, in voxels
                 if(axis != dim && fromWall < 0.5f){
-                    v *= 1.0f - stick*(1.0f - 2.0f*fmaxf(fromWall, 0.0f));
+                    v *= 1.0f - stick.stick[2*axis + (fromUpper < fromLower)]*(1.0f - 2.0f*fmaxf(fromWall, 0.0f));
                 }
             }
         }
@@ -142,7 +157,7 @@ __device__ inline float3 sampleVelocity(const float* tile, int tileWidth, float3
 //The velocity that moves a particle from point through a tile's field for a step, where step turns a velocity into the voxels it moves in that: with
 //Ralston's RK3, which samples the field 3 times along the way, or the field's where the particle starts (forward Euler). Where nothing reached (spray
 //leaving the fluid), a stage reuses the stage before, and the first the particle's own velocity, so the particle flies straight
-__device__ inline float3 velocityThrough(const float* tile, int tileWidth, float3 point, int3 tileOrigin, int3 domainVoxels, float3 own, float step, bool rungeKutta3, float stick){
+__device__ inline float3 velocityThrough(const float* tile, int tileWidth, float3 point, int3 tileOrigin, int3 domainVoxels, float3 own, float step, bool rungeKutta3, const WallStick& stick){
     float3 k1 = sampleVelocity(tile, tileWidth, point, tileOrigin, domainVoxels, own, stick);
     float3 velocity = k1;
     if(rungeKutta3){

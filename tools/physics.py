@@ -135,8 +135,13 @@ def free_fall(bake):
 @check("momentum",
        "With no gravity and nothing to push it, a ball of liquid keeps the velocity it has, all of it together, and its shape.",
        "Nothing acts on it, so there is nothing to allow for: the limits are a thousandth of its speed, and a voxel on its width.",
-       known="Its mean velocity changes by about 0.13% of its speed every substep, and its particles' velocities spread by as much: with FLIP, PIC or "
-             "APIC transfers alike, with the density correction off, and at half the voxel size. The same on the 4 October build. Not traced further yet.")
+       known="Traced and mended 8 October, but for the density correction. P2G gave the faces at the edge of its reach wrong velocities (its sums "
+             "rounded each particle's share of the weight and of the momentum on their own, and divided by the weight plus 1e-7), and the "
+             "extrapolation after it left a handful of unreached faces at rest each substep; the pressure solve took both for divergence, and the "
+             "ball lost a thousandth of its speed a substep. The sums are exact now and the extrapolation reaches every face: with the density "
+             "correction off the ball keeps its velocity to 2e-8 of its speed over 12 substeps, whatever its size. What's left here is the "
+             "correction itself: the ball's particles cross the voxels in step, the counts it reads rise and fall by a particle as they do, and "
+             "it answers each: 0.4% of the ball's speed in spread after a quarter of a second. Not looked into further.")
 def momentum(bake):
     start = [0.5, 0.3, 0.2]
     speed = math.sqrt(sum(v * v for v in start))
@@ -301,16 +306,149 @@ def viscous_front(bake):
 
 # ---- walls ----
 
+def slab(bake, name, low, high, frames, walls=None):
+    """a slab of water at rest in a 1 m box, 2.5 cm voxels, between two heights and out to +-high[0] across: its fall by frame"""
+    made = scene([-0.5, 0.0, -0.5], [0.5, 1.0, 0.5], 0.025, frames, [box([-high[0], low, -high[0]], [high[0], high[1], high[0]])])
+    if walls:
+        made["domain"]["walls"] = walls
+    return bake(name, made)
+
+
+def behind(run, frame):
+    """how far its mean speed is behind free fall's at a frame, m/s"""
+    return G * run.time(frame) + run.velocity(frame)[1]
+
+
 @check("near-ceiling",
        "Liquid that isn't touching a wall doesn't feel it: a slab at rest two voxels under the ceiling falls at g.",
        "As free-fall's.",
-       known="The pressure solve's liquid is the particles' footprint, a voxel or two wider than the particles, and every wall holds what touches it, "
-             "pulling as well as pushing: so a wall holds back liquid up to two voxels off it. Waiting on walls that can let go.")
+       known="The pressure solve's liquid is the particles' footprint, a voxel or two wider than the particles, and a wall that holds pulls on whatever "
+             "touches it as well as pushing: so it holds back liquid up to two voxels off it. A wall that lets go doesn't (near-ceiling-lets-go). For "
+             "one that holds to pass, it would have to hold only the voxels with liquid in them at the wall, which changes every bake there is.")
 def near_ceiling(bake):
-    run = bake("near-ceiling", scene([-0.5, 0.0, -0.5], [0.5, 1.0, 0.5], 0.025, 4, [box([-0.25, 0.75, -0.25], [0.25, 0.95, 0.25])]))
+    run = slab(bake, "near-ceiling", 0.75, (0.25, 0.95), 4)
     last = run.frames[-1]
     t = run.time(last)
     return [Result("fall speed after %.2f s" % t, -run.velocity(last)[1], G * t, 0.005, "m/s")]
+
+
+@check("near-ceiling-lets-go",
+       "The same slab under a ceiling that lets go.",
+       "As free-fall's. Measured 8 October: 0.4% slow after a third of a second, all of it lost in the first substep (free-fall's own is 0.2%).")
+def near_ceiling_lets_go(bake):
+    run = slab(bake, "near-ceiling-lets-go", 0.75, (0.25, 0.95), 8, {"+y": {"hold": False}})
+    last = run.frames[-1]
+    t = run.time(last)
+    return [Result("fall speed after %.2f s" % t, -run.velocity(last)[1], G * t, 0.005, "m/s")]
+
+
+@check("lets-go",
+       "Liquid on a wall that lets go comes away from it where air can get in behind it: a slab on the ceiling, its edges free, falls.",
+       "The pressure lets it go at once, and the wall's faces where it has let go carry the liquid's own velocity on for the particles that read "
+       "them, so its top layer leaves with the rest. Measured 8 October: 0.002 m/s behind free fall after a third of a second, 0.01 allowed, and "
+       "its top no higher than a voxel over where free fall has it. (0.27 m/s behind while the particles still read the wall's faces as at rest; "
+       "on a ceiling that holds, 0.79 m/s behind and still on it.)")
+def lets_go(bake):
+    run = slab(bake, "lets-go", 0.8, (0.25, 1.0), 8, {"+y": {"hold": False}})
+    last = run.frames[-1]
+    t = run.time(last)
+    return [Result("behind free fall after %.2f s" % t, behind(run, last), 0.0, 0.01, "m/s", "most"),
+            Result("its top, as a height", run.rows[last]["highest"][1], 0.0, 1.0 - 0.5 * G * t * t + 0.025, "m", "most")]
+
+
+@check("sealed",
+       "A wall lets go only where air can get in. A slab filling the top of a box, under a ceiling that lets go, stays up while the walls round "
+       "it hold, as water does in an upturned glass: nothing can get in behind it. Where the walls let go too, air comes up them, and it falls.",
+       "Held, nothing moves at all: a hundredth of a voxel allowed in a quarter of a second. (Its flat underside is unstable, and gives way after "
+       "about a second: no check of that.) Let go, it's free fall as lets-go's is: 0.007 m/s behind measured, 0.02 allowed; and the half substep "
+       "free-fall's distance is ahead by.")
+def sealed(bake):
+    held = slab(bake, "sealed", 0.8, (0.5, 1.0), 6, {"+y": {"hold": False}})
+    freed = slab(bake, "sealed-let-go", 0.8, (0.5, 1.0), 6, {"hold": False})
+    last = held.frames[-1]
+    t = held.time(last)
+    fallen = lambda run: run.rows[0]["centroid"][1] - run.rows[last]["centroid"][1]
+    return [Result("walls holding, fallen after %.2f s" % t, fallen(held), 0.0, 0.01 * 0.025, "m", "most"),
+            Result("walls letting go, behind free fall", behind(freed, last), 0.0, 0.02, "m/s", "most"),
+            Result("walls letting go, short of free fall's distance", 0.5 * G * t * t - fallen(freed), 0.0, 0.03, "m", "most")]
+
+
+@check("rest-lets-go",
+       "Walls that let go still hold up what rests on them: rest's tank, with every wall letting go, stays at rest.",
+       "As rest's: nothing pulls on a wall there, so nothing is let go.")
+def rest_lets_go(bake):
+    voxel = 0.025
+    made = scene([-0.5, 0.0, -0.25], [0.5, 0.6, 0.25], voxel, 24, [box([-0.5, 0.0, -0.25], [0.5, 0.3, 0.25])])
+    made["domain"]["walls"] = {"hold": False}
+    run = bake("rest-lets-go", made)
+    start = run.rows[0]["centroid"]
+    moved = max(math.sqrt(sum((run.rows[f]["centroid"][axis] - start[axis]) ** 2 for axis in range(3))) for f in run.frames)
+    rms = max(math.sqrt(2.0 * run.rows[f]["kineticEnergy"] / run.rows[f]["particles"]) for f in run.frames if f >= 12)
+    return [Result("rms speed in its second half second", rms, 0.0, 0.01 * math.sqrt(G * voxel), "m/s", "most"),
+            Result("furthest its centre of mass moves", moved, 0.0, 0.01 * voxel, "m", "most")]
+
+
+@check("collider-lets-go",
+       "A collider that lets go is left as a wall is: a slab at rest against its underside falls at g, whether that's flat on the voxels' planes, "
+       "flat and off them, tilted, or round. One that holds keeps it.",
+       "Measured 8 October, after a sixth of a second (free fall is 1.63 m/s): 0.008 m/s behind on the planes, 0.003 off them, 0.014 tilted 30 "
+       "degrees and 0.036 under a ball; 0.03 allowed flat or tilted and 0.05 round, where the faces the surface cuts still blend the liquid's "
+       "velocity with the collider's. Off the planes with the slab's edges on the nodes' planes is as off them anywhere: 0.02 between the two. "
+       "(Before the faces of a collider that has let go carried the liquid's velocity: 0.25 behind on the planes; and off them it never let go, "
+       "the air's way in past the liquid's edge counting as solid.) Held, its top stays within half a voxel of the face.")
+def collider_lets_go(bake):
+    voxel, frames = 0.025, 4
+    def fall(name, obstacle, fluid, hold=False):
+        made = scene([-0.5, 0.0, -0.5], [0.5, 1.0, 0.5], voxel, frames, [fluid], obstacles=[dict(obstacle, hold=hold)])
+        return bake("collider-" + name, made)
+    def flat(name, face, across, hold=False):
+        return fall(name, box([-0.6, face, -0.6], [0.6, 1.1, 0.6]), box([-across, face - 0.2, -across], [across, face, across]), hold)
+    c, s = math.cos(math.radians(30.0)), math.sin(math.radians(30.0))
+    tilted = dict(box([-1.0, 0.0, -1.0], [1.0, 0.6, 1.0]), transform=[c, -s, 0, 0, s, c, 0, 0.7, 0, 0, 1, 0, 0, 0, 0, 1])
+    runs = [("flat, on the voxels' planes", flat("on", 0.8, 0.25), 0.03),
+            ("flat, off them", flat("off", 0.81, 0.25), 0.03),
+            ("flat, off them, its edges on the nodes' planes", flat("off-nodes", 0.81, 0.2), 0.03),
+            ("tilted 30 degrees", fall("tilted", tilted, box([-0.2, 0.35, -0.2], [0.2, 0.95, 0.2])), 0.03),
+            ("round", fall("round", {"shape": "sphere", "center": [0.0, 0.9, 0.0], "radius": 0.3}, box([-0.2, 0.4, -0.2], [0.2, 0.75, 0.2])), 0.05)]
+    held = flat("held", 0.81, 0.25, True)
+    t = held.time(frames)
+    results = [Result("%s: behind free fall after %.2f s" % (what, t), abs(behind(run, frames)), 0.0, allowed, "m/s", "most") for what, run, allowed in runs]
+    results.append(Result("off the planes, edges on the nodes' or not", abs(behind(runs[1][1], frames) - behind(runs[2][1], frames)), 0.0, 0.02, "m/s", "most"))
+    results.append(Result("held, its top under the face", 0.81 - held.rows[frames]["highest"][1], 0.0, 0.5 * voxel, "m", "most"))
+    return results
+
+
+def differing(one, other):
+    """how many of two bakes' frames differ in their state's hash"""
+    return sum(1 for frame in one.frames if frame not in other.rows or one.rows[frame]["hash"] != other.rows[frame]["hash"]) + abs(len(one.frames) - len(other.frames))
+
+
+@check("wall-settings",
+       "A wall's own friction and contact angle are that wall's alone. A drop on a floor given 120 degrees, under a liquid whose angle is 60, "
+       "is the drop of a liquid whose angle is 120; and friction on walls the liquid never comes near changes nothing.",
+       "Exact: the bakes are the same to the bit.")
+def wall_settings(bake):
+    def drop(name, liquid_angle, walls):
+        made = scene([-0.2, 0.0, -0.2], [0.2, 0.2, 0.2], 0.00625, 6, [{"shape": "sphere", "center": [0.0, 0.0, 0.0], "radius": 0.1}], gravity=[0.0, 0.0, 0.0],
+                     liquid={"density": 1000.0, "surfaceTension": 10.0, "contactAngle": liquid_angle})
+        if walls:
+            made["domain"]["walls"] = walls
+        return bake(name, made)
+    def slide(name, walls):
+        made = scene([-2.0, 0.0, -0.1], [2.0, 0.4, 0.1], 0.025, 6, [box([-1.8, 0.0, -0.1], [-1.3, 0.1, 0.1], [2.0, 0.0, 0.0])])
+        if walls:
+            made["domain"]["walls"] = walls
+        return bake(name, made)
+    beads = drop("wall-settings-120", 120.0, None)
+    floor = drop("wall-settings-floor", 60.0, {"-y": {"contactAngle": 120.0}, "+x": {"contactAngle": 20.0}})
+    wets = drop("wall-settings-60", 60.0, None)
+    slips = slide("wall-settings-slip", None)
+    far = slide("wall-settings-far", {"+y": {"friction": 1.0}, "+x": {"friction": 1.0}})
+    rough = slide("wall-settings-rough", {"-y": {"friction": 1.0}})
+    return [Result("frames that differ, the floor's own angle against the liquid's", differing(floor, beads), 0, 0, "", "most"),
+            Result("frames the same at 60 and 120 degrees (so the angle is read)", len(wets.frames) - differing(wets, beads), 0, 1, "", "most"),
+            Result("frames that differ with friction on walls it doesn't touch", differing(far, slips), 0, 0, "", "most"),
+            Result("speed kept on a floor with friction, over one without", rough.velocity(rough.frames[-1])[0] / slips.velocity(slips.frames[-1])[0], 0.0, 0.99, "", "most")]
 
 
 def main():

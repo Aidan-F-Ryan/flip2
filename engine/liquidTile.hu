@@ -45,6 +45,13 @@ __device__ inline void loadTileNodes(uint* nodes, uint cell, uint numUsedGridNod
     }
 }
 
+//The angle the liquid's surface meets each of the domain's walls at, as its cosine, in the neighbours' order (-x, +x, -y, +y, -z, +z): 0 square on,
+//more and the liquid wets the wall, less than none and it beads up on it (Particles::setWallContactAngle)
+struct WallWetting{
+    float cosine[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    bool any = false;   //whether any wall's isn't 0: with none the level set past the walls is its plain mirror image
+};
+
 //A tile: a node's interior voxels and halo more on every side, which a block gathers into shared memory from the interiors of the 27 nodes around it
 //(halo can't be more than a node's interior). Stencils then reach whatever is stored around each of the node's voxels, in any direction, which the
 //neighbour arrays only give the pressure unknowns along the axes. A slot is a place in the tile, x fastest. Every node computes its own voxels' values
@@ -113,6 +120,28 @@ struct Tile{
         return (g.x < 0 ? -0.5f - g.x : g.x >= domainVoxels.x ? g.x + 0.5f - domainVoxels.x : 0.0f)
              + (g.y < 0 ? -0.5f - g.y : g.y >= domainVoxels.y ? g.y + 0.5f - domainVoxels.y : 0.0f)
              + (g.z < 0 ? -0.5f - g.z : g.z >= domainVoxels.z ? g.z + 0.5f - domainVoxels.z : 0.0f);
+    }
+
+    //What a level set's slot past the walls holds, from its mirror image inside: the image's value, less 2 wetting for every voxel the slot is past
+    //a wall, wetting being that wall's (WallWetting). The level set's slope across the wall is then that cosine, so its zero meets the wall at that
+    //angle: square on with none, as a plain mirror image has it, reaching out along the wall with more, and pulling back from it with less than
+    //none. The surface tension that follows the level set's curvature does the rest: nothing else knows the angle. Written as the first wall's
+    //wetting for all the depth, and then what the others' differ from it by, which is nothing where the walls are alike
+    __device__ float pastWall(float image, int3 t, const WallWetting& wetting) const{
+        int3 g = global(t);
+        int at[3] = {g.x, g.y, g.z}, size[3] = {domainVoxels.x, domainVoxels.y, domainVoxels.z};
+        float first = 0.0f, others = 0.0f;
+        bool past = false;
+        #pragma unroll
+        for(int axis = 0; axis < 3; ++axis){
+            if(at[axis] < 0 || at[axis] >= size[axis]){
+                float cosine = wetting.cosine[2*axis + (at[axis] >= size[axis])];
+                first = past ? first : cosine;
+                past = true;
+                others += (at[axis] < 0 ? -0.5f - at[axis] : at[axis] + 0.5f - size[axis])*(cosine - first);
+            }
+        }
+        return image - 2.0f*pastWalls(t)*first - 2.0f*others;
     }
 
     //for a slot past the domain's walls: the slot of its mirror image inside them, voxel for voxel

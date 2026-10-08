@@ -227,19 +227,22 @@ __device__ inline bool isWallVoxel(uint cell, int slot, int voxels1D, int apronC
 }
 
 //the slot whose dim face a particle reads in place of voxel's: a face inside a wall reads its mirror image in the domain, reversed (sign) when it's the
-//wall's normal component, so that's 0 on the wall itself, and times along when tangential: 1, as is, so walls don't drag, down to -1 for a liquid
-//viscous enough to hold to them (Particles::wallStick), which puts 0 on the wall for those too. origin is the block's first voxel in domain coordinates
-__device__ inline int mirroredSlot(int3 voxel, int dim, int3 origin, int3 domainVoxels, int voxels1D, float along, float& sign){
+//wall's normal component, so that's 0 on the wall itself, and times that wall's along when tangential (WallStick::along, in the neighbours' order): 1,
+//as is, so the wall doesn't drag, down to -1 for one that holds what's on it, which puts 0 on the wall for those too. origin is the block's first
+//voxel in domain coordinates. across says whether the face is in or past a wall along dim itself: -1 the lower one, 1 the upper, 0 neither
+__device__ inline int mirroredSlot(int3 voxel, int dim, int3 origin, int3 domainVoxels, int voxels1D, const float* along, float& sign, int& across){
     int local[3] = {voxel.x, voxel.y, voxel.z};
     int start[3] = {origin.x, origin.y, origin.z};
     int size[3] = {domainVoxels.x, domainVoxels.y, domainVoxels.z};
+    across = 0;
     #pragma unroll
     for(int axis = 0; axis < 3; ++axis){
         int global = start[axis] + local[axis];
         int tangential = axis != dim;   //a dim face sits on a voxel boundary along dim, and mid-voxel along the other axes
         if(global < 0 || global >= size[axis]){
             local[axis] += (global < 0 ? -2*global : 2*(size[axis] - global)) - tangential;
-            sign = tangential ? along*sign : -sign;
+            sign = tangential ? along[2*axis + (global >= size[axis])]*sign : -sign;
+            across = tangential ? across : global < 0 ? -1 : 1;
         }
     }
     return local[0] + local[1]*voxels1D + local[2]*voxels1D*voxels1D;
@@ -939,6 +942,10 @@ void Particles::generateVoxels(){
     if(twoPhase.escaping() || whitewater.on){   //what escaping particles and the whitewater are judged by
         liquidShare.resizeAsync(numUsedVoxels, stream);
     }
+    if(lettingGo()){    //which voxels boundaries have let go of, a solve at a time (boundaries.cu)
+        letGo.resizeAsync(numUsedVoxels, stream);
+        heldCodes.resizeAsync(numUsedVoxels, stream);
+    }
     p.zeroDeviceAsync(stream);
 
     for(CudaVec<uint>* lower : {&neighborNx, &neighborNy, &neighborNz}){   //air voxels' lower neighbours: NO_VOXEL unless an unknown below claims them
@@ -981,31 +988,44 @@ static AffineVelocities affineVelocities(CudaVec<float> (&affine)[9]){
     return out;
 }
 
-//P2G: a block per node and a thread per particle. Each particle adds its momentum and weight on the 27 faces of each component around it into the
-//node's voxel block in shared memory, and 1 to the count of the voxel holding it; then each voxel the node stores adds the block's sums into its owner.
-//It sums in 32-bit fixed point, as sm_86 has native shared integer atomics but not float ones. 7 ints per slot: 14 KB for an 8^3 block. The owners'
-//sums stay fixed point too, in the float arrays' storage: integers add up the same in any order, so the result doesn't depend on which node gets there
-//first. normalizeVoxelVelocities turns them into floats. With APIC, each face takes the particle's velocity carried out to it along its gradient,
-//v + c.(x_face - x). With two PHASES (TwoPhase, particles.hu), a particle weighs as much as its fluid, air's being airMass of the liquid's: the momentum
-//and the weights are then each face's momentum and mass, so the velocity they give is the two fluids' together, and three more sums a slot keep the
-//liquid's weights alone: what's left of a face's mass is its air's, so how much of the face is liquid is exact, and so is whether either fluid
-//reaches it at all (10 ints per slot: 20 KB)
+//P2G: a block per node and a thread per particle. Each particle adds its weight and its momentum on the 27 faces of each component around it into
+//the node's voxel block in shared memory, and 1 to the count of the voxel holding it; then each voxel the node stores adds the block's sums into its
+//owner. It sums in fixed point, as sm_86 has native shared integer atomics but not float ones, and integers add up the same in any order, so the
+//result doesn't depend on which node gets there first.
+//A particle's share of a face's weight is a whole number of units (weightScale to a weight of 1), and its share of the face's momentum is that many
+//times its velocity there, in whole units too (velocityScale to 1 m/s: 2^MOMENTUM_DIGIT to the fastest there is). So a face's momentum over its
+//weight is the mean of its particles' velocities, each by its share, exactly, however little of any of them reaches it; and a share too small to
+//be a unit adds to neither. (Each was rounded on its own once, the momentum from the weight unrounded. A face at the edge of a particle's reach
+//then held a few units of each, and their ratio was anything from nothing to the fastest velocity there is: round a ball moving all at one
+//velocity, faces were off by a third of it, the pressure solve took that for divergence, and the ball lost a thousandth of its speed a substep.)
+//The products take 64 bits, and the shared atomics that are native are 32: so each sum is two words, the product's low half added to the low
+//one, and its high half to the high one with the carry, which the add that wrapped the low word knows it made, by what it found there. Per slot,
+//3 such sums, and 4 ints, the weights and the count: 20 KB for an 8^3 block. The owners' sums are 32-bit, in the float arrays' storage: the
+//momentum's as two digits, the low MOMENTUM_DIGIT bits of each block's sum (low) and the rest of it (ux, uy, uz). No more than 8 blocks reach a
+//voxel, so neither digit can run over. normalizeVoxelVelocities turns them into floats.
+//With APIC, each face takes the particle's velocity carried out to it along its gradient, v + c.(x_face - x). With two PHASES (TwoPhase,
+//particles.hu), a particle weighs as much as its fluid, air's being airMass of the liquid's: the momentum and the weights are then each face's
+//momentum and mass, so the velocity they give is the two fluids' together, and three more sums a slot keep the liquid's weights alone: what's left
+//of a face's mass is its air's, so how much of the face is liquid is exact, and so is whether either fluid reaches it at all (26 KB)
 template<bool APIC, bool PHASES>
 __global__ void scatterParticleVelsToVoxels(uint numParticleNodes, uint numParticles, uint numVoxels1D, const uint* gridNodeIndicesToFirstParticleIndex, const uint* gridPosition,
                                             const double* px, const double* py, const double* pz, const float* vx, const float* vy, const float* vz,
                                             AffineVelocities affine, float voxelSize,
                                             const uint* numVoxelsEachNode, const uint* voxelIDs, const uint* voxelOwners,
-                                            int* ux, int* uy, int* uz, int* weightsX, int* weightsY, int* weightsZ, int* particleCounts, float momentumScale, float weightScale, double radius, Grid grid, uint refinementLevel,
+                                            int* ux, int* uy, int* uz, unsigned int* lowX, unsigned int* lowY, unsigned int* lowZ, int* weightsX, int* weightsY, int* weightsZ, int* particleCounts,
+                                            float velocityScale, float weightScale, double radius, Grid grid, uint refinementLevel,
                                             const uint* ids, float airMass, int* liquidX, int* liquidY, int* liquidZ){
-    extern __shared__ int fixedSums[];    //per slot: x, y, z momentum, then x, y, z weight, then particle count; with PHASES, then the liquid's x, y, z weight
-    const int SUMS = PHASES ? 10 : 7;
+    extern __shared__ long long blockSums[];    //per slot: x, y, z momentum; then, as ints, x, y, z weight and the particle count, and with PHASES the liquid's x, y, z weight
+    const int SUMS = PHASES ? 7 : 4;
     int voxels1D = numVoxels1D;
     int voxels3D = voxels1D*voxels1D*voxels1D;
+    unsigned int* momentum = (unsigned int*)blockSums;      //each sum's low word, then its high one
+    int* fixedSums = (int*)(blockSums + 3*voxels3D);
     int apronCells = floor(radius);
     uint firstParticle = gridNodeIndicesToFirstParticleIndex[blockIdx.x];
     uint lastParticle = blockIdx.x == numParticleNodes - 1 ? numParticles : gridNodeIndicesToFirstParticleIndex[blockIdx.x + 1];
-    for(int i = threadIdx.x; i < SUMS*voxels3D; i += blockDim.x){
-        fixedSums[i] = 0;
+    for(int i = threadIdx.x; i < (6 + SUMS)*voxels3D; i += blockDim.x){
+        ((int*)blockSums)[i] = 0;
     }
     __syncthreads();
     const float* velocities[3] = {vx, vy, vz};
@@ -1027,6 +1047,7 @@ __global__ void scatterParticleVelsToVoxels(uint numParticleNodes, uint numParti
             const Spline3& y = stencil.axis(dim, 1);
             const Spline3& z = stencil.axis(dim, 2);
             float velocity = velocities[dim][index];
+            int units = __float2int_rn(velocity*velocityScale);     //the velocity it gives a face, in whole units: with APIC, each face's own
             float slope[3], start[3];   //APIC: the component's change per voxel along each axis, and the stencil's first face from the particle, in voxels
             if constexpr(APIC){
                 float q[3] = {pos.x, pos.y, pos.z};
@@ -1048,30 +1069,35 @@ __global__ void scatterParticleVelsToVoxels(uint numParticleNodes, uint numParti
                     }
                     #pragma unroll
                     for(int i = 0; i < 3; ++i){
-                        float weight = x.w[i]*yz;
-                        float faceVelocity = rowVelocity;
-                        if constexpr(APIC){
-                            faceVelocity += slope[0]*(start[0] + i);
-                        }
-                        if constexpr(PHASES){
-                            atomicAdd(fixedSums + dim*voxels3D + rowStart + i, __float2int_rn(weight*mass*faceVelocity*momentumScale));
-                            atomicAdd(fixedSums + (3 + dim)*voxels3D + rowStart + i, __float2int_rn(weight*mass*weightScale));
-                            if(liquid){     //its mass is 1, so this is the very number its mass just added
-                                atomicAdd(fixedSums + (7 + dim)*voxels3D + rowStart + i, __float2int_rn(weight*weightScale));
+                        int share = __float2int_rn(x.w[i]*yz*mass*weightScale);
+                        if(share != 0){
+                            if constexpr(APIC){
+                                units = __float2int_rn((rowVelocity + slope[0]*(start[0] + i))*velocityScale);
                             }
-                        }
-                        else{
-                            atomicAdd(fixedSums + dim*voxels3D + rowStart + i, __float2int_rn(weight*faceVelocity*momentumScale));
-                            atomicAdd(fixedSums + (3 + dim)*voxels3D + rowStart + i, __float2int_rn(weight*weightScale));
+                            atomicAdd(fixedSums + dim*voxels3D + rowStart + i, share);
+                            long long product = (long long)share*units;
+                            unsigned int low = (unsigned int)product;
+                            unsigned int* words = momentum + 2*(dim*voxels3D + rowStart + i);
+                            int high = (int)(product >> 32) + (atomicAdd(words, low) + low < low);     //and the carry, if this wrapped the low word
+                            if(high != 0){
+                                atomicAdd((int*)words + 1, high);
+                            }
+                            if constexpr(PHASES){
+                                if(liquid){     //its mass is 1, so its share of the liquid's weight is its share of the mass
+                                    atomicAdd(fixedSums + (4 + dim)*voxels3D + rowStart + i, share);
+                                }
+                            }
                         }
                     }
                 }
             }
         }
-        atomicAdd(fixedSums + 6*voxels3D + (int)pos.x + (int)pos.y*voxels1D + (int)pos.z*voxels1D*voxels1D, 1);
+        atomicAdd(fixedSums + 3*voxels3D + (int)pos.x + (int)pos.y*voxels1D + (int)pos.z*voxels1D*voxels1D, 1);
     }
     __syncthreads();
-    int* accumulators[10] = {ux, uy, uz, weightsX, weightsY, weightsZ, particleCounts, liquidX, liquidY, liquidZ};
+    int* accumulators[7] = {weightsX, weightsY, weightsZ, particleCounts, liquidX, liquidY, liquidZ};
+    int* high[3] = {ux, uy, uz};
+    unsigned int* low[3] = {lowX, lowY, lowZ};
     for(uint i = (blockIdx.x == 0 ? 0 : numVoxelsEachNode[blockIdx.x - 1]) + threadIdx.x; i < numVoxelsEachNode[blockIdx.x]; i += blockDim.x){    //coalesced over the node's voxels
         int slot = voxelIDs[i];
         uint owner = voxelOwners[i];    //itself for interior voxels, so these atomics are mostly consecutive
@@ -1080,6 +1106,14 @@ __global__ void scatterParticleVelsToVoxels(uint numParticleNodes, uint numParti
             int value = fixedSums[sum*voxels3D + slot];
             if(value != 0){
                 atomicAdd(accumulators[sum] + owner, value);
+            }
+        }
+        #pragma unroll
+        for(int dim = 0; dim < 3; ++dim){
+            long long value = blockSums[dim*voxels3D + slot];
+            if(value != 0){     //as two digits: value is the high one times 2^MOMENTUM_DIGIT, plus the low one, which is never negative
+                atomicAdd(low[dim] + owner, (unsigned int)(value & ((1LL << MOMENTUM_DIGIT) - 1)));
+                atomicAdd(high[dim] + owner, (int)(value >> MOMENTUM_DIGIT));
             }
         }
     }
@@ -1150,7 +1184,9 @@ double Particles::getCourantDt(){
 }
 
 void Particles::particleVelToVoxels(){
-    for(CudaVec<float>* accumulator : {&voxelsUx, &voxelsUy, &voxelsUz, &voxelWeightsX, &voxelWeightsY, &voxelWeightsZ, &particleCounts}){
+    //the voxels' sums: the momentum's in two arrays a component, its high digits where the velocities will be and its low ones where FLIP's old
+    //velocities go once there are any (scatterParticleVelsToVoxels)
+    for(CudaVec<float>* accumulator : {&voxelsUx, &voxelsUy, &voxelsUz, &voxelsUxOld, &voxelsUyOld, &voxelsUzOld, &voxelWeightsX, &voxelWeightsY, &voxelWeightsZ, &particleCounts}){
         accumulator->zeroDeviceAsync(stream);
     }
     float voxelSize = grid.cellSize / (2<<refinementLevel);
@@ -1178,9 +1214,10 @@ void Particles::particleVelToVoxels(){
     float accelerated;
     memcpy(&accelerated, &accelerationFound, sizeof(accelerated));
     maxAcceleration = context->maxOverPartitions(accelerated);
-    //P2G sums in fixed point: a face's weight sum is about the particles per voxel, so budget 128 (15x rest) and keep every sum under 2^30
+    //P2G sums in fixed point: a face's weight sum is about the particles per voxel, so budget 128 (15x rest) and keep every sum under 2^30. And
+    //velocities in units of the fastest there is over 2^MOMENTUM_DIGIT: a face's momentum, the weights' units times those, is then under 2^58
     float weightScale = (1 << 30) / 128.0f;
-    float momentumScale = weightScale / fmax(transferred, 1e-6);
+    float velocityScale = (float)((1 << MOMENTUM_DIGIT) / fmax(transferred, 1e-6));
     bool phases = twoPhase.on;     //air and liquid: each particle weighs as its fluid does, and the liquid's weights are kept beside the masses
     if(phases){
         liquidWeightUnit = 1.0f / weightScale;
@@ -1191,13 +1228,14 @@ void Particles::particleVelToVoxels(){
     if(numParticleNodes > 0){
         auto scatter = phases ? (apic ? scatterParticleVelsToVoxels<true, true> : scatterParticleVelsToVoxels<false, true>)
                               : (apic ? scatterParticleVelsToVoxels<true, false> : scatterParticleVelsToVoxels<false, false>);
-        scatter<<<numParticleNodes, NODE_THREADS, (phases ? 10 : 7)*sizeof(int)*numVoxelsPerNode, stream>>>(numParticleNodes, size, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(),
+        scatter<<<numParticleNodes, NODE_THREADS, (3*sizeof(long long) + (phases ? 7 : 4)*sizeof(int))*numVoxelsPerNode, stream>>>(numParticleNodes, size, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(),
             affineVelocities(affine), voxelSize, nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(), voxelOwners.devPtr(), (int*)voxelsUx.devPtr(), (int*)voxelsUy.devPtr(), (int*)voxelsUz.devPtr(),
-            (int*)voxelWeightsX.devPtr(), (int*)voxelWeightsY.devPtr(), (int*)voxelWeightsZ.devPtr(), (int*)particleCounts.devPtr(), momentumScale, weightScale, radius, grid, refinementLevel,
+            (unsigned int*)voxelsUxOld.devPtr(), (unsigned int*)voxelsUyOld.devPtr(), (unsigned int*)voxelsUzOld.devPtr(),
+            (int*)voxelWeightsX.devPtr(), (int*)voxelWeightsY.devPtr(), (int*)voxelWeightsZ.devPtr(), (int*)particleCounts.devPtr(), velocityScale, weightScale, radius, grid, refinementLevel,
             particleIds.devPtr(), 1.0f / twoPhase.densityRatio, (int*)liquidWeights[0].devPtr(), (int*)liquidWeights[1].devPtr(), (int*)liquidWeights[2].devPtr());
     }
     //particles near this partition's edge reach into ghost voxels: their owners add those sums in, which in fixed point come out the same in any order
-    for(CudaVec<float>* accumulator : {&voxelsUx, &voxelsUy, &voxelsUz, &voxelWeightsX, &voxelWeightsY, &voxelWeightsZ, &particleCounts}){
+    for(CudaVec<float>* accumulator : {&voxelsUx, &voxelsUy, &voxelsUz, &voxelsUxOld, &voxelsUyOld, &voxelsUzOld, &voxelWeightsX, &voxelWeightsY, &voxelWeightsZ, &particleCounts}){
         context->reduceGhosts((int*)accumulator->devPtr(), stream);
     }
     if(phases){
@@ -1206,7 +1244,7 @@ void Particles::particleVelToVoxels(){
             context->fillGhosts(liquid.devPtr(), stream);   //as bits: they stay fixed point
         }
     }
-    cudaNormalizeVoxelVelocities(solids, voxelWeightsX, voxelWeightsY, voxelWeightsZ, voxelsUx, voxelsUy, voxelsUz, particleCounts, momentumScale, weightScale, stream);
+    cudaNormalizeVoxelVelocities(solids, voxelWeightsX, voxelWeightsY, voxelWeightsZ, voxelsUx, voxelsUy, voxelsUz, voxelsUxOld, voxelsUyOld, voxelsUzOld, particleCounts, velocityScale, weightScale, stream);
     for(CudaVec<float>* field : {&voxelsUx, &voxelsUy, &voxelsUz, &voxelWeightsX, &voxelWeightsY, &voxelWeightsZ, &particleCounts}){   //and the ghosts take the totals
         context->fillGhosts(field->devPtr(), stream);
     }
@@ -1269,10 +1307,13 @@ void Particles::pressureSolve(){
     addObstacleFlux();      //what obstacles' surfaces make of the flow through the faces they cut or close
     addSurfaceDivergence(correctionRate);   //sharp: the surface tension's pressure, and spreading what's packed near the surface
     balanceSealedPockets(); //and fluid no air reaches can't change its volume
-    cudaGetA(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, dt/(density*voxelSize*voxelSize), stream);
-    weighCutCells(dt/(density*voxelSize*voxelSize));      //the faces obstacles cut weigh as much as they're open
-    weighSurfaceFaces(dt/(density*voxelSize*voxelSize));  //sharp, the liquid's faces to air as near as the surface is
-    weighDensityFaces(dt/(density*voxelSize*voxelSize));  //two phases, every face as light as what's on it
+    auto assemble = [&](){
+        cudaGetA(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, dt/(density*voxelSize*voxelSize), stream);
+        weighCutCells(dt/(density*voxelSize*voxelSize));      //the faces obstacles cut weigh as much as they're open
+        weighSurfaceFaces(dt/(density*voxelSize*voxelSize));  //sharp, the liquid's faces to air as near as the surface is
+        weighDensityFaces(dt/(density*voxelSize*voxelSize));  //two phases, every face as light as what's on it
+    };
+    assemble();
     gpuErrchk(cudaPeekAtLastError());
     uint interiorWidth = numVoxels1D - 2*(uint)std::floor(radius);
     uint3 domainVoxels = make_uint3(grid.sizeX*interiorWidth, grid.sizeY*interiorWidth, grid.sizeZ*interiorWidth);
@@ -1308,14 +1349,44 @@ void Particles::pressureSolve(){
         solveFailure = message.str();
         return false;
     };
+    //With boundaries that let go of the liquid (boundaries.cu), a solve is done once none of their voxels is left pulled on, or let go and squeezed.
+    //The voxels the solve leaves pulled on, that air can reach, are let go; sweeps of relaxation hold again the ones that letting go of the others
+    //leaves pressed on, and the rest are solved for. If that leaves any of those let go squeezed they're held, and it's swept and solved again,
+    //until a solve leaves none. Without such boundaries, or where none pulls on anything, it's the one solve
+    auto settled = [&](){
+        holdEverything();
+        if(!solved()){
+            return false;
+        }
+        if(!lettingGo() || !letGoOfSuction()){
+            return true;
+        }
+        for(bool more = true; more;){
+            relaxLetGo();
+            followLetGo();
+            if(!solved()){
+                takeHoldAgain();
+                return false;
+            }
+            more = holdSqueezed();
+            if(more){   //the equations whole again, for the sweeps
+                unknownsAgain();
+                assemble();
+            }
+        }
+        return true;
+    };
     //Viscosity goes between two solves: the first gives the flow the forces drive once the pressure has answered them, the viscous step acts on that,
     //and the solve below takes out what divergence it leaves. Straight after the forces it would see gravity but not the pressure gradient that turns
     //gravity into a puddle spreading, which would then go on unresisted, as if the floor were slippery
     if(viscosity > 0.0){
-        if(!solved()){
+        if(!settled()){
             return;
         }
         cudaVelocityUpdate(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, p, voxelsUx, voxelsUy, voxelsUz, dt/(density*voxelSize*voxelSize), stream);
+        if(takeHoldAgain()){    //the equations are whole again for the solve below
+            assemble();
+        }
         correctSurfaceFaces();
         lightenFaceUpdates(dt/(density*voxelSize*voxelSize));   //two phases, as updateVoxelVelocities has it: the viscous step acts on the flow the first solve leaves
         p.zeroDeviceAsync(stream);
@@ -1325,7 +1396,7 @@ void Particles::pressureSolve(){
         addSurfaceDivergence(correctionRate);
         balanceSealedPockets();
     }
-    if(!solved()){
+    if(!settled()){
         return;
     }
     elapsedTime += dt;
@@ -1347,12 +1418,20 @@ void Particles::updateVoxelVelocities(){
     double voxelSize = grid.cellSize / (2<<refinementLevel);
     cudaVelocityUpdate(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, p, voxelsUx, voxelsUy, voxelsUz, dt/(0.014*voxelSize*voxelSize), stream);
     gpuErrchk(cudaPeekAtLastError());
+    bool released = takeHoldAgain();    //the voxels boundaries let go of are the liquid's again
     correctSurfaceFaces();      //sharp, the liquid's faces to air with the ghost pressure past them
     lightenFaceUpdates(dt/(0.014*voxelSize*voxelSize));     //two phases, each face pushed as its own density lets the pressure push it
     extendLiquidVelocities();   //and the faces around the liquid that particles read carry its velocity on
     pinEmitterVelocities();     //an emitter's fluid leaves at its velocity, whatever the solve made of it
     mixObstacleFaces(voxelsUx, voxelsUy, voxelsUz);         //the faces obstacles cut carry what crosses them all told, not the open part's alone
     obstacleGhostVelocities(voxelsUx, voxelsUy, voxelsUz);  //the faces between fluid and obstacles take the obstacles' velocity across them; the faces inside continue the fluid's
+    if(released && obstacles.lettingGo()){  //but the liquid's, where an obstacle let go of it; and in FLIP's old velocities, set before the solve said where
+        carryLetGoFaces(voxelsUx, voxelsUy, voxelsUz);
+        carryLetGoFaces(voxelsUxOld, voxelsUyOld, voxelsUzOld);
+        for(CudaVec<float>* velocity : {&voxelsUxOld, &voxelsUyOld, &voxelsUzOld}){
+            context->fillGhosts(velocity->devPtr(), stream);
+        }
+    }
     for(CudaVec<float>* velocity : {&voxelsUx, &voxelsUy, &voxelsUz}){   //G2P and advection read ghost faces
         context->fillGhosts(velocity->devPtr(), stream);
     }
@@ -1388,26 +1467,32 @@ __device__ inline void largestInBlock(unsigned int bits, unsigned int* warpLarge
 //With two PHASES (TwoPhase, particles.hu) the air's particles blend at their own ratio, and with escaping particles (share not nullptr) each is judged
 //here first, by the liquid's share where it is (shareAround, from the voxels' shares, which the block holds with the faces): a particle on the wrong
 //side of the interface escapes, or one back on the right side is the grid's again. An escaped one, as it's judged, keeps the velocity it has: the
-//grid's change isn't its own, and its flight through the substep is flyEscaped's. And the walls' hold on a viscous liquid (alongWalls) is its own
-//particles' alone, as air has no viscosity here: the faces inside the
-//walls mirror what's in the domain as it is, and each liquid particle weighs the ones past a wall, along an axis they're tangential to, by alongWalls
-//itself. That's what the mirror would have made of them: its factor is one per axis, as a face's weight is. A template, so that without them the
-//kernel is the one it always was
+//grid's change isn't its own, and its flight through the substep is flyEscaped's. And the walls' hold is each fluid's own (stick the liquid's,
+//airStick the air's: a viscous liquid holds to them and air, with no viscosity here, only as far as their friction holds it): the faces inside the
+//walls mirror what's in the domain as it is, and each particle weighs the ones past a wall, along an axis they're tangential to, by what its own
+//fluid's mirror would have carried there. That's what that mirror would have made of them: its factor is one per axis, as a face's weight is. A
+//template, so that without them the kernel is the one it always was.
+//Where a wall has let go of a voxel this substep (letGo, boundaries.cu; nullptr with no such walls) the wall isn't holding the liquid there, and
+//its faces don't either: the wall's own face and the ones past it carry on the liquid's velocity across it, the last face inside's, as the faces
+//past the liquid's surface do, in place of the image reversed. Reversed, a particle a quarter of a voxel from a ceiling that had let go took a
+//quarter of what the grid gave the liquid under it, and the liquid's top layer left a third of a second after the rest
 template<bool APIC, bool PHASES>
 __global__ void gatherVoxelVelsToParticles(uint numParticleNodes, uint numParticles, uint numVoxels1D, const uint* gridNodeIndicesToFirstParticleIndex, const uint* gridPosition,
                                             double* px, double* py, double* pz, float* vx, float* vy, float* vz, AffineVelocities affine, float voxelSize,
                                             const uint* numVoxelsEachNode, const uint* voxelIDs, const uint* voxelOwners, const char* solids,
                                             const float* ux, const float* uy, const float* uz, const float* oldUx, const float* oldUy, const float* oldUz,
-                                            float flipRatio, float alongWalls, double radius, Grid grid, uint refinementLevel,
+                                            float flipRatio, WallStick stick, WallStick airStick, double radius, Grid grid, uint refinementLevel,
                                             uint* ids, float airFlipRatio, const float* share,      //two phases; else ids is null
-                                            const float* births, float bornSince, float perSecond, unsigned int* largestChange){    //the most the velocity of any particle
+                                            const float* births, float bornSince, float perSecond, unsigned int* largestChange,     //the most the velocity of any particle
                                             //from before this substep changes by, per second, as a float's bits: one born in it (an emitter's, the band's air)
                                             //starts at its own velocity and takes the grid's, which isn't an acceleration
-    extern __shared__ float blockVelocities[];  //per slot: new x, y, z, then old x, y, z; with PHASES, then the liquid's share of the voxel
+                                            const char* letGo){
+    extern __shared__ float blockVelocities[];  //per slot: new x, y, z, then old x, y, z; with PHASES, then the liquid's share of the voxel; then, a byte a slot, whether a wall let go of it
     __shared__ unsigned int warpLargest[NODE_THREADS / 32];
     const int PLANES = PHASES ? 7 : 6;
     int voxels1D = numVoxels1D;
     int voxels3D = voxels1D*voxels1D*voxels1D;
+    char* gone = (char*)(blockVelocities + PLANES*voxels3D);
     int apronCells = floor(radius);
     uint firstParticle = gridNodeIndicesToFirstParticleIndex[blockIdx.x];
     uint lastParticle = blockIdx.x == numParticleNodes - 1 ? numParticles : gridNodeIndicesToFirstParticleIndex[blockIdx.x + 1];
@@ -1416,6 +1501,11 @@ __global__ void gatherVoxelVelsToParticles(uint numParticleNodes, uint numPartic
     const float* velocities[6] = {ux, uy, uz, oldUx, oldUy, oldUz};
     for(int i = threadIdx.x; i < PLANES*voxels3D; i += blockDim.x){   //every face a particle reaches is stored, but never leave garbage to read; a share
         blockVelocities[i] = PHASES && i >= 6*voxels3D ? nanf("") : 0.0f;   //no voxel holds is unknown (shareAround), not air
+    }
+    if(letGo != nullptr){
+        for(int i = threadIdx.x; i < voxels3D; i += blockDim.x){
+            gone[i] = 0;
+        }
     }
     __syncthreads();
     for(uint i = startVoxel + threadIdx.x; i < endVoxel; i += blockDim.x){  //coalesced over the node's voxels
@@ -1430,12 +1520,37 @@ __global__ void gatherVoxelVelsToParticles(uint numParticleNodes, uint numPartic
                 blockVelocities[6*voxels3D + slot] = share[owner];
             }
         }
+        if(letGo != nullptr){
+            gone[slot] = letGo[owner];
+        }
     }
     __syncthreads();
     uint cell = gridPosition[firstParticle];
     int interiorWidth = voxels1D - 2*apronCells;
     int3 origin = make_int3((int)(cell % grid.sizeX)*interiorWidth - apronCells, (int)(cell / grid.sizeX % grid.sizeY)*interiorWidth - apronCells, (int)(cell / (grid.sizeX*grid.sizeY))*interiorWidth - apronCells);
     int3 domainVoxels = make_int3(grid.sizeX*interiorWidth, grid.sizeY*interiorWidth, grid.sizeZ*interiorWidth);
+    const int strides[3] = {1, voxels1D, voxels1D*voxels1D};
+    const int first[3] = {origin.x, origin.y, origin.z}, size[3] = {domainVoxels.x, domainVoxels.y, domainVoxels.z};
+    float along[6];     //what the images past each wall carry of the faces inside it, along it
+    #pragma unroll
+    for(int wall = 0; wall < 6; ++wall){
+        along[wall] = PHASES ? 1.0f : stick.along(wall);
+    }
+    if(letGo != nullptr){   //a voxel a lower wall has let go of: its own face there is the wall's, and takes the face's across it from it
+        for(uint i = startVoxel + threadIdx.x; i < endVoxel; i += blockDim.x){
+            int slot = voxelIDs[i];
+            if(gone[slot] && !solids[i]){
+                #pragma unroll
+                for(int dim = 0; dim < 3; ++dim){
+                    if(first[dim] + slot / strides[dim] % voxels1D == 0){
+                        blockVelocities[dim*voxels3D + slot] = blockVelocities[dim*voxels3D + slot + strides[dim]];
+                        blockVelocities[(3 + dim)*voxels3D + slot] = blockVelocities[(3 + dim)*voxels3D + slot + strides[dim]];
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
     //Every wall face's mirror image is read before any is written: a face in a wall's upper plane is its own mirror image, and a corner voxel's mirror
     //image can be one of those, which another thread may be writing meanwhile. (P2G leaves walls' faces at rest, so that face is 0 either way, but
     //read as it goes it would come out +0 or -0 by timing, and the frames' bits with it)
@@ -1449,7 +1564,15 @@ __global__ void gatherVoxelVelsToParticles(uint numParticleNodes, uint numPartic
             #pragma unroll
             for(int dim = 0; dim < 3; ++dim){
                 float sign = 1.0f;
-                int source = mirroredSlot(voxel, dim, origin, domainVoxels, voxels1D, PHASES ? 1.0f : alongWalls, sign);
+                int across;
+                int source = mirroredSlot(voxel, dim, origin, domainVoxels, voxels1D, along, sign, across);
+                if(letGo != nullptr && across != 0){    //in or past a wall along its own component: whether the wall has let go of the voxel on it there
+                    int beside = source + ((across < 0 ? 0 : size[dim] - 1) - first[dim] - source / strides[dim] % voxels1D)*strides[dim];
+                    if(gone[beside]){
+                        sign = -sign;       //the liquid's velocity carried on, not reversed
+                        source = source == slot ? beside : source;  //and the upper wall's own plane, its own image, takes the last face inside
+                    }
+                }
                 images[k][dim] = sign*blockVelocities[dim*voxels3D + source];
                 images[k][3 + dim] = sign*blockVelocities[(3 + dim)*voxels3D + source];
             }
@@ -1492,16 +1615,14 @@ __global__ void gatherVoxelVelsToParticles(uint numParticleNodes, uint numPartic
                 ids[index] = id;
                 escaped = id & ESCAPED_PARTICLE;
             }
-            if(!(ids[index] & AIR_PARTICLE)){   //the walls' hold on the liquid, on the faces past them that this particle reads
-                const int first[3] = {origin.x, origin.y, origin.z}, size[3] = {domainVoxels.x, domainVoxels.y, domainVoxels.z};
+            const WallStick& held = ids[index] & AIR_PARTICLE ? airStick : stick;   //the walls' hold on its fluid, on the faces past them that this particle reads
+            #pragma unroll
+            for(int a = 0; a < 3; ++a){
                 #pragma unroll
-                for(int a = 0; a < 3; ++a){
-                    #pragma unroll
-                    for(int i = 0; i < 3; ++i){
-                        int voxel = first[a] + stencil.onCentres[a].base + i;
-                        if(voxel < 0 || voxel >= size[a]){
-                            stencil.onCentres[a].w[i] *= alongWalls;
-                        }
+                for(int i = 0; i < 3; ++i){
+                    int voxel = first[a] + stencil.onCentres[a].base + i;
+                    if(voxel < 0 || voxel >= size[a]){
+                        stencil.onCentres[a].w[i] *= held.along(2*a + (voxel >= size[a]));
                     }
                 }
             }
@@ -1572,21 +1693,29 @@ __global__ void advectParticlePositions(uint numParticles, double dt, double* po
 
 //An advection tile, into a block's shared memory: the interior of a node and its 26 neighbours', 3 nodes wide. Per component, each voxel's negative
 //face: past the walls, their faces at rest; inside, where nothing is stored or no particle reached, no velocity. Then, with share, each voxel's
-//share of liquid, and none (not 0: what isn't liquid is air) where no voxel is stored. Every thread of the block calls it, between two __syncthreads:
-//the one that neighborNodes is whole by, and the one the tile is
+//share of liquid, and none (not 0: what isn't liquid is air) where no voxel is stored. And where a wall has let go of a voxel this substep (letGo,
+//or nullptr), the wall's own face there takes the face's across the voxel from it, as G2P has it: the liquid's velocity carried on to the wall, in
+//place of rest, which a particle beside the wall would otherwise be moved by, the nearer the slower. Every thread of the block calls it, between
+//two __syncthreads: the one that neighborNodes is whole by, and the one the tile is
 __device__ inline void loadTile(float* tile, int interiorWidth, int3 tileOrigin, int3 domainVoxels, const uint* neighborNodes, uint numUsedGridNodes, const uint* interiorVoxels,
-                                const float* ux, const float* uy, const float* uz, const float* weightsX, const float* weightsY, const float* weightsZ, const float* share){
+                                const float* ux, const float* uy, const float* uz, const float* weightsX, const float* weightsY, const float* weightsZ, const float* share,
+                                const char* letGo){
     int tileWidth = 3*interiorWidth;
     int tileVoxels = tileWidth*tileWidth*tileWidth;
     const float* velocities[3] = {ux, uy, uz};
     const float* weights[3] = {weightsX, weightsY, weightsZ};
-    for(int t = threadIdx.x; t < tileVoxels; t += blockDim.x){
+    auto stored = [&](int t, int3& global){
         int x = t % tileWidth, y = t / tileWidth % tileWidth, z = t / (tileWidth*tileWidth);
-        int3 global = make_int3(tileOrigin.x + x, tileOrigin.y + y, tileOrigin.z + z);
+        global = make_int3(tileOrigin.x + x, tileOrigin.y + y, tileOrigin.z + z);
         bool inside = global.x >= 0 && global.y >= 0 && global.z >= 0 && global.x < domainVoxels.x && global.y < domainVoxels.y && global.z < domainVoxels.z;
         uint node = neighborNodes[x / interiorWidth + 3*(y / interiorWidth) + 9*(z / interiorWidth)];
-        uint voxel = inside && node < numUsedGridNodes ?
+        return inside && node < numUsedGridNodes ?
             interiorVoxels[node*interiorWidth*interiorWidth*interiorWidth + x % interiorWidth + (y % interiorWidth)*interiorWidth + (z % interiorWidth)*interiorWidth*interiorWidth] : NO_VOXEL;
+    };
+    for(int t = threadIdx.x; t < tileVoxels; t += blockDim.x){
+        int3 global;
+        uint voxel = stored(t, global);
+        bool inside = global.x >= 0 && global.y >= 0 && global.z >= 0 && global.x < domainVoxels.x && global.y < domainVoxels.y && global.z < domainVoxels.z;
         #pragma unroll
         for(int dim = 0; dim < 3; ++dim){
             tile[dim*tileVoxels + t] = !inside ? 0.0f : voxel != NO_VOXEL && weights[dim][voxel] > 0.0f ? velocities[dim][voxel] : nanf("");
@@ -1595,21 +1724,43 @@ __device__ inline void loadTile(float* tile, int interiorWidth, int3 tileOrigin,
             tile[3*tileVoxels + t] = voxel != NO_VOXEL ? share[voxel] : nanf("");
         }
     }
+    if(letGo != nullptr){
+        __syncthreads();
+        const int strides[3] = {1, tileWidth, tileWidth*tileWidth};
+        for(int t = threadIdx.x; t < tileVoxels; t += blockDim.x){
+            int3 global;
+            uint voxel = stored(t, global);
+            if(voxel == NO_VOXEL || !letGo[voxel]){
+                continue;
+            }
+            const int at[3] = {global.x, global.y, global.z}, size[3] = {domainVoxels.x, domainVoxels.y, domainVoxels.z};
+            #pragma unroll
+            for(int dim = 0; dim < 3; ++dim){
+                int along = t / strides[dim] % tileWidth;
+                if(at[dim] == 0 && along + 1 < tileWidth){          //on the lower wall: its own face is the wall's
+                    tile[dim*tileVoxels + t] = tile[dim*tileVoxels + t + strides[dim]];
+                }
+                if(at[dim] == size[dim] - 1 && along + 1 < tileWidth){  //on the upper one: the wall's is the next slot's
+                    tile[dim*tileVoxels + t + strides[dim]] = tile[dim*tileVoxels + t];
+                }
+            }
+        }
+    }
 }
 
 //moves each particle through the grid's new velocity field for the whole step: with Ralston's RK3 or straight along it (velocityThrough). A straight
 //step squeezes particles together where the flow stretches and spreads them where it turns, by an amount growing with dt^2, which clumps them at large
 //CFL; RK3 leaves that at dt^4. A block per node with particles: its interior and its 26 neighbours' go into shared memory, a tile 3 nodes wide, which
 //holds every trilinear sample RK3 takes up to CFL 4.
-//With two PHASES (ids says which fluid each particle is) the walls' hold, stick, is the liquid's particles' alone, as in G2P; and with escaping
-//particles an escaped one isn't the grid's to move: it's left where it is, for flyEscaped. A template, so that without them the kernel is the one it
-//always was
+//With two PHASES (ids says which fluid each particle is) the walls' hold is each fluid's own, stick the liquid's and airStick the air's, as in G2P;
+//and with escaping particles an escaped one isn't the grid's to move: it's left where it is, for flyEscaped. A template, so that without them the
+//kernel is the one it always was
 template<bool PHASES>
 __global__ void advectThroughGrid(uint numParticleNodes, uint numParticles, const uint* gridNodeIndicesToFirstParticleIndex, const uint* gridPosition,
                                   double* px, double* py, double* pz, float* vx, float* vy, float* vz, const uint* ids, bool escaping,
                                   uint numUsedGridNodes, const uint* nodeCells, const uint* cellToNode, const uint* interiorVoxels,
                                   const float* ux, const float* uy, const float* uz, const float* weightsX, const float* weightsY, const float* weightsZ,
-                                  float dt, bool rungeKutta3, float stick, Grid grid, uint refinementLevel){
+                                  float dt, bool rungeKutta3, WallStick stick, WallStick airStick, Grid grid, uint refinementLevel, const char* letGo){
     extern __shared__ float tile[];     //per component, the tile's voxels' negative faces
     __shared__ uint neighborNodes[27];
     int interiorWidth = 2<<refinementLevel;
@@ -1621,20 +1772,20 @@ __global__ void advectThroughGrid(uint numParticleNodes, uint numParticles, cons
     int3 domainVoxels = make_int3(grid.sizeX*interiorWidth, grid.sizeY*interiorWidth, grid.sizeZ*interiorWidth);
     int3 tileOrigin = make_int3(((int)(cell % grid.sizeX) - 1)*interiorWidth, ((int)(cell / grid.sizeX % grid.sizeY) - 1)*interiorWidth, ((int)(cell / (grid.sizeX*grid.sizeY)) - 1)*interiorWidth);
     __syncthreads();
-    loadTile(tile, interiorWidth, tileOrigin, domainVoxels, neighborNodes, numUsedGridNodes, interiorVoxels, ux, uy, uz, weightsX, weightsY, weightsZ, nullptr);
+    loadTile(tile, interiorWidth, tileOrigin, domainVoxels, neighborNodes, numUsedGridNodes, interiorVoxels, ux, uy, uz, weightsX, weightsY, weightsZ, nullptr, letGo);
     __syncthreads();
     float voxelSize = grid.cellSize / interiorWidth;
     float step = dt / voxelSize;    //turns a velocity into voxels moved this step
     for(uint index = firstParticle + threadIdx.x; index < lastParticle; index += blockDim.x){
-        float held = stick;
+        bool air = false;
         if constexpr(PHASES){
             if(escaping && (ids[index] & ESCAPED_PARTICLE)){
                 continue;
             }
-            held = ids[index] & AIR_PARTICLE ? 0.0f : stick;
+            air = ids[index] & AIR_PARTICLE;
         }
         float3 point = make_float3((px[index] - grid.negX)/voxelSize - tileOrigin.x, (py[index] - grid.negY)/voxelSize - tileOrigin.y, (pz[index] - grid.negZ)/voxelSize - tileOrigin.z);
-        float3 velocity = velocityThrough(tile, tileWidth, point, tileOrigin, domainVoxels, make_float3(vx[index], vy[index], vz[index]), step, rungeKutta3, held);
+        float3 velocity = velocityThrough(tile, tileWidth, point, tileOrigin, domainVoxels, make_float3(vx[index], vy[index], vz[index]), step, rungeKutta3, air ? airStick : stick);
         px[index] += dt*velocity.x;
         py[index] += dt*velocity.y;
         pz[index] += dt*velocity.z;
@@ -1696,7 +1847,7 @@ __device__ inline bool entersOwnFluid(const float* share, int tileWidth, int3 ti
 //particle is: held on the wall's plane instead, it would stay there once it's the grid's again, since the grid's velocity into a wall is 0 on it,
 //and the liquid stacks up along the walls and their edges
 __device__ inline float flyEscapedParticle(uint index, double* px, double* py, double* pz, float* vx, float* vy, float* vz, bool air, const float* tile, int tileWidth,
-                                           int3 tileOrigin, int3 domainVoxels, Grid grid, float voxelSize, float dt, float stick, const EscapedFlight& flight){
+                                           int3 tileOrigin, int3 domainVoxels, Grid grid, float voxelSize, float dt, const WallStick& stick, const EscapedFlight& flight){
     double* position[3] = {px, py, pz};
     float* own[3] = {vx, vy, vz};
     double low[3] = {grid.negX, grid.negY, grid.negZ};
@@ -1769,7 +1920,7 @@ __global__ void flyEscaped(uint numParticleNodes, uint numParticles, const uint*
                            uint numUsedGridNodes, const uint* nodeCells, const uint* cellToNode, const uint* interiorVoxels,
                            const float* ux, const float* uy, const float* uz, const float* oldUx, const float* oldUy, const float* oldUz,
                            const float* weightsX, const float* weightsY, const float* weightsZ,
-                           float dt, bool rungeKutta3, float stick, Grid grid, uint refinementLevel, EscapedFlight droplet, EscapedFlight bubble,
+                           float dt, bool rungeKutta3, WallStick stick, WallStick airStick, Grid grid, uint refinementLevel, EscapedFlight droplet, EscapedFlight bubble,
                            unsigned int* largestChange){    //the most any particle's velocity changes by, per second (G2P's measure, carried on)
     extern __shared__ float tile[];
     __shared__ uint neighborNodes[27];
@@ -1798,8 +1949,8 @@ __global__ void flyEscaped(uint numParticleNodes, uint numParticles, const uint*
     int3 domainVoxels = make_int3(grid.sizeX*interiorWidth, grid.sizeY*interiorWidth, grid.sizeZ*interiorWidth);
     int3 tileOrigin = make_int3(((int)(cell % grid.sizeX) - 1)*interiorWidth, ((int)(cell / grid.sizeX % grid.sizeY) - 1)*interiorWidth, ((int)(cell / (grid.sizeX*grid.sizeY)) - 1)*interiorWidth);
     __syncthreads();
-    loadTile(tile, interiorWidth, tileOrigin, domainVoxels, neighborNodes, numUsedGridNodes, interiorVoxels, ux, uy, uz, weightsX, weightsY, weightsZ, share);
-    loadTile(tile + 4*tileVoxels, interiorWidth, tileOrigin, domainVoxels, neighborNodes, numUsedGridNodes, interiorVoxels, oldUx, oldUy, oldUz, weightsX, weightsY, weightsZ, nullptr);
+    loadTile(tile, interiorWidth, tileOrigin, domainVoxels, neighborNodes, numUsedGridNodes, interiorVoxels, ux, uy, uz, weightsX, weightsY, weightsZ, share, nullptr);
+    loadTile(tile + 4*tileVoxels, interiorWidth, tileOrigin, domainVoxels, neighborNodes, numUsedGridNodes, interiorVoxels, oldUx, oldUy, oldUz, weightsX, weightsY, weightsZ, nullptr, nullptr);
     __syncthreads();
     float voxelSize = grid.cellSize / interiorWidth;
     float change = 0.0f;
@@ -1809,8 +1960,8 @@ __global__ void flyEscaped(uint numParticleNodes, uint numParticles, const uint*
         }
         bool air = ids[index] & AIR_PARTICLE;
         float3 before = make_float3(vx[index], vy[index], vz[index]);
-        //the walls hold the liquid alone (stick): that's the fluid around a bubble as it flies, and a droplet's own once it has landed
-        float flown = flyEscapedParticle(index, px, py, pz, vx, vy, vz, air, tile, tileWidth, tileOrigin, domainVoxels, grid, voxelSize, dt, air ? stick : 0.0f, air ? bubble : droplet);
+        //the walls' hold on the fluid around it as it flies, the liquid for a bubble and the air for a droplet, and then on its own once it has landed
+        float flown = flyEscapedParticle(index, px, py, pz, vx, vy, vz, air, tile, tileWidth, tileOrigin, domainVoxels, grid, voxelSize, dt, air ? stick : airStick, air ? bubble : droplet);
         change = fmaxf(change, fmaxf(fabsf(vx[index] - before.x), fmaxf(fabsf(vy[index] - before.y), fabsf(vz[index] - before.z))));
         if(!(flown < dt)){
             continue;   //escaped still
@@ -1818,12 +1969,22 @@ __global__ void flyEscaped(uint numParticleNodes, uint numParticles, const uint*
         ids[index] &= ~ESCAPED_PARTICLE;
         float left = dt - flown;
         float3 point = make_float3((px[index] - grid.negX)/voxelSize - tileOrigin.x, (py[index] - grid.negY)/voxelSize - tileOrigin.y, (pz[index] - grid.negZ)/voxelSize - tileOrigin.z);
-        float3 velocity = velocityThrough(tile, tileWidth, point, tileOrigin, domainVoxels, make_float3(vx[index], vy[index], vz[index]), left / voxelSize, rungeKutta3, air ? 0.0f : stick);
+        float3 velocity = velocityThrough(tile, tileWidth, point, tileOrigin, domainVoxels, make_float3(vx[index], vy[index], vz[index]), left / voxelSize, rungeKutta3, air ? airStick : stick);
         px[index] += left*velocity.x;
         py[index] += left*velocity.y;
         pz[index] += left*velocity.z;
     }
     largestInBlock(__float_as_uint(change / dt), warpLargest, largestChange);
+}
+
+//each wall's hold on what moves along it (WallStick, gridSampling.hu): the liquid's, or the air's, which only the walls' friction holds
+WallStick Particles::wallSticks(bool liquid) const{
+    WallStick sticks;
+    for(int wall = 0; wall < 6; ++wall){
+        sticks.stick[wall] = (float)std::max(liquid ? wallStick() : 0.0, 0.5*wallFriction[wall]);
+        sticks.any = sticks.any || sticks.stick[wall] > 0.0f;
+    }
+    return sticks;
 }
 
 void Particles::voxelVelsToParticles(){
@@ -1834,20 +1995,23 @@ void Particles::voxelVelsToParticles(){
         std::cerr<<"Particles: a node of "<<numVoxelsPerNode<<" voxels is more than G2P mirrors walls for ("<<NODE_THREADS*MIRRORED_PER_THREAD<<"): raise MIRRORED_PER_THREAD\n";
         exit(1);
     }
-    float stick = (float)wallStick();   //how far a viscous liquid's particles hold to the walls, as its faces do in the viscous solve
+    WallStick stick = wallSticks(true);     //how far each wall holds the liquid's particles: a viscous liquid's as its faces are held in the viscous solve
+    WallStick airStick = wallSticks(false); //and the air's
     bool phases = twoPhase.on;
     accelerationBits.zeroDeviceAsync(stream);   //the most any particle's velocity changes by this substep, per second: G2P's update and the escaped ones' flights, for the next substep's timestep (getCourantDt)
     auto gather = phases ? (apic ? gatherVoxelVelsToParticles<true, true> : gatherVoxelVelsToParticles<false, true>)
                          : (apic ? gatherVoxelVelsToParticles<true, false> : gatherVoxelVelsToParticles<false, false>);
-    gather<<<numParticleNodes, NODE_THREADS, (phases ? 7 : 6)*sizeof(float)*numVoxelsPerNode, stream>>>(numParticleNodes, size, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(),
-        affineVelocities(affine), (float)(grid.cellSize / (2<<refinementLevel)), nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(), voxelOwners.devPtr(), solids.devPtr(), voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr(), voxelsUxOld.devPtr(), voxelsUyOld.devPtr(), voxelsUzOld.devPtr(), flipRatio, 1.0f - 2.0f*stick, radius, grid, refinementLevel,
-        phases ? particleIds.devPtr() : nullptr, twoPhase.airFlipRatio, twoPhase.escaping() ? liquidShare.devPtr() : nullptr, particleBirths.devPtr(), (float)substepStart, (float)(1.0 / dt), accelerationBits.devPtr());
+    const char* gone = lettingGo() ? letGo.devPtr() : nullptr;  //the voxels boundaries let go of in this substep's solve: their walls' faces carry the liquid's velocity on
+    gather<<<numParticleNodes, NODE_THREADS, ((phases ? 7 : 6)*sizeof(float) + 1)*numVoxelsPerNode, stream>>>(numParticleNodes, size, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(),
+        affineVelocities(affine), (float)(grid.cellSize / (2<<refinementLevel)), nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(), voxelOwners.devPtr(), solids.devPtr(), voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr(), voxelsUxOld.devPtr(), voxelsUyOld.devPtr(), voxelsUzOld.devPtr(), flipRatio, stick, airStick, radius, grid, refinementLevel,
+        phases ? particleIds.devPtr() : nullptr, twoPhase.airFlipRatio, twoPhase.escaping() ? liquidShare.devPtr() : nullptr, particleBirths.devPtr(), (float)substepStart, (float)(1.0 / dt), accelerationBits.devPtr(),
+        gone);
     gpuErrchk(cudaPeekAtLastError());
     uint tileWidth = 3*(numVoxels1D - 2*(uint)std::floor(radius));
     auto advect = phases ? advectThroughGrid<true> : advectThroughGrid<false>;
     advect<<<numParticleNodes, NODE_THREADS, 3*sizeof(float)*tileWidth*tileWidth*tileWidth, stream>>>(numParticleNodes, size, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(),
         px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(), phases ? particleIds.devPtr() : nullptr, twoPhase.escaping(), numUsedGridNodes, nodeCells.devPtr(), cellToNode.devPtr(), nodeInteriorVoxels.devPtr(),
-        voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr(), voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), dt, rungeKutta3, stick, grid, refinementLevel);
+        voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr(), voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), dt, rungeKutta3, stick, airStick, grid, refinementLevel, gone);
     gpuErrchk(cudaPeekAtLastError());
     if(twoPhase.escaping()){    //then the escaped ones, which that left where they were
         double voxelSize = grid.cellSize / (2<<refinementLevel);
@@ -1866,7 +2030,7 @@ void Particles::voxelVelsToParticles(){
             px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(), particleIds.devPtr(), liquidShare.devPtr(),
             numUsedGridNodes, nodeCells.devPtr(), cellToNode.devPtr(), nodeInteriorVoxels.devPtr(),
             voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr(), voxelsUxOld.devPtr(), voxelsUyOld.devPtr(), voxelsUzOld.devPtr(),
-            voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), dt, rungeKutta3, stick, grid, refinementLevel, droplet, bubble, accelerationBits.devPtr());
+            voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), dt, rungeKutta3, stick, airStick, grid, refinementLevel, droplet, bubble, accelerationBits.devPtr());
         gpuErrchk(cudaPeekAtLastError());
     }
 }
