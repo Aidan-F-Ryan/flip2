@@ -6,6 +6,7 @@
 //  there, emitParticles, which re-bins and sorts again if it added any
 
 #include "particles.hu"
+#include "gridSampling.hu"
 #include <cmath>
 #include <cub/cub.cuh>
 
@@ -124,13 +125,6 @@ void Particles::dropRemovedParticles(){
     if(live < size){
         resizeParticleArrays(live, live);
     }
-}
-
-__device__ inline unsigned long long mixBits64(unsigned long long x){  //splitmix64
-    x += 0x9e3779b97f4a7c15ull;
-    x = (x ^ (x >> 30))*0xbf58476d1ce4e5b9ull;
-    x = (x ^ (x >> 27))*0x94d049bb133111ebull;
-    return x ^ (x >> 31);
 }
 
 //An emitter as a conveyor: a jittered seeding lattice (particlesPerVoxel per voxel) sliding along at the emitter's velocity, whose points become particles

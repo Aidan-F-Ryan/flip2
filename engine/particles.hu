@@ -10,6 +10,7 @@
 #include "forces.hu"
 #include "sources.hu"
 #include "obstacles.hu"
+#include "whitewater.hu"
 #include "algorithms/conjugateGradientFunctions.hu"
 #include <cmath>
 #include <string>
@@ -262,6 +263,25 @@ public:
     //this partition's liquid and air particles added into liquid and air: for tests. It waits for the GPU
     void phaseStatistics(PhaseStatistics& liquid, PhaseStatistics& air);
 
+    //whitewater as well (whitewater.hu): before initialize
+    void setWhitewater(const WhitewaterSettings& settings);
+    //how many whitewater particles this partition holds: straight after a substep it waits for the GPU
+    uint whitewaterCount();
+    //this partition's whitewater for the cache, whitewaterCount() of them, into pinned host memory (CacheWriter::whitewaterBytes): a frame's planes,
+    //or a checkpoint's, recording copied once they're there
+    void copyWhitewaterToHost(char* host, bool checkpoint, cudaEvent_t copied);
+    //a checkpoint's whitewater, each array a plane per component, in place of none, before resume: every partition is given the same, and takes its own
+    void setWhitewaterParticles(uint count, const double* positions, const unsigned long long* ids, const float* velocities, const float* births, const float* lives,
+                                const float* radii, const float* kinds, unsigned long long nextId);
+    unsigned long long nextWhitewaterId() const{    //the id the next whitewater particle made gets: every partition's is the same
+        return whitewaterPool.nextId;
+    }
+    //this partition's whitewater added into statistics: for tests and the bake's log. It waits for the GPU
+    void whitewaterStatistics(WhitewaterStatistics& statistics);
+    unsigned long long whitewaterDropped() const{   //how many maxParticles has kept this partition's surface from making, since the start
+        return whitewaterPool.dropped;
+    }
+
     //the force fields besides gravity, up to MAX_FORCE_FIELDS of them (see forces.hu). volumes holds, for each field that's a volume, its vectors (and
     //nothing for the others, or for any past its end): they go onto this partition's GPU
     void setForceFields(const std::vector<ForceField>& fields, const std::vector<std::shared_ptr<const SceneField>>& volumes = {});
@@ -349,6 +369,14 @@ private:
         return viscousCfl*viscousCfl*voxelSize*voxelSize / viscosity;
     }
     void applyViscosity();      //viscosity.cu
+    void findWhitewater();      //whitewater.cu: what the surface makes this substep, found before the pressure solve
+    void stepWhitewater();      //and the substep's, once the grid has its new velocities and the fluid's particles have moved
+    void placeWhitewater();
+    void orderWhitewater(uint bound);
+    void nameWhitewater(uint count, unsigned long long first);
+    void exchangeWhitewater(uint made);
+    double whitewaterScale() const;
+    WhitewaterGrid whitewaterGrid();
     void receiveParticleNodes(uint maskWords);
     void orderNodes(uint maskWords);
     void checkGhostRuns();
@@ -506,9 +534,11 @@ private:
     float liquidWeightUnit = 0.0f;
     CudaVec<float> faceLightness[3];    //two phases, per stored voxel's three lower faces: the liquid's density over the face's, 1 up to the density ratio
     CudaVec<char> bandRings;            //with an air band, per node cell of the domain: its ring, or BEYOND_BAND (findBandRings)
-    CudaVec<float> liquidShare;         //with escaping particles, per stored voxel: the liquid's density there over its density at rest, where the walls
+    CudaVec<float> liquidShare;         //with escaping particles or whitewater, per stored voxel: the liquid's density there over its density at rest, where the walls
                                         //leave room for it (beside an obstacle over both fluids'); 0 where the pressure solve's faces are all air, and
                                         //none (NaN) in a voxel obstacles close (findLiquidShare, twophase.cu)
+    WhitewaterSettings whitewater;
+    WhitewaterPool whitewaterPool;
     void* viscousSeen = nullptr;    //pinned: the viscous solve's state as the host last read it
     uint viscousIterations = 0;     //what the last viscous solve took, which sizes the next one's first batch
     unsigned long long substepIndex = 0;    //substeps taken, which seeds the emitters' jitter

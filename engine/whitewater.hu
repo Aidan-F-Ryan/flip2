@@ -1,0 +1,112 @@
+//Copyright 2023 Aberrant Behavior LLC
+
+#ifndef WHITEWATER_HU
+#define WHITEWATER_HU
+
+#include "typedefs.h"
+
+//Whitewater: the spray, foam and bubbles a liquid makes where it breaks up, as particles of their own (whitewater.cu). A grid of voxels holds the
+//liquid's surface no finer than a voxel, and what real water does below that, shedding droplets and folding air under, it can't: so where the
+//surface is being torn faster than gravity and surface tension can hold it together, particles are made there that stand for what was shed, and
+//move as what they are. They take nothing from the liquid and give nothing back: the fluid's own particles come out the same with them or without.
+//
+//Each is one of three things, and moves as that:
+//- spray, a droplet in air: the engine's own flight for a ball of liquid in air (EscapedPath, gridSampling.hu), its weight against the air's drag
+//  on a ball of its radius. A fine one is stopped within a hand's breadth and drifts down as mist; a coarse one flies the way it was thrown
+//- a bubble, air in the liquid: the same flight for a ball of air, lifted by the liquid's weight and dragged along by its flow. A small one follows
+//  the liquid wherever it goes; a large one rises through it
+//- foam, a bubble that has come up to the surface: it rides the liquid's velocity there until it bursts, which each does at the same rate whatever
+//  its age, so a patch thins evenly rather than vanishing at once
+//A droplet that lands on the liquid is foam where it landed; a bubble that reaches the surface is foam; foam the liquid closes over is a bubble
+//again, and foam the liquid falls away from is spray.
+//
+//Their radii are real ones, a millimetre or so, whatever the voxel's size: how one moves depends on its size, and that is what lets a splash leave
+//mist hanging over it and a plunge leave a cloud of fine bubbles under the coarse ones that rise first. What's drawn is something else: each
+//particle stands for an equal share of a voxel's volume of whitewater, perVoxel of them to the voxel, however many real droplets or bubbles that is.
+struct WhitewaterSettings{
+    bool on = false;
+    float amount = 1.0f;            //how much a breaking surface makes, against what the model gives: the look's to set
+    float spray = 1.0f;             //and how much of that is spray, and how much bubbles, each against the model's own share
+    float bubbles = 1.0f;
+    int perVoxel = 27;              //the particles a voxel's volume of whitewater is drawn as: more is finer, and that many times as many
+    uint capacity = 16000000;       //the most a partition is to hold. With less room than the surface would fill, what it makes thins evenly (thinWhitewater)
+    float foamLife = 2.0f;          //how long a bubble lasts at the surface, on average, seconds: fresh water's foam is gone in under one, the sea's in several
+    float maxAge = 30.0f;           //seconds after which any of it is gone, wherever it is
+    float surfaceTension = 7.2e-5f; //the liquid's, over its density, m^3/s^2: with gravity, how hard its surface is to break, and what sizes it breaks into
+    float airDensity = 1.2e-3f;     //the air's density over the liquid's
+    float airViscosity = 1.5e-5f;   //the air's kinematic viscosity, m^2/s: the drag on a droplet
+    float liquidViscosity = 1.0e-6f;    //the liquid's: the drag on a bubble
+    float dropletScale = 1.0f;      //droplets' radii against what the model gives: for a miniature that should read as big water, or the other way
+    float bubbleScale = 1.0f;       //and bubbles'
+    unsigned long long seed = 1;
+};
+
+//what a whitewater particle is; WHITEWATER_GONE marks one that's no longer anything, until the sort that follows drops it
+enum WhitewaterKind : char{
+    WHITEWATER_SPRAY = 0,
+    WHITEWATER_FOAM = 1,
+    WHITEWATER_BUBBLE = 2,
+    WHITEWATER_GONE = 3
+};
+
+//One partition's whitewater. The particles alive are the first count of each array, in the order of the node cells they're in (as the fluid's are, so
+//a block per node finds its own), and the arrays grow as they have to. The host knows how many there are, and how many more each substep makes,
+//without waiting for the device: each number is copied to pinned memory as the device finds it, and the substep has waited for other things by the
+//time it's needed (Particles::findWhitewater, whitewaterCount)
+struct WhitewaterPool{
+    double* position[3] = {nullptr, nullptr, nullptr};
+    float* velocity[3] = {nullptr, nullptr, nullptr};
+    uint* cells = nullptr;              //each one's node cell
+    unsigned long long* ids = nullptr;  //which it keeps for as long as it exists: numbered from 0 as they're made (Particles::nameWhitewater)
+    float* births = nullptr;            //when it came to be, seconds from the start
+    float* lives = nullptr;             //how much longer it lasts as foam, seconds
+    float* radii = nullptr;             //the droplet's or the bubble's, metres
+    char* kinds = nullptr;              //WhitewaterKind
+    //the sort's working space: a second array for the keys and one for the order the sorted come from (the sort goes back and forth between each and
+    //its other: the order's is the 4-byte spare), a spare array of each element size for the others to be gathered into, and cub's own
+    uint* otherCells = nullptr;
+    uint* order = nullptr;
+    void* spare8 = nullptr;
+    void* spare4 = nullptr;
+    void* spare1 = nullptr;
+    void* sortSpace = nullptr;
+    size_t sortBytes = 0;
+    uint slots = 0;             //how many each array has room for
+    uint count = 0;             //how many are alive, once counted has landed
+    uint sorted = 0;            //how many the last sort took in: those, then the ones that had gone
+    //what the surface makes this substep, per voxel of the partition's own, from findWhitewater until stepWhitewater has made them: how many, where
+    //its first goes among them all, how many of them are bubbles (its first ones), and the two differences in speed that are breaking its surface up
+    uint* counts = nullptr;
+    unsigned long long* starts = nullptr;
+    uint* folded = nullptr;
+    float* folds = nullptr;
+    float* tears = nullptr;
+    uint sources = 0;           //how many voxels those are for: 0 when there are none
+    unsigned long long* found = nullptr;    //on the device: how many the last sort left alive, and how many the surface makes this substep
+    unsigned long long* seen = nullptr;     //pinned: those two as the host reads them
+    cudaEvent_t counted = nullptr;          //each has landed
+    cudaEvent_t wanted = nullptr;
+    bool counting = false;      //whether each is on its way
+    bool wanting = false;
+    unsigned long long dropped = 0;     //how many the surface would have made and capacity didn't leave room for, since the start
+    unsigned long long nextId = 0;      //the id the next one made gets: every partition's is the same
+
+    void start();
+    void reserve(uint needed, uint keep, uint most, cudaStream_t stream);
+    void forget(cudaStream_t stream);
+    void release(cudaStream_t stream);
+};
+
+struct WhitewaterGrid;      //what the whitewater's kernels read of the grid (whitewater.cu)
+
+//one fluid's whitewater at a frame, for tests and for the bake's log
+struct WhitewaterStatistics{
+    unsigned long long count = 0;
+    unsigned long long kinds[3] = {0, 0, 0};    //spray, foam, bubbles
+    unsigned long long hashHigh = 0;            //the sums of each particle's hash's halves, as the fluid's diagnostics have them (diagnostics.hu):
+    unsigned long long hashLow = 0;             //the same in any order
+    float fastest = 0.0f;
+    unsigned long long dropped = 0;             //how many maxParticles has kept from being made, since the start (WhitewaterPool::dropped)
+};
+
+#endif

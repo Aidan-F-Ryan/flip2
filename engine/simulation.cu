@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <thread>
 
 Simulation::Simulation(uint numParticles, int numPartitions, int numDevices)
@@ -238,6 +239,35 @@ void Simulation::writeDiagnostics(const std::string& path, int frame){
             }
         }
     });
+    //the whitewater as it is: how many of each kind, a hash of every one's state, the same in any order, and how many maxParticles has kept from being made
+    WhitewaterStatistics whitewater;
+    if(partitions[0]->whitewater.on){
+        for(const std::unique_ptr<Particles>& partition : partitions){
+            gpuErrchk(cudaSetDevice(partition->device()));
+            partition->whitewaterStatistics(whitewater);
+        }
+        gpuErrchk(cudaSetDevice(partitions[0]->device()));
+        if(numPartitions() != numRanks){    //across processes each rank holds its own: all of them, added up
+            unsigned long long mine[8] = {whitewater.count, whitewater.kinds[0], whitewater.kinds[1], whitewater.kinds[2], whitewater.hashHigh, whitewater.hashLow, whitewater.dropped, 0};
+            std::memcpy(mine + 7, &whitewater.fastest, sizeof(float));
+            std::vector<unsigned long long> all(8*(size_t)numRanks);
+            transports[0]->allGatherHost(mine, all.data(), sizeof(mine));
+            whitewater = WhitewaterStatistics();
+            for(int rank = 0; rank < numRanks; ++rank){
+                const unsigned long long* theirs = all.data() + 8*(size_t)rank;
+                whitewater.count += theirs[0];
+                for(int kind = 0; kind < 3; ++kind){
+                    whitewater.kinds[kind] += theirs[1 + kind];
+                }
+                whitewater.hashHigh += theirs[4];
+                whitewater.hashLow += theirs[5];
+                whitewater.dropped += theirs[6];
+                float fastest;
+                std::memcpy(&fastest, theirs + 7, sizeof(float));
+                whitewater.fastest = std::max(whitewater.fastest, fastest);
+            }
+        }
+    }
     if(ranks[0] != 0){
         return;
     }
@@ -273,7 +303,16 @@ void Simulation::writeDiagnostics(const std::string& path, int frame){
                <<",\"centroid\":"<<jsonArray(centroid, 3, "%.17g")<<",\"lowest\":"<<jsonArray(d.lowest, 3, "%.17g")<<",\"highest\":"<<jsonArray(d.highest, 3, "%.17g");
     char tail[256];
     std::snprintf(tail, sizeof(tail), ",\"fastest\":%.9g,\"occupiedVoxels\":%llu,\"volume\":%.17g,", d.fastest, d.occupiedVoxels, d.occupiedVoxels*voxelSize*voxelSize*voxelSize);
-    diagnostics<<tail<<"\"perVoxel\":"<<jsonArray(d.perVoxel, DIAGNOSTIC_BUCKETS, "%llu")<<",\"core\":"<<jsonArray(d.core, DIAGNOSTIC_BUCKETS, "%llu")<<"}\n";
+    diagnostics<<tail<<"\"perVoxel\":"<<jsonArray(d.perVoxel, DIAGNOSTIC_BUCKETS, "%llu")<<",\"core\":"<<jsonArray(d.core, DIAGNOSTIC_BUCKETS, "%llu");
+    if(first.whitewater.on){    //dropped: since the frame before, or since the bake started or was resumed
+        char more[360];
+        std::snprintf(more, sizeof(more), ",\"whitewater\":{\"particles\":%llu,\"spray\":%llu,\"foam\":%llu,\"bubbles\":%llu,\"hash\":\"%016llx%016llx\",\"fastest\":%.9g,\"dropped\":%llu}",
+                      whitewater.count, whitewater.kinds[0], whitewater.kinds[1], whitewater.kinds[2], whitewater.hashHigh, whitewater.hashLow, (double)whitewater.fastest,
+                      whitewater.dropped - whitewaterDroppedBefore);
+        whitewaterDroppedBefore = whitewater.dropped;
+        diagnostics<<more;
+    }
+    diagnostics<<"}\n";
     diagnostics.flush();
 }
 
@@ -296,15 +335,42 @@ void Simulation::startCache(const std::string& directory, CacheDescription descr
     description.domainMin[2] = first.grid.negZ;
     cacheWriter = std::make_unique<CacheWriter>(directory, description, ranks, committedBefore, std::move(done));
     cacheCopies.resize(partitions.size());
+    whitewaterCopies.resize(partitions.size());
     for(size_t index = 0; index < partitions.size(); ++index){
         gpuErrchk(cudaSetDevice(partitions[index]->device()));
         for(int buffer = 0; buffer < cacheWriter->numBuffers(); ++buffer){
-            cudaEvent_t copied;
-            gpuErrchk(cudaEventCreateWithFlags(&copied, cudaEventDisableTiming));
-            cacheCopies[index].push_back(copied);
+            for(std::vector<std::vector<cudaEvent_t>>* copies : {&cacheCopies, &whitewaterCopies}){
+                cudaEvent_t copied;
+                gpuErrchk(cudaEventCreateWithFlags(&copied, cudaEventDisableTiming));
+                (*copies)[index].push_back(copied);
+            }
         }
     }
     gpuErrchk(cudaSetDevice(partitions[0]->device()));
+}
+
+void Simulation::whitewaterHere(unsigned long long& particles, unsigned long long& dropped){
+    particles = 0;
+    dropped = 0;
+    for(const std::unique_ptr<Particles>& partition : partitions){
+        gpuErrchk(cudaSetDevice(partition->device()));
+        particles += partition->whitewaterCount();
+        dropped += partition->whitewaterDropped();
+    }
+    gpuErrchk(cudaSetDevice(partitions[0]->device()));
+}
+
+//each partition here's whitewater particles, or nothing without whitewater
+std::vector<uint> Simulation::countWhitewater(){
+    std::vector<uint> counts;
+    if(partitions[0]->whitewater.on){
+        for(const std::unique_ptr<Particles>& partition : partitions){
+            gpuErrchk(cudaSetDevice(partition->device()));
+            counts.push_back(partition->whitewaterCount());
+        }
+        gpuErrchk(cudaSetDevice(partitions[0]->device()));
+    }
+    return counts;
 }
 
 void Simulation::writeCacheFrame(int frame){
@@ -316,9 +382,15 @@ void Simulation::writeCacheFrame(int frame){
         counts.push_back(partition->countFrameParticles());
         total += counts.back();
     }
-    int buffer = cacheWriter->acquire(CacheWriter::frameBytes(total, ids, ages));  //emitters and sinks change the count from frame to frame
+    std::vector<uint> whitewaterCounts = countWhitewater();     //with whitewater, each partition's, which goes in after the particles
+    size_t fluidBytes = (CacheWriter::frameBytes(total, ids, ages) + 7) / 8*8;
+    size_t whitewaterTotal = 0;
+    for(uint count : whitewaterCounts){
+        whitewaterTotal += count;
+    }
+    int buffer = cacheWriter->acquire(fluidBytes + CacheWriter::whitewaterBytes(whitewaterTotal, false));  //emitters and sinks change the count from frame to frame
     char* host = cacheWriter->hostBuffer(buffer);
-    std::vector<CacheShard> shards;
+    std::vector<CacheShard> shards, whitewater;
     std::vector<cudaEvent_t> copies;
     size_t offset = 0;
     for(int index = 0; index < numPartitions(); ++index){   //each copies its own planes straight from its GPU
@@ -329,15 +401,30 @@ void Simulation::writeCacheFrame(int frame){
         copies.push_back(cacheCopies[index][buffer]);
         offset += CacheWriter::frameBytes(counts[index], ids, ages);
     }
+    offset = fluidBytes;
+    for(size_t index = 0; index < whitewaterCounts.size(); ++index){
+        Particles& partition = *partitions[index];
+        gpuErrchk(cudaSetDevice(partition.device()));
+        partition.copyWhitewaterToHost(host + offset, false, whitewaterCopies[index][buffer]);
+        whitewater.push_back({ranks[index], whitewaterCounts[index], offset});
+        copies.push_back(whitewaterCopies[index][buffer]);
+        offset += CacheWriter::whitewaterBytes(whitewaterCounts[index], false);
+    }
     gpuErrchk(cudaSetDevice(partitions[0]->device()));
-    cacheWriter->submit(buffer, frame, partitions[0]->elapsedTime, shards, copies);
+    cacheWriter->submit(buffer, frame, partitions[0]->elapsedTime, shards, copies, whitewater);
 }
 
 void Simulation::writeCheckpoint(int frame){
     bool apic = partitions[0]->apic;
-    int buffer = cacheWriter->acquire(CacheWriter::checkpointBytes(particlesHere(), apic));
+    std::vector<uint> whitewaterCounts = countWhitewater();
+    size_t fluidBytes = (CacheWriter::checkpointBytes(particlesHere(), apic) + 7) / 8*8;
+    size_t whitewaterTotal = 0;
+    for(uint count : whitewaterCounts){
+        whitewaterTotal += count;
+    }
+    int buffer = cacheWriter->acquire(fluidBytes + CacheWriter::whitewaterBytes(whitewaterTotal, true));
     char* host = cacheWriter->hostBuffer(buffer);
-    std::vector<CacheShard> shards;
+    std::vector<CacheShard> shards, whitewater;
     std::vector<cudaEvent_t> copies;
     size_t offset = 0;
     CheckpointState state;
@@ -350,12 +437,22 @@ void Simulation::writeCheckpoint(int frame){
         offset += CacheWriter::checkpointBytes(partition.numParticles(), apic);
         state.acceleration = std::max(state.acceleration, partition.acceleration());    //this rank's partitions' largest; the record takes every rank's
     }
+    offset = fluidBytes;
+    for(size_t index = 0; index < whitewaterCounts.size(); ++index){
+        Particles& partition = *partitions[index];
+        gpuErrchk(cudaSetDevice(partition.device()));
+        partition.copyWhitewaterToHost(host + offset, true, whitewaterCopies[index][buffer]);
+        whitewater.push_back({ranks[index], whitewaterCounts[index], offset});
+        copies.push_back(whitewaterCopies[index][buffer]);
+        offset += CacheWriter::whitewaterBytes(whitewaterCounts[index], true);
+    }
     gpuErrchk(cudaSetDevice(partitions[0]->device()));
     state.time = partitions[0]->elapsedTime;
     state.substep = partitions[0]->substepIndex;
     state.apic = apic;
     state.nextId = partitions[0]->nextId();
-    cacheWriter->submitCheckpoint(buffer, frame, state, shards, copies);
+    state.whitewaterNextId = partitions[0]->nextWhitewaterId();
+    cacheWriter->submitCheckpoint(buffer, frame, state, shards, copies, whitewater);
 }
 
 void Simulation::resume(double time, unsigned long long substep, double acceleration){

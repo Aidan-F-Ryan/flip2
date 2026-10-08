@@ -81,6 +81,16 @@ public:
     void setTwoPhase(const TwoPhase& settings){
         simulation.forEachPartition([&](Particles& partition){ partition.setTwoPhase(settings); });
     }
+    void setWhitewater(const WhitewaterSettings& settings){
+        simulation.forEachPartition([&](Particles& partition){ partition.setWhitewater(settings); });
+    }
+    void setWhitewaterParticles(uint count, const double* positions, const unsigned long long* ids, const float* velocities, const float* births, const float* lives,
+                                const float* radii, const float* kinds, unsigned long long nextId){     //a checkpoint's: every partition is given them all, and takes the ones in its planes
+        simulation.forEachPartition([&](Particles& partition){ partition.setWhitewaterParticles(count, positions, ids, velocities, births, lives, radii, kinds, nextId); });
+    }
+    void whitewaterHere(unsigned long long& particles, unsigned long long& dropped){
+        simulation.whitewaterHere(particles, dropped);
+    }
     void markAirParticles(size_t first){
         simulation.forEachPartition([&](Particles& partition){ partition.markAirParticles((uint)first); });
     }

@@ -2,6 +2,8 @@
 (BAKE/export/houdini/surface.NNNN.bgeo.sc and particles.NNNN.bgeo.sc, or .bgeo uncompressed: Export Format, which it finds), on its first output. Its second has the bake's fluid fields if `flip2 mesh --fields`
 wrote them (fields.NNNN.vdb: surface and vel), its third the domain the bake filled, and its fourth the collision geometry wired to its input, the last
 two as Houdini's own FLIP nodes make them: what Whitewater Source takes as its Liquid Simulation, Container and Collisions (whitewater.py sets it up).
+Its fifth has the bake's own whitewater, if it was baked with any (whitewater.NNNN.bgeo.sc): points with v, id, age, life, radius, kind (0 spray, 1
+foam, 2 a bubble) and the pscale to draw them at.
 
 A flip2 frame is a time: frame N is N/fps seconds after the bake's start. Houdini's frame 1 is time 0, so loading by time puts the bake's frame 0 on
 Houdini's frame 1, and keeps it there whatever frame rate either uses. A frame the bake hasn't made (yet) loads as no geometry.
@@ -15,6 +17,7 @@ import hou
 PARTICLES = "particles"
 SURFACE = "surface"
 FIELDS = "fields"
+WHITEWATER = "whitewater"
 SHOW = (("surface", "Surface"), ("particles", "Particles"), ("both", "Surface and Particles"))
 FORMATS = (("bgeo.sc", "Compressed (.bgeo.sc)"), ("bgeo", "Uncompressed (.bgeo)"))
 
@@ -89,6 +92,23 @@ def build_fields(node, folder, frame):
     loader.parm("file").set('%s/fields.`padzero(4, %s)`.vdb' % (folder, frame))
     _output(node, 1, loader)
     return loader
+
+
+def build_whitewater(node, folder, frame):
+    """inside node, a File node loading a frame's whitewater from folder at frame (as build_loaders), on the node's fifth output. Makes only what's
+    missing"""
+    loader = node.node(WHITEWATER)
+    if loader is None:
+        loader = node.createNode("file", WHITEWATER)
+        loader.parm("missingframe").set("empty")
+    loader.parm("file").set('%s/whitewater.`padzero(4, %s)`.`chs("../exportformat")`' % (folder, frame))
+    _output(node, 4, loader)
+    return loader
+
+
+def has_whitewater(folder):
+    """whether a bake's export/houdini directory holds any whitewater frames"""
+    return bool(glob.glob(os.path.join(hou.text.expandString(folder), WHITEWATER + ".[0-9]*.bgeo*")))
 
 
 def build_container(node, collision, wired):
@@ -170,6 +190,7 @@ def _network(node):
     shown = build_loaders(node, folder, frame)
     build_fields(node, folder, frame)
     build_container(node, node.indirectInputs()[0], 0)
+    build_whitewater(node, folder, frame)
     if node.parm("label1") is not None:
         node.parm("label1").set("Collisions (for Whitewater)")
     return shown
@@ -222,7 +243,7 @@ def reload(node):
         committed, frames = bake.get("committed", -1), bake.get("frames", -1)
         node.parm("status").set("%d of frames 0-%d committed, at %g fps" % (committed + 1, frames, bake.get("fps", 24.0)) if committed < frames
                                 else "frames 0-%d, at %g fps" % (frames, bake.get("fps", 24.0)))
-    for name in (SURFACE, PARTICLES, FIELDS):
+    for name in (SURFACE, PARTICLES, FIELDS, WHITEWATER):
         loader = node.node(name)
         if loader is not None:
             loader.parm("reload").pressButton()

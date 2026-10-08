@@ -9,7 +9,7 @@ the particles' energy, momentum and extent, how they fill the voxels, and a hash
   golden.py diff a.jsonl b.jsonl      compare two diagnostics files
 
 A run on the same build of the same code on the same GPU architecture repeats exactly, and so does a run split between partitions, so the hash, the
-counts, the histograms and the timesteps have to match exactly. The double sums (energy, momenta, centroid) are added in a different order when the domain
+counts, the histograms and the timesteps have to match exactly, and with whitewater its counts and its own hash. The double sums (energy, momenta, centroid) are added in a different order when the domain
 is split, so a split run only has to match them to 1e-9 relative. When check finds the golden files came from another GPU, build or CUDA version, it says
 so and compares the physical numbers alone, with looser tolerances. Only Python's standard library: coeus has no numpy.
 """
@@ -68,8 +68,11 @@ SCENES = {   #main's arguments after the frame count (and any environment it run
     "air-everywhere": "scenes/air-everywhere.json", #the dam break with air filling the rest of the cube: no band, sealed
     "air-viscous-dam": "scenes/air-viscous-dam.json",   #viscous-dam with the band: the viscous step on both fluids' faces, the walls holding the liquid's particles alone
     "air-tension-drop": "scenes/air-tension-drop.json", #tension-drop with the band: surface tension from the energy of the surface between the two fluids
+    "whitewater-dam": "scenes/whitewater-dam.json",     #whitewater (engine/whitewater.cu): a dam break into a pillar, its spray, foam and bubbles
+    "whitewater-air-jet": "scenes/whitewater-air-jet.json", #air-jet with whitewater: two phases' liquid share and weights, an emitter
+    "whitewater-cap": "scenes/whitewater-cap.json",     #whitewater-dam held to 20,000: thinned where there's no room. Each partition's cap is its own, so not for split
 }
-DEFAULT_SCENES = ["dam16", "tank", "swirl", "swirl-apic", "nozzle", "drain", "forces", "tank-box", "paddle", "tank-meshsphere", "tank-pulse", "mesh-sources", "tank-vdbspin", "sealed-pulse", "sealed-box", "tension-drop", "tension-sessile", "viscous-dam", "dam16-sharp", "tank-sharp", "tension-drop-sharp", "tank-box-sharp", "viscous-dam-sharp", "force-volume", "velocity-volume", "linear-volume", "patch-volume", "strain-volume", "air-dam", "air-jet", "air-sphere", "air-bubble", "air-everywhere", "air-viscous-dam", "air-tension-drop"]
+DEFAULT_SCENES = ["dam16", "tank", "swirl", "swirl-apic", "nozzle", "drain", "forces", "tank-box", "paddle", "tank-meshsphere", "tank-pulse", "mesh-sources", "tank-vdbspin", "sealed-pulse", "sealed-box", "tension-drop", "tension-sessile", "viscous-dam", "dam16-sharp", "tank-sharp", "tension-drop-sharp", "tank-box-sharp", "viscous-dam-sharp", "force-volume", "velocity-volume", "linear-volume", "patch-volume", "strain-volume", "air-dam", "air-jet", "air-sphere", "air-bubble", "air-everywhere", "air-viscous-dam", "air-tension-drop", "whitewater-dam", "whitewater-air-jet"]
 
 EXACT = ["particles", "hash", "occupiedVoxels", "perVoxel", "core", "substeps", "time", "dtMin", "dtMax", "lowest", "highest", "fastest"]
 SUMS = ["kineticEnergy", "momentum", "angularMomentum", "centroid"]
@@ -133,6 +136,8 @@ def compare(a, b, exact, sums, relative):
         for key in exact:
             if recordA[key] != recordB[key]:
                 return f"frame {frame}: {key} differs: {recordA[key]} against {recordB[key]}"
+        if "hash" in exact and recordA.get("whitewater") != recordB.get("whitewater"):  #a scene with whitewater: how many of each kind, and their hash
+            return f"frame {frame}: whitewater differs: {recordA.get('whitewater')} against {recordB.get('whitewater')}"
         for key in sums:
             for valueA, valueB in zip(flatten(recordA[key]), flatten(recordB[key])):
                 if not close(valueA, valueB, relative):

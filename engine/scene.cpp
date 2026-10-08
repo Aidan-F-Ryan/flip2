@@ -307,7 +307,7 @@ Scene loadScene(const std::string& path){
     if(root.kind != Json::OBJECT){
         read.fail("the file", "should be one JSON object, {...}");
     }
-    read.checkKeys(root, "the scene", {"schema", "fps", "frames", "domain", "solver", "gravity", "liquid", "air", "particlesPerVoxel", "seed", "fluids", "emitters", "sinks", "obstacles", "forces", "partitions", "devices", "output"});
+    read.checkKeys(root, "the scene", {"schema", "fps", "frames", "domain", "solver", "gravity", "liquid", "air", "whitewater", "particlesPerVoxel", "seed", "fluids", "emitters", "sinks", "obstacles", "forces", "partitions", "devices", "output"});
     std::string schema = read.text(root, "schema", "the scene", "flip2.scene/1");
     if(schema != "flip2.scene/1"){
         read.fail("schema", "is \"" + schema + "\"; this flip2 reads \"flip2.scene/1\"");
@@ -417,6 +417,23 @@ Scene loadScene(const std::string& path){
         }
         if(scene.airDensity <= 0.0 || scene.airDensity > scene.density || scene.airFlipRatio > 1.0 || scene.airBand < 0){
             read.fail("air", "density has to be positive and no more than the liquid's, flipRatio at most 1, and band at least 0");
+        }
+    }
+    if(const Json* whitewater = read.object(root, "whitewater", "the scene")){   //spray, foam and bubbles (whitewater.hu)
+        read.checkKeys(*whitewater, "whitewater", {"amount", "spray", "bubbles", "perVoxel", "maxParticles", "foamLife", "maxAge", "dropletScale", "bubbleScale"});
+        scene.whitewater = true;
+        scene.whitewaterAmount = read.number(*whitewater, "amount", "whitewater", scene.whitewaterAmount);
+        scene.whitewaterSpray = read.number(*whitewater, "spray", "whitewater", scene.whitewaterSpray);
+        scene.whitewaterBubbles = read.number(*whitewater, "bubbles", "whitewater", scene.whitewaterBubbles);
+        scene.whitewaterPerVoxel = (int)read.number(*whitewater, "perVoxel", "whitewater", scene.whitewaterPerVoxel);
+        scene.whitewaterMaxParticles = read.number(*whitewater, "maxParticles", "whitewater", scene.whitewaterMaxParticles);
+        scene.whitewaterFoamLife = read.number(*whitewater, "foamLife", "whitewater", scene.whitewaterFoamLife);
+        scene.whitewaterMaxAge = read.number(*whitewater, "maxAge", "whitewater", scene.whitewaterMaxAge);
+        scene.whitewaterDropletScale = read.number(*whitewater, "dropletScale", "whitewater", scene.whitewaterDropletScale);
+        scene.whitewaterBubbleScale = read.number(*whitewater, "bubbleScale", "whitewater", scene.whitewaterBubbleScale);
+        if(!(scene.whitewaterAmount >= 0.0) || !(scene.whitewaterSpray >= 0.0) || !(scene.whitewaterBubbles >= 0.0) || scene.whitewaterPerVoxel < 1 || !(scene.whitewaterMaxParticles >= 1.0 && scene.whitewaterMaxParticles <= 4.0e9) ||
+           !(scene.whitewaterFoamLife > 0.0) || !(scene.whitewaterMaxAge > 0.0) || !(scene.whitewaterDropletScale > 0.0) || !(scene.whitewaterBubbleScale > 0.0)){
+            read.fail("whitewater", "amount, spray and bubbles have to be at least 0, perVoxel at least 1, maxParticles from 1 to 4e9, and foamLife, maxAge, dropletScale and bubbleScale positive");
         }
     }
     scene.particlesPerVoxel = (int)read.number(root, "particlesPerVoxel", "the scene", scene.particlesPerVoxel);

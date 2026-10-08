@@ -24,7 +24,8 @@
 //line, for a DCC or a farm to follow:
 //
 //  {"event":"start","particles":1240000,"frames":120,"nodes":[32,32,32],"voxelSize":0.0078125,"ranks":1}     with "resumedFrom":40 when resuming
-//  {"event":"frame","frame":1,"seconds":0.041}                 a frame simulated
+//  {"event":"frame","frame":1,"seconds":0.041,"particles":1240000}    a frame simulated; with whitewater, and ,"whitewater":310000}, how much of it there
+//      is, and ,"whitewaterDropped":5000} in a frame whose surface would have made that many more had whitewater.maxParticles left room
 //  {"event":"committed","frame":1}                             and its cache frame on the disk, whole; from the cache's thread, so it can come later
 //  {"event":"checkpoint","frame":10}                           a checkpoint on the disk, whole
 //  {"event":"cancelled","frame":57,"seconds":3.1}              stopped by a signal after frame 57, which is committed and checkpointed
@@ -248,7 +249,12 @@ static int verify(const std::string& directory){
                 problem((frame / "commit.json").string() + ": no shards");
                 continue;
             }
-            for(const Json& shard : list->items){
+            std::vector<const Json*> lists = {list};    //the particles' shards, and the whitewater's from a bake with any
+            const Json* whitewater = commit.find("whitewater");
+            if(whitewater != nullptr && whitewater->find("shards") != nullptr){
+                lists.push_back(whitewater->find("shards"));
+            }
+            for(const Json* each : lists) for(const Json& shard : each->items){
                 const Json* file = shard.find("file");
                 const Json* size = shard.find("bytes");
                 const Json* hash = shard.find("xxh64");
@@ -287,7 +293,7 @@ static int verify(const std::string& directory){
                 else if(std::memcmp(header, "FLIP2SHD", 8) != 0 || headerCount != (unsigned long long)count->number){
                     problem(path + ": not a shard of " + std::to_string((unsigned long long)count->number) + " particles");
                 }
-                particles += (unsigned long long)count->number;
+                particles += each == list ? (unsigned long long)count->number : 0;
                 bytes += length;
             }
         }
@@ -322,7 +328,7 @@ static std::string frameName(int frame){    //as the cache's folders and the exp
 //when they've all been made. Ends with the event finished, counting the files written as written
 static int eachCommittedFrame(const std::string& directory, int first, int last, bool overwrite, bool follow, const char* finished, const char* written,
                               const std::function<std::vector<std::string>(int)>& targets,
-                              const std::function<bool(int, const std::vector<ShardData>&, const std::vector<std::string>&, std::string&)>& make){
+                              const std::function<bool(int, const std::vector<ShardData>&, const std::vector<ShardData>&, const std::vector<std::string>&, std::string&)>& make){
     auto start = std::chrono::steady_clock::now();
     size_t made = 0, problems = 0;
     std::vector<bool> done;     //per frame in range: made, or found already made
@@ -378,7 +384,7 @@ static int eachCommittedFrame(const std::string& directory, int first, int last,
                 continue;
             }
             std::string why;
-            std::vector<ShardData> shards;
+            std::vector<ShardData> shards, whitewater;   //the frame's particles, and its whitewater if the bake made any
             try{
                 std::string contents;
                 if(!readFile(record, contents)){
@@ -397,6 +403,16 @@ static int eachCommittedFrame(const std::string& directory, int first, int last,
                         why = why.empty() ? record + ": a shard without its file and xxh64" : why;
                     }
                 }
+                const Json* more = why.empty() ? commit.find("whitewater") : nullptr;
+                const Json* moreList = more != nullptr ? more->find("shards") : nullptr;
+                for(size_t index = 0; why.empty() && moreList != nullptr && index < moreList->items.size(); ++index){
+                    const Json* shardFile = moreList->items[index].find("file");
+                    const Json* hash = moreList->items[index].find("xxh64");
+                    whitewater.emplace_back();
+                    if(shardFile == nullptr || hash == nullptr || !readShard(directory + "/frames/" + name + "/" + shardFile->text, hash->text, whitewater.back(), why)){
+                        why = why.empty() ? record + ": a whitewater shard without its file and xxh64" : why;
+                    }
+                }
             }
             catch(const std::exception& error){
                 why = error.what();
@@ -405,7 +421,7 @@ static int eachCommittedFrame(const std::string& directory, int first, int last,
                 std::error_code ignored;
                 std::filesystem::create_directories(std::filesystem::path(file).parent_path(), ignored);
             }
-            if(why.empty() && make(frame, shards, files, why)){
+            if(why.empty() && make(frame, shards, whitewater, files, why)){
                 ++made;
                 done[frame - first] = true;
             }
@@ -440,7 +456,9 @@ static bool makeDirectory(const std::string& path){
 //flip2 export: the cache's committed frames, as files DCCs load natively. For now Houdini's: OUT/particles.NNNN.bgeo.sc (OUT is DIR/export/houdini
 //unless --out says; .bgeo, uncompressed, with format "bgeo"), each a frame's every shard in one point cloud, in rank order (the order one partition would
 //have held them), with P and v, and id and age if the cache's frames carry them (bgeo.cu). Frame NNNN is the cache's: frame 0 is the start, at time
-//0. Frames are picked, redone and followed as eachCommittedFrame says
+//0. A bake with whitewater has each frame's beside it, OUT/whitewater.NNNN.bgeo.sc, a point cloud too, with life, radius, kind, and the pscale its
+//particles are meant to be drawn at: half the spacing of what a voxel's volume of whitewater is drawn as. Frames are picked, redone and followed as
+//eachCommittedFrame says
 static int exportCache(const std::string& directory, int first, int last, std::string out, bool overwrite, bool follow, const std::string& format){
     if(out.empty()){
         out = directory + "/export/houdini";
@@ -450,7 +468,7 @@ static int exportCache(const std::string& directory, int first, int last, std::s
     }
     return eachCommittedFrame(directory, first, last, overwrite, follow, "exportDone", "exported", [&](int frame){
         return std::vector<std::string>{out + "/particles." + frameName(frame) + "." + format};
-    }, [&](int frame, const std::vector<ShardData>& shards, const std::vector<std::string>& targets, std::string& why){
+    }, [&](int frame, const std::vector<ShardData>& shards, const std::vector<ShardData>& whitewater, const std::vector<std::string>& targets, std::string& why){
         const std::string& target = targets[0];
         std::vector<const ShardData*> pieces;
         unsigned long long particles = 0;
@@ -461,7 +479,39 @@ static int exportCache(const std::string& directory, int first, int last, std::s
         if(!writeParticlesBgeo(target, pieces, std::string("flip2 ") + FLIP2_BUILD_ID, why)){
             return false;
         }
-        event("{\"event\":\"exported\",\"frame\":" + std::to_string(frame) + ",\"particles\":" + std::to_string(particles) + ",\"file\":" + ::quoted(target) + "}");
+        std::string also;
+        if(!whitewater.empty()){    //drawn at half the spacing of what cache.json says a voxel's volume of it is drawn as
+            double voxelSize = 0.0, perVoxel = 0.0;
+            std::string text;
+            if(readFile(directory + "/cache.json", text)){
+                try{
+                    Json cache = JsonReader(text, directory + "/cache.json").document();
+                    const Json* size = cache.find("voxelSize");
+                    const Json* described = cache.find("whitewater");
+                    const Json* count = described != nullptr ? described->find("perVoxel") : nullptr;
+                    voxelSize = size != nullptr ? size->number : 0.0;
+                    perVoxel = count != nullptr ? count->number : 0.0;
+                }
+                catch(const std::exception&){
+                }
+            }
+            if(!(voxelSize > 0.0) || !(perVoxel > 0.0)){
+                why = directory + "/cache.json: no voxelSize and whitewater.perVoxel to size the whitewater by";
+                return false;
+            }
+            std::vector<const ShardData*> more;
+            unsigned long long points = 0;
+            for(const ShardData& shard : whitewater){
+                more.push_back(&shard);
+                points += shard.particles;
+            }
+            std::string file = out + "/whitewater." + frameName(frame) + "." + format;
+            if(!writeWhitewaterBgeo(file, more, (float)(0.5*voxelSize / std::cbrt(perVoxel)), std::string("flip2 ") + FLIP2_BUILD_ID, why)){
+                return false;
+            }
+            also = ",\"whitewater\":" + std::to_string(points) + ",\"whitewaterFile\":" + ::quoted(file);
+        }
+        event("{\"event\":\"exported\",\"frame\":" + std::to_string(frame) + ",\"particles\":" + std::to_string(particles) + ",\"file\":" + ::quoted(target) + also + "}");
         return true;
     });
 }
@@ -509,7 +559,7 @@ static int meshCache(const std::string& directory, int first, int last, std::str
             files.push_back(out + "/fields." + frameName(frame) + ".vdb");
         }
         return files;
-    }, [&](int frame, const std::vector<ShardData>& shards, const std::vector<std::string>& targets, std::string& why){
+    }, [&](int frame, const std::vector<ShardData>& shards, const std::vector<ShardData>&, const std::vector<std::string>& targets, std::string& why){
         if(settings.separation <= 0.0f){
             std::string text;
             const Json* voxelSize = nullptr;
@@ -665,6 +715,8 @@ struct Checkpoint{
         std::string xxh64;
     };
     std::vector<State> states;  //in rank order
+    std::vector<State> whitewater;  //its ranks' whitewater, from a bake with any
+    unsigned long long whitewaterNextId = 0;    //and the id the next of its particles gets
 };
 
 //the newest checkpoint in directory whose record is down; frame -1 if there's none
@@ -729,6 +781,20 @@ static bool newestCheckpoint(const std::string& directory, Checkpoint& out, std:
         if(out.planes.size() != out.states.size() + 1){
             throw std::runtime_error(path + ": its ranks' planes and states don't match");
         }
+        const Json* whitewater = record.find("whitewater");
+        const Json* shards = whitewater != nullptr ? whitewater->find("shards") : nullptr;
+        if(const Json* nextId = whitewater != nullptr ? whitewater->find("nextId") : nullptr){
+            out.whitewaterNextId = (unsigned long long)nextId->number;
+        }
+        for(size_t index = 0; shards != nullptr && index < shards->items.size(); ++index){
+            const Json* file = shards->items[index].find("file");
+            const Json* rank = shards->items[index].find("rank");
+            const Json* hash = shards->items[index].find("xxh64");
+            if(file == nullptr || rank == nullptr || hash == nullptr){
+                throw std::runtime_error(path + ": a whitewater shard without its file, rank and xxh64");
+            }
+            out.whitewater.push_back({std::string(name) + "/" + file->text, (int)rank->number, hash->text});
+        }
     }
     catch(const std::exception& error){
         why = error.what();
@@ -792,6 +858,55 @@ static bool loadCheckpoint(const std::string& directory, const Checkpoint& check
         ids.clear();
         births.clear();
     }
+    return true;
+}
+
+//the checkpoint's whitewater, every rank's one after another, each attribute a plane per component as Particles::setWhitewaterParticles takes them
+struct CheckpointWhitewater{
+    std::vector<double> positions;      //x, then y, then z
+    std::vector<unsigned long long> ids;
+    std::vector<float> velocities, births, lives, radii, kinds;
+    size_t count = 0;
+};
+
+static bool loadCheckpointWhitewater(const std::string& directory, const Checkpoint& checkpoint, uint low, uint high, CheckpointWhitewater& out, std::string& why){
+    std::vector<ShardData> shards;  //those of the checkpoint's ranks whose planes overlap node planes [low, high), as loadCheckpoint takes the particles'
+    for(const Checkpoint::State& state : checkpoint.whitewater){
+        if(checkpoint.planes[state.rank] >= high || checkpoint.planes[state.rank + 1] <= low){
+            continue;
+        }
+        shards.emplace_back();
+        if(!readShard(directory + "/checkpoints/" + state.file, state.xxh64, shards.back(), why)){
+            return false;
+        }
+        const ShardData& shard = shards.back();
+        auto holds = [&](const char* name, uint32_t type, uint32_t components){
+            const ShardData::Attribute* attribute = shard.find(name);
+            return attribute != nullptr && attribute->type == type && attribute->components == components;
+        };
+        if(!holds("P", 2, 3) || !holds("id", 3, 1) || !holds("v", 1, 3) || !holds("birth", 1, 1) || !holds("life", 1, 1) || !holds("radius", 1, 1) || !holds("kind", 1, 1)){
+            why = directory + "/checkpoints/" + state.file + ": not a checkpoint's whitewater";
+            return false;
+        }
+        out.count += shard.particles;
+    }
+    //planes of every rank's values together: component by component, rank after rank
+    auto gather = [&](const char* name, int components, auto& into){
+        using T = typename std::remove_reference_t<decltype(into)>::value_type;
+        for(int component = 0; component < components; ++component){
+            for(const ShardData& shard : shards){
+                const T* plane = (const T*)shard.find(name)->planes.data() + (size_t)component*shard.particles;
+                into.insert(into.end(), plane, plane + shard.particles);
+            }
+        }
+    };
+    gather("P", 3, out.positions);
+    gather("id", 1, out.ids);
+    gather("v", 3, out.velocities);
+    gather("birth", 1, out.births);
+    gather("life", 1, out.lives);
+    gather("radius", 1, out.radii);
+    gather("kind", 1, out.kinds);
     return true;
 }
 
@@ -1061,8 +1176,8 @@ int main(int argc, char** argv){
     std::vector<std::vector<float>> gradients;
     std::vector<uint> ids;
     std::vector<float> births;
+    uint low = 0, high = scene.nodes[2];    //the node planes this process holds: all of them, or across processes, its rank's
     if(resuming){   //every rank's particles here, or across processes, those of the checkpoint's ranks whose planes overlap this rank's
-        uint low = 0, high = scene.nodes[2];
         if(!alone){
             std::vector<uint> planes = Simulation::planesFor(scene.nodes[2], worldSize);
             if(planes.empty() || myRank < 0 || myRank >= worldSize){
@@ -1162,6 +1277,34 @@ int main(int argc, char** argv){
             std::cerr<<"Two phases: density ratio "<<twoPhase.densityRatio<<"\n";
         }
     }
+    if(scene.whitewater){   //spray, foam and bubbles (whitewater.hu), with the two fluids' properties as the scene has them, whether or not it simulates the air
+        WhitewaterSettings whitewater;
+        whitewater.on = true;
+        whitewater.amount = (float)scene.whitewaterAmount;
+        whitewater.spray = (float)scene.whitewaterSpray;
+        whitewater.bubbles = (float)scene.whitewaterBubbles;
+        whitewater.perVoxel = scene.whitewaterPerVoxel;
+        whitewater.capacity = (uint)scene.whitewaterMaxParticles;
+        whitewater.foamLife = (float)scene.whitewaterFoamLife;
+        whitewater.maxAge = (float)scene.whitewaterMaxAge;
+        whitewater.surfaceTension = (float)((scene.surfaceTension > 0.0 ? scene.surfaceTension : scene.airSurfaceTension) / scene.density);
+        whitewater.airDensity = (float)(scene.airDensity / scene.density);
+        whitewater.airViscosity = (float)scene.airViscosity;
+        whitewater.liquidViscosity = (float)((scene.viscosity > 0.0 ? scene.viscosity : scene.airLiquidViscosity) / scene.density);
+        whitewater.dropletScale = (float)scene.whitewaterDropletScale;
+        whitewater.bubbleScale = (float)scene.whitewaterBubbleScale;
+        whitewater.seed = scene.seed;
+        simulation->setWhitewater(whitewater);
+        if(resuming && !checkpoint.whitewater.empty()){     //as the checkpoint left it; one from a bake without any starts with none
+            CheckpointWhitewater saved;
+            std::string why;
+            if(!loadCheckpointWhitewater(scene.outputDirectory, checkpoint, low, high, saved, why)){
+                return failure(why);
+            }
+            simulation->setWhitewaterParticles((uint)saved.count, saved.positions.data(), saved.ids.data(), saved.velocities.data(), saved.births.data(), saved.lives.data(),
+                                               saved.radii.data(), saved.kinds.data(), checkpoint.whitewaterNextId);
+        }
+    }
     std::vector<ForceField> fields;
     std::vector<std::shared_ptr<const SceneField>> volumes;     //each volume force's vectors, which every partition puts on its own GPU
     for(const SceneForce& force : scene.forces){
@@ -1207,6 +1350,7 @@ int main(int argc, char** argv){
         description.ids = scene.writeIds;
         description.ages = scene.writeAges;
         description.keepCheckpoints = scene.keepCheckpoints;
+        description.whitewaterPerVoxel = scene.whitewater ? scene.whitewaterPerVoxel : 0;
         simulation->startCache(scene.outputDirectory, description, resuming ? checkpoint.frame : -1, [](const char* what, int frame){
             event("{\"event\":\"" + std::string(what) + "\",\"frame\":" + std::to_string(frame) + "}");
         });
@@ -1253,6 +1397,7 @@ int main(int argc, char** argv){
     std::signal(SIGINT, onCancel);
     std::signal(SIGTERM, onCancel);
     int checkpointed = resuming ? checkpoint.frame : -1;    //the newest checkpoint's frame, which resume would carry on from
+    unsigned long long whitewaterDropped = 0;   //what whitewater.maxParticles had kept from being made by the frame before
     for(int frame = firstFrame; frame <= scene.frames; ++frame){
         auto frameStart = std::chrono::steady_clock::now();
         simulation->solveFrame(scene.fps);
@@ -1293,8 +1438,18 @@ int main(int argc, char** argv){
                 return failure(error);
             }
         }
-        std::snprintf(line, sizeof(line), "{\"event\":\"frame\",\"frame\":%d,\"seconds\":%.4f,\"particles\":%zu}", frame,
-                      std::chrono::duration<double>(std::chrono::steady_clock::now() - frameStart).count(), simulation->particlesHere());
+        std::string more;
+        if(scene.whitewater){   //how much whitewater there is here, and how much more the surface would have made this frame with room for it
+            unsigned long long whitewater, dropped;
+            simulation->whitewaterHere(whitewater, dropped);
+            more = ",\"whitewater\":" + std::to_string(whitewater) + (dropped > whitewaterDropped ? ",\"whitewaterDropped\":" + std::to_string(dropped - whitewaterDropped) : std::string());
+            if(dropped > whitewaterDropped && whitewaterDropped == 0 && printsEvents){
+                std::cerr<<"Whitewater: at whitewater.maxParticles ("<<(unsigned long long)scene.whitewaterMaxParticles<<"), so what the surface makes is thinned from frame "<<frame<<" on\n";
+            }
+            whitewaterDropped = dropped;
+        }
+        std::snprintf(line, sizeof(line), "{\"event\":\"frame\",\"frame\":%d,\"seconds\":%.4f,\"particles\":%zu%s}", frame,
+                      std::chrono::duration<double>(std::chrono::steady_clock::now() - frameStart).count(), simulation->particlesHere(), more.c_str());
         event(line);
         if(stopping && !last){
             std::string error = simulation->finishCache();  //the frame and its checkpoint committed

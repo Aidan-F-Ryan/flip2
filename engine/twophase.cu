@@ -24,6 +24,7 @@
 //Every voxel's values come from what its partition holds alike, so they're the same bit for bit however the nodes are split.
 
 #include "particles.hu"
+#include "gridSampling.hu"
 #include "algorithms/voxelSolveFunctions.hu"   //NO_VOXEL, WALL_VOXEL
 #include <cmath>
 #include <cstdlib>
@@ -88,11 +89,6 @@ __global__ void settleFacesOfOneFluid(uint numVoxels, const float* massX, const 
             }
         }
     }
-}
-
-//how much of a face's reach along an axis lies past a wall that many half voxels from it: P2G's quadratic B-spline reaches a voxel and a half each way
-__device__ inline float pastWall(int halfVoxels){
-    return halfVoxels == 0 ? 0.5f : halfVoxels == 1 ? 1.0f/6.0f : halfVoxels == 2 ? 1.0f/48.0f : 0.0f;
 }
 
 //For escaping particles (particles.hu): each stored voxel's share of liquid: the liquid's density there over the density at rest, the mean over its
@@ -226,7 +222,7 @@ void Particles::findFaceDensities(){
     for(float* lightness : light){  //the ghosts take their owners', which read their own neighbours
         context->fillGhosts(lightness, stream);
     }
-    if(twoPhase.escaping()){    //from the faces as the ghosts' exchange left them: a voxel's upper faces are its neighbours'
+    if(twoPhase.escaping() || whitewater.on){   //from the faces as the ghosts' exchange left them: a voxel's upper faces are its neighbours'
         findLiquidShare<<<blocks, BLOCKSIZE, 0, stream>>>(numVoxels, solveCodes.devPtr(), neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(), neighborPy.devPtr(),
             neighborNz.devPtr(), neighborPz.devPtr(), beside ? obstacleNear.devPtr() : nullptr, beside ? obstacleSolids.devPtr() : nullptr, voxelWeightsX.devPtr(),
             voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), (const int*)liquidWeights[0].devPtr(), (const int*)liquidWeights[1].devPtr(), (const int*)liquidWeights[2].devPtr(),

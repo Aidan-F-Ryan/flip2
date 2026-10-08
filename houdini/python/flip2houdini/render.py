@@ -1,18 +1,22 @@
 """flip2 Karma Setup: a flip2 bake, ready to render in Karma.
 
-Builds in /stage what a first render needs: the liquid's surface with a water material, the collision geometry, Houdini's whitewater if flip2 Whitewater
-set it up, a ground under the domain, a sky, a camera that takes the domain in, Karma's render settings and a USD Render node to render with.
+Builds in /stage what a first render needs: the liquid's surface with a water material, the collision geometry, the bake's whitewater if it was baked
+with any (or else Houdini's, if flip2 Whitewater set it up), a ground under the domain, a sky, a camera that takes the domain in, Karma's render settings and a USD Render node to render with.
 
 One of those settings is the reason to have this at all. flip2's surface carries the liquid's velocity as v, which Solaris imports as USD's velocities,
 and Karma blurs a moving mesh by them, but only when its Velocity Blur says to, and it starts at No Velocity Blur: a flip2 surface renders with no
 motion blur at all until that's changed. Here it's on.
 
-Whitewater is rendered as points as wide as they are apart (the solver's pscale makes each twice that, which renders as beads), and the sun is on the
+Whitewater is rendered as points as wide as they are apart (the bake's own come sized so; Houdini's solver's pscale makes each twice that, which
+renders as beads), and the sun is on the
 camera's side: where Karma Physical Sky starts it, behind the scene, whitewater and everything else facing the camera is in shade, and reads as grey.
 """
 import math
+import os
 
 import hou
+
+from . import importer
 
 LOOKS = {     #MaterialX standard surfaces
     "water": dict(base=0.0, specular=1.0, specular_roughness=0.02, specular_IOR=1.33, transmission=1.0, transmission_depth=0.6,
@@ -53,8 +57,12 @@ def create_render(node):
         looks["/" + lop.name()] = look
 
     imported("liquid", node.node("surface"), "water")     #the surface itself, whatever the node's Show says
+    folder = os.path.join(node.evalParm("outputdir").rstrip("/"), "bake") if kind == "solver" else node.evalParm("bakedir").rstrip("/")
+    own = node.node(importer.WHITEWATER)
     whitewater = node.parent().node(prefix + "_whitewater")
-    if whitewater is not None:      #sized to render: the solver's pscale is the points' whole separation
+    if own is not None and importer.has_whitewater(os.path.join(folder, "export", "houdini")):     #the bake's own, its pscale already the size to draw
+        imported("whitewater", own, "whitewater")
+    elif whitewater is not None:    #Houdini's, sized to render: the solver's pscale is the points' whole separation
         sized = node.parent().node(prefix + "_whitewater_render")
         if sized is None:
             sized = node.parent().createNode("attribwrangle", prefix + "_whitewater_render")

@@ -192,6 +192,40 @@ def _interface(node):
     surface.addParmTemplate(hou.ButtonParmTemplate("meshbake", "Mesh Bake", help="Mesh the bake's frames again with these settings, replacing their "
                                                    "surfaces: after a bake made without them, or to try others", **_callback("mesh_bake")))
     group.append(surface)
+    whitewater = hou.FolderParmTemplate("whitewaterfolder", "Whitewater", folder_type=hou.folderType.Tabs)
+    whitewater.addParmTemplate(hou.ToggleParmTemplate("whitewater", "Whitewater", default_value=False,
+                                                      help="Bake spray, foam and bubbles with the liquid: made where its surface breaks up (liquid closing on "
+                                                           "liquid or on a wall, the surface folding under or stretching until it tears), each moving as what "
+                                                           "it is. On the node's fifth output, and flip2 Karma Setup draws it. It takes nothing from the liquid: "
+                                                           "the liquid bakes the same with it or without"))
+    whitewater.addParmTemplate(hou.FloatParmTemplate("wwamount", "Amount", 1, default_value=(1.0,), min=0.0, max=10.0, disable_when="{ whitewater == 0 }",
+                                                     help="How much a breaking surface makes, against the default: 2 is twice the whitewater"))
+    whitewater.addParmTemplate(hou.FloatParmTemplate("wwspray", "Spray", 1, default_value=(1.0,), min=0.0, max=10.0, disable_when="{ whitewater == 0 }",
+                                                     help="How much of it is spray, against the default: droplets thrown off where liquid collides or its "
+                                                          "surface tears. They fly until they land, and are foam where they do"))
+    whitewater.addParmTemplate(hou.FloatParmTemplate("wwbubbles", "Bubbles", 1, default_value=(1.0,), min=0.0, max=10.0, disable_when="{ whitewater == 0 }",
+                                                     help="How much of it is bubbles, against the default: air folded in where liquid collides or its surface "
+                                                          "is drawn under. They rise, and are foam once they're up"))
+    whitewater.addParmTemplate(hou.IntParmTemplate("wwpervoxel", "Particles per Voxel", 1, default_value=(27,), min=1, max=216, disable_when="{ whitewater == 0 }",
+                                                   help="How finely it's drawn: the particles a voxel's volume of whitewater becomes. 27 is a third of a voxel "
+                                                        "apart, as Houdini's own whitewater is set up; 64 is finer and makes 2.4 times as many. Their pscale "
+                                                        "follows, half their spacing"))
+    whitewater.addParmTemplate(hou.FloatParmTemplate("wwfoamlife", "Foam Life", 1, default_value=(2.0,), min=0.05, max=60.0, disable_when="{ whitewater == 0 }",
+                                                     help="Seconds a bubble lasts at the surface, on average: each bursts at the same rate whatever its age, so "
+                                                          "a patch thins evenly. Fresh water's foam is gone in under a second, the sea's lasts several"))
+    whitewater.addParmTemplate(hou.FloatParmTemplate("wwmaxparticles", "Max Particles (millions)", 1, default_value=(16.0,), min=0.01, max=1000.0,
+                                                     disable_when="{ whitewater == 0 }",
+                                                     help="The most there can be at once, on each GPU. With less room than the surface would fill, what it "
+                                                          "makes is thinned evenly, and the bake's log says so. About 100 MB of GPU memory per million there "
+                                                          "are, not per million allowed"))
+    whitewater.addParmTemplate(hou.FloatParmTemplate("wwdropletscale", "Droplet Size", 1, default_value=(1.0,), min=0.01, max=100.0, disable_when="{ whitewater == 0 }",
+                                                     help="Droplets' sizes against real ones (a millimetre or so, finer the harder the surface is torn), which "
+                                                          "is what sets how they fly: larger keep going, smaller hang as mist. For a miniature that should read "
+                                                          "as big water, lower it"))
+    whitewater.addParmTemplate(hou.FloatParmTemplate("wwbubblescale", "Bubble Size", 1, default_value=(1.0,), min=0.01, max=100.0, disable_when="{ whitewater == 0 }",
+                                                     help="Bubbles' sizes against real ones (most of the air is in bubbles a millimetre or more across), which "
+                                                          "sets how fast they rise: larger are up and gone sooner, smaller follow the liquid as a haze"))
+    group.append(whitewater)
     bake = hou.FolderParmTemplate("bakefolder", "Bake", folder_type=hou.folderType.Tabs)
     bake.addParmTemplate(hou.StringParmTemplate("outputdir", "Output Directory", 1, default_value=("$HIP/geo/$HIPNAME.$OS",),
                                                 string_type=hou.stringParmType.FileReference, file_type=hou.fileType.Directory))
@@ -243,6 +277,7 @@ def _network(node):
     folder, frame = '`chs("../outputdir")`/bake/export/houdini', 'round(($T - (ch("../startframe") - 1)/$FPS)*$FPS)'
     shown = importer.build_loaders(node, folder, frame)
     importer.build_fields(node, folder, frame)
+    importer.build_whitewater(node, folder, frame)
     _split_volumes(node)
     _force_network(node)
     box = importer.build_container(node, node.node("collision_unpack"), ROLES.index("collision"))
@@ -608,6 +643,11 @@ def write_scene(node):
                    "attributes": [name for name in ("id", "age") if node.parm("write" + name) is None or node.evalParm("write" + name)],
                    "checkpoints": {"every": node.evalParm("checkpoints"), "keep": 2}},
     }
+    if node.parm("whitewater") is not None and node.evalParm("whitewater"):    #a node from before the Whitewater tab bakes none
+        scene["whitewater"] = {"amount": node.evalParm("wwamount"), "spray": node.evalParm("wwspray"), "bubbles": node.evalParm("wwbubbles"),
+                               "perVoxel": node.evalParm("wwpervoxel"), "foamLife": node.evalParm("wwfoamlife"),
+                               "maxParticles": round(node.evalParm("wwmaxparticles")*1.0e6), "dropletScale": node.evalParm("wwdropletscale"),
+                               "bubbleScale": node.evalParm("wwbubblescale")}
     roles = [role for role in ROLES if _connected(node, ROLES.index(role))]
     total = sum(1 if role == "fluid" else len(frames) for role in roles) + (len(frames) if "collision" in roles else 0)
     sampled = [0]

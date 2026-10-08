@@ -168,6 +168,19 @@ struct Scene{
     double airLiquidViscosity = 0.001;  //the liquid's viscosity for that drag, Pa s: "liquid"'s where that gives one, water's (0.001) where it gives none
     double airSurfaceTension = 0.072;   //between the two fluids, N/m: how far a bubble flattens as it rises, and so how fast a large one does. "liquid"'s
                                         //where that gives one, water's and air's (0.072) where it gives none
+    //"whitewater": {...}: spray, foam and bubbles, made where the liquid's surface breaks up (whitewater.hu). What it needs of the two fluids it takes from
+    //"liquid" and "air", whether or not the air is simulated: the liquid's surface tension and viscosity (water's where it gives none), and the
+    //air's density and viscosity
+    bool whitewater = false;
+    double whitewaterAmount = 1.0;          //how much a breaking surface makes, against what the model gives
+    double whitewaterSpray = 1.0;           //and how much of that is spray, and how much bubbles, each against the model's own share
+    double whitewaterBubbles = 1.0;
+    int whitewaterPerVoxel = 27;            //the particles a voxel's volume of whitewater is drawn as
+    double whitewaterMaxParticles = 1.6e7;  //the most at once, in each partition: with less room than the surface would fill, what it makes thins evenly
+    double whitewaterFoamLife = 2.0;        //seconds a bubble lasts at the surface, on average
+    double whitewaterMaxAge = 30.0;         //seconds after which any of it is gone
+    double whitewaterDropletScale = 1.0;    //droplets' radii against what the model gives, and bubbles'
+    double whitewaterBubbleScale = 1.0;
     int particlesPerVoxel = 8;
     unsigned long long seed = 1;
     std::vector<SceneShape> fluids;

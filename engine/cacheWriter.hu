@@ -23,7 +23,9 @@
 //  frames/0042/particles.r003.f2p      rank 3's particles at frame 42: a shard (below), written by rank 3 itself
 //  frames/0042/commit.json             written last, by rank 0, once every rank's shard is on the disk: each shard's size and XXH64. A frame without one
 //                                      is unfinished, and a reader skips it
+//  frames/0042/whitewater.r003.f2p     with whitewater (whitewater.hu), rank 3's at frame 42, a shard beside its particles', in the same commit record
 //  checkpoints/0040/state.r003.f2p     rank 3's whole state at the end of frame 40, as a shard: what flip2 resume carries on from, exactly
+//  checkpoints/0040/whitewater.r003.f2p    and its whitewater's
 //  checkpoints/0040/ckpt.json          written last, by rank 0, as commit.json is: the time, the substeps taken, the ranks' planes, and each state shard
 //
 //A shard (.f2p, version 1) is little-endian: a 64-byte header, a 64-byte entry per attribute, then each attribute's data. Header: "FLIP2SHD", version,
@@ -35,7 +37,9 @@
 //y, z each, and unless the scene leaves them out, "id", uint64, which a particle keeps for as long as it exists and no other ever has, and "age",
 //float32, the seconds since it came to be. A checkpoint's: "P" as float64, "v", with APIC "c", float32 velocity gradients (component c along axis a at
 //3c + a), "id", and "birth", float32, when each particle came to be. The particles' order changes from frame to frame: the ids say which is which. Floats
-//from a simulation are noisy: losslessly P and v come to about 17 bytes a particle (1.4x) with zstd and 18.5 with lz4, measured on the dam break
+//from a simulation are noisy: losslessly P and v come to about 17 bytes a particle (1.4x) with zstd and 18.5 with lz4, measured on the dam break.
+//A frame's whitewater: "P", "v", "id" and "age" as the particles', then float32 "life" (the seconds it has left as foam), "radius" (the droplet's or
+//the bubble's, metres) and "kind" (0 spray, 1 foam, 2 a bubble). A checkpoint's: "P" as float64, "id", "v", "birth", "life", "radius", "kind"
 struct CacheDescription{
     std::string scenePath;      //as given
     std::string sceneHash;      //XXH64 of the scene file, hex
@@ -54,6 +58,7 @@ struct CacheDescription{
     bool ids = true;            //whether the frames carry "id"
     bool ages = true;           //and "age"
     int keepCheckpoints = 2;    //the newest ones kept; older ones are deleted once a newer one is down
+    int whitewaterPerVoxel = 0; //with whitewater, the particles a voxel's volume of it is drawn as, which sizes them for whatever draws them; 0 with none
 };
 
 //what a checkpoint holds besides its particles: enough to carry on exactly as if the bake had never stopped
@@ -63,6 +68,7 @@ struct CheckpointState{
     bool apic = false;                  //whether the particles carry velocity gradients ("c")
     unsigned long long nextId = 0;      //the id the next new particle gets
     double acceleration = 0.0;          //the most its last substep accelerated a face at, m/s^2, which limits the next substep (Particles::getCourantDt)
+    unsigned long long whitewaterNextId = 0;    //with whitewater, the id the next of its particles gets
 };
 
 //one rank's part of a frame or a checkpoint in a host buffer: its attributes one after another (frameBytes, checkpointBytes), each a plane per component
@@ -106,6 +112,9 @@ public:
     static size_t frameBytes(size_t particles, bool ids, bool ages){
         return (3*sizeof(float) + 3*sizeof(float) + (ids ? sizeof(uint64_t) : 0) + (ages ? sizeof(float) : 0))*particles;
     }
+    static size_t whitewaterBytes(size_t particles, bool checkpoint){   //a rank's whitewater, in a frame or a checkpoint
+        return (checkpoint ? 3*sizeof(double) + sizeof(uint64_t) + 7*sizeof(float) : 6*sizeof(float) + sizeof(uint64_t) + 4*sizeof(float))*particles;
+    }
     static size_t checkpointBytes(size_t particles, bool apic){
         return (3*sizeof(double) + 3*sizeof(float) + (apic ? 9*sizeof(float) : 0) + sizeof(uint64_t) + sizeof(float))*particles;
     }
@@ -123,9 +132,11 @@ public:
     char* hostBuffer(int buffer){
         return hostBuffers[buffer];
     }
-    //writes and commits frame (at time seconds in) once every event in copies has completed; the events mustn't be recorded again until the buffer is free
-    void submit(int buffer, int frame, double time, const std::vector<CacheShard>& shards, const std::vector<cudaEvent_t>& copies);
-    void submitCheckpoint(int buffer, int frame, const CheckpointState& state, const std::vector<CacheShard>& shards, const std::vector<cudaEvent_t>& copies);
+    //writes and commits frame (at time seconds in) once every event in copies has completed; the events mustn't be recorded again until the buffer is free.
+    //whitewater: with whitewater, each rank's part of it in the same buffer, after the particles'
+    void submit(int buffer, int frame, double time, const std::vector<CacheShard>& shards, const std::vector<cudaEvent_t>& copies, const std::vector<CacheShard>& whitewater = {});
+    void submitCheckpoint(int buffer, int frame, const CheckpointState& state, const std::vector<CacheShard>& shards, const std::vector<cudaEvent_t>& copies,
+                          const std::vector<CacheShard>& whitewater = {});
     void flush();           //waits until every job submitted is written and committed, or has failed
     std::string error();    //what went wrong, if anything: nothing from then on is committed
 
@@ -143,6 +154,7 @@ private:
         CheckpointState state;      //a checkpoint's; a frame's time is state.time
         std::vector<CacheShard> shards;
         std::vector<cudaEvent_t> copies;
+        std::vector<CacheShard> whitewater;
     };
     struct ShardRecord{
         int rank = 0;
@@ -159,8 +171,9 @@ private:
     bool writeShard(const std::string& path, int frame, const CacheShard& shard, const char* data, const std::vector<Layout>& layout, ShardRecord& record);
     bool readRecord(const std::string& path, int rank, ShardRecord& record);
     std::string shardsJson(const std::vector<ShardRecord>& records, const char* base) const;
-    bool commit(const std::string& frameDirectory, int frame, double time, const std::vector<ShardRecord>& records);
-    bool commitCheckpoint(const std::string& checkpointDirectory, const Job& job, const std::vector<ShardRecord>& records);
+    std::string whitewaterJson(const std::vector<ShardRecord>& whitewater, const std::string& more = "") const;
+    bool commit(const std::string& frameDirectory, int frame, double time, const std::vector<ShardRecord>& records, const std::vector<ShardRecord>& whitewater);
+    bool commitCheckpoint(const std::string& checkpointDirectory, const Job& job, const std::vector<ShardRecord>& records, const std::vector<ShardRecord>& whitewater);
     void pruneCheckpoints();
     bool describe();    //cache.json, as things are now
     std::string cacheJson() const;

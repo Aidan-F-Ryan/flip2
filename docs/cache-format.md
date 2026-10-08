@@ -11,14 +11,17 @@ DIR/
   cache.json                        the bake: scene, domain, ranks, build, progress
   frames/0042/commit.json           frame 42's commit record, written last
   frames/0042/particles.r003.f2p    rank 3's particles at frame 42 (a shard)
+  frames/0042/whitewater.r003.f2p   rank 3's whitewater at frame 42, in a bake with whitewater
   checkpoints/0040/ckpt.json        checkpoint 40's record, written last
   checkpoints/0040/state.r003.f2p   rank 3's whole state at the end of frame 40 (a shard)
+  checkpoints/0040/whitewater.r003.f2p   and its whitewater's
   frames.discarded/0043/            frames a resume worked out again, kept for comparison
 ```
 
 - Frame and checkpoint directories are named by frame number in decimal, zero-padded to at least 4 digits. Frame 0 is the initial state.
 - Shards are named `<base>.r<rank>.f2p`, with the rank zero-padded to at least 3 digits. Each rank writes its own. A frame has one shard per rank, and every particle is in exactly one of them.
-- Readers ignore any other file. Files ending in `.tmp` are writes in progress. `particles.rNNN.json` and `state.rNNN.json` are notes ranks leave for rank 0 while committing; they aren't part of the format and may or may not be there.
+- A bake with whitewater also has one `whitewater` shard per rank in every frame and checkpoint, even when it holds no particles. See [Whitewater](#whitewater).
+- Readers ignore any other file. Files ending in `.tmp` are writes in progress. `particles.rNNN.json`, `state.rNNN.json` and `whitewater.rNNN.json` are notes ranks leave for rank 0 while committing; they aren't part of the format and may or may not be there.
 
 ## Reading while the bake runs
 
@@ -47,6 +50,7 @@ DIR/
 | `nodes`, `nodeSize`, `voxelSize`, `domainMin` | The simulation grid: node counts along x, y, z, node size in metres (4 voxels), voxel size, and the domain's minimum corner. |
 | `gpu`, `sm`, `cudaRuntime`, `build` | The GPU and build that made it. |
 | `shards` | `format` `"f2p"`, `version` `1`, `compression` (`"blosc-zstd"`, `"blosc-lz4"` or `"none"`), and the attributes of frame shards. |
+| `whitewater` | Only in a bake with whitewater: `perVoxel`, the number of whitewater particles that stand for one voxel's volume of whitewater. |
 
 ## commit.json
 
@@ -64,7 +68,9 @@ DIR/
 - the XXH64 of the whole file, as 16 lowercase hex digits;
 - the bounds of its positions.
 
-`flip2 verify DIR` checks every committed frame's shards against their entries.
+In a bake with whitewater the record also has `"whitewater":{"particles":310000,"shards":[...]}`: the frame's whitewater particle count, and its shards listed the same way.
+
+`flip2 verify DIR` checks every committed frame's shards against their entries, whitewater shards included.
 
 ## Shards (.f2p)
 
@@ -132,6 +138,34 @@ A shard is little-endian and is laid out in this order:
 
 A particle's order within a shard changes from frame to frame, so match particles across frames by `id`, not by index. Concatenating a frame's shards in rank order gives the order a single partition would have held the particles in.
 
+## Whitewater
+
+A scene with a `whitewater` block bakes spray, foam and bubbles as a second set of particles. They are in their own shards, `whitewater.rNNN.f2p`, beside each frame's and each checkpoint's particle shards, with the same header and layout. A reader that only wants the liquid never opens them.
+
+**Frame whitewater shards** have these attributes:
+
+| Name | Type | Components | Meaning |
+|---|---|---|---|
+| `P` | float32 | 3 | position in metres |
+| `v` | float32 | 3 | velocity in metres per second |
+| `id` | uint64 | 1 | the particle's id, kept for as long as it exists |
+| `age` | float32 | 1 | seconds since it was made |
+| `life` | float32 | 1 | seconds it has left as foam; it only runs down while the particle is foam |
+| `radius` | float32 | 1 | the radius of the droplet or bubble it moves as, in metres |
+| `kind` | float32 | 1 | `0` spray, `1` foam, `2` bubble |
+
+**Checkpoint whitewater shards** have `P` (float64, 3), `id` (uint64), `v` (float32, 3), then float32 `birth` (when it was made, in simulated seconds), `life`, `radius` and `kind`.
+
+**What a particle is.** Each one stands for the same volume of whitewater: a voxel's volume divided by `cache.json`'s `whitewater.perVoxel`. That sets how large to draw it. A point drawn with a radius of half of `voxelSize / cbrt(perVoxel)` is as wide as the particles are apart where they are dense, and `flip2 export` writes that as `pscale`. `radius` is something else: the physical size the particle moves by, usually a millimetre or less, and it doesn't depend on the voxel size.
+
+**Kinds change.** A droplet that lands is foam, foam the liquid closes over is a bubble, a bubble that reaches the surface is foam, and foam the liquid falls away from is spray. Read `kind` every frame.
+
+**Ids.** Whitewater particles are numbered from 0 in the order they are made, separately from the liquid's particles: a whitewater particle and a liquid particle can have the same id. The numbering doesn't depend on how the domain is split between ranks. Ids aren't reused, and `flip2 export` writes their low 32 bits to Houdini as int32 `id`.
+
+**Order.** As with the liquid, concatenating a frame's whitewater shards in rank order gives the order a single partition would have held them in, so a bake on 1 GPU and on 4 exports the same files.
+
+**The particle limit.** `whitewater.maxParticles` in the scene limits how many each rank holds. At the limit the bake makes fewer new particles, thinned evenly over the surface, and reports how many it left out: in the `frame` events on its standard output as `whitewaterDropped`, and in the diagnostics file. A bake that reaches the limit gives different whitewater on a different number of ranks, since each rank has its own limit. The liquid is never affected.
+
 ## ckpt.json
 
 ```json
@@ -149,8 +183,9 @@ A particle's order within a shard changes from frame to frame, so match particle
 | `acceleration` | The most the last substep accelerated the fluid at, in m/s², which bounds the next substep's length. A checkpoint from before it was kept has none, and the substep after a resume from it goes by the forces alone. |
 | `partitionPlanes` | The checkpoint's split, as in `cache.json`. A resume can use a different split. |
 | `states` | The state shards in rank order, listed like a commit record's `shards`. |
+| `whitewater` | Only in a bake with whitewater: `particles`, `nextId` (the id the next whitewater particle gets) and `shards`, listed the same way. |
 
-`flip2 resume` carries on from the newest checkpoint and gives exactly the frames the uninterrupted bake would have, whatever split it resumes with. The bake keeps its newest checkpoints, 2 by default. It deletes older ones once a newer one is committed.
+`flip2 resume` carries on from the newest checkpoint and gives exactly the frames the uninterrupted bake would have, whatever split it resumes with. That includes the whitewater. The bake keeps its newest checkpoints, 2 by default. It deletes older ones once a newer one is committed.
 
 ## Compatibility
 
@@ -159,6 +194,7 @@ Version 1 is frozen. Later versions keep these rules:
 - **Adding an attribute** to frame or checkpoint shards doesn't change any version. Particle ids arrived this way, as `id` of type uint64, with `age` and `birth`.
 - **Readers skip attributes they don't know,** including ones whose type is reserved above. They rely only on the attributes listed here.
 - **Adding a key** to a JSON record doesn't change its version. Readers ignore keys they don't know.
+- **Adding a kind of shard** beside a frame's or a checkpoint's doesn't change any version. Whitewater arrived this way, listed under its own key in the records.
 - **Any other change bumps a version:**
   - the shard header's `version`, for a change to its binary layout;
   - the record's `version`, for a change to a JSON record's meaning.

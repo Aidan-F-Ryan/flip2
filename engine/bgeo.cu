@@ -439,11 +439,15 @@ void endVector(BinaryJson& json){
 
 }
 
-bool writeParticlesBgeo(const std::string& path, const std::vector<const ShardData*>& shards, const std::string& software, std::string& why){
+//a point cloud: the shards' P and v, id and age where every shard has them, and with whitewater its life, radius, kind and the pscale given
+static bool writePointsBgeo(const std::string& path, const std::vector<const ShardData*>& shards, bool whitewater, float pscale, const std::string& software, std::string& why){
     uint64_t points = 0;
     float low[3] = {INFINITY, INFINITY, INFINITY}, high[3] = {-INFINITY, -INFINITY, -INFINITY};
     bool ids = true, ages = true;   //written if every shard has them
     for(const ShardData* shard : shards){
+        if(shard->particles == 0){  //nothing to check, or to write: a frame before any whitewater is a cloud of no points
+            continue;
+        }
         const float* positions = planesOf(*shard, "P");
         if(positions == nullptr || planesOf(*shard, "v") == nullptr){
             why = "a shard without float32 P and v";
@@ -451,6 +455,10 @@ bool writeParticlesBgeo(const std::string& path, const std::vector<const ShardDa
         }
         ids = ids && planeOf(*shard, "id", 3) != nullptr;
         ages = ages && planeOf(*shard, "age", 1) != nullptr;
+        if(whitewater && (planeOf(*shard, "kind", 1) == nullptr || planeOf(*shard, "life", 1) == nullptr || planeOf(*shard, "radius", 1) == nullptr)){
+            why = "a whitewater shard without float32 kind, life and radius";
+            return false;
+        }
         for(int axis = 0; axis < 3; ++axis){
             for(uint64_t particle = 0; particle < shard->particles; ++particle){
                 float value = positions[axis*shard->particles + particle];
@@ -501,6 +509,26 @@ bool writeParticlesBgeo(const std::string& path, const std::vector<const ShardDa
                 if(ids){
                     scalar("id", true);
                 }
+                if(whitewater){
+                    beginAttribute(json, "kind", points, 1, true, "nonarithmetic_integer");     //the shards hold it as a float
+                    for(const ShardData* shard : shards){
+                        const float* plane = (const float*)planeOf(*shard, "kind", 1);
+                        narrow.resize(shard->particles);
+                        for(uint64_t particle = 0; particle < shard->particles; ++particle){
+                            narrow[particle] = (int32_t)plane[particle];
+                        }
+                        json.raw(narrow.data(), 4*shard->particles);
+                    }
+                    endVector(json);
+                    scalar("life", false);
+                    beginAttribute(json, "pscale", points, 1, false, nullptr);
+                    for(const ShardData* shard : shards){
+                        tuples.assign(shard->particles, pscale);
+                        json.raw(tuples.data(), 4*shard->particles);
+                    }
+                    endVector(json);
+                    scalar("radius", false);
+                }
             }
             beginVector(json, name, points);
             for(const ShardData* shard : shards){   //each shard's planes interleaved into tuples, a block at a time
@@ -526,6 +554,14 @@ bool writeParticlesBgeo(const std::string& path, const std::vector<const ShardDa
         json.endArray();
         json.endArray();
     });
+}
+
+bool writeParticlesBgeo(const std::string& path, const std::vector<const ShardData*>& shards, const std::string& software, std::string& why){
+    return writePointsBgeo(path, shards, false, 0.0f, software, why);
+}
+
+bool writeWhitewaterBgeo(const std::string& path, const std::vector<const ShardData*>& shards, float pscale, const std::string& software, std::string& why){
+    return writePointsBgeo(path, shards, true, pscale, software, why);
 }
 
 bool writeSurfaceBgeo(const std::string& path, const SurfaceMesh& mesh, const std::string& software, std::string& why){

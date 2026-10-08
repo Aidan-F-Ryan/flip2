@@ -36,6 +36,8 @@ public:
         return *partitions[index];
     }
     size_t particlesHere() const;   //the particles the partitions in this process hold between them
+    //and their whitewater: how many particles, and how many more the surface would have made since the start had maxParticles left room (whitewater.hu)
+    void whitewaterHere(unsigned long long& particles, unsigned long long& dropped);
     void forEachPartition(const std::function<void(Particles&)>& setting);  //for settings, on this thread, with each partition's GPU current in turn
 
     void initialize();      //each partition keeps its own particles and builds its grid
@@ -76,6 +78,7 @@ public:
 
 private:
     void inLockstep(const std::function<void(Particles&)>& step);    //every partition here runs step, each on its own thread
+    std::vector<uint> countWhitewater();
     void startFrameWriter();
 
     uint totalParticles;
@@ -90,9 +93,11 @@ private:
     std::vector<std::vector<cudaEvent_t>> frameCopies;  //per partition here, per frame buffer: its part of the frame has landed; on its GPU
     std::unique_ptr<CacheWriter> cacheWriter;       //writes the cache from a background thread, in every process
     std::vector<std::vector<cudaEvent_t>> cacheCopies;  //per partition here, per cache buffer, as frameCopies
+    std::vector<std::vector<cudaEvent_t>> whitewaterCopies;     //and the same for its whitewater's part of the buffer
     std::vector<uint> planes;   //each rank's first node plane along z, and the last one's end (setDomain)
     CudaVec<float> gatheredFrame;   //across processes, where rank 0 gathers every rank's positions
     double lastFrameSeconds = 0.0;  //wall time of the last solveFrame, for diagnostics
+    unsigned long long whitewaterDroppedBefore = 0;     //what the whitewater's maxParticles had kept from being made by the last diagnostics line
     std::ofstream diagnostics;      //on rank 0, once writeDiagnostics has started it
     std::ofstream phaseDiagnostics; //once writePhaseDiagnostics has started it
 };

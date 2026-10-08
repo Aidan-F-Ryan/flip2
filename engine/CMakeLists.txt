@@ -45,6 +45,7 @@ add_library(particles STATIC
     viscosity.cu
     freesurface.cu
     twophase.cu
+    whitewater.cu
     cacheWriter.cu
 )
 
