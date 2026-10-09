@@ -117,6 +117,21 @@ def create_render(node):
     render.setInput(0, settings)
     stage.layoutChildren()
     settings.setDisplayFlag(True)
+    #Houdini translates the MaterialX materials into the stage with Python of its own, and if a module that Python imports is shadowed by a file of the
+    #same name on sys.path (a dbg.py beside a script run from hython, once) the translation fails without a word, every material comes out empty, and
+    #everything renders grey. Better to say so here than to find out in the frames
+    from pxr import UsdShade
+    built = settings.stage()
+    bare = []
+    for prim in (built.Traverse() if built is not None else ()):
+        if prim.GetTypeName() == "Material":
+            surface = UsdShade.Material(prim).GetSurfaceOutput("mtlx")    #what the translation makes: the material's surface output, wired to its shader
+            if not surface or not surface.HasConnectedSource():
+                bare.append(prim.GetPath().pathString)
+    if bare:
+        raise hou.Error("The materials %s came out without their shaders, so everything would render grey. Houdini's MaterialX translation failed silently: "
+                        "most likely a Python file on sys.path (in the folder of a script run with hython, say) has the name of a module it imports. Run from "
+                        "another folder, or rename the file" % ", ".join(bare))
     return render
 
 

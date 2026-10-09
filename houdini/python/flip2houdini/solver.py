@@ -127,7 +127,9 @@ def _interface(node):
                                                       "of them over its density"))
     liquid.addParmTemplate(hou.FloatParmTemplate("viscosity", "Viscosity", 1, default_value=(0.0,), min=0.0, max=100.0,
                                                  help="Pa s: water 0.001, olive oil 0.1, honey 2 to 10, molasses 10 to 100; 0 for none. Viscous liquid "
-                                                      "sticks to the domain's walls and to collisions"))
+                                                      "sticks to the domain's walls and to collisions. Any value over 0 adds a viscous solve to every "
+                                                      "substep (up to twice the bake time with air simulated), and water's 0.001 shows nothing at "
+                                                      "voxels over a millimetre or two: leave it 0 unless the liquid is thick"))
     liquid.addParmTemplate(hou.FloatParmTemplate("viscouscfl", "Viscous CFL", 1, default_value=(6.0,), min=0.0, max=20.0,
                                                  disable_when="{ viscosity == 0 }",
                                                  help="How many voxels viscosity may spread across in a substep, as CFL Condition is for how far the fastest "
@@ -136,9 +138,10 @@ def _interface(node):
                                                       "and pools. Thicker liquid and smaller voxels need more substeps: honey at 2.5 mm voxels about 2 a "
                                                       "frame, at 1 mm about 9"))
     liquid.addParmTemplate(hou.FloatParmTemplate("surfacetension", "Surface Tension", 1, default_value=(0.0,), min=0.0, max=1.0,
-                                                 help="N/m: water 0.073; 0 for none. It only shows on liquid a few centimetres across or less, and it "
-                                                      "shortens the timestep: to sqrt(density x voxel^3 / (2 pi x surface tension)), 6 ms at 2.5 mm voxels "
-                                                      "for water and 0.5 ms at 0.5 mm"))
+                                                 help="N/m: water 0.073; 0 for none. It only shows on liquid a few centimetres across or less, so at "
+                                                      "voxels of a centimetre it costs (a surface pass every substep) and shows nothing. It shortens the "
+                                                      "timestep: to sqrt(density x voxel^3 / (2 pi x surface tension)), 6 ms at 2.5 mm voxels for water "
+                                                      "and 0.5 ms at 0.5 mm"))
     liquid.addParmTemplate(hou.FloatParmTemplate("contactangle", "Contact Angle", 1, default_value=(60.0,), min=0.0, max=180.0,
                                                  disable_when="{ surfacetension == 0 }",
                                                  help="Degrees between the liquid's surface and the domain's walls where they meet, measured through the "
@@ -149,11 +152,14 @@ def _interface(node):
     group.append(liquid)
     air = hou.FolderParmTemplate("airfolder", "Air", folder_type=hou.folderType.Tabs)    #the second fluid, when the Simulation tab's Phases asks for it
     no_air = "{ phases == 0 }"
-    air.addParmTemplate(hou.IntParmTemplate("airband", "Air Band", 1, default_value=(8,), min=0, max=64, disable_when=no_air,
+    air.addParmTemplate(hou.IntParmTemplate("airband", "Air Band", 1, default_value=(8,), min=1, max=64, disable_when=no_air,
                                             help="Voxels of air simulated around the liquid, in whole blocks of 4; past the band the pressure is the open "
-                                                 "air's. 0 simulates the air everywhere in the domain: about 3 times the band's bake time and memory, and "
-                                                 "what air shut in needs, as under a lid or a plate with holes, where the water can only come down as the "
-                                                 "air rises past it"))
+                                                 "air's, and the air flows out and in there freely. Air shut in, as under a lid or a plate with holes, "
+                                                 "isn't simulated from this node yet (that needs the air everywhere, which flip2 takes only with its "
+                                                 "analytic liquid shapes, not geometry). The bake time goes with the air's speed as much as the "
+                                                 "liquid's, and the air gets faster the finer the voxels: measured 23 m/s at 2.5 cm and 110-140 m/s at "
+                                                 "1 cm on dam breaks whose liquid peaks at 7-12 m/s, so a 1 cm two-phase bake can take 10 times a "
+                                                 "single-phase one, against 2 times at 2.5 cm"))
     air.addParmTemplate(hou.FloatParmTemplate("airdensity", "Air Density", 1, default_value=(1.2,), min=0.001, max=1000.0, disable_when=no_air,
                                               help="kg/m^3: 1.2 is air at room temperature. Heavier air drags more on spray and slows the bubbles' rise. "
                                                    "It can't be heavier than the liquid"))
@@ -914,6 +920,12 @@ def _launch_remote(job, host, directory, program, arguments, upload, local, logs
         _ssh(host, 'program=%s; program="${program/#\\~/$HOME}"; '     #a path names an executable file; a bare name is looked up on the PATH
                    'case "$program" in */*) [ -f "$program" ] && [ -x "$program" ];; *) command -v "$program" > /dev/null;; esac || '
                    '{ echo "no flip2 program at $program on this machine: set flip2 Program" >&2; exit 1; }' % shlex.quote(program))
+        #a job still running there (one this node lost touch with, say) would have its cache cleared from under it by this one, and both would write it
+        running = _ssh(host, 'cd %s 2> /dev/null || exit 0; for pid in logs/job.pid logs/bake.pid; do [ -f "$pid" ] && [ ! -f logs/finished ] && '
+                             'kill -0 "$(cat "$pid")" 2> /dev/null && { echo running; break; }; done; exit 0' % directory)
+        if "running" in running:
+            raise RuntimeError("a bake is still running on %s in %s, started by an earlier Bake: wait for it to finish, or stop it there with "
+                               "  kill $(cat %s/logs/job.pid)" % (host, directory, directory))
         _ssh(host, "mkdir -p %s/geo %s/logs && rm -f %s/logs/finished" % (directory, directory, directory))
         if upload:
             job["state"] = "sending the scene to %s" % host
@@ -921,7 +933,9 @@ def _launch_remote(job, host, directory, program, arguments, upload, local, logs
             _rsync([os.path.join(local, "scene.json"), "%s:%s/" % (host, directory)])
         _rsync([os.path.join(scripts, "job.sh"), "%s:%s/" % (host, directory)])
         job["state"] = "starting on %s" % host
-        _ssh(host, "cd %s && nohup bash job.sh %s > /dev/null 2>&1 < /dev/null &" % (directory, " ".join(shlex.quote(word) for word in [program] + arguments)))
+        #in a subshell: a command line ending in a bare & keeps the ssh session open until the job ends (seen with OpenSSH 10.3 on the Mac), and the node
+        #would wait on it until _ssh's timeout and call the bake failed while it ran on; a subshell's background job lets the session close at once
+        _ssh(host, "cd %s && (nohup bash job.sh %s > /dev/null 2>&1 < /dev/null &)" % (directory, " ".join(shlex.quote(word) for word in [program] + arguments)))
         environment = dict(os.environ, FLIP2_RSH=" ".join(["ssh"] + SSH_OPTIONS))
         #a bake from the start replaces the frames here; one resumed or meshed again only adds to them, as its remote copy may have been deleted since
         mirror = ["bash", os.path.join(scripts, "mirror.sh"), host, directory, local] + (["replace"] if upload else [])
@@ -971,6 +985,9 @@ def _start(node, kind, upload=True):
     exporting = ["--format", node.parm("exportformat").evalAsString()]
     job = {"process": None, "export": None, "mesh": None, "events": os.path.join(logs, name + ".events.jsonl"), "log": os.path.join(logs, name + ".log"),
            "kind": kind, "meshing": meshing, "exporting": exporting, "state": "starting", "failure": None, "said": None, "shown": {}}
+    with open(os.path.join(logs, kind + ".options.txt"), "w") as asked:    #what this job was asked for, as the node read its parameters when it started
+        asked.write("%s %s\nbake on: %s\nexport: %s\nmesh: %s\n" % (kind, time.strftime("%Y-%m-%d %H:%M:%S"), ("this machine", "remote")[node.evalParm("bakeon")],
+                                                                    " ".join(exporting), " ".join(meshing) if meshing is not None else "none (Mesh the Surface and Output Fluid Fields off)"))
     if node.evalParm("bakeon") == 1:
         host, directory, program = _remote(node)
         job["remote"] = (host, directory)

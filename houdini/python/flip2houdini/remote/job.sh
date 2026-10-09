@@ -20,6 +20,7 @@ while :; do     # each OPTIONS is numbers, formats and option names only (solver
 done
 mkdir -p logs
 rm -f logs/finished
+echo "$$" > logs/job.pid     # this script's, alive until finished is written: what says a job is still running here (solver.py)
 if [ "$1" = mesh ]; then
     "$program" mesh bake --overwrite "${meshing[@]}" > logs/mesh.events.jsonl 2> logs/mesh.log &
     mesher=$!
