@@ -7,8 +7,9 @@ Its inputs are geometry, as Houdini's own FLIP Solver takes it:
     3 Sources      closed surfaces kept full of fluid moving at the emission velocity (or their v attribute's mean)
     4 Sinks        closed surfaces that remove the fluid inside them
 
-Each input is one object, or with a "name" primitive attribute, one per name. Packed geometry is unpacked, every primitive turned into polygons and the
-polygons into triangles. An object is sampled every frame of the range, and goes to flip2 as what it does: still, its vertices once; moving rigidly (no
+Each input is one object, or with a "name" primitive attribute, one per name. A collision object's geometry can carry its own settings, as primitive
+attributes with one value per object: flip2_friction, flip2_hold (0 or 1) and flip2_thickness; without them it gets the Collisions tab's. Packed
+geometry is unpacked, every primitive turned into polygons and the polygons into triangles. An object is sampled every frame of the range, and goes to flip2 as what it does: still, its vertices once; moving rigidly (no
 vertex further than a hundredth of a voxel from where a turn and a shift put it), its vertices once and a transform per frame, which flip2 turns it
 through exactly; or deforming, its vertices every frame, which flip2 re-voxelizes between, so its points and triangles mustn't change. flip2 takes 16
 collisions: with more names than that, the still ones go as one object, and if need be the moving ones as another.
@@ -38,6 +39,9 @@ exported and meshed frames, so it shows here as a local one does. It needs ssh t
 
 Particle separation and grid scale are Houdini's: flip2's voxels are twice the particle separation, the 2 x 2 x 2 particles per voxel Houdini's FLIP
 seeds at its default grid scale of 2.
+
+The Simulation tab's Phases picks what is simulated: the liquid alone (fast; the domain's walls and the collisions each hold the liquid or let it go,
+Walls and Collisions tabs), or the liquid and the air around it (2-8x the time; the Air tab).
 """
 import hashlib
 import json
@@ -69,6 +73,7 @@ VECTORS = 'if(!match("vec3*", primintrinsic(0, "vdb_value_type", @primnum))) rem
 VOLUME_FILE = "collision_volumes.vdb"
 FORCE_FILE = "force_volumes.vdb"
 LIMIT = 16      #the obstacles flip2 takes, and the meshes among its fluids, emitters and sinks
+SETTINGS = (("friction", "flip2_friction", float), ("hold", "flip2_hold", int), ("thickness", "flip2_thickness", float))  #a collision object's own, as primitive attributes
 FORCE_LIMIT = 16    #and the forces
 SURFACE_DEFAULTS = {"influencescale": (3.0,), "radiusscale": (0.8,), "smoothing": (4,)}     #flip2 mesh's own
 OLD_SURFACE_DEFAULTS = {"influencescale": 2.0, "radiusscale": 0.6, "smoothing": 2}         #what they were, which left the surface dimpled
@@ -84,26 +89,30 @@ def _interface(node):
     """the node's parameters, from the subnet's own on: applied again to an existing node (update), it keeps the values of the parameters it still has"""
     group = node.type().parmTemplateGroup()
     simulation = hou.FolderParmTemplate("simulation", "Simulation", folder_type=hou.folderType.Tabs)
+    simulation.addParmTemplate(hou.MenuParmTemplate("phases", "Phases", ("liquid", "air"), ("Liquid Only (Fast)", "Liquid and Air (Realistic, 2-8x the Time)"), default_value=0,
+                                                    help="Liquid Only simulates the liquid with nothing where it isn't: fast, and right for most shots, but "
+                                                         "with no air to get in behind it the liquid clings to ceilings and the undersides of collisions "
+                                                         "unless they let it go (Walls and Collisions tabs), nothing cushions a splash, and no bubbles are "
+                                                         "carried under. Liquid and Air simulates the air around the liquid as well: entrained bubbles, "
+                                                         "splash crowns, water that pours through a hole only as air rises past it, and nothing clings. "
+                                                         "Measured on the sample scenes: 2 to 8 times the bake time. The air's own settings are on the Air tab"))
     simulation.addParmTemplate(hou.FloatParmTemplate("particlesep", "Particle Separation", 1, default_value=(0.02,), min=0.0001,
                                                      help="The distance between particles at rest. flip2's voxels are twice this"))
     simulation.addParmTemplate(hou.FloatParmTemplate("domaincenter", "Domain Center", 3, default_value=(0.0, 0.5, 0.0)))
     simulation.addParmTemplate(hou.FloatParmTemplate("domainsize", "Domain Size", 3, default_value=(2.0, 1.0, 2.0)))
     simulation.addParmTemplate(hou.ButtonParmTemplate("fitdomain", "Fit Domain to Inputs", help="The domain around every input's geometry over the frame range",
                                                       **_callback("fit_domain")))
-    for index, face in enumerate(FACES):
-        simulation.addParmTemplate(hou.ToggleParmTemplate("closed%d" % index, "Closed %s" % face.upper(), default_value=True,
-                                                          join_with_next=index % 2 == 0,
-                                                          help="A closed side is a wall; an open one removes the fluid that reaches it"))
     simulation.addParmTemplate(hou.IntParmTemplate("startframe", "Start Frame", 1, default_expression=("$FSTART",)))
     simulation.addParmTemplate(hou.IntParmTemplate("endframe", "End Frame", 1, default_expression=("$FEND",)))
     simulation.addParmTemplate(hou.MenuParmTemplate("transfer", "Velocity Transfer", ("flip", "apic"), ("FLIP (Splashy)", "APIC (Swirly)"), default_value=0))
     simulation.addParmTemplate(hou.MenuParmTemplate("freesurface", "Free Surface", ("footprint", "sharp"), ("Footprint (Calm, Fast)", "Sharp (Accurate Surface)"),
-                                                    default_value=0,
+                                                    default_value=0, disable_when="{ phases == 1 }",
                                                     help="Where the pressure solve puts the liquid's surface. Footprint: a voxel or so outside the particles, which "
                                                          "settles quickly and damps small waves. Sharp: at the particles' own surface (ghost fluid), so drops "
                                                          "oscillate and waves travel at the right speed and the liquid keeps its volume better, but calm "
                                                          "water stays a little livelier, and a bake takes about twice as long: more per substep, and more "
-                                                         "substeps, as the liquid keeps moving for longer"))
+                                                         "substeps, as the liquid keeps moving for longer. Not with air yet: with Liquid and Air the surface "
+                                                         "is where the two fluids meet, and the footprint is used"))
     simulation.addParmTemplate(hou.FloatParmTemplate("flipratio", "FLIP Ratio", 1, default_value=(0.95,), min=0.0, max=1.0,
                                                      help="How much of each particle's own velocity it keeps: 0 is pure PIC (or pure APIC), 1 pure FLIP"))
     simulation.addParmTemplate(hou.FloatParmTemplate("cfl", "CFL Condition", 1, default_value=(4.0,), min=0.1, max=4.0,
@@ -138,17 +147,43 @@ def _interface(node):
                                                       "them, and a pool shallower than a few millimetres pulls back from a dry patch. Collisions don't have "
                                                       "one yet: liquid beads on them a little"))
     group.append(liquid)
-    walls = hou.FolderParmTemplate("walls", "Walls", folder_type=hou.folderType.Tabs)
-    for index, face in enumerate(FACES):    #what each closed side of the domain does to the liquid on it
+    air = hou.FolderParmTemplate("airfolder", "Air", folder_type=hou.folderType.Tabs)    #the second fluid, when the Simulation tab's Phases asks for it
+    no_air = "{ phases == 0 }"
+    air.addParmTemplate(hou.IntParmTemplate("airband", "Air Band", 1, default_value=(8,), min=0, max=64, disable_when=no_air,
+                                            help="Voxels of air simulated around the liquid, in whole blocks of 4; past the band the pressure is the open "
+                                                 "air's. 0 simulates the air everywhere in the domain: about 3 times the band's bake time and memory, and "
+                                                 "what air shut in needs, as under a lid or a plate with holes, where the water can only come down as the "
+                                                 "air rises past it"))
+    air.addParmTemplate(hou.FloatParmTemplate("airdensity", "Air Density", 1, default_value=(1.2,), min=0.001, max=1000.0, disable_when=no_air,
+                                              help="kg/m^3: 1.2 is air at room temperature. Heavier air drags more on spray and slows the bubbles' rise. "
+                                                   "It can't be heavier than the liquid"))
+    air_advanced = hou.FolderParmTemplate("airadvanced", "Advanced", folder_type=hou.folderType.Collapsible)
+    air_advanced.addParmTemplate(hou.ToggleParmTemplate("airescaped", "Droplets and Bubbles Fly", default_value=True, disable_when=no_air,
+                                                        help="A particle of liquid that finds itself in the air flies as a droplet, with the air's drag on it, "
+                                                             "and one of air in the liquid rises as a bubble, rather than taking the grid's velocity where "
+                                                             "it is. Off only for comparing"))
+    air_advanced.addParmTemplate(hou.FloatParmTemplate("airdropletradius", "Droplet Radius", 1, default_value=(0.0,), min=0.0, max=0.1, disable_when=no_air,
+                                                       help="Metres, for the air's drag on a flying droplet: 0 for a particle's worth of liquid"))
+    air_advanced.addParmTemplate(hou.FloatParmTemplate("airbubbleradius", "Bubble Radius", 1, default_value=(0.0,), min=0.0, max=0.1, disable_when=no_air,
+                                                       help="Metres, for the liquid's drag on a rising bubble: 0 for a particle's worth of air"))
+    air_advanced.addParmTemplate(hou.FloatParmTemplate("airviscosity", "Air Viscosity", 1, default_value=(1.5e-5,), min=1.0e-7, max=1.0e-2, disable_when=no_air,
+                                                       help="The air's kinematic viscosity, m^2/s, for its drag on droplets: 1.5e-5 is air's"))
+    air.addParmTemplate(air_advanced)
+    group.append(air)
+    walls = hou.FolderParmTemplate("walls", "Walls", folder_type=hou.folderType.Tabs)  #the domain's six sides: what each is, and what it does to the liquid on it
+    for index, face in enumerate(FACES):
         open_side = "{ closed%d == 0 }" % index
-        walls.addParmTemplate(hou.ToggleParmTemplate("wallhold%d" % index, "%s Holds Liquid" % face.upper(), default_value=True, join_with_next=True,
+        walls.addParmTemplate(hou.ToggleParmTemplate("closed%d" % index, "%s Closed" % face.upper(), default_value=True, join_with_next=True,
+                                                     help="A closed side is a wall. An open one is an outflow: the fluid that reaches it leaves the simulation"))
+        walls.addParmTemplate(hou.ToggleParmTemplate("wallhold%d" % index, "Holds Liquid", default_value=True, join_with_next=True,
                                                      disable_when=open_side,
                                                      help="On, the wall pulls on the liquid as well as pushing it, as a sealed tank's does: with no air "
                                                           "simulated nothing can get in behind the liquid, so a splash that reaches the ceiling hangs "
                                                           "there. Off, the wall lets the liquid go wherever air can reach it, as anything standing in "
-                                                          "open air does. Letting go costs more pressure solves in the substeps where liquid is pulling "
-                                                          "on the wall: about a tenth more bake time for a ceiling, and up to twice the time with every "
-                                                          "wall and collision letting go"))
+                                                          "open air does, and still holds it where none can (a lid over a full tank). It costs a second "
+                                                          "pressure solve in the substeps where liquid pulls on the wall: a few percent more bake time "
+                                                          "for a ceiling, up to half as much again with every wall and collision letting go. With "
+                                                          "Liquid and Air simulated the air gets in behind the liquid itself and this does nothing"))
         walls.addParmTemplate(hou.FloatParmTemplate("wallfriction%d" % index, "Friction", 1, default_value=(0.0,), min=0.0, max=1.0, join_with_next=True,
                                                     disable_when=open_side,
                                                     help="As a collision's: 0, the liquid slides along the wall freely; 1, the liquid touching it is at rest"))
@@ -160,13 +195,20 @@ def _interface(node):
                                                          "climbs"))
     group.append(walls)
     collisions = hou.FolderParmTemplate("collisions", "Collisions", folder_type=hou.folderType.Tabs)
+    collisions.addParmTemplate(hou.LabelParmTemplate("collisionnote", "Per Object",
+                                                     column_labels=("These are every collision object's, unless its geometry carries its own: primitive "
+                                                                    "attributes flip2_friction, flip2_hold (0 or 1) and flip2_thickness, one value per object "
+                                                                    "(objects are told apart by their name attribute)",)))
     collisions.addParmTemplate(hou.FloatParmTemplate("friction", "Friction", 1, default_value=(0.0,), min=0.0, max=1.0,
-                                                     help="0: the fluid slips along collisions freely; 1: the fluid touching them moves with them"))
+                                                     help="0: the fluid slips along collisions freely; 1: the fluid touching them moves with them. An object's "
+                                                          "own flip2_friction primitive attribute overrides this"))
     collisions.addParmTemplate(hou.ToggleParmTemplate("collisionhold", "Hold Liquid", default_value=True,
-                                                      help="As a wall's Holds Liquid, for every collision object: off, liquid leaves them wherever air "
-                                                           "can reach it, rather than clinging to their undersides"))
+                                                      help="As a wall's Holds Liquid: on, a collision pulls on the liquid as well as pushing it, so liquid "
+                                                           "clings to its underside; off, it lets the liquid go wherever air can reach it. An object's own "
+                                                           "flip2_hold primitive attribute (0 or 1) overrides this. Does nothing with Liquid and Air simulated"))
     collisions.addParmTemplate(hou.FloatParmTemplate("thickness", "Thickness", 1, default_value=(0.0,), min=0.0,
-                                                     help="0 for closed surfaces; for open ones, like a ground plane, the thickness of the shell around them"))
+                                                     help="0 for closed surfaces; for open ones, like a ground plane, the thickness of the shell around them. "
+                                                          "An object's own flip2_thickness primitive attribute overrides this"))
     group.append(collisions)
     sources = hou.FolderParmTemplate("sources", "Sources", folder_type=hou.folderType.Tabs)
     sources.addParmTemplate(hou.ToggleParmTemplate("usev", "Use v Attribute", default_value=True,
@@ -392,8 +434,30 @@ def _frames(node):
     return start, end
 
 
+def _settings(geometry, chosen, label):
+    """a collision object's own settings, from the SETTINGS primitive attributes its geometry carries, over the primitives chosen: one value each"""
+    import numpy
+    settings = {}
+    for key, name, cast in SETTINGS:
+        attrib = geometry.findPrimAttrib(name)
+        if attrib is None:
+            continue
+        if attrib.dataType() == hou.attribData.Float:
+            values = numpy.array(geometry.primFloatAttribValues(name))
+        elif attrib.dataType() == hou.attribData.Int:
+            values = numpy.array(geometry.primIntAttribValues(name))
+        else:
+            raise hou.NodeError("the primitive attribute %s should be a number, not %s" % (name, attrib.dataType().name().lower()))
+        values = values[chosen]
+        if len(values) and (values != values[0]).any():
+            raise hou.NodeError("%s differs between the primitives of the object %r: flip2 takes one value per object" % (name, label))
+        if len(values):
+            settings[key] = cast(values[0])
+    return settings
+
+
 def _objects(geometry):
-    """an input's triangles at a frame, per object: (name, triangles as point numbers), and its points' positions"""
+    """an input's triangles at a frame, per object: (name, triangles as point numbers, its own settings), and its points' positions"""
     import numpy
     positions = numpy.frombuffer(geometry.pointFloatAttribValuesAsString("P"), dtype=numpy.float32).reshape(-1, 3)
     if geometry.findPrimAttrib("flip2_a") is None or len(geometry.prims()) == 0:
@@ -403,11 +467,12 @@ def _objects(geometry):
     keep = triangles[:, 0] >= 0
     names = geometry.findPrimAttrib("name")
     if names is None or names.dataType() != hou.attribData.String:
-        return [("", triangles[keep])], positions
+        return [("", triangles[keep], _settings(geometry, keep, ""))], positions
     labels = numpy.array(geometry.primStringAttribValues("name"), dtype=object)
     objects = []
     for label in sorted(set(labels[keep])):
-        objects.append((label, triangles[keep & (labels == label)]))
+        chosen = keep & (labels == label)
+        objects.append((label, triangles[chosen], _settings(geometry, chosen, label)))
     return objects, positions
 
 
@@ -424,14 +489,14 @@ def _sample(node, role, frames, progress=None):
     if progress is not None:
         progress()
     samples = []
-    for name, triangles in first:
+    for name, triangles, settings in first:
         used, local = numpy.unique(triangles, return_inverse=True)
         samples.append({"name": name, "triangles": local.reshape(-1, 3).astype(numpy.int32), "points": used, "global": triangles,
-                        "frames": [positions[used].copy()]})
+                        "frames": [positions[used].copy()], "settings": settings})
     for frame in frames[1:]:
         objects, positions = _objects(source.geometryAtFrame(frame))
         same = len(objects) == len(samples) and all(name == sample["name"] and numpy.array_equal(triangles, sample["global"])
-                                                    for sample, (name, triangles) in zip(samples, objects))
+                                                    for sample, (name, triangles, _) in zip(samples, objects))
         if not same:
             raise hou.NodeError("%s: its triangles change at frame %d; flip2 can only move or deform a mesh whose points and triangles stay the same"
                                 % (LABELS[ROLES.index(role)], frame))
@@ -471,14 +536,19 @@ def _motion(samples, tolerance):
 
 
 def _merge(objects):
-    """several sampled objects as one: at every frame their vertices one after another, and their triangles"""
+    """several sampled objects as one: at every frame their vertices one after another, and their triangles. Their own settings have to agree, as the
+    one object gets one set"""
     import numpy
     triangles, offset = [], 0
     for samples in objects:
         triangles.append(samples["triangles"] + offset)
         offset += len(samples["frames"][0])
+    settings = objects[0]["settings"]
+    if any(samples["settings"] != settings for samples in objects):
+        raise hou.NodeError("Collisions: more than %d objects, so flip2 takes some of them as one, and they don't share their flip2_friction, flip2_hold "
+                            "and flip2_thickness attributes: give them the same, or fewer objects" % LIMIT)
     return {"name": "", "triangles": numpy.concatenate(triangles), "points": numpy.concatenate([samples["points"] for samples in objects]),
-            "frames": [numpy.concatenate([samples["frames"][frame] for samples in objects]) for frame in range(len(objects[0]["frames"]))]}
+            "frames": [numpy.concatenate([samples["frames"][frame] for samples in objects]) for frame in range(len(objects[0]["frames"]))], "settings": settings}
 
 
 def _within(objects, limit, tolerance):
@@ -533,19 +603,20 @@ def _sample_volumes(node, frames, progress=None):
     volumes, first = [], {}
     for frame in frames:
         geometry = node.node("COLLISION_VOLUMES").geometryAtFrame(frame)
-        states = {}
+        states, settings = {}, {}
         for volume in geometry.prims():
             name = volume.attribValue("name") if geometry.findPrimAttrib("name") is not None else ""
             if name in states:
                 raise hou.NodeError("Collisions: two volumes are both named %r; flip2 tells them apart by name, so give each its own" % name)
             states[name] = _volume_state(volume)
+            settings[name] = _settings(geometry, numpy.array([prim.number() == volume.number() for prim in geometry.prims()]), name)
         if frame == frames[0]:
             first = states
             vectors = [name for name, state in states.items() if state[0][2].startswith("vec3")]
             for name, state in states.items():
                 if state[0][2] in ("float", "double"):
                     velocity = next((candidate for candidate in (name + "vel", "vel", "v") if candidate in vectors), None)
-                    volumes.append({"name": name, "velocity": velocity, "transforms": [], "still": True})
+                    volumes.append({"name": name, "velocity": velocity, "transforms": [], "still": True, "settings": settings[name]})
         elif set(states) != set(first):
             raise hou.NodeError("Collisions: its volumes change at frame %d; flip2 takes volumes that are there throughout" % frame)
         for volume in volumes:
@@ -713,10 +784,10 @@ def write_scene(node):
             if role == "fluid":
                 entry = {key: entry[key] for key in ("vertices", "triangles")}
                 scene["fluids"].append(entry)
-            elif role == "collision":
-                entry["friction"] = node.evalParm("friction")
-                entry["thickness"] = node.evalParm("thickness")
-                if not holds:
+            elif role == "collision":     #the node's settings, unless the object's geometry carries its own
+                entry["friction"] = samples["settings"].get("friction", node.evalParm("friction"))
+                entry["thickness"] = samples["settings"].get("thickness", node.evalParm("thickness"))
+                if not samples["settings"].get("hold", holds):
                     entry["hold"] = False
                 scene["obstacles"].append(entry)
             elif role == "source":
@@ -727,8 +798,8 @@ def write_scene(node):
     if volumes:     #the level sets as they are at the start, in one file, each named
         node.node("COLLISION_VOLUMES").geometryAtFrame(frames[0]).saveToFile(os.path.join(geo_dir, VOLUME_FILE))
     for volume in volumes:
-        entry = {"vdb": "geo/" + VOLUME_FILE, "grid": volume["name"], "friction": node.evalParm("friction")}
-        if not holds:
+        entry = {"vdb": "geo/" + VOLUME_FILE, "grid": volume["name"], "friction": volume["settings"].get("friction", node.evalParm("friction"))}
+        if not volume["settings"].get("hold", holds):
             entry["hold"] = False
         if volume["velocity"]:
             entry["velocityGrid"] = volume["velocity"]
@@ -740,6 +811,16 @@ def write_scene(node):
         scene["forces"] = forces
     if said:
         made.append(said)
+    if node.parm("phases") is not None and node.evalParm("phases") == 1:   #the air, with the Air tab's settings where they aren't the engine's defaults
+        air = {"density": node.evalParm("airdensity"), "band": node.evalParm("airband")}
+        if not node.evalParm("airescaped"):
+            air["escaped"] = False
+        for key, name, default in (("dropletRadius", "airdropletradius", 0.0), ("bubbleRadius", "airbubbleradius", 0.0), ("viscosity", "airviscosity", 1.5e-5)):
+            if node.evalParm(name) != default:
+                air[key] = node.evalParm(name)
+        scene["air"] = air
+        scene["solver"]["freeSurface"] = "footprint"    #the sharp free surface doesn't go with air yet: the tab says so
+        made.append("air: a band of %d voxels" % air["band"] if air["band"] else "air: everywhere")
     path = os.path.join(directory, "scene.json")
     with open(path, "w") as out:
         json.dump(scene, out, indent=1)
