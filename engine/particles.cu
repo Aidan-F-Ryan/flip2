@@ -1124,6 +1124,10 @@ __global__ void scatterParticleVelsToVoxels(uint numParticleNodes, uint numParti
 //With APIC, P2G sums each particle's velocity carried out along its gradient to faces up to 1.5 voxels away on each axis. Per particle, the most that
 //comes to (largest[1]), and its largest velocity component (largest[0]), as float bits, which order like the floats for values >= 0, so atomicMax
 //takes each exactly, whatever order the blocks land in
+//the fastest component among the liquid's particles alone, as a float's bits (defined with largestInBlock, below): with air the timestep follows the
+//liquid, not the air it drives out of its way (Particles::getCourantDt)
+__global__ void largestLiquidSpeedBits(uint numParticles, const float* vx, const float* vy, const float* vz, const uint* ids, unsigned int* largest);
+
 __global__ void largestApicVelocities(uint numParticles, const float* vx, const float* vy, const float* vz, AffineVelocities affine, float reach, unsigned int* largest){
     __shared__ unsigned int warpLargest[2][BLOCKSIZE / 32];
     unsigned int bits[2] = {0, 0};
@@ -1171,6 +1175,9 @@ __global__ void largestApicVelocities(uint numParticles, const float* vx, const 
 //dt = 2 cfl h / (v + sqrt(v^2 + 4 a cfl h)): cfl h / v where the forces are nothing to its speed, and sqrt(cfl h / a) from rest. Without that, what
 //starts at rest falls g dt^2 in its first substep however long the frame lets that be, and a strong field moves the fluid as far as it likes. The
 //substep an impact begins in has only the substep before to go by, and can still go further
+//With air, maxVelocity and maxAcceleration are the liquid's (particleVelToVoxels, gatherVoxelVelsToParticles): the air the liquid drives out of its
+//way goes faster, in a film a voxel thick where the liquid lands, and nothing of the look is in it; it goes a bounded distance a substep instead
+//(advectThroughGrid)
 double Particles::getCourantDt(){
     double voxelSize = (grid.cellSize / (numVoxels1D - 2*std::floor(radius)));
     double fastest = std::max(maxVelocity, (double)obstacles.fastest());
@@ -1207,6 +1214,18 @@ void Particles::particleVelToVoxels(){
         maxVelocity = largestMagnitude({&vx, &vy, &vz}, stream);   //the fastest component, which also sets the CFL timestep
         maxVelocity = context->maxOverPartitions(maxVelocity);     //every partition's fixed point and timestep have to agree
         transferred = maxVelocity;
+    }
+    if(twoPhase.on && size > 0){    //the timestep follows the liquid: the air driven out of its way goes faster, and may (advectThroughGrid caps how far)
+        unsigned int* largest;
+        unsigned int bits;
+        gpuErrchk(cudaMallocAsync((void**)&largest, sizeof(unsigned int), stream));
+        gpuErrchk(cudaMemsetAsync(largest, 0, sizeof(unsigned int), stream));
+        largestLiquidSpeedBits<<<std::min(size / BLOCKSIZE + 1, 1024u), BLOCKSIZE, 0, stream>>>(size, vx.devPtr(), vy.devPtr(), vz.devPtr(), particleIds.devPtr(), largest);
+        gpuErrchk(cudaMemcpyAsync(&bits, largest, sizeof(unsigned int), cudaMemcpyDeviceToHost, stream));
+        gpuErrchk(cudaFreeAsync(largest, stream));
+        float liquidFastest;
+        memcpy(&liquidFastest, &bits, sizeof(liquidFastest));
+        maxVelocity = context->maxOverPartitions(liquidFastest);
     }
     unsigned int accelerationFound;     //and the most the last substep changed a particle's velocity by, per second (voxelVelsToParticles), for the timestep too
     gpuErrchk(cudaMemcpyAsync(&accelerationFound, accelerationBits.devPtr(), sizeof(unsigned int), cudaMemcpyDeviceToHost, stream));    //to pageable memory: back once it's landed
@@ -1310,6 +1329,7 @@ void Particles::pressureSolve(){
     weighCutCells(dt/(density*voxelSize*voxelSize));      //the faces obstacles cut weigh as much as they're open
     weighSurfaceFaces(dt/(density*voxelSize*voxelSize));  //sharp, the liquid's faces to air as near as the surface is
     weighDensityFaces(dt/(density*voxelSize*voxelSize));  //two phases, every face as light as what's on it
+    giveAir((float)(dt/(density*voxelSize*voxelSize)), (float)dt);  //and its air giving under pressure, if the scene says
     gpuErrchk(cudaPeekAtLastError());
     uint interiorWidth = numVoxels1D - 2*(uint)std::floor(radius);
     uint3 domainVoxels = make_uint3(grid.sizeX*interiorWidth, grid.sizeY*interiorWidth, grid.sizeZ*interiorWidth);
@@ -1438,6 +1458,18 @@ __device__ inline void largestInBlock(unsigned int bits, unsigned int* warpLarge
             atomicMax(largest, bits);
         }
     }
+}
+
+//largestLiquidSpeedBits, declared above particleVelToVoxels
+__global__ void largestLiquidSpeedBits(uint numParticles, const float* vx, const float* vy, const float* vz, const uint* ids, unsigned int* largest){
+    __shared__ unsigned int warpLargest[BLOCKSIZE / 32];
+    unsigned int bits = 0;
+    for(uint i = threadIdx.x + blockIdx.x*blockDim.x; i < numParticles; i += blockDim.x*gridDim.x){
+        if(!(ids[i] & AIR_PARTICLE)){
+            bits = max(bits, max(__float_as_uint(vx[i]) & 0x7fffffffu, max(__float_as_uint(vy[i]) & 0x7fffffffu, __float_as_uint(vz[i]) & 0x7fffffffu)));
+        }
+    }
+    largestInBlock(bits, warpLargest, largest);
 }
 
 //G2P: a block per node and a thread per particle. The block copies the new and old face velocities of every voxel the node stores into shared memory,
@@ -1651,7 +1683,7 @@ __global__ void gatherVoxelVelsToParticles(uint numParticleNodes, uint numPartic
                     updated = particleVelocities[dim][index];
                 }
             }
-            if(births[index] < bornSince){
+            if(births[index] < bornSince && !(PHASES && ids != nullptr && (ids[index] & AIR_PARTICLE))){    //the air's changes don't set the timestep
                 change = fmaxf(change, fabsf(updated - particleVelocities[dim][index]));
             }
             particleVelocities[dim][index] = updated;
@@ -1742,7 +1774,7 @@ __global__ void advectThroughGrid(uint numParticleNodes, uint numParticles, cons
                                   double* px, double* py, double* pz, float* vx, float* vy, float* vz, const uint* ids, bool escaping,
                                   uint numUsedGridNodes, const uint* nodeCells, const uint* cellToNode, const uint* interiorVoxels,
                                   const float* ux, const float* uy, const float* uz, const float* weightsX, const float* weightsY, const float* weightsZ,
-                                  float dt, bool rungeKutta3, WallStick stick, WallStick airStick, Grid grid, uint refinementLevel, const char* letGo){
+                                  float dt, bool rungeKutta3, WallStick stick, WallStick airStick, Grid grid, uint refinementLevel, const char* letGo, float airReach){
     extern __shared__ float tile[];     //per component, the tile's voxels' negative faces
     __shared__ uint neighborNodes[27];
     int interiorWidth = 2<<refinementLevel;
@@ -1767,7 +1799,20 @@ __global__ void advectThroughGrid(uint numParticleNodes, uint numParticles, cons
             air = ids[index] & AIR_PARTICLE;
         }
         float3 point = make_float3((px[index] - grid.negX)/voxelSize - tileOrigin.x, (py[index] - grid.negY)/voxelSize - tileOrigin.y, (pz[index] - grid.negZ)/voxelSize - tileOrigin.z);
-        float3 velocity = velocityThrough(tile, tileWidth, point, tileOrigin, domainVoxels, make_float3(vx[index], vy[index], vz[index]), step, rungeKutta3, air ? airStick : stick);
+        float3 velocity;
+        if(air){    //the timestep is the liquid's (getCourantDt): the air it squeezes out of its way can be faster, and then goes no further than
+            float3 here = velocityThrough(tile, tileWidth, point, tileOrigin, domainVoxels, make_float3(vx[index], vy[index], vz[index]), step, false, airStick);
+            float speed = sqrtf(here.x*here.x + here.y*here.y + here.z*here.z);     //airReach a substep, in a straight step: Runge-Kutta's stages would
+            if(speed*dt > airReach){                                                //reach past the tile, and it could cross a thin obstacle in one
+                velocity = make_float3(here.x*airReach / (speed*dt), here.y*airReach / (speed*dt), here.z*airReach / (speed*dt));
+            }
+            else{
+                velocity = velocityThrough(tile, tileWidth, point, tileOrigin, domainVoxels, make_float3(vx[index], vy[index], vz[index]), step, rungeKutta3, airStick);
+            }
+        }
+        else{
+            velocity = velocityThrough(tile, tileWidth, point, tileOrigin, domainVoxels, make_float3(vx[index], vy[index], vz[index]), step, rungeKutta3, stick);
+        }
         px[index] += dt*velocity.x;
         py[index] += dt*velocity.y;
         pz[index] += dt*velocity.z;
@@ -1944,7 +1989,9 @@ __global__ void flyEscaped(uint numParticleNodes, uint numParticles, const uint*
         float3 before = make_float3(vx[index], vy[index], vz[index]);
         //the walls' hold on the fluid around it as it flies, the liquid for a bubble and the air for a droplet, and then on its own once it has landed
         float flown = flyEscapedParticle(index, px, py, pz, vx, vy, vz, air, tile, tileWidth, tileOrigin, domainVoxels, grid, voxelSize, dt, air ? stick : airStick, air ? bubble : droplet);
-        change = fmaxf(change, fmaxf(fabsf(vx[index] - before.x), fmaxf(fabsf(vy[index] - before.y), fabsf(vz[index] - before.z))));
+        if(!air){   //a droplet's change counts for the timestep; a bubble is air, and the air's doesn't
+            change = fmaxf(change, fmaxf(fabsf(vx[index] - before.x), fmaxf(fabsf(vy[index] - before.y), fabsf(vz[index] - before.z))));
+        }
         if(!(flown < dt)){
             continue;   //escaped still
         }
@@ -1993,7 +2040,8 @@ void Particles::voxelVelsToParticles(){
     auto advect = phases ? advectThroughGrid<true> : advectThroughGrid<false>;
     advect<<<numParticleNodes, NODE_THREADS, 3*sizeof(float)*tileWidth*tileWidth*tileWidth, stream>>>(numParticleNodes, size, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(),
         px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(), phases ? particleIds.devPtr() : nullptr, twoPhase.escaping(), numUsedGridNodes, nodeCells.devPtr(), cellToNode.devPtr(), nodeInteriorVoxels.devPtr(),
-        voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr(), voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), dt, rungeKutta3, stick, airStick, grid, refinementLevel, gone);
+        voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr(), voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), dt, rungeKutta3, stick, airStick, grid, refinementLevel, gone,
+        (float)(cfl*grid.cellSize / (2<<refinementLevel)));     //the air goes at most as far as the liquid may, the tile's reach
     gpuErrchk(cudaPeekAtLastError());
     if(twoPhase.escaping()){    //then the escaped ones, which that left where they were
         double voxelSize = grid.cellSize / (2<<refinementLevel);

@@ -169,6 +169,7 @@ struct Scene{
     //"air": {...}: a second, lighter fluid simulated with the liquid (TwoPhase, particles.hu; experimental). Fluids with "phase": "air" are seeded as it
     bool air = false;
     double airDensity = 1.2;        //kg/m^3: with the liquid's, the density ratio
+    double airSoundSpeed = 0.0;     //m/s: the air gives under pressure as a gas with this speed of sound does; 0 keeps it incompressible
     double airFlipRatio = -1.0;     //the air's share of FLIP; negative: the liquid's
     int airBand = 0;                //voxels of air kept around the liquid; 0 keeps all of it
     bool airEscaped = true;         //whether particles on the wrong side of the interface move on their own: droplets fly under gravity and the air's drag,

@@ -245,6 +245,50 @@ void Particles::weighDensityFaces(float scale){
     gpuErrchk(cudaPeekAtLastError());
 }
 
+//Air that gives under pressure. Incompressible, the air has to get out of the way of the liquid at once, and where the liquid lands it's pushed out
+//through the band at whatever speed that takes, tens of metres a second at a centimetre's voxels; real air takes some of a pulse as volume, at
+//the rate its speed of sound c sets: div u = -(f / (rho_air c^2)) dp/dt over a voxel's share f of air. On the voxel's own coefficient, in the
+//equations' scale (dt / (rho dx^2)), that's scale x densityRatio x (dx / (c dt))^2 x f, with f the mean over the voxel's faces of the air in each
+//(a face's lightness is rho over the face's density, rho f_liquid + rho_air f_air). The pressure is relative to the still air's, and nothing
+//remembers last substep's: a load held on sealed air compresses it on and on. It gives at an impact, over a substep, which is what it's for.
+//At c = 340 m/s sound crosses an 8 cm band several times in a substep, so this is a small term; a lower c is a softer air
+__global__ void giveAirKernel(uint numVoxels, const char* solveCodes, const uint* neighborNx, const uint* neighborPx, const uint* neighborNy, const uint* neighborPy,
+                              const uint* neighborNz, const uint* neighborPz, const float* lightX, const float* lightY, const float* lightZ, float densityRatio, float give,
+                              float* Adiag){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(index < numVoxels && solveCodes[index]){
+        const uint* neighbors[6] = {neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz};
+        const float* light[3] = {lightX, lightY, lightZ};
+        float air = 0.0f;
+        int faces = 0;
+        #pragma unroll
+        for(int face = 0; face < 6; ++face){
+            uint neighbor = neighbors[face][index];
+            if(neighbor == WALL_VOXEL){
+                continue;
+            }
+            float lightness = face % 2 == 0 || neighbor == NO_VOXEL ? light[face/2][index] : light[face/2][neighbor];
+            air += (1.0f - 1.0f / lightness) / (1.0f - 1.0f / densityRatio);   //the face's share of air, 0 all liquid to 1 all air
+            ++faces;
+        }
+        if(faces > 0){
+            Adiag[index] += give*fminf(fmaxf(air / faces, 0.0f), 1.0f);
+        }
+    }
+}
+
+void Particles::giveAir(float scale, float dt){
+    uint numVoxels = voxelIDsUsed.size();
+    if(!twoPhase.on || twoPhase.soundSpeed <= 0.0f || numVoxels == 0){
+        return;
+    }
+    double voxelSize = grid.cellSize / (2<<refinementLevel);
+    float give = (float)(scale*twoPhase.densityRatio*(voxelSize / (twoPhase.soundSpeed*dt))*(voxelSize / (twoPhase.soundSpeed*dt)));
+    giveAirKernel<<<numVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numVoxels, solveCodes.devPtr(), neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(), neighborPy.devPtr(),
+        neighborNz.devPtr(), neighborPz.devPtr(), faceLightness[0].devPtr(), faceLightness[1].devPtr(), faceLightness[2].devPtr(), twoPhase.densityRatio, give, Adiag.devPtr());
+    gpuErrchk(cudaPeekAtLastError());
+}
+
 void Particles::lightenFaceUpdates(float scale){
     uint numVoxels = voxelIDsUsed.size();
     if(!twoPhase.on || numVoxels == 0){

@@ -70,6 +70,7 @@ struct TwoPhase{
     float surfaceTension = 7.2e-5f;     //between the two, over the liquid's density, m^3/s^2: how far a bubble flattens as it rises, which is most of
                                         //the drag on a large one. The liquid's own (setSurfaceTension) where it has one
     int band = 0;                       //voxels of air kept around the liquid, in whole nodes; 0 keeps all of it
+    float soundSpeed = 0.0f;            //m/s: the air gives under pressure as a gas with this speed of sound does (giveAir); 0 keeps it incompressible
 
     bool escaping() const{
         return on && escapes;
@@ -364,6 +365,7 @@ private:
     //velocity update's faces likewise
     void findFaceDensities();
     void weighDensityFaces(float scale);
+    void giveAir(float scale, float dt);    //and the air gives under pressure, with TwoPhase::soundSpeed over 0
     void lightenFaceUpdates(float scale);
     //the air band (twophase.cu): air only within twoPhase.band voxels of the liquid, and the open air's pressure, 0, past it. findBandRings finds each
     //node cell's ring, in every partition alike; markBeyondBand flags the air past the band as removed; emitParticles makes air in the band's empty

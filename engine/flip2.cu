@@ -1264,6 +1264,7 @@ int main(int argc, char** argv){
         TwoPhase twoPhase;
         twoPhase.on = true;
         twoPhase.densityRatio = (float)(scene.density / scene.airDensity);
+        twoPhase.soundSpeed = (float)scene.airSoundSpeed;
         twoPhase.airFlipRatio = (float)(scene.airFlipRatio < 0.0 ? scene.flipRatio : scene.airFlipRatio);
         twoPhase.band = scene.airBand;
         twoPhase.escapes = scene.airEscaped && twoPhase.densityRatio > 1.0f;   //with no difference in density there's no telling the liquid's weight on a face

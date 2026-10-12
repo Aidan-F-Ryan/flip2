@@ -156,10 +156,9 @@ def _interface(node):
                                             help="Voxels of air simulated around the liquid, in whole blocks of 4; past the band the pressure is the open "
                                                  "air's, and the air flows out and in there freely. Air shut in, as under a lid or a plate with holes, "
                                                  "isn't simulated from this node yet (that needs the air everywhere, which flip2 takes only with its "
-                                                 "analytic liquid shapes, not geometry). The bake time goes with the air's speed as much as the "
-                                                 "liquid's, and the air gets faster the finer the voxels: measured 23 m/s at 2.5 cm and 110-140 m/s at "
-                                                 "1 cm on dam breaks whose liquid peaks at 7-12 m/s, so a 1 cm two-phase bake can take 10 times a "
-                                                 "single-phase one, against 2 times at 2.5 cm"))
+                                                 "analytic liquid shapes, not geometry). The timestep follows the liquid: where the liquid lands, the "
+                                                 "air it squeezes out goes many times faster, and is let go a bounded distance a substep rather than "
+                                                 "shortening every substep to it"))
     air.addParmTemplate(hou.FloatParmTemplate("airdensity", "Air Density", 1, default_value=(1.2,), min=0.001, max=1000.0, disable_when=no_air,
                                               help="kg/m^3: 1.2 is air at room temperature. Heavier air drags more on spray and slows the bubbles' rise. "
                                                    "It can't be heavier than the liquid"))
