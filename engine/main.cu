@@ -109,6 +109,10 @@ int main(int argc, char** argv){
     for(int i = 0; i < numFrames; ++i){
         // particles.run();
         particles.solveFrame(24.0f);
+        if(!particles.solveError().empty()){    //no pressure for a substep of this frame: nothing after it means anything
+            std::cerr<<"frame "<<i + 1<<": "<<particles.solveError()<<"\n";
+            return 1;
+        }
         if(diagnostics){
             particles.writeDiagnostics(diagnostics, i + 1);
         }

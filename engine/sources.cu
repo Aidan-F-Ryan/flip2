@@ -6,6 +6,7 @@
 //  there, emitParticles, which re-bins and sorts again if it added any
 
 #include "particles.hu"
+#include "gridSampling.hu"
 #include <cmath>
 #include <cub/cub.cuh>
 
@@ -73,7 +74,7 @@ __global__ void killRemoved(uint numParticles, const char* removed, uint deadCel
 }
 
 bool Particles::removing() const{
-    return sources.removes() || (obstacles.count() > 0 && substepIndex == 0);
+    return sources.removes() || (obstacles.count() > 0 && substepIndex == 0) || airBand();
 }
 
 void Particles::markRemovedParticles(){
@@ -126,13 +127,6 @@ void Particles::dropRemovedParticles(){
     }
 }
 
-__device__ inline unsigned long long mixBits64(unsigned long long x){  //splitmix64
-    x += 0x9e3779b97f4a7c15ull;
-    x = (x ^ (x >> 30))*0xbf58476d1ce4e5b9ull;
-    x = (x ^ (x >> 27))*0x94d049bb133111ebull;
-    return x ^ (x >> 31);
-}
-
 //An emitter as a conveyor: a jittered seeding lattice (particlesPerVoxel per voxel) sliding along at the emitter's velocity, whose points become particles
 //as they enter the emitter, or sweep right through it, during a substep; all of them at the start. Inside the emitter and a voxel around it, the grid's
 //faces are pinned to its velocity (pinEmitterFaces), so the particles it made keep moving with the lattice and nothing doubles up. That delivers exactly
@@ -149,6 +143,8 @@ struct EmitterLattice{
     double low[3];              //the domain
     double high[3];
     double ownLow, ownHigh;     //and along z, this partition's node planes: where its own particles can go
+    double cellSize;            //a node plane's thickness, and which planes are this partition's: for ownPoint, which finds a point's plane as rootCell
+    uint planeLo, planeHi;      //(particleToGridFunctions.cu) finds its cell
 
     __host__ __device__ unsigned long long count() const{
         return (unsigned long long)extent[0]*extent[1]*extent[2];
@@ -196,9 +192,13 @@ __global__ void constrainEmitterVelocities(uint numParticles, const double* px, 
     }
 }
 
-//whether a point that emits does so in this partition's planes: the particle is this partition's to make
+//whether a point that emits does so in this partition's planes: the particle is this partition's to make. Its plane is found exactly as rootCell
+//(particleToGridFunctions.cu) finds the particle's cell, the same expression in double, so the two can't disagree: by the position against the
+//planes' heights, a point a few nanometres under a plane's boundary was one partition's to make, and its cell, found through a float, the next
+//partition's; the partitions then built their node tables apart (the band's air in a 2-way jet, 2026-10-05)
 __device__ inline bool ownPoint(const EmitterLattice& lattice, const double now[3]){
-    return now[2] >= lattice.ownLow && now[2] < lattice.ownHigh;
+    double plane = floor((now[2] - lattice.origin[2]) / lattice.cellSize);
+    return plane >= lattice.planeLo && plane < lattice.planeHi;
 }
 
 //per lattice point: whether it emits (emitting), and whether it does in this partition's planes (own; the same array as emitting in a lone partition)
@@ -238,14 +238,15 @@ __global__ void findFills(EmitterLattice lattice, FluidShapes fluids, int which,
     }
 }
 
-//the new particles' ids and birth times. A particle's id is firstId plus its lattice point's place among every point emitting now, in any partition's
-//planes (ranks: each point's running count of those), so it doesn't depend on which partition makes it
-__global__ void identifyEmitted(unsigned long long count, const uint* own, const uint* ends, const uint* ranks, uint first, uint firstId, float birth, uint* ids,
-                                float* births){
+//the new particles' ids and birth times. A liquid particle's id is firstId plus its lattice point's place among every point emitting now, in any
+//partition's planes (ranks: each point's running count of those), so it doesn't depend on which partition makes it; it keeps to the bits that number
+//a particle (numbers: Particles::idNumbers). Air's particles are AIR_PARTICLE and no number
+__global__ void identifyEmitted(unsigned long long count, const uint* own, const uint* ends, const uint* ranks, uint first, uint firstId, uint numbers, bool air,
+                                float birth, uint* ids, float* births){
     unsigned long long index = threadIdx.x + (unsigned long long)blockIdx.x*blockDim.x;
     if(index < count && own[index]){
         uint particle = first + ends[index] - 1;
-        ids[particle] = firstId + ranks[index] - 1;
+        ids[particle] = air ? AIR_PARTICLE : (firstId + ranks[index] - 1) & numbers;
         births[particle] = birth;
     }
 }
@@ -283,12 +284,111 @@ __global__ void emitFromLattice(EmitterLattice lattice, FluidShape emitter, unsi
     }
 }
 
+//The air band's fill (twophase.cu): what a lattice point needs to know to become air
+struct BandFill{
+    const char* rings;      //per node cell of the domain: its ring (Particles::markBeyondBand)
+    const uint* occupied;   //a bit per voxel of the domain: whether any particle is in it
+    char last;              //the band's last ring
+    bool everywhere;        //the first fill: the empty voxels of the nodes holding liquid too. After it those are left empty, as they are with no air:
+                            //a gap that opens inside the liquid would otherwise fill with air that has to find its way out
+    int perSide;            //lattice points per voxel along an axis
+    int nodeWidth;          //voxels per node along an axis
+    uint cells[3];          //node cells along each axis
+};
+
+//a bit per voxel of the domain holding any particle
+__global__ void markOccupiedVoxels(uint numParticles, const double* px, const double* py, const double* pz, EmitterLattice lattice, BandFill band, uint* occupied){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(index < numParticles){
+        double position[3] = {px[index], py[index], pz[index]};
+        unsigned long long voxel[3];
+        for(int axis = 0; axis < 3; ++axis){
+            long long along = (long long)floor((position[axis] - lattice.origin[axis]) / (lattice.spacing*band.perSide));
+            long long most = (long long)band.cells[axis]*band.nodeWidth - 1;
+            voxel[axis] = (unsigned long long)(along < 0 ? 0 : along > most ? most : along);
+        }
+        unsigned long long bit = voxel[0] + (unsigned long long)band.cells[0]*band.nodeWidth*(voxel[1] + (unsigned long long)band.cells[1]*band.nodeWidth*voxel[2]);
+        atomicOr(occupied + (bit >> 5), 1u << (bit & 31));
+    }
+}
+
+//whether a lattice point becomes air: its node is in the band, its voxel holds no particle, and it isn't inside an obstacle; and where it is. Beside
+//an obstacle an empty voxel is less to go on. At the start, a cell of the lattice that an obstacle holds the centre of leaves only a sliver outside
+//it, which is the liquid's if liquid is modelled up to the obstacle (markInsideObstacles, obstacles.cu): no air from those. After it, a voxel an
+//obstacle cuts has room for only as much of a voxel's worth of particles as it's open, and is empty every few substeps with nothing missing: topped
+//up each time, the cut voxels pumped air into the gap under a box until it pushed down into the pool below and up through the box's floor. A hole
+//in the air is an empty voxel no obstacle cuts; the cut ones fill from those beside them
+__device__ inline bool fillsBand(const EmitterLattice& lattice, const BandFill& band, const Obstacles& obstacles, unsigned long long seed, unsigned long long index, double now[3]){
+    long long point[3];
+    lattice.point(index, point);
+    unsigned long long voxel[3];
+    for(int axis = 0; axis < 3; ++axis){
+        if(point[axis] < 0 || point[axis] >= (long long)band.cells[axis]*band.nodeWidth*band.perSide){
+            return false;   //outside the domain
+        }
+        voxel[axis] = (unsigned long long)(point[axis] / band.perSide);
+        now[axis] = lattice.origin[axis] + (point[axis] + latticeJitter(seed, point, axis))*lattice.spacing;
+    }
+    char ring = band.rings[voxel[0]/band.nodeWidth + band.cells[0]*(voxel[1]/band.nodeWidth + band.cells[1]*(voxel[2]/band.nodeWidth))];
+    if(ring > band.last || (ring == 0 && !band.everywhere)){
+        return false;
+    }
+    unsigned long long bit = voxel[0] + (unsigned long long)band.cells[0]*band.nodeWidth*(voxel[1] + (unsigned long long)band.cells[1]*band.nodeWidth*voxel[2]);
+    if(band.occupied[bit >> 5] >> (bit & 31) & 1){
+        return false;
+    }
+    float distance;
+    float3 normal;
+    if(band.everywhere){
+        float3 centre = make_float3((float)(lattice.origin[0] + (point[0] + 0.5)*lattice.spacing), (float)(lattice.origin[1] + (point[1] + 0.5)*lattice.spacing),
+                                    (float)(lattice.origin[2] + (point[2] + 0.5)*lattice.spacing));
+        if(nearestObstacle(obstacles, centre, distance, normal) >= 0 && distance < 0.0f){
+            return false;
+        }
+    }
+    else{
+        double voxelSize = lattice.spacing*band.perSide;
+        float3 centre = make_float3((float)(lattice.origin[0] + (voxel[0] + 0.5)*voxelSize), (float)(lattice.origin[1] + (voxel[1] + 0.5)*voxelSize),
+                                    (float)(lattice.origin[2] + (voxel[2] + 0.5)*voxelSize));
+        if(nearestObstacle(obstacles, centre, distance, normal) >= 0 && fabsf(distance) <= 0.9f*(float)voxelSize){     //as cutFaces has it (obstacles.cu)
+            return false;
+        }
+    }
+    return !(nearestObstacle(obstacles, make_float3((float)now[0], (float)now[1], (float)now[2]), distance, normal) >= 0 && distance < 0.0f);
+}
+
+__global__ void findBandFills(EmitterLattice lattice, BandFill band, Obstacles obstacles, unsigned long long seed, uint* emitting, uint* own){
+    unsigned long long index = threadIdx.x + (unsigned long long)blockIdx.x*blockDim.x;
+    if(index < lattice.count()){
+        double now[3];
+        bool anywhere = fillsBand(lattice, band, obstacles, seed, index, now);
+        emitting[index] = anywhere;
+        own[index] = anywhere && ownPoint(lattice, now);
+    }
+}
+
+__global__ void fillBandFromLattice(EmitterLattice lattice, BandFill band, Obstacles obstacles, unsigned long long seed, const uint* emitting, const uint* ends, uint first,
+                                    double* px, double* py, double* pz, float* vx, float* vy, float* vz){
+    unsigned long long index = threadIdx.x + (unsigned long long)blockIdx.x*blockDim.x;
+    if(index < lattice.count() && emitting[index]){
+        double now[3];
+        fillsBand(lattice, band, obstacles, seed, index, now);
+        uint particle = first + ends[index] - 1;
+        px[particle] = now[0];
+        py[particle] = now[1];
+        pz[particle] = now[2];
+        vx[particle] = 0.0f;
+        vy[particle] = 0.0f;
+        vz[particle] = 0.0f;
+    }
+}
+
 void Particles::emitParticles(){
     bool filling = false;   //the start, with fluid in meshes to seed
     for(int fluid = 0; fluid < fluids.count && substepIndex == 0; ++fluid){
         filling = filling || fluids.shapes[fluid].kind == FluidShape::MESH;
     }
-    if(sources.numEmitters == 0 && !filling){
+    if(sources.numEmitters == 0 && !filling && !airBand()){
         return;
     }
     int interiorWidth = 2<<refinementLevel;
@@ -305,11 +405,14 @@ void Particles::emitParticles(){
     }
     lattice.ownLow = origin[2] + (double)boxLo*grid.cellSize;
     lattice.ownHigh = origin[2] + (double)boxHi*grid.cellSize;
+    lattice.cellSize = grid.cellSize;
+    lattice.planeLo = boxLo;
+    lattice.planeHi = boxHi;
     uint added = 0;
     //Of the lattice points that can be inside the shape now, or have swept through it this substep, the ones find marks become particles, made by place.
     //Every partition looks at all of them, not only those in its own planes: each new particle's id is its point's place among all that emit, and the
     //next id to hand out moves on by how many did, so the partitions agree on both without a word between them
-    auto emitFrom = [&](const FluidShape& shape, auto find, auto place){
+    auto emitFrom = [&](const FluidShape& shape, bool air, auto find, auto place){
         bool none = false;
         for(int axis = 0; axis < 3; ++axis){
             lattice.shift[axis] = shape.velocity[axis]*elapsedTime;
@@ -359,14 +462,16 @@ void Particles::emitParticles(){
             uint first = size;
             resizeParticleArrays(size + newParticles, size);
             place(count, own, ends, first);
-            identifyEmitted<<<(uint)(count / BLOCKSIZE + 1), BLOCKSIZE, 0, stream>>>(count, own, ends, ranks, first, (uint)nextParticleId, (float)elapsedTime,
+            identifyEmitted<<<(uint)(count / BLOCKSIZE + 1), BLOCKSIZE, 0, stream>>>(count, own, ends, ranks, first, (uint)nextParticleId, idNumbers(), air, (float)elapsedTime,
                 particleIds.devPtr(), particleBirths.devPtr());
             added += newParticles;
         }
-        if(nextParticleId <= 0xFFFFFFFFull && nextParticleId + counts[1] > 0xFFFFFFFFull && verbose()){
-            std::cerr<<"Particles: more than 2^32 particles have been made, and ids are 32 bits: from here on new particles repeat old ids\n";
+        if(!air){   //air takes no numbers
+            if(nextParticleId <= idNumbers() && nextParticleId + counts[1] > idNumbers() && verbose()){
+                std::cerr<<"Particles: more than "<<(unsigned long long)idNumbers() + 1<<" particles have been made, more than their ids can number: from here on new particles repeat old ids\n";
+            }
+            nextParticleId += counts[1];
         }
-        nextParticleId += counts[1];
         gpuErrchk(cudaPeekAtLastError());
         cudaFreeAsync(emitting, stream);
         cudaFreeAsync(ranks, stream);
@@ -382,7 +487,7 @@ void Particles::emitParticles(){
             constrainEmitterVelocities<<<std::min(size / BLOCKSIZE + 1, 4096u), BLOCKSIZE, 0, stream>>>(size, px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(), shape);
         }
         unsigned long long seed = sources.seed + emitter;
-        emitFrom(shape, [&](unsigned long long count, uint* emitting, uint* own){
+        emitFrom(shape, false, [&](unsigned long long count, uint* emitting, uint* own){
             findEmissions<<<(uint)(count / BLOCKSIZE + 1), BLOCKSIZE, 0, stream>>>(lattice, shape, seed, emitting, own);
         }, [&](unsigned long long count, const uint* emitting, const uint* ends, uint first){
             emitFromLattice<<<(uint)(count / BLOCKSIZE + 1), BLOCKSIZE, 0, stream>>>(lattice, shape, seed, emitting, ends, first,
@@ -394,12 +499,52 @@ void Particles::emitParticles(){
             continue;
         }
         unsigned long long seed = sources.seed + MAX_SOURCE_SHAPES + fluid;  //not an emitter's
-        emitFrom(fluids.shapes[fluid], [&](unsigned long long count, uint* emitting, uint* own){
+        emitFrom(fluids.shapes[fluid], false, [&](unsigned long long count, uint* emitting, uint* own){
             findFills<<<(uint)(count / BLOCKSIZE + 1), BLOCKSIZE, 0, stream>>>(lattice, fluids, fluid, obstacles.state(), seed, emitting, own);
         }, [&](unsigned long long count, const uint* emitting, const uint* ends, uint first){
             fillFromLattice<<<(uint)(count / BLOCKSIZE + 1), BLOCKSIZE, 0, stream>>>(lattice, fluids, fluid, obstacles.state(), seed, emitting, ends, first,
                 px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr());
         });
+    }
+    if(airBand()){  //air, at rest, in the band's voxels that hold nothing (twophase.cu): every lattice point of this partition's planes is asked, which a
+                    //band of nodes listed first would save
+        if(added > 0){  //the rings count the liquid just made too: its particles need their cells
+            alignParticlesToGrid();
+        }
+        findBandRings();
+        BandFill band;
+        band.rings = bandRings.devPtr();
+        band.last = (char)bandRingCount();
+        band.everywhere = substepIndex == 0;
+        band.perSide = sources.latticePerSide;
+        band.nodeWidth = interiorWidth;
+        band.cells[0] = grid.sizeX;
+        band.cells[1] = grid.sizeY;
+        band.cells[2] = grid.sizeZ;
+        size_t words = (size_t)((unsigned long long)grid.sizeX*grid.sizeY*grid.sizeZ*interiorWidth*interiorWidth*interiorWidth / 32 + 1);
+        uint* occupied;
+        gpuErrchk(cudaMallocAsync((void**)&occupied, sizeof(uint)*words, stream));
+        gpuErrchk(cudaMemsetAsync(occupied, 0, sizeof(uint)*words, stream));
+        band.occupied = occupied;
+        if(size > 0){
+            markOccupiedVoxels<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, px.devPtr(), py.devPtr(), pz.devPtr(), lattice, band, occupied);
+        }
+        FluidShape everywhere;      //a box: this partition's planes of the domain
+        for(int axis = 0; axis < 3; ++axis){
+            everywhere.low[axis] = lattice.low[axis];
+            everywhere.high[axis] = lattice.high[axis];
+        }
+        everywhere.low[2] = lattice.ownLow;
+        everywhere.high[2] = lattice.ownHigh;
+        //not an emitter's seed or a fluid's, and another every substep: a voxel emptied twice doesn't fill the same way twice
+        unsigned long long seed = sources.seed + 2*MAX_SOURCE_SHAPES + 0x9e3779b97f4a7c15ull*(substepIndex + 1);
+        emitFrom(everywhere, true, [&](unsigned long long count, uint* emitting, uint* own){
+            findBandFills<<<(uint)(count / BLOCKSIZE + 1), BLOCKSIZE, 0, stream>>>(lattice, band, obstacles.state(), seed, emitting, own);
+        }, [&](unsigned long long count, const uint* emitting, const uint* ends, uint first){
+            fillBandFromLattice<<<(uint)(count / BLOCKSIZE + 1), BLOCKSIZE, 0, stream>>>(lattice, band, obstacles.state(), seed, emitting, ends, first,
+                px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr());
+        });
+        gpuErrchk(cudaFreeAsync(occupied, stream));
     }
     if(added > 0){  //the new particles need their cells, and to be sorted in with the rest; rootCell leaves the others as they are
         alignParticlesToGrid();

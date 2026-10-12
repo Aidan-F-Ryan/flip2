@@ -11,7 +11,16 @@
 //    "schema": "flip2.scene/1",
 //    "fps": 24, "frames": 120,
 //    "domain": {"min": [-0.5, -0.5, -0.5], "max": [0.5, 0.5, 0.5], "voxelSize": 0.0078125,     //rounded up to whole nodes of 4^3 voxels
-//               "open": []},                                               //faces that delete the fluid reaching them: "-x", "+x", "-y", "+y", "-z", "+z"
+//               "open": [],                                                //faces that delete the fluid reaching them: "-x", "+x", "-y", "+y", "-z", "+z"
+//               "walls": {"hold": true, "friction": 0, "contactAngle": 60,  //what the walls do to the liquid on them, all of them, and then any that
+//                         "+y": {"hold": false, "friction": 0.5}}},        //differ, by face. hold: a wall that holds pulls on the liquid as well as
+//                                                                           //pushing it, as a sealed tank's do, so a splash hangs from the ceiling;
+//                                                                           //one that doesn't lets it go wherever air can get in behind it, as
+//                                                                           //anything in open air does (boundaries.cu). With "air" simulated the air
+//                                                                           //gets behind the liquid itself, and every wall holds. friction: as an
+//                                                                           //obstacle's, 0 for the liquid sliding freely along the wall to 1.
+//                                                                           //contactAngle: the angle the liquid's surface meets this wall at,
+//                                                                           //where it isn't the liquid's own (below)
 //    "solver": {"flipRatio": 0.95, "cfl": 4, "densityCorrectionTime": 0.1, "pressureSolver": "multigrid", "advection": "rk3", "dotProducts": "exact",
 //               "transfer": "flip",                                        //or "apic": particles carry their velocity's gradient; flipRatio 0 for pure APIC
 //               "viscousCfl": 6,                                           //with viscosity: voxels it may spread across in a substep; 0 for no limit
@@ -29,7 +38,8 @@
 //               {"mesh": "blob.obj", "transform": [...], "velocity": [0, 0, 0]}],         //fluids, emitters and sinks can be meshes, placed as obstacles are
 //    "emitters": [{"shape": "box", "min": [...], "max": [...], "velocity": [0, 0, 2]}],   //inflow: keeps its shape full of fluid moving at velocity
 //    "sinks": [{"shape": "sphere", "center": [...], "radius": 0.1}],                       //outflow: deletes the fluid inside it
-//    "obstacles": [{"mesh": "rock.obj", "friction": 0, "thickness": 0,                   //or "vertices": "v.npy", "triangles": "t.npy"; or a box or sphere;
+//    "obstacles": [{"mesh": "rock.obj", "friction": 0, "thickness": 0, "hold": true,     //or "vertices": "v.npy", "triangles": "t.npy"; or a box or sphere;
+//                                                                                         //hold: as a wall's
 //                                                                                         //or "vdb": "rock.vdb", "grid": "surface", "velocityGrid": "vel"
 //                   "transform": [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1],                    //its own space to the world: row-major, acting on column vectors
 //                   "keyframes": [{"time": 0, "transform": [...]}, ...],                 //instead of a transform, it moves: linearly, rotations by slerp
@@ -91,6 +101,7 @@ struct SceneObstacle{
     std::vector<double> keyTimes;                       //empty: it stays where transforms[0] puts it
     std::vector<std::array<double, 16>> transforms;     //own space to world, row-major, acting on column vectors (translation in elements 3, 7, 11)
     double friction = 0.0;      //0: the fluid slips past freely; 1: the fluid touching it moves with it
+    bool hold = true;           //whether it can pull on the liquid as well as push it: false, the liquid leaves it freely (boundaries.cu)
     double thickness = 0.0;     //mesh: 0 for a closed surface; for an open one, like a ground plane, the shell's thickness around it
     std::vector<double> sampleTimes;                    //deforming: when each sample is; empty: it doesn't deform
     std::shared_ptr<const std::vector<float>> samples;  //deforming: each sample's vertices in turn, x, y, z each, in the world (shared by the scene's copies)
@@ -108,6 +119,8 @@ struct SceneShape{
     double centre[3] = {0.0, 0.0, 0.0};     //a sphere's
     double radius = 0.0;
     double velocity[3] = {0.0, 0.0, 0.0};   //what its fluid starts with
+    bool air = false;                       //a fluid's "phase": "air": it's the scene's air (Scene::air), not its liquid. Air comes after every liquid fluid
+    bool carve = false;                     //an air fluid's "carve": true: it takes its space out of the liquid (a bubble); otherwise liquid has what both hold
     SceneObstacle mesh;                     //a mesh's, and where it is (friction and thickness unused)
 
     bool contains(const double point[3]) const;     //never, for a mesh
@@ -153,12 +166,42 @@ struct Scene{
     double viscosity = 0.0;         //dynamic, Pa s
     double surfaceTension = 0.0;    //N/m
     double contactAngle = 60.0;     //degrees, through the liquid, where its surface meets the domain's walls
+    //"air": {...}: a second, lighter fluid simulated with the liquid (TwoPhase, particles.hu; experimental). Fluids with "phase": "air" are seeded as it
+    bool air = false;
+    double airDensity = 1.2;        //kg/m^3: with the liquid's, the density ratio
+    double airFlipRatio = -1.0;     //the air's share of FLIP; negative: the liquid's
+    int airBand = 0;                //voxels of air kept around the liquid; 0 keeps all of it
+    bool airEscaped = true;         //whether particles on the wrong side of the interface move on their own: droplets fly under gravity and the air's drag,
+                                    //and bubbles smaller than a voxel rise through the liquid's (particles.hu, ESCAPED_PARTICLE)
+    double airDropletRadius = 0.0;  //a droplet's radius for that drag, in metres; 0 for a ball of the liquid one particle stands for
+    double airViscosity = 1.5e-5;   //the air's kinematic viscosity, m^2/s, for the same
+    double airBubbleRadius = 0.0;   //a bubble's radius for the liquid's drag on it, in metres; 0 for a ball of the air one particle stands for
+    double airLiquidViscosity = 0.001;  //the liquid's viscosity for that drag, Pa s: "liquid"'s where that gives one, water's (0.001) where it gives none
+    double airSurfaceTension = 0.072;   //between the two fluids, N/m: how far a bubble flattens as it rises, and so how fast a large one does. "liquid"'s
+                                        //where that gives one, water's and air's (0.072) where it gives none
+    //"whitewater": {...}: spray, foam and bubbles, made where the liquid's surface breaks up (whitewater.hu). What it needs of the two fluids it takes from
+    //"liquid" and "air", whether or not the air is simulated: the liquid's surface tension and viscosity (water's where it gives none), and the
+    //air's density and viscosity
+    bool whitewater = false;
+    double whitewaterAmount = 1.0;          //how much a breaking surface makes, against what the model gives
+    double whitewaterSpray = 1.0;           //and how much of that is spray, and how much bubbles, each against the model's own share
+    double whitewaterBubbles = 1.0;
+    int whitewaterPerVoxel = 27;            //the particles a voxel's volume of whitewater is drawn as
+    double whitewaterMaxParticles = 1.6e7;  //the most at once, in each partition: with less room than the surface would fill, what it makes thins evenly
+    double whitewaterFoamLife = 0.5;        //seconds a bubble lasts once it has reached the surface, on average
+    double whitewaterMaxAge = 30.0;         //seconds after which any of it is gone
+    double whitewaterDropletScale = 1.0;    //droplets' radii against what the model gives, and bubbles'
+    double whitewaterBubbleScale = 1.0;
     int particlesPerVoxel = 8;
     unsigned long long seed = 1;
     std::vector<SceneShape> fluids;
     std::vector<SceneShape> emitters;
     std::vector<SceneShape> sinks;
     unsigned int openFaces = 0;     //bits: -x, +x, -y, +y, -z, +z
+    //"domain": {"walls": {...}}: what each wall does to the liquid on it, in the same order
+    bool wallHold[6] = {true, true, true, true, true, true};    //whether it can pull on the liquid as well as push it; false, the liquid leaves it freely
+    double wallFriction[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};    //0: the fluid slides along it freely; 1: the fluid touching it is at rest, as on an obstacle
+    double wallContactAngle[6] = {60.0, 60.0, 60.0, 60.0, 60.0, 60.0};  //degrees: its own, or the liquid's contactAngle where it has none
     std::vector<SceneObstacle> obstacles;
     std::vector<SceneForce> forces;
     int partitions = 1;
@@ -189,6 +232,8 @@ void loadNpyMesh(const std::string& verticesPath, const std::string& trianglesPa
 
 //the fluid the scene starts with: particlesPerVoxel per voxel, on a lattice of 1, 2 or 3 per side, each jittered within its lattice cell by a hash of
 //the seed and its place in the domain, so the same scene always seeds the same particles. Where shapes overlap, the earlier one's velocity wins
-void seedParticles(const Scene& scene, std::vector<double>& x, std::vector<double>& y, std::vector<double>& z, std::vector<float>& u, std::vector<float>& v, std::vector<float>& w);
+//Fluids are seeded in the order the scene lists them, so with air, which comes last, the liquid's particles are the first *liquid of them
+void seedParticles(const Scene& scene, std::vector<double>& x, std::vector<double>& y, std::vector<double>& z, std::vector<float>& u, std::vector<float>& v, std::vector<float>& w,
+                   size_t* liquid = nullptr);
 
 #endif

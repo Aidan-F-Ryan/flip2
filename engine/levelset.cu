@@ -35,7 +35,8 @@
 //liquid's unknowns and 0 everywhere the pressure is 0, so wherever kappa is constant a pressure of sigma*kappa cancels it exactly: a still drop stays
 //still, and only the curvature's changes along the surface move anything. Nothing about the pressure equations changes. It's explicit, so the timestep
 //can't pass the time the shortest capillary wave takes to cross a voxel (Particles::capillaryDt), which only applies with surface tension on. The sharp
-//free surface takes the same curvature as the pressure at its surface instead, inside the solve (freesurface.cu), and none of this force.
+//free surface takes the same curvature as the pressure at its surface instead, inside the solve (freesurface.cu), and none of this force. Nor does
+//the liquid with air around it (TwoPhase): there the force is the slope of an energy of the two fluids' shares of the voxels (twophase.cu), and no curvature is found.
 
 #include "particles.hu"
 #include "liquidTile.hu"
@@ -91,8 +92,12 @@ __device__ inline void splatPoint(const float p[3], int* sums, int voxels1D, int
 //a voxel of one of the domain's walls is also there as its mirror image in the wall (and in two or three walls at once, by an edge or a corner): beside
 //a wall a centre's reach is half inside it, and with the liquid on one side only the mean would lean away from the wall, as it does at a surface. With
 //the images it reads as the liquid carrying on through the wall as it is on this side
+//With two PHASES (TwoPhase, particles.hu), only the liquid's particles on the grid make its surface: those whose ids aren't marked AIR_PARTICLE or ESCAPED_PARTICLE. A template, so that
+//without them the kernel is the one it always was, to the bit
+template<bool PHASES>
 __global__ void splatParticles(uint numParticleNodes, uint numParticles, const uint* firstParticles, const double* px, const double* py, const double* pz, VoxelPlaces places,
-                               int3 domainVoxels, const uint* voxelOwners, int* weights, int* offsetsX, int* offsetsY, int* offsetsZ){
+                               int3 domainVoxels, const uint* voxelOwners, int* weights, int* offsetsX, int* offsetsY, int* offsetsZ,
+                               const uint* ids){
     extern __shared__ int sums[];   //per slot: the weights, then the weighted offsets along x, y and z, in voxels
     int voxels1D = places.interiorWidth + 2*places.apronCells;
     int voxels3D = voxels1D*voxels1D*voxels1D;
@@ -107,6 +112,11 @@ __global__ void splatParticles(uint numParticleNodes, uint numParticles, const u
     int size[3] = {domainVoxels.x, domainVoxels.y, domainVoxels.z};
     double perVoxel = 1.0 / (double)places.voxelSize();
     for(uint index = firstParticle + threadIdx.x; index < lastParticle; index += blockDim.x){    //consecutive threads, consecutive particles
+        if constexpr(PHASES){
+            if(ids[index] & (AIR_PARTICLE | ESCAPED_PARTICLE)){     //nor its droplets, which aren't the body of the liquid
+                continue;
+            }
+        }
         float p[3] = {(float)((px[index] - places.grid.negX)*perVoxel - origin.x), (float)((py[index] - places.grid.negY)*perVoxel - origin.y),
                       (float)((pz[index] - places.grid.negZ)*perVoxel - origin.z)};     //in the block, in voxels
         float image[3];     //its mirror image along each axis, where a wall is within a voxel of it: past that, no centre inside is in the image's reach
@@ -213,18 +223,11 @@ __global__ void finishLevelSet(VoxelPlaces places, Obstacles obstacles, const ch
 
 // ---- 2: distances ----
 
-//What a slot past a wall holds, from its mirror image inside: the image's value, less 2 wetting for every voxel the slot is past the wall, wetting
-//being the cosine of the angle the liquid's surface should meet the wall at. The level set's slope across the wall is then that cosine, so its zero
-//meets the wall at that angle: square on with none, as a plain mirror image has it, reaching out along the wall with more, and pulling back from it
-//with less than none. The surface tension that follows the level set's curvature does the rest: nothing else knows the angle
-__device__ inline float pastWall(float image, float depth, float wetting){
-    return image - 2.0f*depth*wetting;
-}
-
 //a field into a tile: every slot inside the domain takes its stored voxel's value, or missing where nothing's stored, and the slots past the walls
-//mirror those (pastWall), unless there's nothing there to mirror. Every thread of the block calls it, after loadTileNodes
-__device__ inline void loadLevelTile(const Tile& tile, const uint* nodes, uint numUsedGridNodes, const uint* interiorVoxels, const float* values, float missing, float wetting,
-                                     float* field){
+//mirror those, tilted to meet each wall at its contact angle (Tile::pastWall), unless there's nothing there to mirror. Every thread of the block
+//calls it, after loadTileNodes
+__device__ inline void loadLevelTile(const Tile& tile, const uint* nodes, uint numUsedGridNodes, const uint* interiorVoxels, const float* values, float missing,
+                                     const WallWetting& wetting, float* field){
     for(int slot = threadIdx.x; slot < LEVEL_SLOTS; slot += blockDim.x){
         int3 t = tile.at(slot);
         if(tile.inDomain(t)){
@@ -237,7 +240,7 @@ __device__ inline void loadLevelTile(const Tile& tile, const uint* nodes, uint n
         int3 t = tile.at(slot);
         if(!tile.inDomain(t)){
             float image = field[tile.slot(tile.mirrored(t))];
-            field[slot] = image < missing ? pastWall(image, tile.pastWalls(t), wetting) : missing;
+            field[slot] = image < missing ? tile.pastWall(image, t, wetting) : missing;
         }
     }
     __syncthreads();
@@ -246,7 +249,7 @@ __device__ inline void loadLevelTile(const Tile& tile, const uint* nodes, uint n
 //the level set at a node's own voxels from the particles' field around them: startDistances and three passes of relaxDistances (surface.cu), over a
 //tile in shared memory. A pass is only right a slot further in from the tile's edge than the one before, where every neighbour it read was right;
 //4 passes leave the node's own voxels right. A tile all on one side of the surface is as far from it as the level set goes
-__global__ void redistanceLevelSet(uint numUsedGridNodes, const uint* nodeCells, const uint* cellToNode, const uint* interiorVoxels, Grid grid, float outside, float wetting,
+__global__ void redistanceLevelSet(uint numUsedGridNodes, const uint* nodeCells, const uint* cellToNode, const uint* interiorVoxels, Grid grid, float outside, WallWetting wetting,
                                    const float* raw, float* level){
     __shared__ float fields[2][LEVEL_SLOTS];
     __shared__ char beside[LEVEL_SLOTS];    //whether the surface passes between the slot and one next to it
@@ -360,10 +363,10 @@ __global__ void redistanceLevelSet(uint numUsedGridNodes, const uint* nodeCells,
 //above the liquid than below it (the ones holding its upper faces), so taking what's stored and making up the rest would curve a drop's lower side
 //more than its upper, which pushes it along: a 2% difference had one drifting. So only the values within KEPT_WITHIN of the surface are taken, which
 //are stored on every side of it, and every other slot, stored or not, carries the distances on from those: three passes of the upwind solve, as
-//redistanceLevelSet's, and past those the level set's limit. The slots past the walls mirror what's inside (pastWall). Every thread of the block calls
-//it, after loadTileNodes; the tile ends up in from, with to as its other buffer, and stored says where a voxel is
-__device__ inline void loadSmoothingTile(const Tile& tile, const uint* nodes, uint numUsedGridNodes, const uint* interiorVoxels, const float* values, float wetting, float*& from,
-                                         float*& to, char* missing, char* stored){
+//redistanceLevelSet's, and past those the level set's limit. The slots past the walls mirror what's inside (Tile::pastWall). Every thread of the block
+//calls it, after loadTileNodes; the tile ends up in from, with to as its other buffer, and stored says where a voxel is
+__device__ inline void loadSmoothingTile(const Tile& tile, const uint* nodes, uint numUsedGridNodes, const uint* interiorVoxels, const float* values, const WallWetting& wetting,
+                                         float*& from, float*& to, char* missing, char* stored){
     for(int slot = threadIdx.x; slot < LEVEL_SLOTS; slot += blockDim.x){
         int3 t = tile.at(slot);
         if(tile.inDomain(t)){
@@ -435,11 +438,11 @@ __device__ inline void loadSmoothingTile(const Tile& tile, const uint* nodes, ui
         from = to;
         to = swap;
     }
-    if(wetting != 0.0f){    //the slots past the walls, once what they mirror is a distance at every depth: tilted to meet the wall at the contact angle
+    if(wetting.any){    //the slots past the walls, once what they mirror is a distance at every depth: tilted to meet each wall at its contact angle
         for(int slot = threadIdx.x; slot < LEVEL_SLOTS; slot += blockDim.x){
             int3 t = tile.at(slot);
             if(!tile.inDomain(t)){
-                from[slot] = pastWall(from[tile.slot(tile.mirrored(t))], tile.pastWalls(t), wetting);
+                from[slot] = tile.pastWall(from[tile.slot(tile.mirrored(t))], t, wetting);
             }
         }
         __syncthreads();
@@ -476,7 +479,7 @@ __device__ inline void smoothTile(int passes, float*& from, float*& to){
 //passes take a particle-sized bump's curvature down to about 4% of a drop's 16 voxels across (3 leave 12%), and cost a drop that size about 1% of its
 //frequency. Only tiles holding a voxel near enough the surface for its curvature to be asked do anything: no other is read. The sharp free surface
 //takes fewer passes of its own (freesurface.cu)
-__global__ void smoothLevelSet(uint numUsedGridNodes, const uint* nodeCells, const uint* cellToNode, const uint* interiorVoxels, Grid grid, float wetting, int passes,
+__global__ void smoothLevelSet(uint numUsedGridNodes, const uint* nodeCells, const uint* cellToNode, const uint* interiorVoxels, Grid grid, WallWetting wetting, int passes,
                                const float* level, float* smoothed){
     __shared__ float fields[2][LEVEL_SLOTS];
     __shared__ char flags[2][LEVEL_SLOTS];
@@ -505,7 +508,7 @@ __global__ void smoothLevelSet(uint numUsedGridNodes, const uint* nodeCells, con
 
 //the surface's curvature at a node's own voxels within CURVED_WITHIN of it, in 1/voxels, positive where the liquid bulges; 0 at the rest. The last 3
 //passes of blur, then div(grad d / |grad d|) by central differences. Features a voxel across can't have more curvature than 1 a voxel
-__global__ void curveLevelSet(uint numUsedGridNodes, const uint* nodeCells, const uint* cellToNode, const uint* interiorVoxels, Grid grid, float wetting, const float* level,
+__global__ void curveLevelSet(uint numUsedGridNodes, const uint* nodeCells, const uint* cellToNode, const uint* interiorVoxels, Grid grid, WallWetting wetting, const float* level,
                               const float* smoothed, float* curvature){
     __shared__ float fields[2][LEVEL_SLOTS];
     __shared__ char flags[2][LEVEL_SLOTS];
@@ -601,11 +604,21 @@ __global__ void fillLevels(uint count, float value, float* levels){
     }
 }
 
+//the walls' contact angles as the kernels take them
+WallWetting Particles::wallWettings() const{
+    WallWetting wetting;
+    for(int wall = 0; wall < 6; ++wall){
+        wetting.cosine[wall] = (float)wallWetting[wall];
+        wetting.any = wetting.any || wetting.cosine[wall] != 0.0f;
+    }
+    return wetting;
+}
+
 void Particles::buildLevelSet(){
     uint numVoxels = voxelIDsUsed.size();
     uint interiorWidth = numVoxels1D - 2*(uint)std::floor(radius);
     float outside = SPLAT_REACH;    //where no particle is within reach, the surface is at least that far
-    float wetting = surfaceTension > 0.0 ? (float)wallWetting : 0.0f;   //only surface tension gives the angle the liquid meets the walls at any meaning
+    WallWetting wetting = surfaceTension > 0.0 ? wallWettings() : WallWetting();    //only surface tension gives the angle the liquid meets the walls at any meaning
     float bulk = (float)(restParticlesPerVoxel*M_PI*SPLAT_REACH*SPLAT_REACH*SPLAT_REACH*64.0/315.0);    //a voxel's weight sum deep in liquid at rest
     liquidLevel.resizeAsync(numVoxels, stream);
     int* sums[4];
@@ -618,8 +631,9 @@ void Particles::buildLevelSet(){
     gpuErrchk(cudaMallocAsync((void**)&raw, bytes, stream));
     int3 domainVoxels = make_int3(grid.sizeX*interiorWidth, grid.sizeY*interiorWidth, grid.sizeZ*interiorWidth);
     if(numParticleNodes > 0){
-        splatParticles<<<numParticleNodes, SPLAT_THREADS, 4*sizeof(int)*numVoxelsPerNode, stream>>>(numParticleNodes, size, gridNodeIndicesToFirstParticleIndex.devPtr(), px.devPtr(), py.devPtr(),
-            pz.devPtr(), voxelPlaces(), domainVoxels, voxelOwners.devPtr(), sums[0], sums[1], sums[2], sums[3]);
+        auto splat = twoPhase.on ? splatParticles<true> : splatParticles<false>;
+        splat<<<numParticleNodes, SPLAT_THREADS, 4*sizeof(int)*numVoxelsPerNode, stream>>>(numParticleNodes, size, gridNodeIndicesToFirstParticleIndex.devPtr(), px.devPtr(), py.devPtr(),
+            pz.devPtr(), voxelPlaces(), domainVoxels, voxelOwners.devPtr(), sums[0], sums[1], sums[2], sums[3], particleIds.devPtr());
     }
     for(int* sum : sums){   //particles near this partition's edge reach into ghost voxels: their owners add those sums in
         context->reduceGhosts(sum, stream);
@@ -636,19 +650,19 @@ void Particles::buildLevelSet(){
             raw, liquidLevel.devPtr());
     }
     context->fillGhosts(liquidLevel.devPtr(), stream);
-    if(freeSurfaceMode == FreeSurface::sharp){  //the pressure solve's surface: smoothed a little, so particles' unevenness doesn't become pressure (freesurface.cu)
+    if(needsSurfaceLevel()){    //the pressure solve's surface: smoothed a little, so particles' unevenness doesn't become pressure (freesurface.cu, twophase.cu)
         surfaceLevel.resizeAsync(numVoxels, stream);
         if(numVoxels > 0){
             fillLevels<<<numVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numVoxels, LIQUID_BAND, surfaceLevel.devPtr());
         }
         if(numOwnNodes > 0 && numVoxels > 0){   //mirrored square on at the walls: the contact angle is the curvature's to impose, and tilted into the blur it
                                                 //would wet the floor beside a drop, or dry the drop's underside
-            smoothLevelSet<<<numOwnNodes, LEVEL_THREADS, 0, stream>>>(numUsedGridNodes, nodeCells.devPtr(), cellToNode.devPtr(), nodeInteriorVoxels.devPtr(), grid, 0.0f,
+            smoothLevelSet<<<numOwnNodes, LEVEL_THREADS, 0, stream>>>(numUsedGridNodes, nodeCells.devPtr(), cellToNode.devPtr(), nodeInteriorVoxels.devPtr(), grid, WallWetting(),
                 SURFACE_PASSES, liquidLevel.devPtr(), surfaceLevel.devPtr());
         }
         context->fillGhosts(surfaceLevel.devPtr(), stream);
     }
-    if(surfaceTension > 0.0){
+    if(surfaceTension > 0.0 && !twoPhase.on){   //with air, the force comes from the two fluids' shares (tensionOnMixture, twophase.cu)
         liquidCurvature.resizeAsync(numVoxels, stream);
         liquidCurvature.zeroDeviceAsync(stream);    //0 wherever it isn't worked out
         if(numOwnNodes > 0 && numVoxels > 0){   //the smoothed level set goes where the particles' field was: every voxel a tile reads gets one
@@ -669,17 +683,21 @@ void Particles::buildLevelSet(){
     gpuErrchk(cudaPeekAtLastError());
 }
 
-//adds dt of surface tension to the faces the surface crosses, or takes it back off, as pressureSolve's retry does with every force when it halves dt.
-//The ghosts' faces take their owners'. The sharp free surface has none of this: the solve itself holds the surface's pressure (freesurface.cu)
-void Particles::applySurfaceTension(bool takeBack){
+//adds dt of surface tension to the faces the surface crosses. The ghosts' faces take their owners'. The sharp free surface has none of this: the solve
+//itself holds the surface's pressure (freesurface.cu)
+void Particles::applySurfaceTension(){
     if(freeSurfaceMode == FreeSurface::sharp){
+        return;
+    }
+    if(twoPhase.on){    //with air, the surface is both fluids' shares of the voxels, and the force is the slope of its energy, on the faces (twophase.cu)
+        tensionOnMixture();
         return;
     }
     double voxelSize = grid.cellSize / (2<<refinementLevel);
     float scale = (float)(dt*surfaceTension / (voxelSize*voxelSize));
     if(numOwnVoxels > 0){
         surfaceTensionFaces<<<numOwnVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numOwnVoxels, solveCodes.devPtr(), neighborNx.devPtr(), neighborNy.devPtr(), neighborNz.devPtr(),
-            liquidLevel.devPtr(), liquidCurvature.devPtr(), takeBack ? -scale : scale, voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr());
+            liquidLevel.devPtr(), liquidCurvature.devPtr(), scale, voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr());
         gpuErrchk(cudaPeekAtLastError());
     }
     for(CudaVec<float>* velocity : {&voxelsUx, &voxelsUy, &voxelsUz}){
@@ -690,9 +708,9 @@ void Particles::applySurfaceTension(bool takeBack){
 //the longest timestep explicit surface tension holds for: the shortest capillary wave the grid carries mustn't cross a voxel in one (Brackbill, Kothe
 //and Zemach 1992), sqrt(rho dx^3 / (2 pi sigma)) with rho the mean of the densities either side of the surface. The footprint's surface has unknowns as
 //heavy as liquid on both sides, so that's the liquid's. The sharp surface has air on one, half of it: at the footprint's limit a drop at rest on a wall
-//loses a couple of particles in every thousand over 5 s, and at this one none
+//loses a couple of particles in every thousand over 5 s, and at this one none. With two phases the air is there, as light as it is
 double Particles::capillaryDt() const{
     double voxelSize = grid.cellSize / (2<<refinementLevel);
-    double sides = freeSurfaceMode == FreeSurface::sharp ? 0.5 : 1.0;
+    double sides = freeSurfaceMode == FreeSurface::sharp ? 0.5 : twoPhase.on ? 0.5*(1.0 + 1.0 / twoPhase.densityRatio) : 1.0;
     return std::sqrt(sides*voxelSize*voxelSize*voxelSize / (2.0*M_PI*surfaceTension));
 }

@@ -1,0 +1,52 @@
+{
+ "schema": "flip2.scene/1",
+ "fps": 24,
+ "frames": 12,
+ "domain": {
+  "min": [
+   0,
+   0,
+   0
+  ],
+  "max": [
+   0.25,
+   0.5,
+   0.25
+  ],
+  "voxelSize": 0.00390625
+ },
+ "fluids": [
+  {
+   "shape": "box",
+   "min": [
+    0,
+    0,
+    0
+   ],
+   "max": [
+    0.25,
+    0.5,
+    0.25
+   ]
+  },
+  {
+   "shape": "sphere",
+   "centre": [
+    0.125,
+    0.08,
+    0.125
+   ],
+   "radius": 0.03125,
+   "phase": "air",
+   "carve": true
+  }
+ ],
+ "air": {
+  "density": 1.0
+ },
+ "output": {
+  "dir": "air-bubble",
+  "diagnostics": "diagnostics.jsonl",
+  "positions": false
+ }
+}

@@ -70,12 +70,41 @@ public:
         simulation.forEachPartition([&](Particles& partition){ partition.setContactAngle(degrees); });
     }
 
+    void setWallContactAngle(int wall, double degrees){
+        simulation.forEachPartition([&](Particles& partition){ partition.setWallContactAngle(wall, degrees); });
+    }
+
+    void setWallFriction(int wall, double friction){
+        simulation.forEachPartition([&](Particles& partition){ partition.setWallFriction(wall, friction); });
+    }
+
     void setViscousCfl(double voxels){
         simulation.forEachPartition([&](Particles& partition){ partition.setViscousCfl(voxels); });
     }
 
     void setFreeSurface(FreeSurface mode){
         simulation.forEachPartition([&](Particles& partition){ partition.setFreeSurface(mode); });
+    }
+
+    void setTwoPhase(const TwoPhase& settings){
+        simulation.forEachPartition([&](Particles& partition){ partition.setTwoPhase(settings); });
+    }
+    void setWhitewater(const WhitewaterSettings& settings){
+        simulation.forEachPartition([&](Particles& partition){ partition.setWhitewater(settings); });
+    }
+    void setWhitewaterParticles(uint count, const double* positions, const unsigned long long* ids, const float* velocities, const float* births, const float* lives,
+                                const float* radii, const float* kinds, unsigned long long nextId){     //a checkpoint's: every partition is given them all, and takes the ones in its planes
+        simulation.forEachPartition([&](Particles& partition){ partition.setWhitewaterParticles(count, positions, ids, velocities, births, lives, radii, kinds, nextId); });
+    }
+    void whitewaterHere(unsigned long long& particles, unsigned long long& dropped){
+        simulation.whitewaterHere(particles, dropped);
+    }
+    void markAirParticles(size_t first){
+        simulation.forEachPartition([&](Particles& partition){ partition.markAirParticles((uint)first); });
+    }
+
+    void setWallsLetGo(unsigned int walls){
+        simulation.forEachPartition([&](Particles& partition){ partition.setWallsLetGo(walls); });
     }
 
     void setObstacles(const std::vector<SceneObstacle>& obstacles){
@@ -258,6 +287,9 @@ public:
     void solveFrame(double fps){
         simulation.solveFrame(fps);
     }
+    std::string solveError(){
+        return simulation.solveError();
+    }
 
     void writePositionsToFile(const std::string& fileName){
         simulation.writePositionsToFile(fileName);
@@ -269,6 +301,10 @@ public:
 
     void writeDiagnostics(const std::string& path, int frame){
         simulation.writeDiagnostics(path, frame);
+    }
+
+    void writePhaseDiagnostics(const std::string& path, int frame){
+        simulation.writePhaseDiagnostics(path, frame);
     }
 
     void startCache(const std::string& directory, const CacheDescription& description, int committedBefore, std::function<void(const char*, int)> done){
@@ -291,8 +327,8 @@ public:
         simulation.writeCheckpoint(frame);
     }
 
-    void resume(double time, unsigned long long substep){
-        simulation.resume(time, substep);
+    void resume(double time, unsigned long long substep, double acceleration){
+        simulation.resume(time, substep, acceleration);
     }
 
     bool anyRank(bool mine){

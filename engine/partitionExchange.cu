@@ -26,6 +26,15 @@ __global__ void addInRankOrder(const T* gathered, int ranks, uint count, T* sum)
     }
 }
 
+//every rank's value, in rank order: the least of them
+__global__ void leastOfRanks(const float* gathered, int ranks, float* least){
+    float found = gathered[0];
+    for(int rank = 1; rank < ranks; ++rank){
+        found = fminf(found, gathered[rank]);
+    }
+    *least = found;
+}
+
 PartitionExchange::~PartitionExchange(){
     for(void* allocated : buffers){
         cudaFree(allocated);
@@ -140,16 +149,26 @@ void PartitionExchange::sumOverPartitions(double* value, cudaStream_t stream){
     sum(value, 1u, stream);
 }
 
-//the first coarse grid's cells are 2x2x2 voxels, so a node plane holds 2 of its planes, and a partition's cells are one run of it: each partition sends
-//its run to every other and takes theirs
-void PartitionExchange::gatherFirstLevel(void* cells, size_t bytesPerCell, cudaStream_t stream){
+void PartitionExchange::leastOverPartitions(float* value, cudaStream_t stream){
     if(transport.size() == 1){
         return;
     }
-    size_t cellsPerPlane = (size_t)(2*me.grid.sizeX)*(2*me.grid.sizeY);
+    float* gathered = (float*)buffer(2, sizeof(float)*transport.size(), stream);
+    transport.allGather(value, gathered, sizeof(float), stream);
+    leastOfRanks<<<1, 1, 0, stream>>>(gathered, transport.size(), value);
+    gpuErrchk(cudaPeekAtLastError());
+}
+
+//a dense grid over the domain with perNode cells along a node's side: a node plane holds perNode of its planes, and a partition's cells are one run of
+//it. Each partition sends its run to every other and takes theirs
+void PartitionExchange::gatherRuns(void* cells, size_t bytesPerCell, size_t perNode, cudaStream_t stream){
+    if(transport.size() == 1){
+        return;
+    }
+    size_t cellsPerPlane = (perNode*me.grid.sizeX)*(perNode*me.grid.sizeY);
     auto run = [&](int rank, size_t& first, size_t& bytes){
-        first = 2*me.partitionPlanes[rank]*cellsPerPlane*bytesPerCell;
-        bytes = 2*(me.partitionPlanes[rank + 1] - me.partitionPlanes[rank])*cellsPerPlane*bytesPerCell;
+        first = perNode*me.partitionPlanes[rank]*cellsPerPlane*bytesPerCell;
+        bytes = perNode*(me.partitionPlanes[rank + 1] - me.partitionPlanes[rank])*cellsPerPlane*bytesPerCell;
     };
     std::vector<TransportSend> sends;
     std::vector<TransportReceive> receives;
@@ -164,4 +183,13 @@ void PartitionExchange::gatherFirstLevel(void* cells, size_t bytesPerCell, cudaS
         }
     }
     transport.exchange(sends, receives, stream);
+}
+
+//the first coarse grid's cells are 2x2x2 voxels
+void PartitionExchange::gatherFirstLevel(void* cells, size_t bytesPerCell, cudaStream_t stream){
+    gatherRuns(cells, bytesPerCell, 2, stream);
+}
+
+void PartitionExchange::gatherNodeCells(void* cells, size_t bytesPerCell, cudaStream_t stream){
+    gatherRuns(cells, bytesPerCell, 1, stream);
 }

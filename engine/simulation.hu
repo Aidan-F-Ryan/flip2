@@ -36,10 +36,15 @@ public:
         return *partitions[index];
     }
     size_t particlesHere() const;   //the particles the partitions in this process hold between them
+    //and their whitewater: how many particles, and how many more the surface would have made since the start had maxParticles left room (whitewater.hu)
+    void whitewaterHere(unsigned long long& particles, unsigned long long& dropped);
     void forEachPartition(const std::function<void(Particles&)>& setting);  //for settings, on this thread, with each partition's GPU current in turn
 
     void initialize();      //each partition keeps its own particles and builds its grid
     void solveFrame(double fps);
+    //what stopped the last solveFrame short, if anything did: a pressure solve that didn't come to its tolerance (Particles::solveFrame). Nothing in that
+    //substep has moved, and the simulation goes no further; every rank says the same
+    std::string solveError();
     //every rank's particles, in rank order: the order one partition would have them in. Across processes rank 0 gathers them and writes the file; every
     //rank has to call it
     void writePositionsToFile(const std::string& fileName);
@@ -63,13 +68,17 @@ public:
     void writeCheckpoint(int frame);
     //carries on from a checkpoint in place of initialize, after setParticles (and with APIC setAffine) gave every partition here the checkpoint's particles
     //(across processes, at least those in its planes); every rank has to call it
-    void resume(double time, unsigned long long substep);
+    void resume(double time, unsigned long long substep, double acceleration);
+    //two phases' tests: appends a line of JSON for this frame to path, each fluid's particles' count, centroid, energy, fastest speed and counts by
+    //height (PhaseStatistics, particles.hu), over the partitions in this process
+    void writePhaseDiagnostics(const std::string& path, int frame);
     bool anyRank(bool mine);    //whether any rank says yes; every rank has to call it, and across processes they agree
     //a resumed bake's diagnostics on rank 0: the file keeps its first line and its frames up to lastFrame, and writeDiagnostics carries on after them
     void continueDiagnostics(const std::string& path, int lastFrame);
 
 private:
     void inLockstep(const std::function<void(Particles&)>& step);    //every partition here runs step, each on its own thread
+    std::vector<uint> countWhitewater();
     void startFrameWriter();
 
     uint totalParticles;
@@ -84,10 +93,13 @@ private:
     std::vector<std::vector<cudaEvent_t>> frameCopies;  //per partition here, per frame buffer: its part of the frame has landed; on its GPU
     std::unique_ptr<CacheWriter> cacheWriter;       //writes the cache from a background thread, in every process
     std::vector<std::vector<cudaEvent_t>> cacheCopies;  //per partition here, per cache buffer, as frameCopies
+    std::vector<std::vector<cudaEvent_t>> whitewaterCopies;     //and the same for its whitewater's part of the buffer
     std::vector<uint> planes;   //each rank's first node plane along z, and the last one's end (setDomain)
     CudaVec<float> gatheredFrame;   //across processes, where rank 0 gathers every rank's positions
     double lastFrameSeconds = 0.0;  //wall time of the last solveFrame, for diagnostics
+    unsigned long long whitewaterDroppedBefore = 0;     //what the whitewater's maxParticles had kept from being made by the last diagnostics line
     std::ofstream diagnostics;      //on rank 0, once writeDiagnostics has started it
+    std::ofstream phaseDiagnostics; //once writePhaseDiagnostics has started it
 };
 
 #endif

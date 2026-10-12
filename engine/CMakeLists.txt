@@ -41,9 +41,12 @@ add_library(particles STATIC
     sources.cu
     obstacles.cu
     pockets.cu
+    boundaries.cu
     levelset.cu
     viscosity.cu
     freesurface.cu
+    twophase.cu
+    whitewater.cu
     cacheWriter.cu
 )
 

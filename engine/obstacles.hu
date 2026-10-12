@@ -45,6 +45,7 @@ struct ObstacleState{
     float worldToObject[12];    //row-major 3x4, rigid: (x, 1) to its own space
     float velocity[12];         //row-major 3x4: the solid's velocity at world point x is velocity times (x, 1)
     float friction;
+    bool letsGo;                //whether it only pushes on the liquid, and never pulls (boundaries.cu)
     float3 reachLow, reachHigh; //the box in the world past which nothing asks its distance: around its surface, 3 voxels wider every way
 };
 
@@ -55,10 +56,11 @@ struct Obstacles{
     ObstacleState items[MAX_OBSTACLES];
 };
 
-//obstacleNear's bits, per stored voxel: whether a surface passes near enough to cut its faces, and (CLOSED_FACE << face) whether each face is closed,
-//the faces in the neighbour arrays' order (-x, +x, -y, +y, -z, +z)
+//obstacleNear's bits, per stored voxel: whether a surface passes near enough to cut its faces, (CLOSED_FACE << face) whether each face is closed,
+//the faces in the neighbour arrays' order (-x, +x, -y, +y, -z, +z), and whether every obstacle on it lets go of the liquid (boundaries.cu)
 static constexpr char NEAR_SURFACE = 1;
 static constexpr int CLOSED_FACE = 2;
+static constexpr int LETS_GO = 128;
 
 //obstacleOpen: a near voxel's six open fractions, worked out once a substep (findSolidVoxels) for every pass to read rather than look up its corners
 //again, each a fraction of OPEN_FULL in 16 bits: 0 and 1 exactly, and nothing between closer than 1.5e-5 to either. Three words a voxel, one per axis,
@@ -72,6 +74,7 @@ struct CutFaces{
     bool near;
     float centre;   //the centre's distance from the nearest surface, negative inside; INFINITY with no obstacles
     float covered;  //how much of the voxel is inside obstacles (coveredFraction, obstacles.cu)
+    bool letsGo;    //near: whether every obstacle nearest its centre or a corner of it lets go of the liquid
 };
 
 //a near voxel's faces as findSolidVoxels found them this substep
@@ -85,6 +88,7 @@ __device__ inline CutFaces cachedCut(const uint* opens, uint index){
     cut.near = true;
     cut.centre = 0.0f;
     cut.covered = opens[4*(size_t)index + 3] / OPEN_FULL;
+    cut.letsGo = false;     //not kept with the fractions: obstacleNear's LETS_GO says
     return cut;
 }
 
@@ -300,6 +304,16 @@ public:
         return current.count;
     }
 
+    //whether any of them lets go of the liquid (boundaries.cu)
+    bool lettingGo() const{
+        for(int index = 0; index < current.count; ++index){
+            if(current.items[index].letsGo){
+                return true;
+            }
+        }
+        return false;
+    }
+
     //how fast the fastest point of any obstacle's surface moves at the last update, in m/s: the timestep keeps it within cfl voxels a substep too
     float fastest() const{
         return fastestSurface;
@@ -327,6 +341,7 @@ private:
         std::vector<double> translations;   //per key: x, y, z
         std::vector<double> rotations;      //per key: a unit quaternion, w x y z
         float friction;
+        bool letsGo;
     };
     void release();
     void rigidAt(const Built& obstacle, double time, double matrix[12], int interval = -1) const;

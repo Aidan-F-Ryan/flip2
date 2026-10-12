@@ -307,7 +307,7 @@ Scene loadScene(const std::string& path){
     if(root.kind != Json::OBJECT){
         read.fail("the file", "should be one JSON object, {...}");
     }
-    read.checkKeys(root, "the scene", {"schema", "fps", "frames", "domain", "solver", "gravity", "liquid", "particlesPerVoxel", "seed", "fluids", "emitters", "sinks", "obstacles", "forces", "partitions", "devices", "output"});
+    read.checkKeys(root, "the scene", {"schema", "fps", "frames", "domain", "solver", "gravity", "liquid", "air", "whitewater", "particlesPerVoxel", "seed", "fluids", "emitters", "sinks", "obstacles", "forces", "partitions", "devices", "output"});
     std::string schema = read.text(root, "schema", "the scene", "flip2.scene/1");
     if(schema != "flip2.scene/1"){
         read.fail("schema", "is \"" + schema + "\"; this flip2 reads \"flip2.scene/1\"");
@@ -320,8 +320,9 @@ Scene loadScene(const std::string& path){
         read.fail("the scene", "fps has to be positive and frames at least 0");
     }
 
+    double wallAngles[6] = {-1.0, -1.0, -1.0, -1.0, -1.0, -1.0};    //each wall's own contact angle, where it's given one
     if(const Json* domain = read.object(root, "domain", "the scene")){
-        read.checkKeys(*domain, "domain", {"min", "max", "voxelSize", "open"});
+        read.checkKeys(*domain, "domain", {"min", "max", "voxelSize", "open", "walls"});
         double low[3], high[3];
         read.vector3(*domain, "min", "domain", low, true);
         read.vector3(*domain, "max", "domain", high, true);
@@ -350,6 +351,28 @@ Scene loadScene(const std::string& path){
                     read.fail("domain.open", "lists faces, each \"-x\", \"+x\", \"-y\", \"+y\", \"-z\" or \"+z\"");
                 }
                 scene.openFaces |= 1u << bit;
+            }
+        }
+        if(const Json* walls = read.object(*domain, "walls", "domain")){    //what the walls do to the liquid on them: all of them, then any that differ
+            const char* faces[6] = {"-x", "+x", "-y", "+y", "-z", "+z"};
+            read.checkKeys(*walls, "domain.walls", {"hold", "friction", "contactAngle", "-x", "+x", "-y", "+y", "-z", "+z"});
+            bool hold = read.flag(*walls, "hold", "domain.walls", true);
+            double friction = read.number(*walls, "friction", "domain.walls", 0.0);
+            double contactAngle = read.number(*walls, "contactAngle", "domain.walls", -1.0);    //none: the liquid's
+            for(int face = 0; face < 6; ++face){
+                scene.wallHold[face] = hold;
+                scene.wallFriction[face] = friction;
+                wallAngles[face] = contactAngle;
+                std::string where = std::string("domain.walls[\"") + faces[face] + "\"]";
+                if(const Json* wall = read.object(*walls, faces[face], "domain.walls")){
+                    read.checkKeys(*wall, where, {"hold", "friction", "contactAngle"});
+                    scene.wallHold[face] = read.flag(*wall, "hold", where, hold);
+                    scene.wallFriction[face] = read.number(*wall, "friction", where, friction);
+                    wallAngles[face] = read.number(*wall, "contactAngle", where, contactAngle);
+                }
+                if(scene.wallFriction[face] < 0.0 || scene.wallFriction[face] > 1.0 || wallAngles[face] > 180.0 || (wallAngles[face] < 0.0 && wallAngles[face] != -1.0)){
+                    read.fail(where, "friction is between 0 and 1, and contactAngle from 0 to 180 degrees");
+                }
             }
         }
     }
@@ -394,6 +417,49 @@ Scene loadScene(const std::string& path){
         scene.contactAngle = read.number(*liquid, "contactAngle", "liquid", scene.contactAngle);
         if(!(scene.density > 0.0) || !(scene.viscosity >= 0.0) || !(scene.surfaceTension >= 0.0) || !(scene.contactAngle >= 0.0 && scene.contactAngle <= 180.0)){
             read.fail("liquid", "density has to be positive, viscosity and surfaceTension at least 0, and contactAngle from 0 to 180 degrees");
+        }
+    }
+    for(int face = 0; face < 6; ++face){    //a wall with no contact angle of its own has the liquid's
+        scene.wallContactAngle[face] = wallAngles[face] < 0.0 ? scene.contactAngle : wallAngles[face];
+    }
+    if(const Json* air = read.object(root, "air", "the scene")){     //a second, lighter fluid simulated with the liquid (experimental)
+        read.checkKeys(*air, "air", {"density", "flipRatio", "band", "escaped", "dropletRadius", "viscosity", "bubbleRadius", "liquidViscosity", "surfaceTension"});
+        scene.air = true;
+        scene.airDensity = read.number(*air, "density", "air", scene.airDensity);
+        scene.airFlipRatio = read.number(*air, "flipRatio", "air", scene.airFlipRatio);
+        scene.airBand = (int)read.number(*air, "band", "air", scene.airBand);
+        scene.airEscaped = read.flag(*air, "escaped", "air", scene.airEscaped);
+        scene.airDropletRadius = read.number(*air, "dropletRadius", "air", scene.airDropletRadius);
+        scene.airViscosity = read.number(*air, "viscosity", "air", scene.airViscosity);
+        scene.airBubbleRadius = read.number(*air, "bubbleRadius", "air", scene.airBubbleRadius);
+        //the liquid has one viscosity and one surface tension: where "liquid" gives them, the bubbles' drag takes those, and water's where it doesn't
+        scene.airLiquidViscosity = read.number(*air, "liquidViscosity", "air", scene.viscosity > 0.0 ? scene.viscosity : scene.airLiquidViscosity);
+        scene.airSurfaceTension = read.number(*air, "surfaceTension", "air", scene.surfaceTension > 0.0 ? scene.surfaceTension : scene.airSurfaceTension);
+        if(scene.airDropletRadius < 0.0 || scene.airBubbleRadius < 0.0 || scene.airViscosity <= 0.0 || scene.airLiquidViscosity <= 0.0 || scene.airSurfaceTension <= 0.0){
+            read.fail("air", "dropletRadius and bubbleRadius have to be at least 0 (0 for a particle's worth of the fluid), and viscosity, liquidViscosity and surfaceTension positive");
+        }
+        if((scene.viscosity > 0.0 && scene.airLiquidViscosity != scene.viscosity) || (scene.surfaceTension > 0.0 && scene.airSurfaceTension != scene.surfaceTension)){
+            read.fail("air", "liquidViscosity and surfaceTension are the liquid's own where \"liquid\" gives it a viscosity or a surfaceTension: leave them out");
+        }
+        if(scene.airDensity <= 0.0 || scene.airDensity > scene.density || scene.airFlipRatio > 1.0 || scene.airBand < 0){
+            read.fail("air", "density has to be positive and no more than the liquid's, flipRatio at most 1, and band at least 0");
+        }
+    }
+    if(const Json* whitewater = read.object(root, "whitewater", "the scene")){   //spray, foam and bubbles (whitewater.hu)
+        read.checkKeys(*whitewater, "whitewater", {"amount", "spray", "bubbles", "perVoxel", "maxParticles", "foamLife", "maxAge", "dropletScale", "bubbleScale"});
+        scene.whitewater = true;
+        scene.whitewaterAmount = read.number(*whitewater, "amount", "whitewater", scene.whitewaterAmount);
+        scene.whitewaterSpray = read.number(*whitewater, "spray", "whitewater", scene.whitewaterSpray);
+        scene.whitewaterBubbles = read.number(*whitewater, "bubbles", "whitewater", scene.whitewaterBubbles);
+        scene.whitewaterPerVoxel = (int)read.number(*whitewater, "perVoxel", "whitewater", scene.whitewaterPerVoxel);
+        scene.whitewaterMaxParticles = read.number(*whitewater, "maxParticles", "whitewater", scene.whitewaterMaxParticles);
+        scene.whitewaterFoamLife = read.number(*whitewater, "foamLife", "whitewater", scene.whitewaterFoamLife);
+        scene.whitewaterMaxAge = read.number(*whitewater, "maxAge", "whitewater", scene.whitewaterMaxAge);
+        scene.whitewaterDropletScale = read.number(*whitewater, "dropletScale", "whitewater", scene.whitewaterDropletScale);
+        scene.whitewaterBubbleScale = read.number(*whitewater, "bubbleScale", "whitewater", scene.whitewaterBubbleScale);
+        if(!(scene.whitewaterAmount >= 0.0) || !(scene.whitewaterSpray >= 0.0) || !(scene.whitewaterBubbles >= 0.0) || scene.whitewaterPerVoxel < 1 || !(scene.whitewaterMaxParticles >= 1.0 && scene.whitewaterMaxParticles <= 4.0e9) ||
+           !(scene.whitewaterFoamLife > 0.0) || !(scene.whitewaterMaxAge > 0.0) || !(scene.whitewaterDropletScale > 0.0) || !(scene.whitewaterBubbleScale > 0.0)){
+            read.fail("whitewater", "amount, spray and bubbles have to be at least 0, perVoxel at least 1, maxParticles from 1 to 4e9, and foamLife, maxAge, dropletScale and bubbleScale positive");
         }
     }
     scene.particlesPerVoxel = (int)read.number(root, "particlesPerVoxel", "the scene", scene.particlesPerVoxel);
@@ -569,7 +635,7 @@ Scene loadScene(const std::string& path){
                 read.fail(where, "should be an object, {...}");
             }
             read.checkKeys(item, where, {"shape", "min", "max", "center", "centre", "radius", "velocity", "mesh", "vertices", "triangles", "vdb", "grid", "velocityGrid",
-                                         "transform", "keyframes", "deforming"});
+                                         "transform", "keyframes", "deforming", "phase", "carve"});
             SceneShape shape;
             std::string kind = read.text(item, "shape", where, "box");
             if(item.find("mesh") || item.find("vertices") || item.find("triangles") || item.find("deforming") || item.find("vdb")){
@@ -597,12 +663,49 @@ Scene loadScene(const std::string& path){
                 read.fail(where + ".shape", "is box or sphere, not \"" + kind + "\"");
             }
             read.vector3(item, "velocity", where, shape.velocity);
+            std::string phase = read.text(item, "phase", where, "liquid");
+            if(phase != "liquid" && phase != "air"){
+                read.fail(where + ".phase", "is liquid or air");
+            }
+            shape.air = phase == "air";
+            shape.carve = read.flag(item, "carve", where, false);
+            if(shape.carve && !shape.air){
+                read.fail(where + ".carve", "is for \"phase\": \"air\" fluids: a bubble's space taken out of the liquid");
+            }
             shapes.push_back(shape);
         }
     };
     readShapes("fluids", scene.fluids);
     readShapes("emitters", scene.emitters);
     readShapes("sinks", scene.sinks);
+    bool airFluids = false;     //the seeds are handed over liquid first and the air's marked from there on (markAirParticles): so every air fluid comes after every liquid one
+    bool meshFluid = false;
+    for(const SceneShape& fluid : scene.fluids){
+        if(fluid.air && fluid.kind == SceneShape::MESH){
+            read.fail("fluids", "air can't be a mesh yet: its \"phase\": \"air\" fluids are boxes and spheres");
+        }
+        if(!fluid.air && airFluids){
+            read.fail("fluids", "the \"phase\": \"air\" fluids have to come after every liquid one");
+        }
+        airFluids = airFluids || fluid.air;
+        meshFluid = meshFluid || fluid.kind == SceneShape::MESH;
+    }
+    if(airFluids && meshFluid){    //the GPU seeds a mesh's liquid, after the air is in the mesh's place already
+        read.fail("fluids", "a mesh fluid doesn't go with \"phase\": \"air\" fluids yet: use an air band (air.band), which fills in around it");
+    }
+    for(const std::vector<SceneShape>* shapes : {&scene.emitters, &scene.sinks}){
+        for(const SceneShape& shape : *shapes){
+            if(shape.air){
+                read.fail("the scene", "only fluids have a \"phase\"");
+            }
+        }
+    }
+    if(airFluids && !scene.air){
+        read.fail("fluids", "\"phase\": \"air\" needs an \"air\" block");
+    }
+    if(scene.air && scene.freeSurface == "sharp"){     //its pressure is 0 on the liquid's surface, and with air that's solved for
+        read.fail("air", "doesn't go with the sharp free surface yet");
+    }
     if(scene.emitters.size() > 16 || scene.sinks.size() > 16){
         read.fail("the scene", "can have up to 16 emitters and 16 sinks");
     }
@@ -625,7 +728,7 @@ Scene loadScene(const std::string& path){
                 read.fail(where, "should be an object, {...}");
             }
             read.checkKeys(item, where, {"mesh", "vertices", "triangles", "vdb", "grid", "velocityGrid", "shape", "min", "max", "center", "centre", "radius", "transform", "keyframes",
-                                         "deforming", "friction", "thickness"});
+                                         "deforming", "friction", "thickness", "hold"});
             SceneObstacle obstacle;
             bool deforms = item.find("deforming") != nullptr;
             if(deforms && item.find("shape")){
@@ -658,6 +761,7 @@ Scene loadScene(const std::string& path){
             readPlacement(item, where, obstacle);
             obstacle.friction = read.number(item, "friction", where, obstacle.friction);
             obstacle.thickness = read.number(item, "thickness", where, obstacle.thickness);
+            obstacle.hold = read.flag(item, "hold", where, obstacle.hold);
             if(obstacle.friction < 0.0 || obstacle.friction > 1.0 || obstacle.thickness < 0.0){
                 read.fail(where, "friction is between 0 and 1, and thickness can't be negative");
             }
@@ -792,15 +896,24 @@ static double jitter(unsigned long long seed, unsigned long long cell, int coord
     return (mixBits(mixBits(seed) ^ (cell*3 + coordinate)) >> 11)*(1.0 / 9007199254740992.0);
 }
 
-void seedParticles(const Scene& scene, std::vector<double>& x, std::vector<double>& y, std::vector<double>& z, std::vector<float>& u, std::vector<float>& v, std::vector<float>& w){
+void seedParticles(const Scene& scene, std::vector<double>& x, std::vector<double>& y, std::vector<double>& z, std::vector<float>& u, std::vector<float>& v, std::vector<float>& w,
+                   size_t* liquid){
     int perSide = scene.particlesPerVoxel == 27 ? 3 : scene.particlesPerVoxel == 8 ? 2 : 1;
     double spacing = scene.voxelSize() / perSide;
     unsigned long long lattice[3];  //lattice cells along each axis of the domain
     for(int axis = 0; axis < 3; ++axis){
         lattice[axis] = (unsigned long long)scene.nodes[axis]*4*perSide;
     }
+    bool reachedAir = false;
+    bool anyAir = std::any_of(scene.fluids.begin(), scene.fluids.end(), [](const SceneShape& fluid){ return fluid.air; });
     for(size_t index = 0; index < scene.fluids.size(); ++index){
         const SceneShape& shape = scene.fluids[index];
+        if(shape.air && !reachedAir){   //everything before the first air fluid is liquid
+            reachedAir = true;
+            if(liquid != nullptr){
+                *liquid = x.size();
+            }
+        }
         if(shape.kind == SceneShape::MESH){     //the GPU seeds those (Particles::emitParticles)
             continue;
         }
@@ -828,7 +941,27 @@ void seedParticles(const Scene& scene, std::vector<double>& x, std::vector<doubl
                         continue;
                     }
                     bool earlier = false;   //the cell belongs to the first shape holding its centre
-                    for(size_t other = 0; other < index && !earlier; ++other){
+                    if(anyAir){     //or with air: to the first air fluid that carves, else the first liquid one, else the first other air one
+                        size_t owner = scene.fluids.size(), liquidOwner = owner, airOwner = owner;
+                        for(size_t other = 0; other < scene.fluids.size() && owner == scene.fluids.size(); ++other){
+                            const SceneShape& fluid = scene.fluids[other];
+                            if(fluid.kind == SceneShape::MESH || !fluid.contains(centre)){
+                                continue;
+                            }
+                            if(fluid.air && fluid.carve){
+                                owner = other;
+                            }
+                            else if(!fluid.air && liquidOwner == scene.fluids.size()){
+                                liquidOwner = other;
+                            }
+                            else if(fluid.air && airOwner == scene.fluids.size()){
+                                airOwner = other;
+                            }
+                        }
+                        owner = owner < scene.fluids.size() ? owner : liquidOwner < scene.fluids.size() ? liquidOwner : airOwner;
+                        earlier = owner != index;
+                    }
+                    for(size_t other = 0; !anyAir && other < index && !earlier; ++other){
                         earlier = scene.fluids[other].contains(centre);
                     }
                     if(earlier){
@@ -844,5 +977,8 @@ void seedParticles(const Scene& scene, std::vector<double>& x, std::vector<doubl
                 }
             }
         }
+    }
+    if(liquid != nullptr && !reachedAir){
+        *liquid = x.size();
     }
 }

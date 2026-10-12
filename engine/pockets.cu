@@ -3,7 +3,7 @@
 //Sealed pockets: fluid no air reaches, shut in by obstacles and the domain's walls. Nothing in a pocket's pressure equations is held at 0, so they fix its
 //pressure only up to a constant, and they have a solution only if the fluid's net flow out of the pocket is 0: fluid that can't be compressed can't leave
 //a closed space or arrive in one. An obstacle closing in on a pocket asks for exactly that, as can a deforming one's growth or the density correction, and
-//then the solve can't converge, and pressureSolve's retry loop takes whatever it got, which throws the pocket's fluid about. So each pocket's divergence
+//then the solve can't converge, and there's no pressure to step by (pressureSolve stops the bake there). So each pocket's divergence
 //has its mean taken out before the solve: the pocket keeps its volume, and its pressure balances the rest. Fluid air reaches doesn't change, and nothing
 //but the divergence the solvers are handed does.
 //
