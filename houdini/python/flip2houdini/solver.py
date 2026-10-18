@@ -83,7 +83,7 @@ FIELD_SETTINGS = {  #each one's scene keys, and the parameters of a Force Fields
     "point": (("position", "fieldpos"), ("strength", "fieldstrength"), ("radius", "fieldradius"), ("falloff", "fieldfalloff")),
     "vortex": (("position", "fieldpos"), ("axis", "fieldaxis"), ("strength", "fieldstrength"), ("radius", "fieldradius"), ("falloff", "fieldfalloff")),
     "turbulence": (("strength", "fieldstrength"), ("scale", "fieldscale"), ("speed", "fieldspeed"), ("seed", "fieldseed")),
-    "wind": (("velocity", "fieldvel"), ("drag", "fielddrag"), ("depth", "fielddepth")),
+    "wind": (("velocity", "fieldvel"), ("drag", "fielddrag"), ("depth", "fieldwinddepth")),     #depth in metres here, in voxels in the scene
 }
 SURFACE_DEFAULTS = {"influencescale": (3.0,), "radiusscale": (0.8,), "smoothing": (4,)}     #flip2 mesh's own
 OLD_SURFACE_DEFAULTS = {"influencescale": 2.0, "radiusscale": 0.6, "smoothing": 2}         #what they were, which left the surface dimpled
@@ -147,9 +147,10 @@ def _force_fields_interface():
                                                          help="How fast the surface takes up the wind's velocity, per second: at 1 it closes about two "
                                                               "thirds of the gap in a second, at 10 most of it in a tenth of one"),
                                    "{ fieldtype# != wind }"))
-    fields.addParmTemplate(_hidden(hou.FloatParmTemplate("fielddepth#", "Depth", 1, default_value=(2.0,), min=0.0, max=10.0,
-                                                         help="How far below the liquid's surface the wind reaches, in voxels (twice the Particle "
-                                                              "Separation each)"),
+    fields.addParmTemplate(_hidden(hou.FloatParmTemplate("fieldwinddepth#", "Depth", 1, default_value=(0.08,), min=0.0, max=1.0,
+                                                         help="How far below the liquid's surface the wind reaches, in metres. flip2 counts it in "
+                                                              "voxels (twice the Particle Separation each), so it takes the nearest whole number of "
+                                                              "them: the same depth at any resolution, to within half a voxel"),
                                    "{ fieldtype# != wind }"))
     return fields
 
@@ -750,11 +751,16 @@ def _force_fields(node, frame):
             animated = animated or any(parm.isTimeDependent() for parm in parms)
         if kind == "vortex" and not any(force["axis"]):
             raise hou.NodeError("Forces: force field %d is a vortex with an Axis of 0, which has no direction to swirl around" % instance)
+        if kind == "wind":  #the nearest whole number of voxels to its depth in metres
+            force["depth"] = int(force["depth"] / (2*node.evalParm("particlesep")) + 0.5)
         forces.append(force)
     if not forces:
         return [], None
     kinds = [force["type"] for force in forces]
     said = "force fields: " + ", ".join("%d %s" % (kinds.count(kind), kind) for kind in FIELD_TYPES if kind in kinds)
+    depths = sorted(set(force["depth"] for force in forces if force["type"] == "wind"))
+    if depths:
+        said += " (wind reaching %s voxel%s deep)" % ("/".join(str(depth) for depth in depths), "" if depths == [1] else "s")
     if animated:
         said += " (animated: taken as they are at frame %d)" % frame
     return forces, said
