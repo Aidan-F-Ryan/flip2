@@ -43,7 +43,9 @@
 //                                                                                         //or "vdb": "rock.vdb", "grid": "surface", "velocityGrid": "vel"
 //                   "transform": [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1],                    //its own space to the world: row-major, acting on column vectors
 //                   "keyframes": [{"time": 0, "transform": [...]}, ...],                 //instead of a transform, it moves: linearly, rotations by slerp
-//                   "deforming": [{"time": 0, "mesh": "f1.obj"}, {"time": 0.04, "vertices": "f2.npy"}, ...]}],   //or it deforms: see SceneObstacle
+//                   "deforming": [{"time": 0, "mesh": "f1.obj"}, {"time": 0.04, "vertices": "f2.npy"}, ...],     //or it deforms: see SceneObstacle
+//                   "dynamic": {"density": 1000, "mass": 0, "velocity": [0, 0, 0], "angularVelocity": [0, 0, 0],      //or the liquid moves it, from where its
+//                               "bounce": 0, "contactFriction": 0.5}}],                                               //transform puts it: see SceneBody
 //    "forces": [{"type": "point", "position": [...], "strength": 9.8, "radius": 0, "falloff": 1},       //strength in m/s^2, towards it (negative: away)
 //               {"type": "vortex", "position": [...], "axis": [0, 1, 0], "strength": 5, "radius": 0, "falloff": 1},
 //               {"type": "turbulence", "strength": 2, "scale": 0.1, "speed": 0.5, "seed": 0},
@@ -85,6 +87,18 @@ struct SceneField{
     double high[3] = {0.0, 0.0, 0.0};
 };
 
+//A dynamic obstacle's own (bodies.cu): a rigid body the liquid moves as it moves the liquid, falling under gravity, pushed by the pressure on it and
+//kept out of the walls and the other obstacles. Its mass is its density over the volume inside it, or the mass given; its centre of mass and inertia
+//follow from where that mass is
+struct SceneBody{
+    double density = 1000.0;    //kg/m^3
+    double mass = 0.0;          //kg: over 0, this in place of the density's
+    double velocity[3] = {0.0, 0.0, 0.0};           //its centre of mass's at the start, m/s
+    double angularVelocity[3] = {0.0, 0.0, 0.0};    //at the start, rad/s, about its centre of mass
+    double bounce = 0.0;            //how much of its speed into a contact it leaves with: 0 none, 1 all
+    double contactFriction = 0.5;   //Coulomb's, in its contacts: how hard it can be pushed along a contact for how hard it's pressed into it
+};
+
 //Something solid the fluid flows around: a triangle mesh, a box or a sphere, in its own space, placed in the world by a transform or moved by keyframed
 //transforms. Each transform's scale is baked into the shape at the first key, so it moves rigidly from there on, and the fluid sees its true distances.
 //Or a deforming mesh: samples of its vertices in the world over time, with the same triangles throughout, each an OBJ (whose triangles have to be the
@@ -106,6 +120,8 @@ struct SceneObstacle{
     std::vector<double> sampleTimes;                    //deforming: when each sample is; empty: it doesn't deform
     std::shared_ptr<const std::vector<float>> samples;  //deforming: each sample's vertices in turn, x, y, z each, in the world (shared by the scene's copies)
     std::shared_ptr<const SceneField> field;            //FIELD: its distances, and velocities if it came with a velocity grid (then it isn't placed)
+    bool dynamic = false;       //whether the liquid moves it (body): it starts where its transform puts it, and moves itself from there
+    SceneBody body;
 };
 
 //a fluid, emitter or sink: a box or sphere in the world, or a closed mesh placed and moved as an obstacle is ("mesh" or "vertices" and "triangles", with

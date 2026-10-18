@@ -729,7 +729,7 @@ Scene loadScene(const std::string& path){
                 read.fail(where, "should be an object, {...}");
             }
             read.checkKeys(item, where, {"mesh", "vertices", "triangles", "vdb", "grid", "velocityGrid", "shape", "min", "max", "center", "centre", "radius", "transform", "keyframes",
-                                         "deforming", "friction", "thickness", "hold"});
+                                         "deforming", "friction", "thickness", "hold", "dynamic"});
             SceneObstacle obstacle;
             bool deforms = item.find("deforming") != nullptr;
             if(deforms && item.find("shape")){
@@ -766,10 +766,36 @@ Scene loadScene(const std::string& path){
             if(obstacle.friction < 0.0 || obstacle.friction > 1.0 || obstacle.thickness < 0.0){
                 read.fail(where, "friction is between 0 and 1, and thickness can't be negative");
             }
+            if(const Json* dynamic = read.object(item, "dynamic", where)){
+                std::string at = where + ".dynamic";
+                read.checkKeys(*dynamic, at, {"density", "mass", "velocity", "angularVelocity", "bounce", "contactFriction"});
+                if(item.find("keyframes") || item.find("deforming")){
+                    read.fail(where, "a dynamic obstacle moves itself, from where its \"transform\" puts it: it can't have \"keyframes\" or be \"deforming\"");
+                }
+                if(obstacle.kind == SceneObstacle::FIELD && !obstacle.field->velocities.empty()){
+                    read.fail(where, "a dynamic obstacle moves itself: its level set can't come with a \"velocityGrid\"");
+                }
+                SceneBody& body = obstacle.body;
+                body.density = read.number(*dynamic, "density", at, body.density);
+                body.mass = read.number(*dynamic, "mass", at, body.mass);
+                read.vector3(*dynamic, "velocity", at, body.velocity);
+                read.vector3(*dynamic, "angularVelocity", at, body.angularVelocity);
+                body.bounce = read.number(*dynamic, "bounce", at, body.bounce);
+                body.contactFriction = read.number(*dynamic, "contactFriction", at, body.contactFriction);
+                if(!(body.density > 0.0) || body.mass < 0.0 || body.bounce < 0.0 || body.bounce > 1.0 || body.contactFriction < 0.0){
+                    read.fail(at, "density has to be positive, mass at least 0 (0: from the density), bounce between 0 and 1, and contactFriction at least 0");
+                }
+                obstacle.dynamic = true;
+            }
             scene.obstacles.push_back(obstacle);
         }
         if(scene.obstacles.size() > 16){
             read.fail("obstacles", "can have up to 16 of them");
+        }
+        for(const SceneObstacle& obstacle : scene.obstacles){
+            if(obstacle.dynamic && scene.pressureSolver == "sor"){  //a body's motion ties every unknown its surface cuts together, which SOR can't solve
+                read.fail("solver.pressureSolver", "dynamic obstacles need \"multigrid\", \"cg\" or \"jacobi\", not \"sor\"");
+            }
         }
     }
 

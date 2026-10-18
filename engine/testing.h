@@ -107,8 +107,8 @@ public:
         simulation.forEachPartition([&](Particles& partition){ partition.setWallsLetGo(walls); });
     }
 
-    void setObstacles(const std::vector<SceneObstacle>& obstacles){
-        simulation.forEachPartition([&](Particles& partition){ partition.setObstacles(obstacles); });
+    void setObstacles(const std::vector<SceneObstacle>& obstacles, double liquidDensity = 1000.0){
+        simulation.forEachPartition([&](Particles& partition){ partition.setObstacles(obstacles, liquidDensity); });
     }
 
     void setSources(const Sources& sources){

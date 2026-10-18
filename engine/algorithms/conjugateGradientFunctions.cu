@@ -22,6 +22,7 @@
 //            costs too much
 
 #include "conjugateGradientFunctions.hu"
+#include "exactSum.hu"
 #include "multigridFunctions.hu"
 #include "voxelSolveFunctions.hu"     //NO_VOXEL
 #include <cmath>
@@ -78,44 +79,9 @@ __global__ void sumPartials(uint numPartials, const float* partials, double* tot
     }
 }
 
-// ---- exact sums ----
+// ---- exact sums (exactSum.hu) ----
 
-static const int EXACT_DIGITS = 9;      //32-bit digits from 2^-149, the smallest float, up past the largest float's 2^128
 static const uint NODE_SLOTS = 64;      //a node's interior voxels, 4^3
-
-//an exact sum of floats in fixed point: digit k counts units of 2^(32k - 149). Each digit is a 64-bit integer holding its 32 bits plus carries not yet
-//passed up, so it takes 2^31 additions before anything could overflow, and integers add up the same in any order. Summing across partitions is just
-//adding these words up, one allreduce
-struct ExactSum{
-    long long digits[EXACT_DIGITS];
-    long long nonFinite;    //how many infs or NaNs went in, so the result is NaN as a float sum's would be
-};
-static const uint EXACT_WORDS = sizeof(ExactSum) / sizeof(long long);
-
-//adds a float to an exact sum: its 24-bit significand, shifted to its binary exponent, straddles at most two digits
-__device__ inline void addExactly(float value, ExactSum& sum){
-    uint bits = __float_as_uint(value);
-    int exponent = bits >> 23 & 0xFF;
-    if(value == 0.0f){
-        return;
-    }
-    if(exponent == 0xFF){
-        atomicAdd((unsigned long long*)&sum.nonFinite, 1ull);
-        return;
-    }
-    unsigned long long significand = bits & 0x7FFFFF;
-    if(exponent != 0){
-        significand |= 0x800000;    //the hidden bit
-    }
-    else{
-        exponent = 1;               //a subnormal: no hidden bit, at the smallest exponent
-    }
-    int position = exponent - 1;    //value = significand*2^(exponent - 150), and 2^-149 is bit 0
-    significand <<= position % 32;
-    long long sign = bits >> 31 ? -1 : 1;
-    atomicAdd((unsigned long long*)sum.digits + position/32, (unsigned long long)(sign*(long long)(significand & 0xFFFFFFFFull)));
-    atomicAdd((unsigned long long*)sum.digits + position/32 + 1, (unsigned long long)(sign*(long long)(significand >> 32)));
-}
 
 //a*b over the unknowns, added into an exact sum: a warp per node, its lanes taking interior slots lane and lane + 32, then pairing off in a fixed tree
 //to the node's share, which goes in exactly. A share depends only on the node's own values, not on where its voxels are stored or which block or GPU
@@ -155,35 +121,9 @@ __global__ void addNodeDotShares(uint numNodes, const uint* interiorVoxels, cons
     }
 }
 
-//an exact sum back to a double: pass the carries up so each digit holds just its 32 bits, then add the digits in from the top. The sign ends up in the
-//top carry; a negative sum is negated first, so the conversion never subtracts two huge numbers
+//an exact sum back to a double (exactValue)
 __global__ void finishExactSum(const ExactSum* sum, double* total){
-    if(sum->nonFinite){
-        *total = nan("");
-        return;
-    }
-    unsigned long long digits[EXACT_DIGITS];
-    long long carry = 0;
-    for(int k = 0; k < EXACT_DIGITS; ++k){
-        long long value = sum->digits[k] + carry;
-        digits[k] = (unsigned long long)value & 0xFFFFFFFFull;
-        carry = value >> 32;    //arithmetic shift, so the digit left behind is in [0, 2^32)
-    }
-    bool negative = carry < 0;
-    if(negative){   //two's complement over the digits and the carry together: flip every bit, add 1
-        unsigned long long add = 1;
-        for(int k = 0; k < EXACT_DIGITS; ++k){
-            unsigned long long value = (~digits[k] & 0xFFFFFFFFull) + add;
-            digits[k] = value & 0xFFFFFFFFull;
-            add = value >> 32;
-        }
-        carry = ~carry + (long long)add;
-    }
-    double magnitude = (double)carry*scalbn(1.0, 32*EXACT_DIGITS - 149);
-    for(int k = EXACT_DIGITS - 1; k >= 0; --k){
-        magnitude += (double)digits[k]*scalbn(1.0, 32*k - 149);
-    }
-    *total = negative ? -magnitude : magnitude;
+    *total = exactValue(*sum);
 }
 
 //total = a*b over the unknowns, the same bit for bit however the nodes are stored or split up: each partition sums its own nodes' shares (layout.numNodes
@@ -288,7 +228,8 @@ __global__ void nextIteration(DotProducts* dots){
 //keeps d's and p's ghosts equal to their owners' too, as they're only ever combined from z's; and q = A*d reads ghost d's
 template <typename Precondition>
 static float conjugateGradient(const CudaVec<char>& solveCodes, Stencil A, const VoxelLayout& layout, DotProductSums sums, CudaVec<float>& divU, CudaVec<float>& p, CudaVec<float>& residuals,
-                                float tolerance, uint maxIterations, uint checkEvery, uint numOwnVoxels, PartitionContext& context, cudaStream_t stream, float* z, DotProducts* dots, Precondition precondition){
+                                float tolerance, uint maxIterations, uint checkEvery, uint numOwnVoxels, PartitionContext& context, cudaStream_t stream, float* z, DotProducts* dots, SolveTerm* term,
+                                Precondition precondition){
     uint numUsedVoxels = p.size();
     uint blocks = numUsedVoxels / BLOCKSIZE + 1;
     float maxDivergence = (float)context.maxOverPartitions(std::abs(divU.getMax(stream, true, numOwnVoxels)));
@@ -321,6 +262,9 @@ static float conjugateGradient(const CudaVec<char>& solveCodes, Stencil A, const
     cudaMemsetAsync(d, 0, sizeof(float)*numUsedVoxels, stream);
     cudaMemsetAsync(dots, 0, sizeof(DotProducts), stream);
     startDownhill<<<blocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, solveCodes.devPtr(), A, divU.devPtr(), p.devPtr(), r);
+    if(term != nullptr){
+        term->addTimes(p.devPtr(), r, -1.0f, nullptr, stream);
+    }
     precondition(r, z, partials);
     context.fillGhosts(z, stream);
     dotProduct(r, z, &dots->rzNext);
@@ -330,7 +274,13 @@ static float conjugateGradient(const CudaVec<char>& solveCodes, Stencil A, const
     SolveProgress progress;
     for(uint iteration = 1; iteration <= maxIterations; ++iteration){
         multiplyByA<<<blocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, numOwnVoxels, solveCodes.devPtr(), A, d, q, partials);
+        if(term != nullptr){
+            term->addTimes(d, q, 1.0f, nullptr, stream);
+        }
         dotProduct(d, q, &dots->dq);
+        if(term != nullptr && sums == DotProductSums::perBlock){    //its blocks' shares were the stencil's alone
+            term->addLastEnergy(&dots->dq, stream);
+        }
         stepDownhill<<<blocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, d, q, p.devPtr(), r, dots);
         precondition(r, z, partials);
         context.fillGhosts(z, stream);
@@ -551,7 +501,7 @@ __global__ void stepDownResidual(uint numOwnVoxels, const char* solveCodes, cons
 template <typename Precondition, typename Refree>
 static float boundedConjugateGradient(const CudaVec<char>& solveCodes, Stencil A, const VoxelLayout& layout, CudaVec<float>& divU, CudaVec<float>& p, CudaVec<float>& residuals, const char* bounded,
                                        char* free, float tolerance, uint maxIterations, uint checkEvery, uint numOwnVoxels, PartitionContext& context, cudaStream_t stream, float* z,
-                                       Precondition precondition, Refree refree){
+                                       SolveTerm* term, Precondition precondition, Refree refree){
     uint numUsedVoxels = p.size();
     uint blocks = numUsedVoxels / BLOCKSIZE + 1;
     float* r = residuals.devPtr();
@@ -578,7 +528,8 @@ static float boundedConjugateGradient(const CudaVec<char>& solveCodes, Stencil A
     float maxDiagonal = (float)context.maxOverPartitions(floatOfBits(seen.expanded));
     float maxResidual = 0.0f;
     if(maxDivergence != 0.0f && maxDiagonal != 0.0f){
-        float stepBound = 0.5f / maxDiagonal;
+        //with a term, its norm on top: the stencil's no more than twice its largest coefficient, and the term's no more than its bound
+        float stepBound = term == nullptr ? 0.5f / maxDiagonal : 1.0f / (2.0f*maxDiagonal + term->normBound());
         auto dotProduct = [&](const float* a, const float* b, double* total){
             exactDotProduct(layout, solveCodes.devPtr(), a, b, exact, total, context, stream);
         };
@@ -586,6 +537,9 @@ static float boundedConjugateGradient(const CudaVec<char>& solveCodes, Stencil A
         cudaMemsetAsync(d, 0, sizeof(float)*numUsedVoxels, stream);
         raiseToBounds<<<blocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, bounded, p.devPtr());
         startDownhill<<<blocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, solveCodes.devPtr(), A, divU.devPtr(), p.devPtr(), r);
+        if(term != nullptr){
+            term->addTimes(p.devPtr(), r, -1.0f, nullptr, stream);
+        }
         bool changed = true;    //which unknowns are free, since refree last knew
         bool afresh = true;     //CG's next direction has no last one to keep any of
         float best = INFINITY;
@@ -610,6 +564,9 @@ static float boundedConjugateGradient(const CudaVec<char>& solveCodes, Stencil A
             if(seen.chopped > PROPORTION*PROPORTION*seen.freed){    //proportioning: q is the chopped residual, and z takes A times it
                 context.fillGhosts(q, stream);
                 multiplyByA<<<blocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, numOwnVoxels, solveCodes.devPtr(), A, q, z, nullptr);
+                if(term != nullptr){
+                    term->addTimes(q, z, 1.0f, nullptr, stream);
+                }
                 dotProduct(q, z, &state->dots.dq);
                 stepByChopped<<<1, 1, 0, stream>>>(state);
                 stepDownhill<<<blocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, q, z, p.devPtr(), r, &state->dots);
@@ -632,6 +589,9 @@ static float boundedConjugateGradient(const CudaVec<char>& solveCodes, Stencil A
             turnDirection<<<blocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, z, d, &state->dots);
             nextIteration<<<1, 1, 0, stream>>>(&state->dots);
             multiplyByA<<<blocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, numOwnVoxels, solveCodes.devPtr(), A, d, q, nullptr);
+            if(term != nullptr){
+                term->addTimes(d, q, 1.0f, nullptr, stream);
+            }
             dotProduct(d, q, &state->dots.dq);
             noBoundYet<<<1, 1, 0, stream>>>(state);
             findFeasible<<<numOwnVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numOwnVoxels, bounded, p.devPtr(), d, (uint*)&state->feasible);
@@ -639,6 +599,9 @@ static float boundedConjugateGradient(const CudaVec<char>& solveCodes, Stencil A
             boundStep<<<1, 1, 0, stream>>>(state);
             tryToBounds<<<blocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, bounded, p.devPtr(), d, tried, state);
             residualIf<<<blocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, solveCodes.devPtr(), A, divU.devPtr(), tried, z, &state->expanded);
+            if(term != nullptr){
+                term->addTimes(tried, z, -1.0f, &state->expanded, stream);
+            }
             weighTried<<<blocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, p.devPtr(), tried, r, z, d, q, state);
             dotProduct(d, q, &state->gain);     //d*q again, and nothing reads it, after a step that reached no bound
             judgeTried<<<1, 1, 0, stream>>>(state, stepBound);
@@ -646,6 +609,9 @@ static float boundedConjugateGradient(const CudaVec<char>& solveCodes, Stencil A
             stepDownResidual<<<numOwnVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numOwnVoxels, solveCodes.devPtr(), bounded, r, p.devPtr(), stepBound, state);
             context.fillGhosts(p.devPtr(), stream);
             residualIf<<<blocks, BLOCKSIZE, 0, stream>>>(numUsedVoxels, solveCodes.devPtr(), A, divU.devPtr(), p.devPtr(), r, &state->fellBack);
+            if(term != nullptr){
+                term->addTimes(p.devPtr(), r, -1.0f, &state->fellBack, stream);
+            }
         }
     }
     cudaFreeAsync(d, stream);
@@ -664,14 +630,15 @@ static Stencil makeStencil(const CudaVec<uint>& neighborNx, const CudaVec<uint>&
 
 //with no preconditioner (z = r) or Jacobi's (z = r / the unknown's own coefficient)
 static float diagonallyPreconditioned(bool jacobi, const CudaVec<char>& solveCodes, Stencil A, const VoxelLayout& layout, DotProductSums sums, CudaVec<float>& divU, CudaVec<float>& p,
-                                      CudaVec<float>& residuals, float tolerance, uint maxIterations, uint numOwnVoxels, PartitionContext& context, cudaStream_t stream, const char* bounded){
+                                      CudaVec<float>& residuals, float tolerance, uint maxIterations, uint numOwnVoxels, PartitionContext& context, cudaStream_t stream, const char* bounded,
+                                      SolveTerm* term){
     uint numUsedVoxels = p.size();
     if(bounded != nullptr){
         float* preconditioned;
         char* free;
         gpuErrchk(cudaMallocAsync((void**)&preconditioned, sizeof(float)*numUsedVoxels, stream));
         gpuErrchk(cudaMallocAsync((void**)&free, numUsedVoxels, stream));
-        float residual = boundedConjugateGradient(solveCodes, A, layout, divU, p, residuals, bounded, free, tolerance, maxIterations, 16, numOwnVoxels, context, stream, preconditioned,
+        float residual = boundedConjugateGradient(solveCodes, A, layout, divU, p, residuals, bounded, free, tolerance, maxIterations, 16, numOwnVoxels, context, stream, preconditioned, term,
             [&](const float* r, float* z){
                 preconditionFree<<<numUsedVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numUsedVoxels, free, r, jacobi ? A.Adiag : nullptr, z);
             }, [](){});
@@ -685,7 +652,8 @@ static float diagonallyPreconditioned(bool jacobi, const CudaVec<char>& solveCod
     if(jacobi){
         gpuErrchk(cudaMallocAsync((void**)&z, sizeof(float)*numUsedVoxels, stream));
     }
-    float residual = conjugateGradient(solveCodes, A, layout, sums, divU, p, residuals, tolerance, maxIterations, 16, numOwnVoxels, context, stream, z, dots, [&](const float* r, float* preconditioned, float* partials){
+    float residual = conjugateGradient(solveCodes, A, layout, sums, divU, p, residuals, tolerance, maxIterations, 16, numOwnVoxels, context, stream, z, dots, term,
+                                       [&](const float* r, float* preconditioned, float* partials){
         if(jacobi || partials != nullptr){  //with no preconditioner, exact sums leave nothing for it to do
             preconditionByDiagonal<<<numUsedVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numUsedVoxels, numOwnVoxels, r, jacobi ? A.Adiag : nullptr, preconditioned, partials);
         }
@@ -700,23 +668,23 @@ static float diagonallyPreconditioned(bool jacobi, const CudaVec<char>& solveCod
 float cudaConjugateGradient(const CudaVec<char>& solveCodes, const CudaVec<uint>& neighborNx, const CudaVec<uint>& neighborPx, const CudaVec<uint>& neighborNy, const CudaVec<uint>& neighborPy, const CudaVec<uint>& neighborNz, const CudaVec<uint>& neighborPz,
     const CudaVec<float>& Anx, const CudaVec<float>& Apx, const CudaVec<float>& Any, const CudaVec<float>& Apy, const CudaVec<float>& Anz, const CudaVec<float>& Apz, const CudaVec<float>& Adiag,
     CudaVec<float>& divU, CudaVec<float>& p, CudaVec<float>& residuals, float tolerance, uint maxIterations, const VoxelLayout& layout, DotProductSums sums, uint numOwnVoxels,
-    PartitionContext& context, cudaStream_t stream, const char* bounded){
+    PartitionContext& context, cudaStream_t stream, const char* bounded, SolveTerm* term){
     return diagonallyPreconditioned(false, solveCodes, makeStencil(neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag), layout, sums, divU, p, residuals,
-                                    tolerance, maxIterations, numOwnVoxels, context, stream, bounded);
+                                    tolerance, maxIterations, numOwnVoxels, context, stream, bounded, term);
 }
 
 float cudaJacobiConjugateGradient(const CudaVec<char>& solveCodes, const CudaVec<uint>& neighborNx, const CudaVec<uint>& neighborPx, const CudaVec<uint>& neighborNy, const CudaVec<uint>& neighborPy, const CudaVec<uint>& neighborNz, const CudaVec<uint>& neighborPz,
     const CudaVec<float>& Anx, const CudaVec<float>& Apx, const CudaVec<float>& Any, const CudaVec<float>& Apy, const CudaVec<float>& Anz, const CudaVec<float>& Apz, const CudaVec<float>& Adiag,
     CudaVec<float>& divU, CudaVec<float>& p, CudaVec<float>& residuals, float tolerance, uint maxIterations, const VoxelLayout& layout, DotProductSums sums, uint numOwnVoxels,
-    PartitionContext& context, cudaStream_t stream, const char* bounded){
+    PartitionContext& context, cudaStream_t stream, const char* bounded, SolveTerm* term){
     return diagonallyPreconditioned(true, solveCodes, makeStencil(neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag), layout, sums, divU, p, residuals,
-                                    tolerance, maxIterations, numOwnVoxels, context, stream, bounded);
+                                    tolerance, maxIterations, numOwnVoxels, context, stream, bounded, term);
 }
 
 float cudaMultigridConjugateGradient(const CudaVec<char>& solveCodes, const CudaVec<uint>& neighborNx, const CudaVec<uint>& neighborPx, const CudaVec<uint>& neighborNy, const CudaVec<uint>& neighborPy, const CudaVec<uint>& neighborNz, const CudaVec<uint>& neighborPz,
     const CudaVec<float>& Anx, const CudaVec<float>& Apx, const CudaVec<float>& Any, const CudaVec<float>& Apy, const CudaVec<float>& Anz, const CudaVec<float>& Apz, const CudaVec<float>& Adiag,
     CudaVec<float>& divU, CudaVec<float>& p, CudaVec<float>& residuals, float tolerance, uint maxIterations, const VoxelLayout& layout, DotProductSums sums, uint numOwnVoxels,
-    PartitionContext& context, cudaStream_t stream, const char* bounded){
+    PartitionContext& context, cudaStream_t stream, const char* bounded, SolveTerm* term){
     uint numUsedVoxels = p.size();
     Stencil A = makeStencil(neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag);
     float* z;
@@ -725,7 +693,7 @@ float cudaMultigridConjugateGradient(const CudaVec<char>& solveCodes, const Cuda
         char* free;
         gpuErrchk(cudaMallocAsync((void**)&free, numUsedVoxels, stream));
         Multigrid multigrid = {};
-        float residual = boundedConjugateGradient(solveCodes, A, layout, divU, p, residuals, bounded, free, tolerance, maxIterations, 2, numOwnVoxels, context, stream, z,
+        float residual = boundedConjugateGradient(solveCodes, A, layout, divU, p, residuals, bounded, free, tolerance, maxIterations, 2, numOwnVoxels, context, stream, z, term,
             [&](const float* r, float* preconditioned){
                 vCycle(multigrid, r, preconditioned, stream);
             }, [&](){
@@ -747,7 +715,8 @@ float cudaMultigridConjugateGradient(const CudaVec<char>& solveCodes, const Cuda
     DotProducts* dots;
     gpuErrchk(cudaMallocAsync((void**)&dots, sizeof(DotProducts), stream));
     //a V-cycle costs dozens of plain iterations and it should take few of them, so it checks sooner
-    float residual = conjugateGradient(solveCodes, A, layout, sums, divU, p, residuals, tolerance, maxIterations, 2, numOwnVoxels, context, stream, z, dots, [&](const float* r, float* preconditioned, float* partials){
+    float residual = conjugateGradient(solveCodes, A, layout, sums, divU, p, residuals, tolerance, maxIterations, 2, numOwnVoxels, context, stream, z, dots, term,
+                                       [&](const float* r, float* preconditioned, float* partials){
         vCycle(multigrid, r, preconditioned, stream);
         if(partials != nullptr){
             dotResidual<<<numUsedVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numOwnVoxels, r, preconditioned, partials);

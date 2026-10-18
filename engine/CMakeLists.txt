@@ -40,6 +40,7 @@ add_library(particles STATIC
     forces.cu
     sources.cu
     obstacles.cu
+    bodies.cu
     pockets.cu
     boundaries.cu
     levelset.cu

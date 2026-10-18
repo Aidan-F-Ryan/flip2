@@ -10,6 +10,7 @@
 #include "forces.hu"
 #include "sources.hu"
 #include "obstacles.hu"
+#include "bodies.hu"
 #include "whitewater.hu"
 #include "algorithms/conjugateGradientFunctions.hu"
 #include <cmath>
@@ -223,7 +224,9 @@ public:
     //where nothing else already is (sources.cu). After setDomain and setSources
     void setSourceMeshes(const std::vector<SceneObstacle>& meshes, const std::vector<FluidShape>& fluids);
 
-    void setObstacles(const std::vector<SceneObstacle>& descriptions);  //what the fluid flows around (see obstacles.hu); after setDomain
+    //what the fluid flows around (see obstacles.hu), and among them, what it moves too (dynamic ones, bodies.hu): weighed against the liquid's density,
+    //kg/m^3. After setDomain
+    void setObstacles(const std::vector<SceneObstacle>& descriptions, double liquidDensity = 1000.0);
 
     //the liquid's kinematic viscosity, in m^2/s: its dynamic viscosity over its density (water 1e-6, honey around 5e-3). 0, the default, for none:
     //the viscous solve (viscosity.cu) only runs with some
@@ -534,6 +537,7 @@ private:
     Sources sources;            //emitters, sinks and open faces
     CudaVec<char> removedFlags; //per particle, while initialize runs: whether a sink or an open face takes it
     ObstacleSet obstacles;      //what the fluid flows around
+    Bodies bodies;              //and the dynamic ones among them, which it moves too
     ObstacleSet sourceMeshes;   //the meshes of the emitters, sinks and fluids
     FluidShapes fluids;         //the fluid to start with (setSourceMeshes)
     CudaVec<char> obstacleSolids;   //per stored voxel: whether obstacles close every face of it

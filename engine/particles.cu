@@ -1180,9 +1180,9 @@ __global__ void largestApicVelocities(uint numParticles, const float* vx, const 
 //(advectThroughGrid)
 double Particles::getCourantDt(){
     double voxelSize = (grid.cellSize / (numVoxels1D - 2*std::floor(radius)));
-    double fastest = std::max(maxVelocity, (double)obstacles.fastest());
+    double fastest = std::max({maxVelocity, (double)obstacles.fastest(), (double)bodies.fastest()});
     double strongest = std::max({std::abs(forces.gravity.x), std::abs(forces.gravity.y), std::abs(forces.gravity.z)}) + fieldAcceleration + fieldDrag*maxVelocity;
-    strongest = std::max(strongest, maxAcceleration);
+    strongest = std::max({strongest, maxAcceleration, (double)bodies.acceleration()});  //and a body's surface, which a splash can kick as hard as the liquid
     if(verbose()){
         std::cout<<"maxVel: "<<maxVelocity<<" fastest obstacle: "<<obstacles.fastest()<<" strongest force: "<<strongest<<" (the last substep's acceleration "<<maxAcceleration<<") voxelSize: "<<voxelSize<<"\n";
     }
@@ -1317,6 +1317,7 @@ void Particles::pressureSolve(){
     }
     findWhitewater();   //what the surface makes this substep, now its length is known: read from the grid as P2G left it, and nothing of the fluid's changes by it
     applyForces(forces, dt, elapsedTime, forceVoxels(), stream);
+    bodies.predict(dt, forces.gravity);     //the dynamic bodies fall as the fluid does, and the solve starts them from there
     floatInAir(dt);     //an air band: less the still air's weight
     if(surfaceTension > 0.0){
         applySurfaceTension();
@@ -1334,17 +1335,24 @@ void Particles::pressureSolve(){
     uint interiorWidth = numVoxels1D - 2*(uint)std::floor(radius);
     uint3 domainVoxels = make_uint3(grid.sizeX*interiorWidth, grid.sizeY*interiorWidth, grid.sizeZ*interiorWidth);
     VoxelLayout layout = {nodeCells.devPtr(), nodeInteriorVoxels.devPtr(), coarseCells.devPtr(), numOwnNodes, interiorWidth, domainVoxels};   //the nodes this partition solves for
+    //the dynamic bodies' coupling, which the solve adds to A (bodies.cu): each one's motion ties together the unknowns its surface cuts
+    SolveTerm* coupling = nullptr;
+    if(bodies.count() > 0){
+        bodies.prepare(dt/(density*voxelSize*voxelSize), obstacleNodes.devPtr(), numOwnNodes, nodeCells.devPtr(), nodeInteriorVoxels.devPtr(), solveCodes.devPtr(), obstacleNear.devPtr(),
+                       obstacleOpen.devPtr(), grid, (int)interiorWidth, lettingGo());
+        coupling = &bodies;
+    }
     auto solve = [&](const char* bounded){   //bounded: the voxels to keep from going under the air's pressure, from the pressures the last solve left (boundaries.cu)
         switch(pressureSolver){
             case PressureSolver::cg:
                 return cudaConjugateGradient(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, divU, p, residuals, tolerance, maxIterations,
-                                             layout, dotProductSums, numOwnVoxels, *context, stream, bounded);
+                                             layout, dotProductSums, numOwnVoxels, *context, stream, bounded, coupling);
             case PressureSolver::jacobi:
                 return cudaJacobiConjugateGradient(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, divU, p, residuals, tolerance, maxIterations,
-                                                   layout, dotProductSums, numOwnVoxels, *context, stream, bounded);
+                                                   layout, dotProductSums, numOwnVoxels, *context, stream, bounded, coupling);
             case PressureSolver::multigrid:
                 return cudaMultigridConjugateGradient(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, divU, p, residuals, tolerance, maxIterations,
-                                                      layout, dotProductSums, numOwnVoxels, *context, stream, bounded);
+                                                      layout, dotProductSums, numOwnVoxels, *context, stream, bounded, coupling);
             default:
                 return cudaGSiteration(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, divU, p, residuals, tolerance, maxIterations,
                                        numOwnVoxels, *context, stream, bounded);
@@ -1368,18 +1376,19 @@ void Particles::pressureSolve(){
     //With boundaries that let go of the liquid (boundaries.cu): the voxels on them that the solve leaves pulled on, and that air can reach, are solved
     //for again with the rest, each ending either held or let go, at the air's pressure. Without such boundaries, or where none pulls on anything
     //that air reaches, it's the one solve
+    //And the dynamic bodies take the impulse the pressure it settles on gives them
     auto settled = [&](){
         holdEverything();
         if(!solved(nullptr)){
             return false;
         }
-        if(!lettingGo() || !letGoOfSuction()){
-            return true;
+        if(lettingGo() && letGoOfSuction()){
+            if(!solved(letGo.devPtr())){
+                return false;
+            }
+            keepLetGo();
         }
-        if(!solved(letGo.devPtr())){
-            return false;
-        }
-        keepLetGo();
+        bodies.takePressure(p.devPtr());
         return true;
     };
     //Viscosity goes between two solves: the first gives the flow the forces drive once the pressure has answered them, the viscous step acts on that,
@@ -2115,6 +2124,7 @@ void Particles::solveFrame(double fps){
         updateVoxelVelocities();
         voxelVelsToParticles();   //also moves the particles; initialize re-bins them wherever they landed, reflecting any that crossed a wall
         stepWhitewater();         //the whitewater flies through the same grid, and what the surface made joins it: nothing of the fluid's changes by it
+        bodies.move(dt);          //the dynamic bodies move with what the substep left them with, before initialize places the obstacles
         ++substepIndex;
         initialize();
     }

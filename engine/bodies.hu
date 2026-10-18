@@ -1,0 +1,159 @@
+//Copyright 2023 Aberrant Behavior LLC
+
+#ifndef BODIES_HU
+#define BODIES_HU
+
+#include "typedefs.h"
+#include "grid.hpp"
+#include "obstacles.hu"
+#include "scene.hpp"
+#include "partitionContext.hu"
+#include "cudaVec.hu"
+#include "algorithms/conjugateGradientFunctions.hu"
+#include "algorithms/exactSum.hu"
+#include <vector>
+
+//Two-way coupled rigid bodies: dynamic obstacles (SceneBody), which the liquid moves as they move it. Batty, Bertails and Bridson's variational
+//coupling (A fast variational framework for accurate solid-fluid coupling, 2007), on the cut cells the obstacles already have: the pressure solve
+//finds the fluid's pressure and the bodies' velocities together, as the one kinetic energy they share at its lowest.
+//
+//A body's generalized velocity xi = (V, w), its centre of mass's and its turning, moves the solid part of each face its surface cuts at
+//e.(V + w x (x_face - c)): that's the flow obstacleFaceFlux puts in the divergence, row B_i xi for each unknown i, B_i the sum over its faces the body cuts
+//of sign (1 - open)(e, (x_face - c) x e). The pressure pushes back on it through the same faces, so the impulse a substep's pressure gives it is the
+//transpose: B^T p, in the solve's units. With the solve's scale s (dt over its density and the voxel's area, as cudaGetA has it) and the body's mass in
+//voxels of liquid (M~ = M / (rho dx^3)), its velocity after the solve is xi* + s M~^-1 B^T p, and the unknowns' equations become
+//    (A + s B M~^-1 B^T) p = -divU(u*, xi*)
+//symmetric and positive definite still: CG solves it as it does A alone (the term's part of each product is Bodies::addTimes), and the multigrid, which
+//preconditions A, needs nothing new. A light body is as stable as a heavy one, which a body pushed by the pressure from a solve that didn't know its
+//mass isn't: there, it overshoots by its added mass every substep.
+//
+//Each body is one obstacle (obstacles.hu), its shape built once in its own space as a rigid obstacle's is; only where it is and how it moves, its
+//BodyFrame, is the GPU's, which moves it. Its state is in double, its mass, centre of mass and inertia come from integrating its density over the
+//inside of its shape (uniform for now; a density that varies through it is the same integral), and its turning carries over as angular momentum, so
+//a body tumbling through the air keeps its momentum while its axes turn. Nothing the bodies do waits on the host: the host reads their state a substep
+//late, after the waits the substep already has, for the timestep and the frames.
+
+static constexpr int BODY_LANES = 6;    //a body's generalized velocity: V, then w
+
+//one body's state, on the GPU, in double: a body resting on the bottom has to stay put to well under a voxel for thousands of substeps
+struct BodyState{
+    double position[3];         //its centre of mass, in the world
+    double orientation[4];      //a unit quaternion, w x y z: its own axes in the world's
+    double velocity[3];         //its centre of mass's
+    double angularVelocity[3];  //about its centre of mass, in the world
+    double angularMomentum[3];  //the same as momentum, which the substeps carry over (without torque, it's what stays the same while it tumbles)
+    double before[BODY_LANES];  //its velocities at the start of the substep, for how fast they changed
+    double acceleration;        //the most its surface's velocity changed by over the last substep, per second, for the timestep
+};
+
+//what stays the same: its mass and how it's spread
+struct BodyMass{
+    double mass;                //kg
+    double volume;              //m^3: the inside of its shape
+    double centre[3];           //its centre of mass in its own space (the obstacle's, which its transform's scale is baked into)
+    double inertia[9];          //about its centre of mass, along its own axes, kg m^2
+    double inverseInertia[9];
+    double reach;               //how far its bounds' farthest corner is from its centre of mass: the most any point of it moves for a turn
+    float3 objectLow, objectHigh;   //its bounds in its own space
+    double liquidVoxelMass;     //rho dx^3: the liquid's mass in a voxel, the unit the coupling weighs the body in
+};
+
+//one body as the coupling's kernels take it this substep: its centre of mass, and its inverse mass and inertia in voxels of liquid, in the world's axes
+struct BodyCoupling{
+    float3 centre;
+    double inverseMass;
+    double inverseInertia[9];
+};
+
+//where the unknowns are, as the coupling's kernels read them this substep: the nodes near obstacles (findSolidVoxels), the partition's own coming first,
+//their interior voxels, which of those are unknowns, how open each face is and which body is across it
+struct CouplingGrid{
+    const uint* nodes;          //how many, then the stored nodes near obstacles
+    uint numOwnNodes;
+    const uint* nodeCells;
+    const uint* interiorVoxels; //per node, its 4^3 interior's voxels, x fastest, or NO_VOXEL
+    const char* solveCodes;
+    const char* near;           //obstacleNear's bits
+    const uint* opens;          //obstacleOpen's fractions
+    const uint* faceBodies;     //per near unknown: per face, 5 bits: the body across it, plus 1, or 0
+    Grid grid;
+    int interiorWidth;
+};
+
+class Bodies : public SolveTerm{
+public:
+    Bodies() = default;
+    Bodies(const Bodies&) = delete;
+    Bodies& operator=(const Bodies&) = delete;
+    ~Bodies();
+
+    //the dynamic obstacles among descriptions, which obstacles has built: their mass, from their density over the inside of their shapes, and where
+    //they start. Their frames are then the obstacle set's to hand to the kernels (ObstacleSet::setFrames). On stream, in this partition's context
+    void setUp(const std::vector<SceneObstacle>& descriptions, ObstacleSet& obstacles, double liquidDensity, double voxelSize, PartitionContext* context,
+               cudaStream_t stream);
+
+    int count() const{
+        return numBodies;
+    }
+
+    //each body's frame from its state: where it is, its reach, how it moves, and what the coupling weighs it at there. After it moves, and on resuming
+    void writeFrames();
+    //the start of a substep: gravity's dt on each body, which the divergence's flow at its surface (obstacleFaceFlux) and the solve start from
+    void predict(double dt, float3 gravity);
+    //which body is across each face of the near unknowns (findFaceBodies), after obstacleFaceFlux's lookups: once a substep, once the obstacles' solids are
+    //marked, for numVoxels stored voxels
+    void findFaceBodies(const Obstacles& obstacles, const VoxelPlaces& places, uint3 domainVoxels, const uint* nodes, uint numOwnNodes, const char* solveCodes,
+                        const char* near, const uint* opens, const uint* const neighbors[6], uint numVoxels);
+    //before a solve: the solve's scale, and where the unknowns are this substep; with bounded, the term's norm bound too, which normBound() returns once
+    //the host has waited on the stream after this (the bounded solve does, before it needs it)
+    void prepare(double scale, const uint* nodes, uint numOwnNodes, const uint* nodeCells, const uint* interiorVoxels, const char* solveCodes, const char* near,
+                 const uint* opens, const Grid& grid, int interiorWidth, bool bounded);
+    //after a solve (once the boundaries have settled it): the impulse the pressure p gives each body, s M~^-1 B^T p, onto its velocity
+    void takePressure(const float* p);
+    //the end of a substep: each body moves, at the velocity the substep left it with, and its state goes to the host
+    void move(double dt);
+
+    //SolveTerm
+    void addTimes(const float* x, float* y, float sign, const uint* onlyIf, cudaStream_t stream) override;
+    void addLastEnergy(double* total, cudaStream_t stream) override;
+    float normBound() const override;
+
+    //from the state the host last read back: the fastest any body's surface moves, in m/s, and the most its velocity changed by per second
+    float fastest() const;
+    float acceleration() const;
+    const BodyState* hostStates() const{   //each body's state as the host last read it back
+        return seen;
+    }
+    const BodyMass& mass(int body) const{
+        return masses[body];
+    }
+    int obstacleOf(int body) const{
+        return obstacles[body];
+    }
+
+private:
+    void release();
+    void sumShares(const float* x, const uint* onlyIf);    //B^T x into the sums, every partition's, then s M~^-1 of it into responses
+
+    int numBodies = 0;
+    std::vector<int> obstacles;         //per body, its obstacle's place in the obstacle set
+    std::vector<BodyMass> masses;
+    BodyState* states = nullptr;        //on the GPU
+    BodyMass* deviceMasses = nullptr;
+    BodyFrame* frames = nullptr;
+    BodyCoupling* couplings = nullptr;
+    ExactSum* sums = nullptr;           //B^T x, BODY_LANES per body
+    double* responses = nullptr;        //s M~^-1 B^T x, BODY_LANES per body, then (B^T x).(s M~^-1 B^T x) in all
+    ExactSum* boundSums = nullptr;      //per body, the sum over its unknowns of B_i M~^-1 B_i^T
+    double* bound = nullptr;            //s times their total, on the GPU
+    double* seenBound = nullptr;        //and pinned, for normBound
+    BodyState* seen = nullptr;          //pinned: the states as the host last read them
+    double scale = 0.0;                 //the solve's, s
+    CudaVec<uint> faceBodyCodes;        //per stored voxel, findFaceBodies'
+    CouplingGrid where = {};
+    PartitionContext* context = nullptr;
+    cudaStream_t stream = nullptr;
+    double voxel = 0.0;
+};
+
+#endif

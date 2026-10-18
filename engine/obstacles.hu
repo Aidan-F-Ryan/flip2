@@ -35,6 +35,13 @@ enum ObstacleKind{
     OBSTACLE_SPHERE
 };
 
+//where a dynamic body is and how it moves (bodies.cu): what ObstacleState holds for the others, kept on the GPU, which moves the body every substep
+struct BodyFrame{
+    float worldToObject[12];    //as ObstacleState's
+    float velocity[12];
+    float3 reachLow, reachHigh;
+};
+
 //one obstacle where it is now, for the kernels: its shape in its own space, how the world maps into that space, and how fast each point of it moves
 struct ObstacleState{
     int kind;
@@ -47,7 +54,17 @@ struct ObstacleState{
     float friction;
     bool letsGo;                //whether it only pushes on the liquid, and never pulls (boundaries.cu)
     float3 reachLow, reachHigh; //the box in the world past which nothing asks its distance: around its surface, 3 voxels wider every way
+    const BodyFrame* frame;     //a dynamic body's place, motion and reach, on the GPU, which hold in place of the three above; nullptr for the others
 };
+
+//an obstacle's transform, velocity and reach, wherever they're kept
+__device__ inline const float* toObject(const ObstacleState& obstacle){
+    return obstacle.frame != nullptr ? obstacle.frame->worldToObject : obstacle.worldToObject;
+}
+
+__device__ inline const float* velocityMatrix(const ObstacleState& obstacle){
+    return obstacle.frame != nullptr ? obstacle.frame->velocity : obstacle.velocity;
+}
 
 //every obstacle, as one kernel argument
 struct Obstacles{
@@ -199,7 +216,7 @@ __device__ inline float boxDistance(float3 low, float3 high, float3 p, float3& g
 
 //how far a world point is outside the obstacle (negative inside), and the way out of it there: its unit normal in the world
 __device__ inline float obstacleDistance(const ObstacleState& obstacle, float3 x, float3& normal){
-    const float* m = obstacle.worldToObject;
+    const float* m = toObject(obstacle);
     float3 p = make_float3(m[0]*x.x + m[1]*x.y + m[2]*x.z + m[3], m[4]*x.x + m[5]*x.y + m[6]*x.z + m[7], m[8]*x.x + m[9]*x.y + m[10]*x.z + m[11]);
     float3 g;
     float distance;
@@ -253,7 +270,7 @@ __device__ inline float3 obstacleVelocity(const ObstacleState& obstacle, float3 
     if(obstacle.kind == OBSTACLE_MESH && obstacle.sdf.velocities != nullptr){
         return sdfVelocity(obstacle.sdf, x);
     }
-    const float* v = obstacle.velocity;
+    const float* v = velocityMatrix(obstacle);
     return make_float3(v[0]*x.x + v[1]*x.y + v[2]*x.z + v[3], v[4]*x.x + v[5]*x.y + v[6]*x.z + v[7], v[8]*x.x + v[9]*x.y + v[10]*x.z + v[11]);
 }
 
@@ -264,7 +281,9 @@ __device__ inline int nearestObstacle(const Obstacles& obstacles, float3 x, floa
     distance = INFINITY;
     for(int index = 0; index < obstacles.count; ++index){
         const ObstacleState& obstacle = obstacles.items[index];
-        if(x.x < obstacle.reachLow.x || x.y < obstacle.reachLow.y || x.z < obstacle.reachLow.z || x.x > obstacle.reachHigh.x || x.y > obstacle.reachHigh.y || x.z > obstacle.reachHigh.z){
+        float3 low = obstacle.frame != nullptr ? obstacle.frame->reachLow : obstacle.reachLow;
+        float3 high = obstacle.frame != nullptr ? obstacle.frame->reachHigh : obstacle.reachHigh;
+        if(x.x < low.x || x.y < low.y || x.z < low.z || x.x > high.x || x.y > high.y || x.z > high.z){
             continue;
         }
         float3 n;
@@ -327,6 +346,24 @@ public:
         return description < builtIndex.size() ? builtIndex[description] : -1;
     }
 
+    //a dynamic body's frame, on the GPU, which the kernels read for where it is from the next update on (bodies.cu); its own bounds, and where its first
+    //transform puts it (a unit quaternion, w x y z, and a translation, its own space to the world)
+    void setFrame(int index, const BodyFrame* frame){
+        built[index].frame = frame;
+    }
+    void objectBounds(int index, float3& low, float3& high) const{
+        low = built[index].objectLow;
+        high = built[index].objectHigh;
+    }
+    void restPlacement(int index, double translation[3], double rotation[4]) const{
+        for(int i = 0; i < 3; ++i){
+            translation[i] = built[index].translations[i];
+        }
+        for(int i = 0; i < 4; ++i){
+            rotation[i] = built[index].rotations[i];
+        }
+    }
+
 private:
     struct Built{
         int kind;
@@ -342,6 +379,7 @@ private:
         std::vector<double> rotations;      //per key: a unit quaternion, w x y z
         float friction;
         bool letsGo;
+        const BodyFrame* frame = nullptr;   //a dynamic body's (setFrame)
     };
     void release();
     void rigidAt(const Built& obstacle, double time, double matrix[12], int interval = -1) const;

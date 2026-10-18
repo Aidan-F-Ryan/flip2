@@ -1,0 +1,77 @@
+//Copyright 2023 Aberrant Behavior LLC
+
+#ifndef EXACTSUM_HU
+#define EXACTSUM_HU
+
+    #include "../typedefs.h"
+    #include <cmath>
+
+    //Sums of floats that come out the same bit for bit in any order, and so the same however the domain is split between partitions: CG's dot products
+    //(conjugateGradientFunctions.cu) and the coupled bodies' sums over the faces they cut (bodies.cu)
+
+    static constexpr int EXACT_DIGITS = 9;      //32-bit digits from 2^-149, the smallest float, up past the largest float's 2^128
+
+    //an exact sum of floats in fixed point: digit k counts units of 2^(32k - 149). Each digit is a 64-bit integer holding its 32 bits plus carries not yet
+    //passed up, so it takes 2^31 additions before anything could overflow, and integers add up the same in any order. Summing across partitions is just
+    //adding these words up, one allreduce
+    struct ExactSum{
+        long long digits[EXACT_DIGITS];
+        long long nonFinite;    //how many infs or NaNs went in, so the result is NaN as a float sum's would be
+    };
+    static constexpr uint EXACT_WORDS = sizeof(ExactSum) / sizeof(long long);
+
+    //adds a float to an exact sum: its 24-bit significand, shifted to its binary exponent, straddles at most two digits
+    __device__ inline void addExactly(float value, ExactSum& sum){
+        uint bits = __float_as_uint(value);
+        int exponent = bits >> 23 & 0xFF;
+        if(value == 0.0f){
+            return;
+        }
+        if(exponent == 0xFF){
+            atomicAdd((unsigned long long*)&sum.nonFinite, 1ull);
+            return;
+        }
+        unsigned long long significand = bits & 0x7FFFFF;
+        if(exponent != 0){
+            significand |= 0x800000;    //the hidden bit
+        }
+        else{
+            exponent = 1;               //a subnormal: no hidden bit, at the smallest exponent
+        }
+        int position = exponent - 1;    //value = significand*2^(exponent - 150), and 2^-149 is bit 0
+        significand <<= position % 32;
+        long long sign = bits >> 31 ? -1 : 1;
+        atomicAdd((unsigned long long*)sum.digits + position/32, (unsigned long long)(sign*(long long)(significand & 0xFFFFFFFFull)));
+        atomicAdd((unsigned long long*)sum.digits + position/32 + 1, (unsigned long long)(sign*(long long)(significand >> 32)));
+    }
+
+    //an exact sum back to a double: pass the carries up so each digit holds just its 32 bits, then add the digits in from the top. The sign ends up in the
+    //top carry; a negative sum is negated first, so the conversion never subtracts two huge numbers
+    __device__ inline double exactValue(const ExactSum& sum){
+        if(sum.nonFinite){
+            return nan("");
+        }
+        unsigned long long digits[EXACT_DIGITS];
+        long long carry = 0;
+        for(int k = 0; k < EXACT_DIGITS; ++k){
+            long long value = sum.digits[k] + carry;
+            digits[k] = (unsigned long long)value & 0xFFFFFFFFull;
+            carry = value >> 32;    //arithmetic shift, so the digit left behind is in [0, 2^32)
+        }
+        bool negative = carry < 0;
+        if(negative){   //two's complement over the digits and the carry together: flip every bit, add 1
+            unsigned long long add = 1;
+            for(int k = 0; k < EXACT_DIGITS; ++k){
+                unsigned long long value = (~digits[k] & 0xFFFFFFFFull) + add;
+                digits[k] = value & 0xFFFFFFFFull;
+                add = value >> 32;
+            }
+            carry = ~carry + (long long)add;
+        }
+        double magnitude = (double)carry*scalbn(1.0, 32*EXACT_DIGITS - 149);
+        for(int k = EXACT_DIGITS - 1; k >= 0; --k){
+            magnitude += (double)digits[k]*scalbn(1.0, 32*k - 149);
+        }
+        return negative ? -magnitude : magnitude;
+    }
+#endif

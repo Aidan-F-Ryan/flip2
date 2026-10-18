@@ -1120,6 +1120,11 @@ int main(int argc, char** argv){
     }
     if(resuming){
         scene.writeCache = true;    //into the cache it resumes
+        for(const SceneObstacle& obstacle : scene.obstacles){
+            if(obstacle.dynamic){   //@TODO: the bodies' state in the checkpoints
+                return failure(scenePath + ": a bake with dynamic obstacles can't be resumed yet");
+            }
+        }
     }
     if(const char* partitions = std::getenv("FLIP2_PARTITIONS")){
         scene.partitions = std::max(1, std::atoi(partitions));
@@ -1350,7 +1355,7 @@ int main(int argc, char** argv){
     if(!sourceMeshes.empty()){
         simulation->setSourceMeshes(sourceMeshes, fluids);      //after setDomain and setSources
     }
-    simulation->setObstacles(scene.obstacles);      //after setDomain: they're voxelized at its voxel size
+    simulation->setObstacles(scene.obstacles, scene.density);      //after setDomain: they're voxelized at its voxel size, and the dynamic ones weighed against the liquid
     unsigned int wallsLetGo = 0;    //the walls that let go of the liquid, a bit each
     for(int face = 0; face < 6; ++face){
         wallsLetGo |= scene.wallHold[face] ? 0u : 1u << face;

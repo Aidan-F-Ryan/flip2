@@ -304,6 +304,16 @@ void Simulation::writeDiagnostics(const std::string& path, int frame){
     char tail[256];
     std::snprintf(tail, sizeof(tail), ",\"fastest\":%.9g,\"occupiedVoxels\":%llu,\"volume\":%.17g,", d.fastest, d.occupiedVoxels, d.occupiedVoxels*voxelSize*voxelSize*voxelSize);
     diagnostics<<tail<<"\"perVoxel\":"<<jsonArray(d.perVoxel, DIAGNOSTIC_BUCKETS, "%llu")<<",\"core\":"<<jsonArray(d.core, DIAGNOSTIC_BUCKETS, "%llu");
+    if(first.bodies.count() > 0){  //each dynamic body where it is and how it moves: every partition's are the same
+        diagnostics<<",\"bodies\":[";
+        for(int body = 0; body < first.bodies.count(); ++body){
+            const BodyState& state = first.bodies.hostStates()[body];
+            diagnostics<<(body ? "," : "")<<"{\"obstacle\":"<<first.bodies.obstacleOf(body)<<",\"position\":"<<jsonArray(state.position, 3, "%.17g")<<",\"orientation\":"
+                       <<jsonArray(state.orientation, 4, "%.17g")<<",\"velocity\":"<<jsonArray(state.velocity, 3, "%.17g")<<",\"angularVelocity\":"
+                       <<jsonArray(state.angularVelocity, 3, "%.17g")<<"}";
+        }
+        diagnostics<<"]";
+    }
     if(first.whitewater.on){    //dropped: since the frame before, or since the bake started or was resumed
         char more[360];
         std::snprintf(more, sizeof(more), ",\"whitewater\":{\"particles\":%llu,\"spray\":%llu,\"foam\":%llu,\"bubbles\":%llu,\"hash\":\"%016llx%016llx\",\"fastest\":%.9g,\"dropped\":%llu}",

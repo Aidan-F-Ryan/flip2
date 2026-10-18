@@ -1076,6 +1076,11 @@ void ObstacleSet::update(double time){
         state.radius = obstacle.radius;
         state.friction = obstacle.friction;
         state.letsGo = obstacle.letsGo;
+        state.frame = obstacle.frame;
+        if(obstacle.frame != nullptr){  //a dynamic body: the GPU moves it, and its frame says where it is (bodies.cu)
+            current.moving = true;
+            continue;
+        }
         float reach = (float)(3.0*voxel);
         double now[12];
         rigidAt(obstacle, time, now);
@@ -1303,14 +1308,17 @@ static uint obstacleBlocks(){
     return 2*processors;
 }
 
-void Particles::setObstacles(const std::vector<SceneObstacle>& descriptions){
-    obstacles.build(descriptions, grid.cellSize / (2<<refinementLevel), stream);
+void Particles::setObstacles(const std::vector<SceneObstacle>& descriptions, double liquidDensity){
+    double voxelSize = grid.cellSize / (2<<refinementLevel);
+    obstacles.build(descriptions, voxelSize, stream);
+    bodies.setUp(descriptions, obstacles, liquidDensity, voxelSize, context, stream);  //the dynamic ones: their mass, where they start, and their frames
     obstacles.update(elapsedTime);
 }
 
 void Particles::updateObstacles(){
     if(obstacles.count() > 0){
         obstacles.update(elapsedTime);
+        bodies.writeFrames();   //and the dynamic ones where they've moved to
     }
     placeSourceMeshes();    //meshes of emitters, sinks and fluids move as obstacles do
 }
@@ -1532,7 +1540,8 @@ __device__ inline float obstacleDivergence(const ObstacleState& obstacle, float3
         }
         return sum / h;
     }
-    return obstacle.velocity[0] + obstacle.velocity[5] + obstacle.velocity[10];
+    const float* v = velocityMatrix(obstacle);
+    return v[0] + v[5] + v[10];
 }
 
 //per stored voxel, a block per node: whether it's solid. One the fluid has reached is once obstacles close every face of it: partly inside one, it stays
@@ -1728,6 +1737,13 @@ void Particles::markObstacleSolids(){
     retireSolidVoxels<<<numVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numVoxels, obstacleSolids.devPtr(), solveCodes.devPtr(), neighborNx.devPtr(), neighborPx.devPtr(),
         neighborNy.devPtr(), neighborPy.devPtr(), neighborNz.devPtr(), neighborPz.devPtr());
     gpuErrchk(cudaPeekAtLastError());
+    if(bodies.count() > 0){     //which body is across each face the obstacles' flow goes through, for the coupling (bodies.cu)
+        uint interiorWidth = 2<<refinementLevel;
+        uint3 domainVoxels = make_uint3(grid.sizeX*interiorWidth, grid.sizeY*interiorWidth, grid.sizeZ*interiorWidth);
+        const uint* const neighbors[6] = {neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(), neighborPy.devPtr(), neighborNz.devPtr(), neighborPz.devPtr()};
+        bodies.findFaceBodies(obstacles.state(), voxelPlaces(), domainVoxels, obstacleNodes.devPtr(), numOwnNodes, solveCodes.devPtr(), obstacleNear.devPtr(), obstacleOpen.devPtr(),
+                              neighbors, numVoxels);
+    }
 }
 
 //the flow obstacles' surfaces make through the unknowns' faces, which cudaCalcDivU took as all fluid: through a face open a fraction w, the fluid flows
