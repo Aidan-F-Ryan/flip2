@@ -36,7 +36,8 @@
 //  {"event":"meshed","frame":42,"particles":1240000,"points":310000,"faces":309000,"bandCells":52000,"rounds":2,"seconds":0.05,"file":"/shots/a/export/houdini/surface.0042.bgeo.sc"}
 //      with --fields, and ...,"surfaceVoxels":90000,"velocityVoxels":180000,"fieldSeconds":0.01,"writeSeconds":0.05,"fields":"/shots/a/export/houdini/fields.0042.vdb"}
 //  {"event":"meshDone","frames":121,"meshed":121,"seconds":12.1}
-//  {"event":"info","build":"7dc95a4","architectures":"86","cudaRuntime":13040,"driver":13040,"gpus":[{"index":0,"name":"...","sm":86,"memoryMB":24135,"runs":true}],...}
+//  {"event":"info","build":"7dc95a4","architectures":"86","cudaRuntime":13040,"driver":13040,"gpus":[{"index":0,"name":"...","uuid":"GPU-7c2ab39e-...","pci":"0000:0A:00.0",
+//      "sm":86,"memoryMB":24135,"runs":true}],...}
 //  {"event":"error","message":"scene.json: domain: needs a positive \"voxelSize\""}
 //
 //Everything else the engine says goes to standard error. As with main, FLIP2_PARTITIONS splits the domain between partitions in this process, and
@@ -150,10 +151,18 @@ static int info(){
         cudaFree(landed);
         bool runs = tried == cudaSuccess && found == 1;
         running += runs;
-        char entry[512];
-        std::snprintf(entry, sizeof(entry), "%s{\"index\":%d,\"name\":%s,\"sm\":%d,\"memoryMB\":%zu,\"runs\":%s%s%s}", device ? "," : "", device, quoted(properties.name).c_str(),
-                      properties.major*10 + properties.minor, properties.totalGlobalMem >> 20, runs ? "true" : "false", runs ? "" : ",\"error\":",
-                      runs ? "" : quoted(cudaGetErrorString(tried)).c_str());
+        //its UUID as nvidia-smi writes it, which CUDA_VISIBLE_DEVICES takes too and which names the same GPU however the devices are numbered, and
+        //where it sits on the PCI bus
+        const unsigned char* id = (const unsigned char*)properties.uuid.bytes;
+        char uuid[48];
+        std::snprintf(uuid, sizeof(uuid), "GPU-%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x", id[0], id[1], id[2], id[3], id[4], id[5], id[6],
+                      id[7], id[8], id[9], id[10], id[11], id[12], id[13], id[14], id[15]);
+        char bus[32] = "";
+        cudaDeviceGetPCIBusId(bus, sizeof(bus), device);
+        char entry[768];
+        std::snprintf(entry, sizeof(entry), "%s{\"index\":%d,\"name\":%s,\"uuid\":\"%s\",\"pci\":%s,\"sm\":%d,\"memoryMB\":%zu,\"runs\":%s%s%s}", device ? "," : "", device,
+                      quoted(properties.name).c_str(), uuid, quoted(bus).c_str(), properties.major*10 + properties.minor, properties.totalGlobalMem >> 20,
+                      runs ? "true" : "false", runs ? "" : ",\"error\":", runs ? "" : quoted(cudaGetErrorString(tried)).c_str());
         gpus += entry;
     }
     bool openvdb = false;
@@ -1264,6 +1273,7 @@ int main(int argc, char** argv){
         TwoPhase twoPhase;
         twoPhase.on = true;
         twoPhase.densityRatio = (float)(scene.density / scene.airDensity);
+        twoPhase.soundSpeed = (float)scene.airSoundSpeed;
         twoPhase.airFlipRatio = (float)(scene.airFlipRatio < 0.0 ? scene.flipRatio : scene.airFlipRatio);
         twoPhase.band = scene.airBand;
         twoPhase.escapes = scene.airEscaped && twoPhase.densityRatio > 1.0f;   //with no difference in density there's no telling the liquid's weight on a face

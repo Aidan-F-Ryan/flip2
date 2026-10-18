@@ -17,10 +17,11 @@ collisions: with more names than that, the still ones go as one object, and if n
 VDBs in the Collisions input stay volumes: a level set that's still (with a velocity VDB beside it, if there is one: named after it with "vel" on the
 end, or "vel" or "v") or moved rigidly goes to flip2 as it is. One that changes shape over time flip2 can't take yet.
 
-Forces come from a SOP too, but one named on the Forces tab, as a subnet has only the four inputs: every vector VDB it holds is a force on the fluid
-wherever it has active voxels, and nothing elsewhere. Its vectors are accelerations, which push the fluid, or velocities, which the fluid inside it is
-drawn to at Drag a second: Volumes Are says which, or leaves it to each volume's name. flip2 takes them as they are at the start frame; it doesn't yet
-take ones that change over time.
+Forces are set on the Forces tab, 16 in all. Force Fields are made there: a point that pulls the fluid in or pushes it out, a vortex that swirls it
+around an axis, turbulence that stirs it, or wind that drags its surface along. Force Volumes come from a SOP too, but one named on the tab, as a
+subnet has only the four inputs: every vector VDB it holds is a force on the fluid wherever it has active voxels, and nothing elsewhere. Its vectors
+are accelerations, which push the fluid, or velocities, which the fluid inside it is drawn to at Drag a second: Volumes Are says which, or leaves it
+to each volume's name. flip2 takes both as they are at the start frame; it doesn't yet take forces that change over time.
 
 Everything goes in the output directory ($HIP/geo/<scene>.<node> by default, beside File Cache's caches): scene.json and geo/ (what the node writes), bake/ (flip2's cache, which a
 running bake commits frames to, and export/houdini/ beside it) and logs/. The bake's frame 0 is the start frame, and the node shows it there: its
@@ -36,6 +37,8 @@ to 4 are what Whitewater Source takes as its Liquid Simulation, Container and Co
 Bake On picks where flip2 runs: this machine, or another over ssh (a GPU box, for a Mac). A remote bake sends scene.json and geo/ to the remote
 directory, runs there detached (remote/job.sh), and is mirrored back every couple of seconds (remote/mirror.sh): its logs, its cache.json and its
 exported and meshed frames, so it shows here as a local one does. It needs ssh to reach the host without a password (a key), and rsync at both ends.
+Find GPUs asks that machine for its GPUs (flip2 info) and gives each a box to tick: the bake and its meshing see only the ticked ones, by their
+UUIDs in CUDA_VISIBLE_DEVICES. With every box ticked, or before Find GPUs, they see all of them.
 
 Particle separation and grid scale are Houdini's: flip2's voxels are twice the particle separation, the 2 x 2 x 2 particles per voxel Houdini's FLIP
 seeds at its default grid scale of 2.
@@ -75,6 +78,13 @@ FORCE_FILE = "force_volumes.vdb"
 LIMIT = 16      #the obstacles flip2 takes, and the meshes among its fluids, emitters and sinks
 SETTINGS = (("friction", "flip2_friction", float), ("hold", "flip2_hold", int), ("thickness", "flip2_thickness", float))  #a collision object's own, as primitive attributes
 FORCE_LIMIT = 16    #and the forces
+FIELD_TYPES = ("point", "vortex", "turbulence", "wind")     #the Forces tab's force fields, as the scene names them
+FIELD_SETTINGS = {  #each one's scene keys, and the parameters of a Force Fields instance they come from
+    "point": (("position", "fieldpos"), ("strength", "fieldstrength"), ("radius", "fieldradius"), ("falloff", "fieldfalloff")),
+    "vortex": (("position", "fieldpos"), ("axis", "fieldaxis"), ("strength", "fieldstrength"), ("radius", "fieldradius"), ("falloff", "fieldfalloff")),
+    "turbulence": (("strength", "fieldstrength"), ("scale", "fieldscale"), ("speed", "fieldspeed"), ("seed", "fieldseed")),
+    "wind": (("velocity", "fieldvel"), ("drag", "fielddrag"), ("depth", "fielddepth")),
+}
 SURFACE_DEFAULTS = {"influencescale": (3.0,), "radiusscale": (0.8,), "smoothing": (4,)}     #flip2 mesh's own
 OLD_SURFACE_DEFAULTS = {"influencescale": 2.0, "radiusscale": 0.6, "smoothing": 2}         #what they were, which left the surface dimpled
 _jobs = {}      #per node path, its bake's processes, while this session runs them
@@ -83,6 +93,65 @@ GEO_FILE = re.compile(r"^((%s)\d+_(triangles|vertices|f-?\d+)\.npy|(collision|fo
 
 def _callback(function):
     return dict(script_callback="__import__('flip2houdini').solver.%s(kwargs['node'])" % function, script_callback_language=hou.scriptLanguage.Python)
+
+
+def _hidden(template, condition):
+    """template, hidden when condition holds"""
+    template.setConditional(hou.parmCondType.HideWhen, condition)
+    return template
+
+
+def _force_fields_interface():
+    """the Forces tab's Force Fields: a block of settings per field, those that its Type doesn't use hidden"""
+    fields = hou.FolderParmTemplate("forcefields", "Force Fields", folder_type=hou.folderType.MultiparmBlock)
+    fields.setHelp("Forces on the fluid besides gravity, made here: each a point, a vortex, turbulence or wind. Up to 16, with the Force Volumes")
+    fields.addParmTemplate(hou.ToggleParmTemplate("fieldenable#", "Enable", default_value=True))
+    fields.addParmTemplate(hou.MenuParmTemplate("fieldtype#", "Type", FIELD_TYPES, ("Point", "Vortex", "Turbulence", "Wind"), default_value=0,
+                                                help="Point pulls the fluid towards a point, or pushes it away. Vortex swirls it around an axis. "
+                                                     "Turbulence stirs it with swirls of a size you set. Wind drags the liquid's surface along, as "
+                                                     "wind does water"))
+    fields.addParmTemplate(_hidden(hou.FloatParmTemplate("fieldpos#", "Position", 3, default_value=(0.0, 0.5, 0.0),
+                                                         help="Point: where it pulls towards. Vortex: a point on its axis"),
+                                   "{ fieldtype# == turbulence } { fieldtype# == wind }"))
+    fields.addParmTemplate(_hidden(hou.FloatParmTemplate("fieldaxis#", "Axis", 3, default_value=(0.0, 1.0, 0.0),
+                                                         help="The line through Position the fluid swirls around, by the right-hand rule: with your "
+                                                              "thumb along it, the fluid goes the way your fingers curl. Any length but 0"),
+                                   "{ fieldtype# != vortex }"))
+    fields.addParmTemplate(_hidden(hou.FloatParmTemplate("fieldstrength#", "Strength", 1, default_value=(2.0,), min=-20.0, max=20.0,
+                                                         help="Its acceleration in m/s2 (gravity's is 9.8), the same at any distance until Radius fades "
+                                                              "it. Point: towards Position, or away from it when negative. Vortex: around the axis, the "
+                                                              "other way round when negative. Turbulence: the swirls' typical acceleration"),
+                                   "{ fieldtype# == wind }"))
+    fields.addParmTemplate(_hidden(hou.FloatParmTemplate("fieldradius#", "Radius", 1, default_value=(0.0,), min=0.0, max=10.0,
+                                                         help="How far it reaches, from Position (Point) or from the axis (Vortex): it fades to nothing "
+                                                              "there. 0 for no fade, so it reaches everywhere"),
+                                   "{ fieldtype# == turbulence } { fieldtype# == wind }"))
+    fields.addParmTemplate(_hidden(hou.FloatParmTemplate("fieldfalloff#", "Falloff", 1, default_value=(1.0,), min=0.0, max=4.0,
+                                                         disable_when="{ fieldradius# == 0 }",
+                                                         help="How it fades out to Radius, as (1 - distance/radius)^falloff: 1 fades it evenly, more keeps "
+                                                              "it near the middle, 0 keeps it at full strength right up to Radius"),
+                                   "{ fieldtype# == turbulence } { fieldtype# == wind }"))
+    fields.addParmTemplate(_hidden(hou.FloatParmTemplate("fieldscale#", "Scale", 1, default_value=(0.1,), min=0.001, max=2.0,
+                                                         help="The size of its swirls, in metres"),
+                                   "{ fieldtype# != turbulence }"))
+    fields.addParmTemplate(_hidden(hou.FloatParmTemplate("fieldspeed#", "Speed", 1, default_value=(0.5,), min=0.0, max=5.0,
+                                                         help="How fast its pattern of swirls changes, in swirls a second: 0 holds it still"),
+                                   "{ fieldtype# != turbulence }"))
+    fields.addParmTemplate(_hidden(hou.IntParmTemplate("fieldseed#", "Seed", 1, default_value=(0,), min=0, max=100,
+                                                       help="Another pattern of swirls, of the same size and strength"),
+                                   "{ fieldtype# != turbulence }"))
+    fields.addParmTemplate(_hidden(hou.FloatParmTemplate("fieldvel#", "Velocity", 3, default_value=(2.0, 0.0, 0.0),
+                                                         help="The wind's velocity, in m/s, which the liquid's surface is drawn towards"),
+                                   "{ fieldtype# != wind }"))
+    fields.addParmTemplate(_hidden(hou.FloatParmTemplate("fielddrag#", "Drag", 1, default_value=(1.0,), min=0.0, max=10.0,
+                                                         help="How fast the surface takes up the wind's velocity, per second: at 1 it closes about two "
+                                                              "thirds of the gap in a second, at 10 most of it in a tenth of one"),
+                                   "{ fieldtype# != wind }"))
+    fields.addParmTemplate(_hidden(hou.FloatParmTemplate("fielddepth#", "Depth", 1, default_value=(2.0,), min=0.0, max=10.0,
+                                                         help="How far below the liquid's surface the wind reaches, in voxels (twice the Particle "
+                                                              "Separation each)"),
+                                   "{ fieldtype# != wind }"))
+    return fields
 
 
 def _interface(node):
@@ -156,10 +225,9 @@ def _interface(node):
                                             help="Voxels of air simulated around the liquid, in whole blocks of 4; past the band the pressure is the open "
                                                  "air's, and the air flows out and in there freely. Air shut in, as under a lid or a plate with holes, "
                                                  "isn't simulated from this node yet (that needs the air everywhere, which flip2 takes only with its "
-                                                 "analytic liquid shapes, not geometry). The bake time goes with the air's speed as much as the "
-                                                 "liquid's, and the air gets faster the finer the voxels: measured 23 m/s at 2.5 cm and 110-140 m/s at "
-                                                 "1 cm on dam breaks whose liquid peaks at 7-12 m/s, so a 1 cm two-phase bake can take 10 times a "
-                                                 "single-phase one, against 2 times at 2.5 cm"))
+                                                 "analytic liquid shapes, not geometry). The timestep follows the liquid: where the liquid lands, the "
+                                                 "air it squeezes out goes many times faster, and is let go a bounded distance a substep rather than "
+                                                 "shortening every substep to it"))
     air.addParmTemplate(hou.FloatParmTemplate("airdensity", "Air Density", 1, default_value=(1.2,), min=0.001, max=1000.0, disable_when=no_air,
                                               help="kg/m^3: 1.2 is air at room temperature. Heavier air drags more on spray and slows the bubbles' rise. "
                                                    "It can't be heavier than the liquid"))
@@ -222,9 +290,11 @@ def _interface(node):
     sources.addParmTemplate(hou.FloatParmTemplate("emitvel", "Emission Velocity", 3, default_value=(0.0, 0.0, 0.0)))
     group.append(sources)
     forces = hou.FolderParmTemplate("forces", "Forces", folder_type=hou.folderType.Tabs)
+    forces.addParmTemplate(_force_fields_interface())
     forces.addParmTemplate(hou.StringParmTemplate("forcesop", "Force Volumes", 1, default_value=("",), string_type=hou.stringParmType.NodeReference,
                                                   tags={"opfilter": "!!SOP!!", "oprelative": "."},
-                                                  help="A SOP whose vector VDBs act on the fluid, each a force of its own (up to 16), wherever it has "
+                                                  help="A SOP whose vector VDBs act on the fluid, each a force of its own (up to 16, with the Force "
+                                                       "Fields), wherever it has "
                                                        "active voxels and not elsewhere. They're taken as they are at the start frame: flip2 doesn't yet "
                                                        "take volumes that change over time. Anything else the SOP holds is left out"))
     forces.addParmTemplate(hou.MenuParmTemplate("forcemode", "Volumes Are", ("name", "force", "velocity"),
@@ -310,9 +380,12 @@ def _interface(node):
                                                 help="The machine to bake on, as ssh knows it (a host, user@host, or a Host in ~/.ssh/config)"))
     bake.addParmTemplate(hou.StringParmTemplate("remotedir", "Remote Directory", 1, default_value=("~/flip2-bakes",), disable_when="{ bakeon == 0 }",
                                                 help="Where the remote machine keeps bakes: each node's goes in its own folder there"))
-    bake.addParmTemplate(hou.IntParmTemplate("gpus", "GPUs", 1, default_value=(0,), min=0, help="How many GPUs to use; 0 for all of them"))
+    for template in _gpus_interface(node):
+        bake.addParmTemplate(template)
     bake.addParmTemplate(hou.IntParmTemplate("partitions", "Partitions", 1, default_value=(1,), min=1,
-                                             help="How many pieces to split the domain into, across the GPUs"))
+                                             help="How many pieces to split the domain into, spread over the GPUs. The results are the same however "
+                                                  "many, but a GPU with no piece sits idle, so a bake raises it to at least one per GPU ticked "
+                                                  "above; more pieces than GPUs share them"))
     bake.addParmTemplate(hou.IntParmTemplate("checkpoints", "Checkpoint Every", 1, default_value=(10,), min=0,
                                              help="Frames between checkpoints, which a cancelled bake resumes from; 0 for one only on cancel and at the end"))
     bake.addParmTemplate(hou.MenuParmTemplate("compression", "Compression", ("zstd", "lz4", "none"), ("Zstd", "LZ4", "None"), default_value=0,
@@ -660,6 +733,33 @@ def _velocities(name, mode):
     return name == "v" or name.startswith("vel") or name.endswith("vel")
 
 
+def _force_fields(node, frame):
+    """the Forces tab's force fields as they are at frame: the scene's forces for them, and what to say of them (None with none on)"""
+    if node.parm("forcefields") is None:    #a node from before Force Fields has none
+        return [], None
+    forces, animated = [], False
+    for instance in range(1, node.evalParm("forcefields") + 1):
+        if not node.parm("fieldenable%d" % instance).evalAtFrame(frame):
+            continue
+        kind = FIELD_TYPES[node.parm("fieldtype%d" % instance).evalAtFrame(frame)]
+        force = {"type": kind}
+        for key, name in FIELD_SETTINGS[kind]:
+            parms = node.parmTuple("%s%d" % (name, instance))
+            values = parms.evalAtFrame(frame)
+            force[key] = list(values) if len(values) == 3 else values[0]
+            animated = animated or any(parm.isTimeDependent() for parm in parms)
+        if kind == "vortex" and not any(force["axis"]):
+            raise hou.NodeError("Forces: force field %d is a vortex with an Axis of 0, which has no direction to swirl around" % instance)
+        forces.append(force)
+    if not forces:
+        return [], None
+    kinds = [force["type"] for force in forces]
+    said = "force fields: " + ", ".join("%d %s" % (kinds.count(kind), kind) for kind in FIELD_TYPES if kind in kinds)
+    if animated:
+        said += " (animated: taken as they are at frame %d)" % frame
+    return forces, said
+
+
 def _force_volumes(node, frame, geo_dir):
     """the Forces tab's volumes as they are at frame: the scene's forces for them, their VDBs written into geo_dir in one file, each named, and what to
     say of them (None with no Force Volumes)"""
@@ -719,6 +819,7 @@ def write_scene(node):
     frames = list(range(start, end + 1))
     fps = hou.fps()
     directory = _output_directory(node)
+    _, ticked = _chosen_gpus(node)
     geo_dir = os.path.join(directory, "geo")
     os.makedirs(geo_dir, exist_ok=True)
     for name in os.listdir(geo_dir):    #what an earlier scene wrote, and nothing else
@@ -739,7 +840,7 @@ def write_scene(node):
                    for key, name, default in (("density", "density", 1000.0), ("viscosity", "viscosity", 0.0), ("surfaceTension", "surfacetension", 0.0),
                                               ("contactAngle", "contactangle", 60.0))},
         "fluids": [], "emitters": [], "sinks": [], "obstacles": [],
-        "partitions": node.evalParm("partitions"), "devices": node.evalParm("gpus"),
+        "partitions": node.evalParm("partitions"), "devices": node.evalParm("gpus") if node.parm("gpus") is not None else 0,    #the ticked GPUs are all it sees
         "output": {"dir": "bake", "compression": ("zstd", "lz4", "none")[node.evalParm("compression")],
                    "attributes": [name for name in ("id", "age") if node.parm("write" + name) is None or node.evalParm("write" + name)],
                    "checkpoints": {"every": node.evalParm("checkpoints"), "keep": 2}},
@@ -813,10 +914,17 @@ def write_scene(node):
             entry["keyframes"] = [{"time": (frame - frames[0]) / fps, "transform": transform} for frame, transform in zip(frames, volume["transforms"])]
         scene["obstacles"].append(entry)
     forces, said = _force_volumes(node, frames[0], geo_dir)
-    if forces:
-        scene["forces"] = forces
-    if said:
-        made.append(said)
+    fields, fields_said = _force_fields(node, frames[0])
+    if len(forces) + len(fields) > FORCE_LIMIT:
+        raise hou.NodeError("flip2 takes up to %d forces; the Forces tab has %d force fields on and %d force volumes" % (FORCE_LIMIT, len(fields), len(forces)))
+    if forces or fields:
+        scene["forces"] = forces + fields
+    for told in (fields_said, said):
+        if told:
+            made.append(told)
+    if ticked is not None and scene["partitions"] < ticked:    #a GPU with no piece of the domain would sit idle
+        scene["partitions"] = ticked
+        made.append("partitions: %d, one per GPU ticked" % ticked)
     if node.parm("phases") is not None and node.evalParm("phases") == 1:   #the air, with the Air tab's settings where they aren't the engine's defaults
         air = {"density": node.evalParm("airdensity"), "band": node.evalParm("airband")}
         if not node.evalParm("airescaped"):
@@ -879,6 +987,110 @@ def _program(node):
     return program
 
 
+def _where(node):
+    """the machine that bakes, as the GPUs Find GPUs found there are filed under: this one, or the remote host"""
+    return "remote:" + node.evalParm("remotehost").strip() if node.evalParm("bakeon") == 1 else "local"
+
+
+def _gpu_cache(node):
+    """what Find GPUs found last, {"where": the machine it asked (_where), "gpus": [flip2 info's, for each GPU]}, or None if it hasn't been pressed"""
+    try:
+        found = json.loads(node.userData("flip2_gpus") or "null")
+    except ValueError:
+        return None
+    return found if isinstance(found, dict) and isinstance(found.get("gpus"), list) else None
+
+
+def _machine(where):
+    return "this machine" if where == "local" else where[len("remote:"):] or "the remote host"
+
+
+def _gpus_interface(node):
+    """the Bake tab's GPUs: Find GPUs, a line on what it found where, and a box to tick for each GPU there that flip2 runs on, labelled with its number,
+    name and memory (and its PCI slot, when two have the same name)"""
+    found = _gpu_cache(node)
+    gpus = [gpu for gpu in found["gpus"] if gpu.get("runs", True)] if found else []
+    if found is None:
+        note = "Find GPUs to choose which of the baking machine's GPUs flip2 uses; until then it uses all of them"
+    elif not gpus:
+        note = "Found no GPU that flip2 runs on, on %s" % _machine(found["where"])
+    else:
+        note = "On %s: flip2 bakes on the GPUs ticked here" % _machine(found["where"])
+    templates = [hou.ButtonParmTemplate("findgpus", "Find GPUs", join_with_next=True, **_callback("find_gpus"),
+                                        help="Ask the machine that bakes (this one, or the Remote Host) which GPUs it has, and list them here to tick"),
+                 hou.LabelParmTemplate("gpusfound", "GPUs", column_labels=(note,), is_label_hidden=True)]
+    names = [gpu["name"] for gpu in gpus]
+    for gpu in gpus:
+        label = "GPU %d: %s, %d GB" % (gpu["index"], gpu["name"], round(gpu["memoryMB"] / 1024))
+        if names.count(gpu["name"]) > 1 and gpu.get("pci"):
+            label += " (PCI %s)" % gpu["pci"]
+        templates.append(hou.ToggleParmTemplate("gpu%d" % gpu["index"], label, default_value=True,
+                                                help="Whether flip2 bakes on this GPU. Ticking more than one splits the domain between them (Partitions)"))
+    return templates
+
+
+def find_gpus(node):
+    """asks the machine that bakes which GPUs it has (flip2 info), keeps the answer on the node, and lists them on the Bake tab to tick: as they were
+    ticked if it asked the same machine before, otherwise all ticked. Returns them"""
+    if node.evalParm("bakeon") == 1:
+        host, _, program = _remote(node)
+        command = ["ssh"] + SSH_OPTIONS + [host, 'program=%s; "${program/#\\~/$HOME}" info' % shlex.quote(program)]
+        machine = host
+    else:
+        command = [_program(node), "info"]
+        machine = "this machine"
+    try:    #flip2 info ends in failure when no GPU runs its kernels, and still says what it found
+        result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise hou.NodeError("Find GPUs: couldn't run flip2 on %s: %s" % (machine, error))
+    info = next((json.loads(line) for line in result.stdout.splitlines() if line.startswith("{") and '"event":"info"' in line), None)
+    if info is None:
+        raise hou.NodeError("Find GPUs: flip2 info on %s said nothing about GPUs: %s" % (machine, (result.stderr or result.stdout).strip() or
+                                                                                         "exit status %d" % result.returncode))
+    gpus = [{key: gpu[key] for key in ("index", "name", "uuid", "pci", "memoryMB", "runs") if key in gpu} for gpu in info.get("gpus", [])]
+    earlier = _gpu_cache(node)
+    where = _where(node)
+    node.setUserData("flip2_gpus", json.dumps({"where": where, "gpus": gpus}))
+
+    def relist():   #the boxes for what was found; another machine's GPUs all start ticked, rather than as the boxes of the same numbers were
+        _interface(node)
+        if earlier is None or earlier["where"] != where:
+            for gpu in gpus:
+                box = node.parm("gpu%d" % gpu["index"])
+                if box is not None:
+                    box.set(True)
+    if hou.isUIAvailable():     #after this button's callback returns, as relisting replaces the parameters, the button among them
+        import hdefereval
+        hdefereval.executeDeferred(relist)
+        if not any(gpu.get("runs", True) for gpu in gpus):
+            hou.ui.displayMessage("%s has no GPU this flip2 runs on%s" % (machine, ":\n" + "\n".join("%d: %s" % (gpu["index"], gpu["name"]) for gpu in gpus)
+                                                                          if gpus else ""), title="flip2: Find GPUs")
+    else:
+        relist()
+    return gpus
+
+
+def _chosen_gpus(node):
+    """the GPUs ticked on the Bake tab: their UUIDs, as CUDA_VISIBLE_DEVICES takes them (their numbers if Find GPUs asked an older flip2), or None
+    for every GPU there is, and how many GPUs the bake will have, or None if that isn't known. With every box ticked, or before Find GPUs, that's all
+    of them"""
+    found = _gpu_cache(node)
+    boxes = [(gpu, node.parm("gpu%d" % gpu["index"])) for gpu in (found["gpus"] if found else ()) if gpu.get("runs", True)]
+    boxes = [(gpu, box) for gpu, box in boxes if box is not None]
+    if not boxes:
+        return None, None
+    ticked = [gpu for gpu, box in boxes if box.eval()]
+    here = found["where"] == _where(node)
+    if len(ticked) == len(boxes):   #no need to name them, and one added to the machine since is used as well
+        return None, len(boxes) if here else None
+    if not here:
+        raise hou.NodeError("GPUs: the boxes ticked are %s's GPUs, and this bakes on %s: press Find GPUs to list its own" % (
+            _machine(found["where"]), _machine(_where(node))))
+    if not ticked:
+        raise hou.NodeError("GPUs: no GPU is ticked; tick at least one")
+    return [gpu.get("uuid") or str(gpu["index"]) for gpu in ticked], len(ticked)
+
+
 REMOTE_DIRECTORY = re.compile(r"^[A-Za-z0-9_./~-]+$")
 JOB_FOLDER = re.compile(r"^[A-Za-z0-9_.-]+-[0-9a-f]{8}$")     #<node>-<hash of its output directory>: the only folders delete_remote deletes
 SSH_OPTIONS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ControlMaster=auto", "-o", "ControlPath=~/.ssh/flip2-%r@%h:%p",
@@ -911,9 +1123,10 @@ def _rsync(arguments):
         raise RuntimeError("rsync: %s" % (result.stderr.strip() or "exit status %d" % result.returncode))
 
 
-def _launch_remote(job, host, directory, program, arguments, upload, local, logs):
-    """on a thread: checks there's a flip2 on host, sends the scene if upload, starts the bake there detached (remote/job.sh), and the mirror bringing
-    it back here (remote/mirror.sh). Says how far it's got in job["state"], and why it stopped in job["failure"]"""
+def _launch_remote(job, host, directory, program, arguments, upload, local, logs, visible=None):
+    """on a thread: checks there's a flip2 on host, sends the scene if upload, starts the bake there detached (remote/job.sh), seeing only the GPUs
+    visible names (CUDA_VISIBLE_DEVICES; None for all), and the mirror bringing it back here (remote/mirror.sh). Says how far it's got in job["state"],
+    and why it stopped in job["failure"]"""
     scripts = os.path.join(os.path.dirname(os.path.abspath(__file__)), "remote")
     try:
         job["state"] = "connecting to %s" % host
@@ -935,7 +1148,8 @@ def _launch_remote(job, host, directory, program, arguments, upload, local, logs
         job["state"] = "starting on %s" % host
         #in a subshell: a command line ending in a bare & keeps the ssh session open until the job ends (seen with OpenSSH 10.3 on the Mac), and the node
         #would wait on it until _ssh's timeout and call the bake failed while it ran on; a subshell's background job lets the session close at once
-        _ssh(host, "cd %s && (nohup bash job.sh %s > /dev/null 2>&1 < /dev/null &)" % (directory, " ".join(shlex.quote(word) for word in [program] + arguments)))
+        _ssh(host, "cd %s && (%snohup bash job.sh %s > /dev/null 2>&1 < /dev/null &)" % (directory, "CUDA_VISIBLE_DEVICES=%s " % shlex.quote(visible) if visible else "",
+                                                                                        " ".join(shlex.quote(word) for word in [program] + arguments)))
         environment = dict(os.environ, FLIP2_RSH=" ".join(["ssh"] + SSH_OPTIONS))
         #a bake from the start replaces the frames here; one resumed or meshed again only adds to them, as its remote copy may have been deleted since
         mirror = ["bash", os.path.join(scripts, "mirror.sh"), host, directory, local] + (["replace"] if upload else [])
@@ -975,6 +1189,9 @@ def _start(node, kind, upload=True):
     if node.path() in _jobs:
         raise hou.NodeError("a bake is running already")
     meshing = _mesh_options(node) if kind == "mesh" or node.evalParm("meshsurface") or node.evalParm("outputfields") else None
+    chosen, _ = _chosen_gpus(node)  #the GPUs its processes may use, and see alone
+    visible = ",".join(chosen) if chosen else None
+    environment = dict(os.environ, CUDA_VISIBLE_DEVICES=visible) if visible else None
     local = _output_directory(node)
     logs = os.path.join(local, "logs")
     os.makedirs(logs, exist_ok=True)
@@ -986,8 +1203,9 @@ def _start(node, kind, upload=True):
     job = {"process": None, "export": None, "mesh": None, "events": os.path.join(logs, name + ".events.jsonl"), "log": os.path.join(logs, name + ".log"),
            "kind": kind, "meshing": meshing, "exporting": exporting, "state": "starting", "failure": None, "said": None, "shown": {}}
     with open(os.path.join(logs, kind + ".options.txt"), "w") as asked:    #what this job was asked for, as the node read its parameters when it started
-        asked.write("%s %s\nbake on: %s\nexport: %s\nmesh: %s\n" % (kind, time.strftime("%Y-%m-%d %H:%M:%S"), ("this machine", "remote")[node.evalParm("bakeon")],
-                                                                    " ".join(exporting), " ".join(meshing) if meshing is not None else "none (Mesh the Surface and Output Fluid Fields off)"))
+        asked.write("%s %s\nbake on: %s\ngpus: %s\nexport: %s\nmesh: %s\n" % (kind, time.strftime("%Y-%m-%d %H:%M:%S"), ("this machine", "remote")[node.evalParm("bakeon")],
+                                                                              visible or "all", " ".join(exporting),
+                                                                              " ".join(meshing) if meshing is not None else "none (Mesh the Surface and Output Fluid Fields off)"))
     if node.evalParm("bakeon") == 1:
         host, directory, program = _remote(node)
         job["remote"] = (host, directory)
@@ -995,14 +1213,14 @@ def _start(node, kind, upload=True):
         arguments = ["--export", " ".join(exporting)] + arguments
         if meshing is not None:
             arguments = ["--mesh", " ".join(meshing)] + arguments
-        threading.Thread(target=_launch_remote, args=(job, host, directory, program, arguments, upload, local, logs), daemon=True).start()
+        threading.Thread(target=_launch_remote, args=(job, host, directory, program, arguments, upload, local, logs, visible), daemon=True).start()
     else:
         program = _program(node)
         bake = os.path.join(local, "bake")
         job["program"] = program
         if kind == "mesh":
             job["process"] = subprocess.Popen([program, "mesh", bake, "--overwrite"] + meshing, stdout=open(job["events"], "w"),
-                                              stderr=open(job["log"], "w"), cwd=local)
+                                              stderr=open(job["log"], "w"), cwd=local, env=environment)
         else:
             if kind == "bake":      #from the start: an earlier bake's cache and what was made of it go first, or the exporter and mesher following this
                 for part in ("frames", "frames.discarded", "checkpoints", "export"):    #one would take them for its own, and stop
@@ -1010,12 +1228,12 @@ def _start(node, kind, upload=True):
                 if os.path.exists(os.path.join(bake, "cache.json")):
                     os.remove(os.path.join(bake, "cache.json"))
             arguments = {"bake": ["bake", os.path.join(local, "scene.json"), "--out", bake, "--overwrite"], "resume": ["resume", bake]}[kind]
-            job["process"] = subprocess.Popen([program] + arguments, stdout=open(job["events"], "w"), stderr=open(job["log"], "w"), cwd=local)
+            job["process"] = subprocess.Popen([program] + arguments, stdout=open(job["events"], "w"), stderr=open(job["log"], "w"), cwd=local, env=environment)
             job["export"] = subprocess.Popen([program, "export", bake, "--follow"] + exporting, stdout=open(os.path.join(logs, "export.events.jsonl"), "w"),
-                                             stderr=open(os.path.join(logs, "export.log"), "w"), cwd=local)
+                                             stderr=open(os.path.join(logs, "export.log"), "w"), cwd=local, env=environment)
             if meshing is not None:
                 job["mesh"] = subprocess.Popen([program, "mesh", bake, "--follow"] + meshing, stdout=open(os.path.join(logs, "mesh.events.jsonl"), "w"),
-                                               stderr=open(os.path.join(logs, "mesh.log"), "w"), cwd=local)
+                                               stderr=open(os.path.join(logs, "mesh.log"), "w"), cwd=local, env=environment)
         job["state"] = "meshing" if kind == "mesh" else "baking"
     _jobs[node.path()] = job
     node.parm("status").set("meshing" if kind == "mesh" else "baking")

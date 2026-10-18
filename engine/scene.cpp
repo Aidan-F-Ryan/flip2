@@ -423,11 +423,12 @@ Scene loadScene(const std::string& path){
         scene.wallContactAngle[face] = wallAngles[face] < 0.0 ? scene.contactAngle : wallAngles[face];
     }
     if(const Json* air = read.object(root, "air", "the scene")){     //a second, lighter fluid simulated with the liquid (experimental)
-        read.checkKeys(*air, "air", {"density", "flipRatio", "band", "escaped", "dropletRadius", "viscosity", "bubbleRadius", "liquidViscosity", "surfaceTension"});
+        read.checkKeys(*air, "air", {"density", "flipRatio", "band", "escaped", "dropletRadius", "viscosity", "bubbleRadius", "liquidViscosity", "surfaceTension", "soundSpeed"});
         scene.air = true;
         scene.airDensity = read.number(*air, "density", "air", scene.airDensity);
         scene.airFlipRatio = read.number(*air, "flipRatio", "air", scene.airFlipRatio);
         scene.airBand = (int)read.number(*air, "band", "air", scene.airBand);
+        scene.airSoundSpeed = read.number(*air, "soundSpeed", "air", scene.airSoundSpeed);
         scene.airEscaped = read.flag(*air, "escaped", "air", scene.airEscaped);
         scene.airDropletRadius = read.number(*air, "dropletRadius", "air", scene.airDropletRadius);
         scene.airViscosity = read.number(*air, "viscosity", "air", scene.airViscosity);
@@ -441,8 +442,8 @@ Scene loadScene(const std::string& path){
         if((scene.viscosity > 0.0 && scene.airLiquidViscosity != scene.viscosity) || (scene.surfaceTension > 0.0 && scene.airSurfaceTension != scene.surfaceTension)){
             read.fail("air", "liquidViscosity and surfaceTension are the liquid's own where \"liquid\" gives it a viscosity or a surfaceTension: leave them out");
         }
-        if(scene.airDensity <= 0.0 || scene.airDensity > scene.density || scene.airFlipRatio > 1.0 || scene.airBand < 0){
-            read.fail("air", "density has to be positive and no more than the liquid's, flipRatio at most 1, and band at least 0");
+        if(scene.airDensity <= 0.0 || scene.airDensity > scene.density || scene.airFlipRatio > 1.0 || scene.airBand < 0 || scene.airSoundSpeed < 0.0){
+            read.fail("air", "density has to be positive and no more than the liquid's, flipRatio at most 1, and band and soundSpeed at least 0");
         }
     }
     if(const Json* whitewater = read.object(root, "whitewater", "the scene")){   //spray, foam and bubbles (whitewater.hu)
