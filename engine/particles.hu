@@ -332,6 +332,7 @@ private:
     void pushOutParticles();
     void markParticlesInsideObstacles();
     void markObstacleSolids();
+    void findOccupiedVoxels();      //which stored voxels a particle sits in, the ghosts' from their owners (for markObstacleSolids)
     void addObstacleFlux();
     void weighCutCells(float scale);
     //of these face velocities: the new ones, or FLIP's old; with dynamic bodies, frictionShare of what their friction gives the particles is counted
@@ -548,6 +549,7 @@ private:
     ObstacleSet sourceMeshes;   //the meshes of the emitters, sinks and fluids
     FluidShapes fluids;         //the fluid to start with (setSourceMeshes)
     CudaVec<char> obstacleSolids;   //per stored voxel: whether obstacles close every face of it
+    CudaVec<char> occupiedVoxels;   //per stored voxel, while markObstacleSolids runs: whether a particle sits in it
     CudaVec<char> obstacleNear;     //per stored voxel: whether a surface passes close enough to cut its faces, so the other passes can skip the rest, and which
                                     //of its faces are closed (bits, obstacles.cu)
     CudaVec<uint> obstacleOpen;     //per stored voxel near a surface: its six faces' open fractions and how much of it is covered this substep, in 16-bit

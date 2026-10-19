@@ -337,6 +337,26 @@ __global__ void markReachedVoxels(uint numParticleNodes, uint numParticles, uint
     }
 }
 
+//which voxels hold a particle, a block per node holding particles: each particle's own voxel, in its node's interior (markObstacleSolids). One that
+//rounding puts just past the interior, on its boundary, counts in the voxel at the edge
+__global__ void findOccupiedVoxels(uint numParticleNodes, uint numParticles, uint numVoxels1D, const uint* gridNodeIndicesToFirstParticleIndex, const uint* gridPosition, const double* px, const double* py,
+                                   const double* pz, const uint* interiorVoxels, char* occupied, double radius, Grid grid, uint refinementLevel){
+    int apronCells = floor(radius);
+    int interiorWidth = numVoxels1D - 2*apronCells;
+    uint firstParticle = gridNodeIndicesToFirstParticleIndex[blockIdx.x];
+    uint lastParticle = blockIdx.x == numParticleNodes - 1 ? numParticles : gridNodeIndicesToFirstParticleIndex[blockIdx.x + 1];
+    for(uint index = firstParticle + threadIdx.x; index < lastParticle; index += blockDim.x){
+        float3 pos = positionInNodeBlock(index, gridPosition, px, py, pz, grid, refinementLevel, apronCells);
+        int x = min(max((int)floorf(pos.x) - apronCells, 0), interiorWidth - 1);
+        int y = min(max((int)floorf(pos.y) - apronCells, 0), interiorWidth - 1);
+        int z = min(max((int)floorf(pos.z) - apronCells, 0), interiorWidth - 1);
+        uint voxel = interiorVoxels[(size_t)blockIdx.x*interiorWidth*interiorWidth*interiorWidth + x + (y + z*interiorWidth)*interiorWidth];
+        if(voxel != NO_VOXEL){
+            occupied[voxel] = 1;
+        }
+    }
+}
+
 //marking pass 2, per node: its fluid is every interior voxel any particle reaches, its own or a neighbour's, so the node owning a voxel solves for it
 //wherever the particles reaching it live. It stores its fluid, the voxels above each fluid voxel in x, y and z (which hold its upper faces), the voxels
 //its own particles reach (to find their owners) and, if it has particles, its block's wall voxels. Write the stored mask, then the fluid mask, and count the stored voxels.
@@ -807,6 +827,18 @@ void Particles::orderNodes(uint maskWords){
     gpuErrchk(cudaPeekAtLastError());
 }
 
+//which stored voxels hold a particle (::findOccupiedVoxels), the ghosts' from their owners, which have their particles
+void Particles::findOccupiedVoxels(){
+    occupiedVoxels.resizeAsync(voxelIDsUsed.size(), stream);
+    occupiedVoxels.zeroDeviceAsync(stream);
+    if(numParticleNodes > 0 && occupiedVoxels.size() > 0){
+        ::findOccupiedVoxels<<<numParticleNodes, NODE_THREADS, 0, stream>>>(numParticleNodes, size, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(),
+            pz.devPtr(), nodeInteriorVoxels.devPtr(), occupiedVoxels.devPtr(), radius, grid, refinementLevel);
+        gpuErrchk(cudaPeekAtLastError());
+    }
+    context->fillGhosts(occupiedVoxels.devPtr(), stream);
+}
+
 //each ghost node's voxels here and in its owner, for filling and reducing; and the check that both partitions built it alike
 //A partition's ghost runs have to be its neighbours' edge runs, node for node and voxel for voxel. Both sides build them from the same particles, so they
 //always should be; if they ever differ, filling ghosts would mix up voxels, so stop
@@ -957,8 +989,8 @@ void Particles::generateVoxels(){
             grid, refinementLevel);
     }
     gpuErrchk(cudaPeekAtLastError());
+    checkGhostRuns();       //before anything fills the ghosts
     markObstacleSolids();   //the voxels inside obstacles stop being unknowns, and their neighbours see walls
-    checkGhostRuns();
 
     if(numRanks == 1){
         std::cout<<"Nodes: "<<numParticleNodes<<" with particles, "<<numUsedGridNodes<<" in all, holding "<<numUsedVoxels<<" voxels\n";

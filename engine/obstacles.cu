@@ -1621,13 +1621,23 @@ __device__ inline float obstacleDivergence(const ObstacleState& obstacle, float3
 //fluid, through the open part of its faces. One the fluid hasn't, once its centre is inside one, as every voxel was before cut cells: an empty sliver
 //left as air, behind a moving obstacle, would hold p = 0 deep in the fluid, and the solve, weighing its faces only as much as they're open, would let
 //their velocities run away (the hydrostatic head across a face 1% open drives it at metres a second), and advection would carry particles through them
-//many voxels a substep. The domain's walls stay the domain's
-__global__ void findSolidVoxels(Obstacles obstacles, VoxelPlaces places, const char* walls, const char* solveCodes, const uint* voxelOwners, char* solid, char* near, uint* opens,
-                                uint* centroids, uint* nodes){
+//many voxels a substep. The domain's walls stay the domain's.
+//The fluid has reached a voxel that's an unknown with a particle in it or in a voxel sharing a face or an edge with it (findOccupiedVoxels). The
+//unknowns alone won't do: they're every voxel a particle's stencils reach, which is a voxel further toward +x, +y and +z than back (a voxel stores its
+//lower faces), so inside obstacles there was a layer more of them on the faces toward -x, -y and -z, and a ball resting on the floor crept toward +x
+//and +z. Every particle's stencils reach its own voxel and the ones sharing a face or an edge with it, however it sits in its voxel, and which voxels
+//hold particles doesn't depend on which way round the fluid is
+__global__ void findSolidVoxels(Obstacles obstacles, VoxelPlaces places, uint numUsedGridNodes, const uint* cellToNode, const uint* interiorVoxels, const char* occupied, const char* walls,
+                                const char* solveCodes, const uint* voxelOwners, char* solid, char* near, uint* opens, uint* centroids, uint* nodes){
+    __shared__ uint tileNodes[27];
     uint node = blockIdx.x;
     uint first = node == 0 ? 0 : places.nodeVoxelEnds[node - 1];
     uint last = places.nodeVoxelEnds[node];
     uint cell = places.nodeCells[node];
+    loadTileNodes(tileNodes, cell, numUsedGridNodes, places.nodeCells, cellToNode, places.grid);
+    __syncthreads();
+    Tile tile(cell, places.grid, places.interiorWidth, places.apronCells + 1);   //the node's block and a voxel more round it
+    int voxels1D = places.interiorWidth + 2*places.apronCells;
     bool touches = false;   //whether this node's block has anything for the obstacle passes: a voxel within 1.5 voxels of a surface, or in one
     for(uint index = first + threadIdx.x; index < last; index += blockDim.x){
         uint centres[3];
@@ -1651,6 +1661,20 @@ __global__ void findSolidVoxels(Obstacles obstacles, VoxelPlaces places, const c
             }
         }
         bool empty = !solveCodes[voxelOwners[index]];    //no fluid reached it: it's no unknown, and the solve would take it for air
+        if(!empty && !closed && cut.centre < 0.0f){
+            int slot = places.voxelSlots[index];
+            int3 t = make_int3(slot % voxels1D + 1, slot / voxels1D % voxels1D + 1, slot / (voxels1D*voxels1D) + 1);
+            empty = true;
+            for(int beside = 0; beside < 27 && empty; ++beside){
+                int3 step = make_int3(beside % 3 - 1, beside / 3 % 3 - 1, beside / 9 - 1);
+                int3 there = make_int3(t.x + step.x, t.y + step.y, t.z + step.z);
+                if((step.x != 0 && step.y != 0 && step.z != 0) || !tile.inDomain(there)){
+                    continue;   //a corner: the stencils of a particle there needn't reach it
+                }
+                uint voxel = tile.voxel(there, tileNodes, numUsedGridNodes, interiorVoxels);
+                empty = voxel == NO_VOXEL || !occupied[voxel];
+            }
+        }
         solid[index] = !walls[index] && (closed || (empty && cut.centre < 0.0f));
         near[index] = (char)(bits | (cut.letsGo ? LETS_GO : 0));
         touches = touches || cut.centre < 1.5f*places.voxelSize();
@@ -1806,11 +1830,17 @@ void Particles::markObstacleSolids(){
     obstacleCentroids.resizeAsync(3*numVoxels, stream);
     obstacleNodes.resizeAsync(numStoredNodes + 1, stream);
     gpuErrchk(cudaMemsetAsync(obstacleNodes.devPtr(), 0, sizeof(uint), stream));    //the list starts empty
+    findOccupiedVoxels();   //every partition, voxels or none: they fill their ghosts together
+    if(numVoxels > 0){
+        findSolidVoxels<<<numStoredNodes, OBSTACLE_THREADS, 0, stream>>>(obstacles.state(), voxelPlaces(), numUsedGridNodes, cellToNode.devPtr(), nodeInteriorVoxels.devPtr(),
+            occupiedVoxels.devPtr(), solids.devPtr(), solveCodes.devPtr(), voxelOwners.devPtr(), obstacleSolids.devPtr(), obstacleNear.devPtr(), obstacleOpen.devPtr(),
+            obstacleCentroids.devPtr(), obstacleNodes.devPtr());
+    }
+    occupiedVoxels.clearAsync(stream);
+    context->fillGhosts(obstacleSolids.devPtr(), stream);   //the voxels beside a ghost can be past the ones stored here, where its owner sees particles this partition can't
     if(numVoxels == 0){
         return;
     }
-    findSolidVoxels<<<numStoredNodes, OBSTACLE_THREADS, 0, stream>>>(obstacles.state(), voxelPlaces(), solids.devPtr(), solveCodes.devPtr(), voxelOwners.devPtr(), obstacleSolids.devPtr(),
-        obstacleNear.devPtr(), obstacleOpen.devPtr(), obstacleCentroids.devPtr(), obstacleNodes.devPtr());
     wallOffSolidNeighbors<<<obstacleBlocks(), OBSTACLE_THREADS, 0, stream>>>(obstacles.state(), voxelPlaces(), obstacleNodes.devPtr(), obstacleSolids.devPtr(), obstacleNear.devPtr(), obstacleOpen.devPtr(),
         obstacleCentroids.devPtr(), solveCodes.devPtr(), neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(), neighborPy.devPtr(), neighborNz.devPtr(), neighborPz.devPtr());
     retireSolidVoxels<<<numVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numVoxels, obstacleSolids.devPtr(), solveCodes.devPtr(), neighborNx.devPtr(), neighborPx.devPtr(),
