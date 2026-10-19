@@ -405,8 +405,8 @@ Scene loadScene(const std::string& path){
         if(scene.dotProducts != "exact" && scene.dotProducts != "blocks"){
             read.fail("solver.dotProducts", "is exact or blocks");
         }
-        if(scene.freeSurface != "footprint" && scene.freeSurface != "sharp"){
-            read.fail("solver.freeSurface", "is footprint or sharp");
+        if(!scene.freeSurface.empty() && scene.freeSurface != "levelSet" && scene.freeSurface != "voxel"){
+            read.fail("solver.freeSurface", "is levelSet or voxel");
         }
         if(scene.cfl <= 0.0 || scene.flipRatio < 0.0 || scene.flipRatio > 1.0 || scene.densityCorrectionTime < 0.0 || !(scene.viscousCfl >= 0.0)){
             read.fail("solver", "cfl has to be positive, flipRatio between 0 and 1, and densityCorrectionTime and viscousCfl at least 0");
@@ -709,8 +709,11 @@ Scene loadScene(const std::string& path){
     if(airFluids && !scene.air){
         read.fail("fluids", "\"phase\": \"air\" needs an \"air\" block");
     }
-    if(scene.air && scene.freeSurface == "sharp"){     //its pressure is 0 on the liquid's surface, and with air that's solved for
-        read.fail("air", "doesn't go with the sharp free surface yet");
+    if(scene.freeSurface.empty()){
+        scene.freeSurface = scene.air ? "voxel" : "levelSet";
+    }
+    if(scene.air && scene.freeSurface == "levelSet"){       //its pressure is 0 on the liquid's surface, and with air that's solved for
+        read.fail("air", "doesn't go with the levelSet free surface yet: with air, the surface is where the two fluids meet, and voxel is used");
     }
     if(scene.emitters.size() > 16 || scene.sinks.size() > 16){
         read.fail("the scene", "can have up to 16 emitters and 16 sinks");
@@ -804,16 +807,12 @@ Scene loadScene(const std::string& path){
             }
             dynamic = dynamic || obstacle.dynamic;
         }
-        //A floating body is held up by the pressure on it, so it floats where the solve puts the liquid's surface: the footprint puts the pressure's 0 at
-        //the centres of the first air voxels past the particles' stencils, 2 to 2.5 voxels over the particles, and a half-density ball rode that much high;
-        //the sharp surface puts it on the level set through the particles (freesurface.cu), and with air there's no free surface to put
-        if(dynamic && !scene.air){
-            const Json* solver = root.find("solver");
-            if(solver != nullptr && solver->find("freeSurface") && scene.freeSurface != "sharp"){
-                read.fail("solver.freeSurface", "dynamic obstacles float at the liquid's surface only with the sharp free surface, or with air simulated: "
-                          "the footprint's surface is 2 to 2.5 voxels over the particles");
-            }
-            scene.freeSurface = "sharp";
+        //A floating body is held up by the pressure on it, so it floats where the solve puts the liquid's surface: the voxel surface puts the pressure's 0
+        //at the centres of the first air voxels past the particles' stencils, 2 to 2.5 voxels over the particles, and a half-density ball rode that much
+        //high; the level set surface puts it on the level set through the particles (freesurface.cu), and with air there's no free surface to put
+        if(dynamic && !scene.air && scene.freeSurface != "levelSet"){
+            read.fail("solver.freeSurface", "dynamic obstacles float at the liquid's surface only with levelSet, or with air simulated: voxel's "
+                      "surface is 2 to 2.5 voxels over the particles");
         }
     }
 

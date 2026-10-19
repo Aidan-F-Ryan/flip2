@@ -1298,10 +1298,12 @@ void ObstacleSet::build(const std::vector<SceneObstacle>& obstacles, double voxe
 //threads per node block in the obstacle passes: a block's 8^3 slots a thread each. The few nodes near obstacles are all the work, a chain of distance
 //lookups per slot, and with only a few warps of them on each SM there's little to hide its latency behind; a thread per slot keeps each chain short
 static constexpr int OBSTACLE_THREADS = 512;
+static constexpr int GHOST_REACH = 3;   //voxels round a node obstacleGhostFaces reads: its second layer reads a face's neighbour's neighbour's lower face,
+                                        //three below the face, and a node owns only its lower faces, so any less and its low side reads fewer than its high
 
 //blocks for the passes over the nodes near obstacles: two per SM, each taking the listed nodes in turn. Launching a block per node would spend most of
 //the pass starting and ending the thousands of blocks with nothing to do
-uint obstacleBlocks(){
+static uint obstacleBlocks(){
     int device, processors;
     gpuErrchk(cudaGetDevice(&device));
     gpuErrchk(cudaDeviceGetAttribute(&processors, cudaDevAttrMultiProcessorCount, device));
@@ -1927,8 +1929,8 @@ void Particles::addObstacleFlux(){
     gpuErrchk(cudaPeekAtLastError());
 }
 
-//One layer of the faces around and inside obstacles, a block per node of this partition's own: the node's voxels and the two more on every side go into
-//shared memory, each from the node that owns it (liquidTile.hu: a node's own list has only the voxels around it that its own particles reach, and a
+//One layer of the faces around and inside obstacles, a block per node of this partition's own: the node's voxels and GHOST_REACH more on every side go
+//into shared memory, each from the node that owns it (liquidTile.hu: a node's own list has only the voxels around it that its own particles reach, and a
 //fluid voxel missing from it, taken for part of the obstacle by its centre, had the fluid's face beside it set to the obstacle's velocity wherever the
 //liquid's edge ran along a node's), with the places no voxel is stored taken as inside an obstacle if their centres are, and each of its interior
 //voxels' faces with an obstacle on either side gets a velocity:
@@ -1941,8 +1943,9 @@ __global__ void obstacleGhostFaces(int layer, Obstacles obstacles, VoxelPlaces p
                                    float* ux, float* uy, float* uz, BodyFriction friction){
     extern __shared__ float blockVelocities[];  //per component, a value per slot; then per slot, whether it's stored, whether it's solid, its near bits
     __shared__ uint tileNodes[27];
-    int voxels1D = places.interiorWidth + 2*places.apronCells;
+    int voxels1D = places.interiorWidth + 2*GHOST_REACH;
     int voxels3D = voxels1D*voxels1D*voxels1D;
+    int nodeBlock1D = places.interiorWidth + 2*places.apronCells;     //the node's own block of voxels, which its voxel list's slots are in
     char* stored = (char*)(blockVelocities + 3*voxels3D);
     char* inside = stored + voxels3D;
     char* bits = inside + voxels3D;
@@ -1957,7 +1960,7 @@ __global__ void obstacleGhostFaces(int layer, Obstacles obstacles, VoxelPlaces p
         float* velocities[3] = {ux, uy, uz};
         loadTileNodes(tileNodes, cell, numUsedGridNodes, places.nodeCells, cellToNode, places.grid);
         __syncthreads();
-        Tile tile(cell, places.grid, places.interiorWidth, places.apronCells);  //its slots are the node's block's
+        Tile tile(cell, places.grid, places.interiorWidth, GHOST_REACH);
         const float* before[3] = {beforeX, beforeY, beforeZ};
         for(int slot = threadIdx.x; slot < voxels3D; slot += blockDim.x){
             int3 t = tile.at(slot);
@@ -2012,12 +2015,14 @@ __global__ void obstacleGhostFaces(int layer, Obstacles obstacles, VoxelPlaces p
             return false;
         };
         for(uint index = first + threadIdx.x; index < last; index += blockDim.x){
-            int slot = places.voxelSlots[index];
-            int x = slot % voxels1D, y = slot / voxels1D % voxels1D, z = slot / (voxels1D*voxels1D);
-            if(x < places.apronCells || y < places.apronCells || z < places.apronCells || x >= voxels1D - places.apronCells || y >= voxels1D - places.apronCells || z >= voxels1D - places.apronCells){
+            int nodeSlot = places.voxelSlots[index];
+            int x = nodeSlot % nodeBlock1D, y = nodeSlot / nodeBlock1D % nodeBlock1D, z = nodeSlot / (nodeBlock1D*nodeBlock1D);
+            if(x < places.apronCells || y < places.apronCells || z < places.apronCells || x >= nodeBlock1D - places.apronCells || y >= nodeBlock1D - places.apronCells
+               || z >= nodeBlock1D - places.apronCells){
                 continue;   //only the node's own voxels: their neighbours own the apron's
             }
-            int3 voxel = places.voxelOf(cell, slot);
+            int slot = tile.slot(make_int3(x - places.apronCells + GHOST_REACH, y - places.apronCells + GHOST_REACH, z - places.apronCells + GHOST_REACH));
+            int3 voxel = places.voxelOf(cell, nodeSlot);
             //which of its lower faces have anything to do, and the obstacles' distance at those, looked up together so their latencies overlap: the blocks
             //here are few, and each waits on its chain of lookups
             bool here = inside[slot];
@@ -2231,7 +2236,7 @@ void Particles::obstacleGhostVelocities(CudaVec<float>& ux, CudaVec<float>& uy, 
     if(obstacles.count() == 0 || numOwnNodes == 0){
         return;
     }
-    int voxels1D = numVoxels1D;
+    int voxels1D = (2<<refinementLevel) + 2*GHOST_REACH;
     size_t shared = (3*sizeof(float) + 3)*voxels1D*voxels1D*voxels1D;
     Obstacles state = obstacles.state();
     if(viscosity > 0.0){    //a viscous liquid holds to them at least as much as to the walls

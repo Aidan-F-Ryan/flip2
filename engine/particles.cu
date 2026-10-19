@@ -1390,6 +1390,7 @@ void Particles::pressureSolve(){
             }
             keepLetGo();
         }
+        letGoOfAir();       //and the air on them, which nothing holds
         bodies.takePressure(p.devPtr());
         return true;
     };

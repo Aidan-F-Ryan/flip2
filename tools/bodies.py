@@ -16,7 +16,7 @@ Kinds:
             should keep its spin, and the water stay still (shape=box for a cube, which does stir the water)
 
 Keys: voxel (m, default 1/128), box (the tank's side, m, 0.5), depth (the water's, m, 0.25), radius (m, 0.08), size (the box's width, m, 0.12),
-density (kg/m^3), height (where its centre starts, m), tilt (degrees), frames (96), fps (24), solver (multigrid), freeSurface (footprint or sharp),
+density (kg/m^3), height (where its centre starts, m), tilt (degrees), frames (96), fps (24), solver (multigrid), freeSurface (levelSet or voxel),
 air (0: no; 1: air simulated), spin (rad/s), shape (box: a cube in place of the ball), friction (the water's hold on it, 0 to 1), pool (0: no water),
 bounce, contactFriction, velocity (x,y,z m/s), count (that many, stacked a voxel apart, each turned 7 degrees more about y), substeps (collision
 substeps a frame)

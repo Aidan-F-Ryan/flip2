@@ -1273,7 +1273,7 @@ int main(int argc, char** argv){
         simulation->setWallFriction(face, scene.wallFriction[face]);
     }
     simulation->setViscousCfl(scene.viscousCfl);
-    simulation->setFreeSurface(scene.freeSurface == "sharp" ? FreeSurface::sharp : FreeSurface::footprint);
+    simulation->setFreeSurface(scene.freeSurface == "levelSet" ? FreeSurface::sharp : FreeSurface::footprint);
     if(scene.air){      //a second fluid (TwoPhase, particles.hu): the particles seeded after the liquid's, and any made later, are air
         TwoPhase twoPhase;
         twoPhase.on = true;

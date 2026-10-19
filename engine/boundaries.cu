@@ -162,6 +162,24 @@ __global__ void holdPulled(uint numVoxels, char* letGo){
     }
 }
 
+//Once the solves are done, a block per node of this partition's: the air on boundaries that let go, which the solve has no say over, is let go too.
+//A boundary that lets go never pulls, so nothing holds what's there. With the level set free surface particles can be there, outside the liquid's
+//surface: the film a slab leaves on a ceiling as it falls away, its edges, whose voxels' centres are outside the liquid. Reading the boundary's faces
+//as at rest, they hung on the ceiling until the slab's top was 15 cm behind free fall's. With the voxel free surface every voxel a particle reads is an unknown,
+//and this changes nothing
+__global__ void letGoOfAir(VoxelPlaces places, Boundaries b, const char* solveCodes, char* letGo){
+    uint node = blockIdx.x;
+    uint start = node == 0 ? 0 : places.nodeVoxelEnds[node - 1];
+    uint end = places.nodeVoxelEnds[node];
+    uint cell = places.nodeCells[node];
+    int3 domainVoxels = make_int3(places.grid.sizeX*places.interiorWidth, places.grid.sizeY*places.interiorWidth, places.grid.sizeZ*places.interiorWidth);
+    for(uint index = start + threadIdx.x; index < end; index += blockDim.x){
+        if(!solveCodes[index] && mayLetGo(b, index, places.voxelOf(cell, places.voxelSlots[index]), domainVoxels)){
+            letGo[index] = LET_GO;
+        }
+    }
+}
+
 //after the solve that keeps the voxels air reached from going under its pressure: the ones it left at it are let go, the ones over it held
 __global__ void keepLetGo(uint numVoxels, const float* p, char* letGo){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
@@ -234,6 +252,24 @@ bool Particles::letGoOfSuction(){
         anyLetGo = true;
     }
     return any;
+}
+
+//once the solves are done: the air on boundaries that let go is let go (::letGoOfAir). Whether any is isn't known here without waiting for the GPU, so
+//with the level set surface, where particles can be in it, the obstacles' faces are carried every substep (carryLetGoFaces)
+void Particles::letGoOfAir(){
+    uint numVoxels = voxelIDsUsed.size();
+    if(!lettingGo() || letGo.size() == 0){
+        return;
+    }
+    if(numOwnNodes > 0 && numVoxels > 0){
+        bool beside = obstacles.count() > 0 && numStoredNodes > 0;
+        Boundaries b = {{neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(), neighborPy.devPtr(), neighborNz.devPtr(), neighborPz.devPtr()},
+                        beside ? obstacleNear.devPtr() : nullptr, beside ? obstacleOpen.devPtr() : nullptr, wallsLetGo};
+        ::letGoOfAir<<<numOwnNodes, LET_GO_THREADS, 0, stream>>>(voxelPlaces(), b, solveCodes.devPtr(), letGo.devPtr());
+        gpuErrchk(cudaPeekAtLastError());
+    }
+    context->fillGhosts(letGo.devPtr(), stream);
+    anyLetGo = anyLetGo || freeSurfaceMode == FreeSurface::sharp;
 }
 
 //Once the solve that keeps them from going under the air's pressure is done: of the voxels it was given, the ones still at the air's pressure are

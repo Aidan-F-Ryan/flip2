@@ -27,9 +27,10 @@ enum class PressureSolver{
     multigrid   //conjugate gradient, preconditioned by a multigrid V-cycle
 };
 
-//where the pressure solve puts the liquid's surface (freesurface.cu)
+//where the pressure solve puts the liquid's surface (freesurface.cu); scene files call them voxel and levelSet
 enum class FreeSurface{
-    footprint,  //every voxel the particles' stencils reach is liquid, and the pressure is 0 at the centres of the air voxels past them
+    footprint,  //every voxel the particles' stencils reach is liquid, and the pressure is 0 at the centres of the air voxels past them: the marker cells
+                //of Harlow and Welch's MAC method (1965)
     sharp       //the liquid is what the level set finds, and the pressure is 0 (or the surface tension's) at the surface itself: the ghost fluid method
 };
 
@@ -269,8 +270,8 @@ public:
         viscousCfl = voxels;
     }
 
-    //where the pressure solve puts the liquid's surface (see FreeSurface): the particles' footprint, the default, or the level set's surface, sharp,
-    //which also finds the level set every substep and, with surface tension, keeps to a capillary limit 1/sqrt(2) as long
+    //where the pressure solve puts the liquid's surface (see FreeSurface): the level set's surface, sharp, the default, which finds the level set every
+    //substep and, with surface tension, keeps to a capillary limit 1/sqrt(2) as long; or the particles' footprint
     void setFreeSurface(FreeSurface mode){
         freeSurfaceMode = mode;
     }
@@ -341,6 +342,7 @@ private:
     bool lettingGo() const;         //boundaries that let go of the liquid (boundaries.cu): whether there are any, which there aren't with the air simulated
     void holdEverything();          //before a solve
     bool letGoOfSuction();          //after it: whether air reaches any voxel on them that it left pulled on, so that it's solved again with those kept from going under the air's pressure
+    void letGoOfAir();              //once the solves are done: the air on boundaries that let go, which nothing holds
     void keepLetGo();               //after that solve: the ones it left at the air's pressure are let go
     void carryLetGoFaces(CudaVec<float>& ux, CudaVec<float>& uy, CudaVec<float>& uz);   //after the velocity update and the obstacles' ghost velocities, of the new face velocities and FLIP's old
     void findSealedPockets();       //fluid no air reaches (pockets.cu): labelled once a substep, settled across partitions, its divergence balanced before each solve
@@ -565,7 +567,7 @@ private:
     double wallWetting[6] = {0.5, 0.5, 0.5, 0.5, 0.5, 0.5};     //the cosine of the angle the liquid meets each wall at: 60 degrees
     double wallFriction[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};    //each wall's friction, 0 to 1
     double viscousCfl = 6.0;        //voxels viscosity may spread across in a substep
-    FreeSurface freeSurfaceMode = FreeSurface::footprint;
+    FreeSurface freeSurfaceMode = FreeSurface::sharp;
     CudaVec<float> liquidLevel;     //per stored voxel: the liquid's signed distance at its centre, in voxels, negative inside, to LIQUID_BAND either way (levelset.cu)
     CudaVec<float> liquidCurvature; //per stored voxel beside the surface: its curvature, in 1/voxels, positive where the liquid bulges
     CudaVec<float> surfaceLevel;    //per stored voxel, with the sharp free surface: the level set smoothed for the pressure solve (SURFACE_PASSES)

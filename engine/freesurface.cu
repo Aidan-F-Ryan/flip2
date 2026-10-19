@@ -1,9 +1,11 @@
 //Copyright 2023 Aberrant Behavior LLC
 
-//The sharp free surface (FreeSurface::sharp, particles.hu): the pressure solve's liquid is what the level set finds (levelset.cu), and its pressure is 0
-//at the surface itself, or sigma kappa with surface tension, rather than at the centres of the air voxels past the particles' footprint.
+//The sharp free surface (FreeSurface::sharp, particles.hu; levelSet in scene files, Level Set in Houdini, and the default without air): the pressure
+//solve's liquid is what the level set finds (levelset.cu), and its pressure is 0 at the surface itself, or sigma kappa with surface tension, rather than
+//at the centres of the air voxels past the particles' footprint.
 //
-//With the footprint, the default, every voxel the particles' stencils reach is an unknown, and the pressure is 0 at the centre of each air voxel past
+//With the footprint (voxel in scene files, Voxel in Houdini: the opt-in, and what air goes with), every voxel the particles' stencils reach is an
+//unknown, and the pressure is 0 at the centre of each air voxel past
 //them: the solve's surface sits a voxel or two outside the liquid's. Liquid near the surface then moves as if it were that much deeper: a drop 16 voxels
 //in radius oscillates 9% slow (2% sharp), and a pool's sloshing dies away in a few seconds where sharp it carries on.
 //
@@ -14,7 +16,8 @@
 //pressure under the liquid's weight, and collapse at metres a second.
 //1. The unknowns whose centres are outside the liquid stop being unknowns (retireDryUnknowns): the solve's liquid is the voxels whose centres are in it.
 //   Nothing's added, as the level set's liquid lies inside the footprint. Particles outside it move with the velocities step 5 gives them, with no
-//   pressure to hold them apart, so an unknown packed with particles stays one whatever the level set says (dryUnknown).
+//   pressure to hold them apart, so an unknown packed with particles stays one whatever the level set says (dryUnknown). A voxel an obstacle cuts
+//   whose centre is inside the obstacle has the level across its open faces as its own (smoothLevelSet), where its liquid is.
 //2. Each liquid unknown's face to air weighs 1/theta in its pressure equation (weighSurfaceFaces), theta being how far from its centre towards the air
 //   voxel's the level set crosses 0: the pressure past the face is the one a line through the unknown's pressure and the surface's reaches there, the
 //   ghost fluid method (Gibou, Fedkiw, Cheng and Kang 2002; Enright, Nguyen, Gibou and Fedkiw 2003). Only the diagonal changes, and it only grows, so

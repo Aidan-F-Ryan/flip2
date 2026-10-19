@@ -24,8 +24,10 @@
 //    "solver": {"flipRatio": 0.95, "cfl": 4, "densityCorrectionTime": 0.1, "pressureSolver": "multigrid", "advection": "rk3", "dotProducts": "exact",
 //               "transfer": "flip",                                        //or "apic": particles carry their velocity's gradient; flipRatio 0 for pure APIC
 //               "viscousCfl": 6,                                           //with viscosity: voxels it may spread across in a substep; 0 for no limit
-//               "freeSurface": "footprint",                                //or "sharp": the pressure is 0 at the level set's surface (ghost fluid),
-//                                                                           //which costs more a substep and, with surface tension, 0.7 the timestep
+//               "freeSurface": "levelSet",                                 //the pressure is 0 at the level set's surface (freesurface.cu); or
+//                                                                           //"voxel": at the centres of the voxels past the particles' footprint,
+//                                                                           //which costs about half as much a frame and damps the surface. With air,
+//                                                                           //voxel, the only one that goes with it yet
 //               "collisionSubsteps": 5},                                   //dynamic obstacles: their contacts' steps a frame, at least
 //    "gravity": [0, -9.8, 0],
 //    "liquid": {"density": 1000, "viscosity": 0, "surfaceTension": 0,       //kg/m^3; Pa s, dynamic (water 0.001, honey 2 to 10); N/m (water 0.073). With
@@ -178,7 +180,8 @@ struct Scene{
     std::string dotProducts = "exact";
     std::string transfer = "flip";
     double viscousCfl = 6.0;        //with viscosity: voxels it may spread across in a substep; 0 for no limit
-    std::string freeSurface = "footprint";  //or "sharp": where the pressure solve puts the liquid's surface (FreeSurface, particles.hu)
+    std::string freeSurface;                //"levelSet" or "voxel": where the pressure solve puts the liquid's surface (FreeSurface, particles.hu); unset,
+                                            //levelSet without air and voxel with it
     int collisionSubsteps = 5;              //the dynamic bodies' contact steps a frame, at least (Bodies::setCollisionSubsteps)
     double gravity[3] = {0.0, -9.8, 0.0};
     double density = 1000.0;        //the liquid's, kg/m^3: what turns its viscosity and surface tension into accelerations

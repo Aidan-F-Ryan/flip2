@@ -163,7 +163,9 @@ def momentum(bake):
 @check("rest",
        "A tank of liquid at rest stays at rest.",
        "The pressure holds gravity exactly on the faces; what moves is the particles' jitter settling under the density correction. The limits "
-       "are a hundredth of sqrt(g dx), the speed gravity gives over a voxel, and a hundredth of a voxel on the centre of mass.")
+       "are a hundredth of sqrt(g dx), the speed gravity gives over a voxel, and two hundredths of a voxel on the centre of mass: with ghost "
+       "fluid's surface, the default since 19 October, the settling moves it up to 0.015 of a voxel in the first second, a different way for "
+       "each seed (5 seeds measured, 19 October), and lifts it about 0.005 as the liquid evens out. Marker cells held it within 0.01.")
 def rest(bake):
     voxel = 0.025
     run = bake("rest", scene([-0.5, 0.0, -0.25], [0.5, 0.6, 0.25], voxel, 24, [box([-0.5, 0.0, -0.25], [0.5, 0.3, 0.25])]))
@@ -171,7 +173,7 @@ def rest(bake):
     moved = max(math.sqrt(sum((run.rows[f]["centroid"][axis] - start[axis]) ** 2 for axis in range(3))) for f in run.frames)
     rms = max(math.sqrt(2.0 * run.rows[f]["kineticEnergy"] / run.rows[f]["particles"]) for f in run.frames if f >= 12)
     return [Result("rms speed in its second half second", rms, 0.0, 0.01 * math.sqrt(G * voxel), "m/s", "most"),
-            Result("furthest its centre of mass moves", moved, 0.0, 0.01 * voxel, "m", "most")]
+            Result("furthest its centre of mass moves", moved, 0.0, 0.02 * voxel, "m", "most")]
 
 
 @check("energy",
@@ -224,22 +226,23 @@ def slosh_run(bake, name, solver):
 @check("slosh",
        "A tank's water, given a push, swings end to end at the period of its first standing wave, omega^2 = g k tanh(k h) with k = pi / L, and "
        "with nothing to slow it keeps swinging.",
-       "The footprint free surface is first order in the voxel: the pressure is 0 a voxel or so outside the particles, and the surface's height "
-       "is only known to a voxel. Measured 8 October at 12 voxels' depth: the period 8% long, 17% of the swing lost each half period (3.5% and "
-       "3.5% at 24 voxels), and a wave under a voxel high dies within two swings and leaves the surface tilted. 12% and 20% allowed.")
+       "Measured 8 October with the level set free surface (then opt-in, the default since 19 October) at 12 voxels' depth: the period within 1%, "
+       "1.5% of the swing lost each half period. 2% and 3% allowed.")
 def slosh(bake):
     measured, expected, count, kept = slosh_run(bake, "slosh", None)
-    return [Result("period, over %d half swings" % max(count - 1, 0), measured, expected, 0.12, "s"),
-            Result("swing kept each half period", kept, 1.0, 0.20, "", "absolute")]
-
-
-@check("slosh-sharp",
-       "The same tank with the sharp free surface.",
-       "Measured 8 October at 12 voxels' depth: the period within 1%, 1.5% of the swing lost each half period. 2% and 3% allowed.")
-def slosh_sharp(bake):
-    measured, expected, count, kept = slosh_run(bake, "slosh-sharp", {"freeSurface": "sharp"})
     return [Result("period, over %d half swings" % max(count - 1, 0), measured, expected, 0.02, "s"),
             Result("swing kept each half period", kept, 1.0, 0.03, "", "absolute")]
+
+
+@check("slosh-voxel",
+       "The same tank with the voxel free surface, the opt-in.",
+       "The voxel free surface is first order in the voxel: the pressure is 0 a voxel or so outside the particles, and the surface's height is only known to "
+       "a voxel. Measured 8 October at 12 voxels' depth: the period 8% long, 17% of the swing lost each half period (3.5% and 3.5% at 24 voxels), "
+       "and a wave under a voxel high dies within two swings and leaves the surface tilted. 12% and 20% allowed.")
+def slosh_voxel(bake):
+    measured, expected, count, kept = slosh_run(bake, "slosh-voxel", {"freeSurface": "voxel"})
+    return [Result("period, over %d half swings" % max(count - 1, 0), measured, expected, 0.12, "s"),
+            Result("swing kept each half period", kept, 1.0, 0.20, "", "absolute")]
 
 
 # ---- surface tension ----
@@ -275,19 +278,19 @@ def drop(bake, name, solver):
 
 @check("drop",
        "A drop pulled out of round, in no gravity, swings at Rayleigh's frequency: omega^2 = 8 sigma / (rho R^3).",
-       "Measured when surface tension was built (2 October): its frequency 9% low at 16 voxels' radius, so its period 10% long, first order in "
-       "the voxel: the footprint free surface sits outside the liquid and adds to the mass that swings. 12% allowed.")
-def drop_footprint(bake):
+       "Measured when the level set free surface was built (3 October): its frequency 2% low at 16 voxels' radius. 4% allowed.")
+def drop_ghost(bake):
     measured, expected, count = drop(bake, "drop", None)
-    return [Result("period, over %d half swings" % max(count - 1, 0), measured, expected, 0.12, "s")]
-
-
-@check("drop-sharp",
-       "The same drop with the sharp free surface.",
-       "Measured when the sharp surface was built (3 October): its frequency 2% low at 16 voxels' radius. 4% allowed.")
-def drop_sharp(bake):
-    measured, expected, count = drop(bake, "drop-sharp", {"freeSurface": "sharp"})
     return [Result("period, over %d half swings" % max(count - 1, 0), measured, expected, 0.04, "s")]
+
+
+@check("drop-voxel",
+       "The same drop with the voxel free surface.",
+       "Measured when surface tension was built (2 October): its frequency 9% low at 16 voxels' radius, so its period 10% long, first order in "
+       "the voxel: the voxel free surface sits outside the liquid and adds to the mass that swings. 12% allowed.")
+def drop_voxel(bake):
+    measured, expected, count = drop(bake, "drop-voxel", {"freeSurface": "voxel"})
+    return [Result("period, over %d half swings" % max(count - 1, 0), measured, expected, 0.12, "s")]
 
 
 # ---- viscosity ----
@@ -306,11 +309,13 @@ def viscous_front(bake):
 
 # ---- walls ----
 
-def slab(bake, name, low, high, frames, walls=None):
+def slab(bake, name, low, high, frames, walls=None, solver=None):
     """a slab of water at rest in a 1 m box, 2.5 cm voxels, between two heights and out to +-high[0] across: its fall by frame"""
     made = scene([-0.5, 0.0, -0.5], [0.5, 1.0, 0.5], 0.025, frames, [box([-high[0], low, -high[0]], [high[0], high[1], high[0]])])
     if walls:
         made["domain"]["walls"] = walls
+    if solver:
+        made["solver"] = solver
     return bake(name, made)
 
 
@@ -321,12 +326,22 @@ def behind(run, frame):
 
 @check("near-ceiling",
        "Liquid that isn't touching a wall doesn't feel it: a slab at rest two voxels under the ceiling falls at g.",
-       "As free-fall's.",
-       known="The pressure solve's liquid is the particles' footprint, a voxel or two wider than the particles, and a wall that holds pulls on whatever "
-             "touches it as well as pushing: so it holds back liquid up to two voxels off it. A wall that lets go doesn't (near-ceiling-lets-go). For "
-             "one that holds to pass, it would have to hold only the voxels with liquid in them at the wall, which changes every bake there is.")
+       "As free-fall's.")
 def near_ceiling(bake):
     run = slab(bake, "near-ceiling", 0.75, (0.25, 0.95), 4)
+    last = run.frames[-1]
+    t = run.time(last)
+    return [Result("fall speed after %.2f s" % t, -run.velocity(last)[1], G * t, 0.005, "m/s")]
+
+
+@check("near-ceiling-voxel",
+       "The same slab with the voxel free surface.",
+       "As free-fall's.",
+       known="The voxel free surface's liquid is the particles' footprint, a voxel or two wider than the particles, and a wall that holds pulls on whatever "
+             "touches it as well as pushing: so it holds back liquid up to two voxels off it. A wall that lets go doesn't (near-ceiling-lets-go), "
+             "and neither does the level set's surface, which is the particles' own (near-ceiling).")
+def near_ceiling_voxel(bake):
+    run = slab(bake, "near-ceiling-voxel", 0.75, (0.25, 0.95), 4, solver={"freeSurface": "voxel"})
     last = run.frames[-1]
     t = run.time(last)
     return [Result("fall speed after %.2f s" % t, -run.velocity(last)[1], G * t, 0.005, "m/s")]
@@ -359,7 +374,8 @@ def lets_go(bake):
 @check("sealed",
        "A wall lets go only where air can get in. A slab filling the top of a box, under a ceiling that lets go, stays up while the walls round "
        "it hold, as water does in an upturned glass: nothing can get in behind it. Where the walls let go too, air comes up them, and it falls.",
-       "Held, nothing moves at all: a hundredth of a voxel allowed in a quarter of a second. (Its flat underside is unstable, and gives way after "
+       "Held, nothing moves but the particles' settling, as rest's: two hundredths of a voxel allowed in a quarter of a second (0.010 measured "
+       "with the level set surface, 19 October). (Its flat underside is unstable, and gives way after "
        "about a second: no check of that.) Let go, it's free fall as lets-go's is: 0.007 m/s behind measured, 0.02 allowed; and the half substep "
        "free-fall's distance is ahead by.")
 def sealed(bake):
@@ -368,7 +384,7 @@ def sealed(bake):
     last = held.frames[-1]
     t = held.time(last)
     fallen = lambda run: run.rows[0]["centroid"][1] - run.rows[last]["centroid"][1]
-    return [Result("walls holding, fallen after %.2f s" % t, fallen(held), 0.0, 0.01 * 0.025, "m", "most"),
+    return [Result("walls holding, fallen after %.2f s" % t, fallen(held), 0.0, 0.02 * 0.025, "m", "most"),
             Result("walls letting go, behind free fall", behind(freed, last), 0.0, 0.02, "m/s", "most"),
             Result("walls letting go, short of free fall's distance", 0.5 * G * t * t - fallen(freed), 0.0, 0.03, "m", "most")]
 
@@ -385,7 +401,7 @@ def rest_lets_go(bake):
     moved = max(math.sqrt(sum((run.rows[f]["centroid"][axis] - start[axis]) ** 2 for axis in range(3))) for f in run.frames)
     rms = max(math.sqrt(2.0 * run.rows[f]["kineticEnergy"] / run.rows[f]["particles"]) for f in run.frames if f >= 12)
     return [Result("rms speed in its second half second", rms, 0.0, 0.01 * math.sqrt(G * voxel), "m/s", "most"),
-            Result("furthest its centre of mass moves", moved, 0.0, 0.01 * voxel, "m", "most")]
+            Result("furthest its centre of mass moves", moved, 0.0, 0.02 * voxel, "m", "most")]
 
 
 @check("collider-lets-go",

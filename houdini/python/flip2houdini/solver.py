@@ -175,14 +175,16 @@ def _interface(node):
     simulation.addParmTemplate(hou.IntParmTemplate("startframe", "Start Frame", 1, default_expression=("$FSTART",)))
     simulation.addParmTemplate(hou.IntParmTemplate("endframe", "End Frame", 1, default_expression=("$FEND",)))
     simulation.addParmTemplate(hou.MenuParmTemplate("transfer", "Velocity Transfer", ("flip", "apic"), ("FLIP (Splashy)", "APIC (Swirly)"), default_value=0))
-    simulation.addParmTemplate(hou.MenuParmTemplate("freesurface", "Free Surface", ("footprint", "sharp"), ("Footprint (Calm, Fast)", "Sharp (Accurate Surface)"),
-                                                    default_value=0, disable_when="{ phases == 1 }",
-                                                    help="Where the pressure solve puts the liquid's surface. Footprint: a voxel or so outside the particles, which "
-                                                         "settles quickly and damps small waves. Sharp: at the particles' own surface (ghost fluid), so drops "
-                                                         "oscillate and waves travel at the right speed and the liquid keeps its volume better, but calm "
-                                                         "water stays a little livelier, and a bake takes about twice as long: more per substep, and more "
-                                                         "substeps, as the liquid keeps moving for longer. Not with air yet: with Liquid and Air the surface "
-                                                         "is where the two fluids meet, and the footprint is used"))
+    simulation.addParmTemplate(hou.MenuParmTemplate("freesurface", "Free Surface", ("voxel", "levelset"), ("Voxel (Fast/Damped)", "Level Set (Accurate)"),
+                                                    default_value=1, disable_when="{ phases == 1 }",
+                                                    help="Where the pressure solve puts the liquid's surface. Level Set: at the particles' own surface, found as a "
+                                                         "level set each substep, with the pressure set exactly there (the ghost fluid method), so drops "
+                                                         "oscillate and waves travel at the right speed, the liquid keeps its volume, and floating objects sit "
+                                                         "at the right height; calm water stays a little lively. Voxel: every voxel the particles touch is "
+                                                         "liquid, and the surface is the edge of those voxels, a voxel or two outside the particles (marker "
+                                                         "cells), which settles quickly, damps small waves, and bakes in about half the time; not with dynamic "
+                                                         "objects, which would float high. Not with air yet: with Liquid and Air the surface is where the two "
+                                                         "fluids meet, and Voxel is used"))
     simulation.addParmTemplate(hou.FloatParmTemplate("flipratio", "FLIP Ratio", 1, default_value=(0.95,), min=0.0, max=1.0,
                                                      help="How much of each particle's own velocity it keeps: 0 is pure PIC (or pure APIC), 1 pure FLIP"))
     simulation.addParmTemplate(hou.FloatParmTemplate("cfl", "CFL Condition", 1, default_value=(4.0,), min=0.1, max=4.0,
@@ -840,7 +842,7 @@ def write_scene(node):
         "solver": {"flipRatio": node.evalParm("flipratio"), "cfl": node.evalParm("cfl"), "densityCorrectionTime": node.evalParm("densitytime"),
                    "transfer": ("flip", "apic")[node.evalParm("transfer")],
                    "viscousCfl": node.evalParm("viscouscfl") if node.parm("viscouscfl") is not None else 6.0,
-                   "freeSurface": ("footprint", "sharp")[node.evalParm("freesurface")] if node.parm("freesurface") is not None else "footprint"},
+                   "freeSurface": ("voxel", "levelSet")[node.evalParm("freesurface")] if node.parm("freesurface") is not None else "levelSet"},
         "gravity": list(node.evalParmTuple("gravity")),
         "liquid": {key: node.evalParm(name) if node.parm(name) is not None else default       #a node from before the Liquid tab has none of it
                    for key, name, default in (("density", "density", 1000.0), ("viscosity", "viscosity", 0.0), ("surfaceTension", "surfacetension", 0.0),
@@ -939,7 +941,7 @@ def write_scene(node):
             if node.evalParm(name) != default:
                 air[key] = node.evalParm(name)
         scene["air"] = air
-        scene["solver"]["freeSurface"] = "footprint"    #the sharp free surface doesn't go with air yet: the tab says so
+        scene["solver"]["freeSurface"] = "voxel"        #the level set surface doesn't go with air yet: the tab says so
         made.append("air: a band of %d voxels" % air["band"] if air["band"] else "air: everywhere")
     path = os.path.join(directory, "scene.json")
     with open(path, "w") as out:
