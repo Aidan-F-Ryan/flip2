@@ -24,8 +24,9 @@
 //    "solver": {"flipRatio": 0.95, "cfl": 4, "densityCorrectionTime": 0.1, "pressureSolver": "multigrid", "advection": "rk3", "dotProducts": "exact",
 //               "transfer": "flip",                                        //or "apic": particles carry their velocity's gradient; flipRatio 0 for pure APIC
 //               "viscousCfl": 6,                                           //with viscosity: voxels it may spread across in a substep; 0 for no limit
-//               "freeSurface": "footprint"},                               //or "sharp": the pressure is 0 at the level set's surface (ghost fluid),
+//               "freeSurface": "footprint",                                //or "sharp": the pressure is 0 at the level set's surface (ghost fluid),
 //                                                                           //which costs more a substep and, with surface tension, 0.7 the timestep
+//               "collisionSubsteps": 5},                                   //dynamic obstacles: their contacts' steps a frame, at least
 //    "gravity": [0, -9.8, 0],
 //    "liquid": {"density": 1000, "viscosity": 0, "surfaceTension": 0,       //kg/m^3; Pa s, dynamic (water 0.001, honey 2 to 10); N/m (water 0.073). With
 //               "contactAngle": 60},                                        //viscosity, it sticks to walls and obstacles; with surface tension, the
@@ -45,7 +46,8 @@
 //                   "keyframes": [{"time": 0, "transform": [...]}, ...],                 //instead of a transform, it moves: linearly, rotations by slerp
 //                   "deforming": [{"time": 0, "mesh": "f1.obj"}, {"time": 0.04, "vertices": "f2.npy"}, ...],     //or it deforms: see SceneObstacle
 //                   "dynamic": {"density": 1000, "mass": 0, "velocity": [0, 0, 0], "angularVelocity": [0, 0, 0],      //or the liquid moves it, from where its
-//                               "bounce": 0, "contactFriction": 0.5}}],                                               //transform puts it: see SceneBody
+//                               "bounce": 0, "contactFriction": 0.5}}],                                               //transform puts it: see SceneBody. Without
+//                                                                                                                     //air, the free surface is then sharp
 //    "forces": [{"type": "point", "position": [...], "strength": 9.8, "radius": 0, "falloff": 1},       //strength in m/s^2, towards it (negative: away)
 //               {"type": "vortex", "position": [...], "axis": [0, 1, 0], "strength": 5, "radius": 0, "falloff": 1},
 //               {"type": "turbulence", "strength": 2, "scale": 0.1, "speed": 0.5, "seed": 0},
@@ -177,6 +179,7 @@ struct Scene{
     std::string transfer = "flip";
     double viscousCfl = 6.0;        //with viscosity: voxels it may spread across in a substep; 0 for no limit
     std::string freeSurface = "footprint";  //or "sharp": where the pressure solve puts the liquid's surface (FreeSurface, particles.hu)
+    int collisionSubsteps = 5;              //the dynamic bodies' contact steps a frame, at least (Bodies::setCollisionSubsteps)
     double gravity[3] = {0.0, -9.8, 0.0};
     double density = 1000.0;        //the liquid's, kg/m^3: what turns its viscosity and surface tension into accelerations
     double viscosity = 0.0;         //dynamic, Pa s

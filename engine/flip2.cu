@@ -1356,6 +1356,7 @@ int main(int argc, char** argv){
         simulation->setSourceMeshes(sourceMeshes, fluids);      //after setDomain and setSources
     }
     simulation->setObstacles(scene.obstacles, scene.density);      //after setDomain: they're voxelized at its voxel size, and the dynamic ones weighed against the liquid
+    simulation->setCollisionSubsteps(scene.collisionSubsteps);
     unsigned int wallsLetGo = 0;    //the walls that let go of the liquid, a bit each
     for(int face = 0; face < 6; ++face){
         wallsLetGo |= scene.wallHold[face] ? 0u : 1u << face;

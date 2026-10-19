@@ -79,6 +79,25 @@ static constexpr char NEAR_SURFACE = 1;
 static constexpr int CLOSED_FACE = 2;
 static constexpr int LETS_GO = 128;
 
+//obstacleCentroids: a near voxel's faces' solid parts' centres (centroids), in each face's own two axes, axis + 1 and axis + 2 around, 0 to 1 of a voxel
+//in 8 bits each: three words a voxel, one per axis, its lower face in the low half. A rigid motion's velocity is linear in x, so the solid part of a face
+//moves across it as its centroid does, and the pressure on it turns a body about where it is: there, a ball's own faces turn it not at all, as a ball
+//can't be turned by pressure, where at the faces' centres it was. A face obstacles close all over is all solid, its centroid its centre
+static constexpr float CENTROID_FULL = 255.0f;
+
+__device__ inline uint centroidHalf(float u, float w){
+    return __float2uint_rn(fminf(fmaxf(u, 0.0f), 1.0f)*CENTROID_FULL) | __float2uint_rn(fminf(fmaxf(w, 0.0f), 1.0f)*CENTROID_FULL) << 8;
+}
+
+//where on a face the solid part of it is centred, in the face's axis + 1 and axis + 2 around, 0 to 1: from the cache, or its middle if obstacles close it
+__device__ inline float2 cachedCentroid(const uint* centroids, uint index, int face, bool closed){
+    if(closed){
+        return make_float2(0.5f, 0.5f);
+    }
+    uint half = centroids[3*(size_t)index + face/2] >> 16*(face % 2) & 0xFFFFu;
+    return make_float2((half & 0xFFu) / CENTROID_FULL, (half >> 8) / CENTROID_FULL);
+}
+
 //obstacleOpen: a near voxel's six open fractions, worked out once a substep (findSolidVoxels) for every pass to read rather than look up its corners
 //again, each a fraction of OPEN_FULL in 16 bits: 0 and 1 exactly, and nothing between closer than 1.5e-5 to either. Three words a voxel, one per axis,
 //its lower face in the low half
@@ -296,6 +315,40 @@ __device__ inline int nearestObstacle(const Obstacles& obstacles, float3 x, floa
     }
     return nearest;
 }
+
+//One component, along axis, of the velocity a face with an obstacle's surface across it takes: a wall the fluid slips along freely (Bridson's free-slip
+//boundary: the fluid's velocity carried into the solid, its part across the surface replaced by the solid's), held by its friction. Across the surface
+//(normal n), the obstacle's velocity, (u_solid.n) n; along it, the fluid's own, v - (v.n) n, v its velocity there from the faces around (fluidAlong is that
+//along axis), held towards the obstacle's own motion along the surface by friction, 0 slipping freely to 1 moving with it. A ball spinning in place moves
+//nothing across its surface, so the fluid at it takes nothing from the spin; water running along a tilted floor keeps all its speed along it
+__device__ inline float slipVelocity(float3 solid, float3 normal, int axis, float fluidAlong, float friction){
+    float across = dot(solid, normal)*component(normal, axis);
+    return across + (1.0f - friction)*fluidAlong + friction*(component(solid, axis) - across);
+}
+
+//what friction adds to that over a wall the fluid slips along freely, which a dynamic body gives up (addFriction)
+__device__ inline float frictionPart(float3 solid, float3 normal, int axis, float fluidAlong, float friction){
+    float across = dot(solid, normal)*component(normal, axis);
+    return friction*(component(solid, axis) - across - fluidAlong);
+}
+
+//a velocity's part along a surface, its component along axis: v - (v.n) n
+__device__ inline float alongSurface(float3 velocity, float3 normal, int axis){
+    return component(velocity, axis) - dot(velocity, normal)*component(normal, axis);
+}
+
+//where the obstacle passes add up the momentum friction gives the fluid at the dynamic bodies' faces (bodies.cu), which the bodies then give up: a
+//face's change times the particles' weight on it, which is what G2P hands them, times scale. sums is nullptr when no body is to be told
+struct ExactSum;
+struct BodyCoupling;
+struct BodyFriction{
+    ExactSum* sums;                 //per body, its six lanes: the momentum, and its moment about the body's centre of mass
+    const BodyCoupling* couplings;  //each body's centre of mass, there
+    signed char of[MAX_OBSTACLES];  //per obstacle, its body, or -1
+    const float* weights[3];        //P2G's weight sums at each face
+    float scale;                    //a particle's mass in voxels of liquid, times the share of the pass's change the particles take (G2P): all of it in
+                                    //the new velocities, less the FLIP ratio in FLIP's old
+};
 
 struct MeshField;   //a mesh's field and what building it takes (obstacles.cu)
 

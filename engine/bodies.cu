@@ -15,42 +15,6 @@ static constexpr uint MASS_BLOCKS = 1024;       //fixed, so the mass's sums are 
 static constexpr int MOMENTS = 10;              //a mass's: its sum, its first moments, then xx, yy, zz, xy, xz, yz
 static constexpr double MAX_MASS_SAMPLES = 64.0*1024*1024;
 
-// ---- small double helpers, for the bodies' own state ----
-
-__host__ __device__ inline void rotationOf(const double q[4], double r[9]){     //a unit quaternion, w x y z, as a row-major rotation
-    double w = q[0], x = q[1], y = q[2], z = q[3];
-    r[0] = 1 - 2*(y*y + z*z);
-    r[1] = 2*(x*y - w*z);
-    r[2] = 2*(x*z + w*y);
-    r[3] = 2*(x*y + w*z);
-    r[4] = 1 - 2*(x*x + z*z);
-    r[5] = 2*(y*z - w*x);
-    r[6] = 2*(x*z - w*y);
-    r[7] = 2*(y*z + w*x);
-    r[8] = 1 - 2*(x*x + y*y);
-}
-
-//R M R^T: a tensor along a body's own axes, along the world's
-__host__ __device__ inline void turned(const double r[9], const double m[9], double out[9]){
-    double rm[9];
-    for(int row = 0; row < 3; ++row){
-        for(int column = 0; column < 3; ++column){
-            rm[3*row + column] = r[3*row]*m[column] + r[3*row + 1]*m[3 + column] + r[3*row + 2]*m[6 + column];
-        }
-    }
-    for(int row = 0; row < 3; ++row){
-        for(int column = 0; column < 3; ++column){
-            out[3*row + column] = rm[3*row]*r[3*column] + rm[3*row + 1]*r[3*column + 1] + rm[3*row + 2]*r[3*column + 2];
-        }
-    }
-}
-
-__host__ __device__ inline void times(const double m[9], const double v[3], double out[3]){
-    for(int row = 0; row < 3; ++row){
-        out[row] = m[3*row]*v[0] + m[3*row + 1]*v[1] + m[3*row + 2]*v[2];
-    }
-}
-
 // ---- its mass: its density over the inside of its shape ----
 
 //the moments of the mass inside an obstacle's shape, in its own space, over a lattice of samples spacing h apart from low: each sample is a cube of the
@@ -127,19 +91,6 @@ static bool invert(const double m[9], double out[9]){
 
 // ---- where they are and how they move, each a thread ----
 
-//a body's velocity as the obstacle passes read it: the velocity at world point x is velocity times (x, 1), V + w x (x - c) = W x + (V - W c)
-__device__ inline void writeVelocity(const BodyState& state, BodyFrame& frame){
-    const double* w = state.angularVelocity;
-    const double* c = state.position;
-    double W[9] = {0.0, -w[2], w[1], w[2], 0.0, -w[0], -w[1], w[0], 0.0};
-    for(int row = 0; row < 3; ++row){
-        for(int column = 0; column < 3; ++column){
-            frame.velocity[4*row + column] = (float)W[3*row + column];
-        }
-        frame.velocity[4*row + 3] = (float)(state.velocity[row] - (W[3*row]*c[0] + W[3*row + 1]*c[1] + W[3*row + 2]*c[2]));
-    }
-}
-
 //a body's frame where it is: the world to its own space, (R^T, its centre in its own space - R^T x); its reach, the box around its bounds' corners
 //3 voxels wider every way, as ObstacleSet::update has it for the others; how it moves; and what the coupling weighs it at
 __global__ void writeBodyFrames(int numBodies, const BodyState* states, const BodyMass* masses, BodyFrame* frames, BodyCoupling* couplings, double voxelSize){
@@ -182,17 +133,13 @@ __global__ void writeBodyFrames(int numBodies, const BodyState* states, const Bo
     }
 }
 
-//gravity's dt on each body, from where the last substep left it
+//gravity's dt on each body, from where the last substep and the warm start (contacts.cu) left it
 __global__ void predictBodies(int numBodies, BodyState* states, BodyFrame* frames, double dt, double3 gravity){
     int body = threadIdx.x + blockIdx.x*blockDim.x;
     if(body >= numBodies){
         return;
     }
     BodyState& state = states[body];
-    for(int axis = 0; axis < 3; ++axis){
-        state.before[axis] = state.velocity[axis];
-        state.before[3 + axis] = state.angularVelocity[axis];
-    }
     state.velocity[0] += dt*gravity.x;
     state.velocity[1] += dt*gravity.y;
     state.velocity[2] += dt*gravity.z;
@@ -218,10 +165,11 @@ __global__ void takeBodyImpulses(int numBodies, BodyState* states, const BodyMas
     writeVelocity(state, frames[body]);
 }
 
-//the end of a substep: each body goes dt along its velocity, and turns by w dt (exactly, as a quaternion: by |w| dt about w); its angular momentum stays,
+//the end of a substep: each body goes dt along its velocity, and turns by w dt (exactly, as a quaternion: by |w| dt about w), each with its contacts'
+//push out of what it's sunk into on top, which is gone after (contacts.cu); its angular momentum stays,
 //and its angular velocity is what that momentum makes of its inertia where it's turned to now. How fast its surface's velocity changed over the substep
 //is for the next one's timestep
-__global__ void moveBodies(int numBodies, BodyState* states, const BodyMass* masses, double dt){
+__global__ void moveBodies(int numBodies, BodyState* states, const BodyMass* masses, double dt, double measureOver){
     int body = threadIdx.x + blockIdx.x*blockDim.x;
     if(body >= numBodies){
         return;
@@ -229,13 +177,17 @@ __global__ void moveBodies(int numBodies, BodyState* states, const BodyMass* mas
     BodyState& state = states[body];
     const BodyMass& mass = masses[body];
     double change = 0.0, turning = 0.0;
+    double w[3];    //what turns it this substep: its angular velocity, and its contacts' push out of what it's sunk into
     for(int axis = 0; axis < 3; ++axis){
         change += (state.velocity[axis] - state.before[axis])*(state.velocity[axis] - state.before[axis]);
         turning += (state.angularVelocity[axis] - state.before[3 + axis])*(state.angularVelocity[axis] - state.before[3 + axis]);
-        state.position[axis] += dt*state.velocity[axis];
+        state.position[axis] += dt*(state.velocity[axis] + state.pseudo[axis]);
+        w[axis] = state.angularVelocity[axis] + state.pseudo[3 + axis];
     }
-    state.acceleration = dt > 0.0 ? (sqrt(change) + sqrt(turning)*mass.reach) / dt : 0.0;
-    const double* w = state.angularVelocity;
+    for(double& pushed : state.pseudo){
+        pushed = 0.0;
+    }
+    state.acceleration = measureOver > 0.0 ? (sqrt(change) + sqrt(turning)*mass.reach) / measureOver : 0.0;
     double speed = sqrt(w[0]*w[0] + w[1]*w[1] + w[2]*w[2]);
     if(speed > 0.0){
         double half = 0.5*speed*dt;
@@ -316,8 +268,9 @@ __global__ void findFaceBodiesKernel(Obstacles obstacles, BodiesOf bodies, Voxel
 // ---- the coupling: B^T x, s M~^-1 of it, and B times that ----
 
 //an own unknown's row of B for one body: over its faces that body's surface cuts, the solid part of each, the way the flow through it leaves the voxel,
-//times what the body's motion does across it: sign (1 - open)(e, (x_face - c) x e). In a fixed order of faces, rounded the same way in every pass that
-//asks (no fused multiply-adds), so B^T and B are each other's transpose to the bit
+//times what the body's motion does across it: sign (1 - open)(e, (x - c) x e), x the solid part's centroid, where the motion's flow through it and the
+//pressure's push on it act (obstacleCentroids). In a fixed order of faces, rounded the same way in every pass that asks (no fused multiply-adds), so B^T
+//and B are each other's transpose to the bit
 __device__ inline bool couplingRow(const CouplingGrid& where, uint voxel, int3 at, int body, float3 centre, float row[BODY_LANES]){
     for(int lane = 0; lane < BODY_LANES; ++lane){
         row[lane] = 0.0f;
@@ -335,13 +288,18 @@ __device__ inline bool couplingRow(const CouplingGrid& where, uint voxel, int3 a
         any = true;
         int axis = face/2, side = face % 2;
         uint word = where.opens[4*(size_t)voxel + axis];
-        float open = where.near[voxel] & CLOSED_FACE << face ? 0.0f : (side ? word >> 16 : word & 0xFFFFu) / OPEN_FULL;
+        bool closed = where.near[voxel] & CLOSED_FACE << face;
+        float open = closed ? 0.0f : (side ? word >> 16 : word & 0xFFFFu) / OPEN_FULL;
         float solid = __fsub_rn(1.0f, open);
         float flow = side ? solid : -solid;
+        float2 centre = cachedCentroid(where.centroids, voxel, face, closed);
+        float offsets[3];
+        offsets[axis] = side ? 1.0f : 0.0f;
+        offsets[(axis + 1) % 3] = centre.x;
+        offsets[(axis + 2) % 3] = centre.y;
         float lever[3];
-        for(int dim = 0; dim < 3; ++dim){   //from its centre of mass to the face's centre
-            float offset = dim == axis ? (side ? 1.0f : 0.0f) : 0.5f;
-            lever[dim] = __fsub_rn(__fadd_rn(origin[dim], __fmul_rn(__fadd_rn(corner[dim], offset), h)), c[dim]);
+        for(int dim = 0; dim < 3; ++dim){   //from its centre of mass to the solid part's centroid
+            lever[dim] = __fsub_rn(__fadd_rn(origin[dim], __fmul_rn(__fadd_rn(corner[dim], offsets[dim]), h)), c[dim]);
         }
         float turn[3] = {axis == 0 ? 0.0f : axis == 1 ? -lever[2] : lever[1],      //lever x e
                          axis == 0 ? lever[2] : axis == 1 ? 0.0f : -lever[0],
@@ -497,6 +455,31 @@ __global__ void applyBodyResponses(int numBodies, CouplingGrid where, const Body
     }
 }
 
+//the friction the substep's faces gave the particles, every partition's, taken off each body: its momentum off the velocity, its moment off the turning
+__global__ void takeBodyFriction(int numBodies, BodyState* states, const BodyMass* masses, BodyFrame* frames, const BodyCoupling* couplings, const ExactSum* sums){
+    int body = threadIdx.x + blockIdx.x*blockDim.x;
+    if(body >= numBodies){
+        return;
+    }
+    BodyState& state = states[body];
+    const BodyCoupling& coupling = couplings[body];
+    double given[BODY_LANES];
+    for(int lane = 0; lane < BODY_LANES; ++lane){
+        given[lane] = exactValue(sums[BODY_LANES*body + lane]);
+    }
+    double turn[3];
+    times(coupling.inverseInertia, given + 3, turn);
+    for(int axis = 0; axis < 3; ++axis){
+        state.velocity[axis] -= coupling.inverseMass*given[axis];
+        state.angularVelocity[axis] -= turn[axis];
+    }
+    double r[9], inertia[9];
+    rotationOf(state.orientation, r);
+    turned(r, masses[body].inertia, inertia);
+    times(inertia, state.angularVelocity, state.angularMomentum);
+    writeVelocity(state, frames[body]);
+}
+
 __global__ void addBodyEnergy(int numBodies, const double* responses, double* total){
     *total += responses[BODY_LANES*numBodies];
 }
@@ -574,7 +557,9 @@ static uint couplingBlocks(){
 }
 
 void Bodies::release(){
-    for(void* device : {(void*)states, (void*)deviceMasses, (void*)frames, (void*)couplings, (void*)sums, (void*)responses, (void*)boundSums, (void*)bound}){
+    for(void* device : {(void*)states, (void*)deviceMasses, (void*)frames, (void*)couplings, (void*)sums, (void*)responses, (void*)frictionSums, (void*)boundSums,
+                        (void*)bound, (void*)surfacePoints, (void*)surfaceBodies, (void*)picks, (void*)contacts, (void*)lastContacts, (void*)contactOrder,
+                        (void*)batchStarts}){
         if(device != nullptr){
             cudaFree(device);
         }
@@ -590,10 +575,19 @@ void Bodies::release(){
     couplings = nullptr;
     sums = nullptr;
     responses = nullptr;
+    frictionSums = nullptr;
     boundSums = nullptr;
     bound = nullptr;
     seen = nullptr;
     seenBound = nullptr;
+    surfacePoints = nullptr;
+    surfaceBodies = nullptr;
+    numSurfacePoints = 0;
+    picks = nullptr;
+    contacts = nullptr;
+    lastContacts = nullptr;
+    contactOrder = nullptr;
+    batchStarts = nullptr;
     numBodies = 0;
     obstacles.clear();
     masses.clear();
@@ -685,6 +679,8 @@ void Bodies::setUp(const std::vector<SceneObstacle>& descriptions, ObstacleSet& 
             mass.reach = std::max(mass.reach, std::sqrt(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]));
         }
         mass.liquidVoxelMass = liquidDensity*voxelSize*voxelSize*voxelSize;
+        mass.bounce = (float)obstacle.body.bounce;
+        mass.contactFriction = (float)obstacle.body.contactFriction;
         //where it starts: its transform's rotation and translation, which take its own space to the world, its centre of mass with them
         double translation[3], rotation[4];
         obstacleSet.restPlacement(built, translation, rotation);
@@ -720,6 +716,8 @@ void Bodies::setUp(const std::vector<SceneObstacle>& descriptions, ObstacleSet& 
     gpuErrchk(cudaMalloc((void**)&sums, sizeof(ExactSum)*BODY_LANES*numBodies));
     gpuErrchk(cudaMalloc((void**)&responses, sizeof(double)*(BODY_LANES*numBodies + 1)));
     gpuErrchk(cudaMalloc((void**)&boundSums, sizeof(ExactSum)*numBodies));
+    gpuErrchk(cudaMalloc((void**)&frictionSums, sizeof(ExactSum)*BODY_LANES*numBodies));
+    gpuErrchk(cudaMemsetAsync(frictionSums, 0, sizeof(ExactSum)*BODY_LANES*numBodies, stream));
     gpuErrchk(cudaMalloc((void**)&bound, sizeof(double)));
     gpuErrchk(cudaMallocHost((void**)&seen, sizeof(BodyState)*numBodies));
     gpuErrchk(cudaMallocHost((void**)&seenBound, sizeof(double)));
@@ -732,6 +730,7 @@ void Bodies::setUp(const std::vector<SceneObstacle>& descriptions, ObstacleSet& 
     for(int body = 0; body < numBodies; ++body){
         obstacleSet.setFrame(obstacles[body], frames + body);
     }
+    setUpContacts(obstacleSet, voxelSize);
     writeFrames();
 }
 
@@ -775,7 +774,7 @@ void Bodies::findFaceBodies(const Obstacles& obstacleState, const VoxelPlaces& p
 }
 
 void Bodies::prepare(double solveScale, const uint* nodes, uint numOwnNodes, const uint* nodeCells, const uint* interiorVoxels, const char* solveCodes, const char* near,
-                     const uint* opens, const Grid& grid, int interiorWidth, bool bounded){
+                     const uint* opens, const uint* centroids, const Grid& grid, int interiorWidth, bool bounded){
     if(numBodies == 0){
         return;
     }
@@ -787,6 +786,7 @@ void Bodies::prepare(double solveScale, const uint* nodes, uint numOwnNodes, con
     where.solveCodes = solveCodes;
     where.near = near;
     where.opens = opens;
+    where.centroids = centroids;
     where.faceBodies = faceBodyCodes.devPtr();
     where.grid = grid;
     where.interiorWidth = interiorWidth;
@@ -834,13 +834,44 @@ void Bodies::takePressure(const float* p){
     gpuErrchk(cudaPeekAtLastError());
 }
 
-void Bodies::move(double dt){
+void Bodies::beginFriction(){
+    if(numBodies > 0){
+        gpuErrchk(cudaMemsetAsync(frictionSums, 0, sizeof(ExactSum)*BODY_LANES*numBodies, stream));
+    }
+}
+
+BodyFriction Bodies::frictionFor(float share, double particleMass, const float* weightsX, const float* weightsY, const float* weightsZ){
+    BodyFriction friction = {};
+    for(int obstacle = 0; obstacle < MAX_OBSTACLES; ++obstacle){
+        friction.of[obstacle] = -1;
+    }
+    if(numBodies == 0 || share == 0.0f){
+        return friction;
+    }
+    friction.sums = frictionSums;
+    friction.couplings = couplings;
+    for(int body = 0; body < numBodies; ++body){
+        friction.of[obstacles[body]] = (signed char)body;
+    }
+    friction.weights[0] = weightsX;
+    friction.weights[1] = weightsY;
+    friction.weights[2] = weightsZ;
+    friction.scale = (float)(share*particleMass);
+    return friction;
+}
+
+void Bodies::takeFriction(){
     if(numBodies == 0){
         return;
     }
-    moveBodies<<<1, 32, 0, stream>>>(numBodies, states, deviceMasses, dt);
+    context->sumOverPartitions((long long*)frictionSums, BODY_LANES*numBodies*EXACT_WORDS, stream);
+    takeBodyFriction<<<1, 32, 0, stream>>>(numBodies, states, deviceMasses, frames, couplings, frictionSums);
     gpuErrchk(cudaPeekAtLastError());
-    gpuErrchk(cudaMemcpyAsync(seen, states, sizeof(BodyState)*numBodies, cudaMemcpyDeviceToHost, stream));     //read after the next substep's waits
+}
+
+void Bodies::moveOnce(double dt, double measureOver){
+    moveBodies<<<1, 32, 0, stream>>>(numBodies, states, deviceMasses, dt, measureOver);
+    gpuErrchk(cudaPeekAtLastError());
 }
 
 float Bodies::fastest() const{

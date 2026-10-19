@@ -41,6 +41,7 @@ add_library(particles STATIC
     sources.cu
     obstacles.cu
     bodies.cu
+    contacts.cu
     pockets.cu
     boundaries.cu
     levelset.cu

@@ -1460,6 +1460,66 @@ __device__ inline float squareInside(float c0, float c1, float c2, float c3){
     return 0.5f*segmentInside(c[0], c[1])*segmentInside(c[0], c[3]) + 0.5f*segmentInside(c[2], c[1])*segmentInside(c[2], c[3]);    //opposite, apart
 }
 
+//where in a square the part of it inside a solid is centred, from the distances at its corners in order around it, from the first corner along the edge to
+//the second and along the edge to the last: the centroid of squareInside's polygon, the corners inside and the edges' crossings, by its signed area's
+//moments; two triangles where two corners inside on a diagonal aren't joined. The square's middle where none or all of it is inside
+__device__ inline float2 squareSolidCentroid(float c0, float c1, float c2, float c3){
+    float c[4] = {c0, c1, c2, c3};
+    const float corner[4][2] = {{0.0f, 0.0f}, {1.0f, 0.0f}, {1.0f, 1.0f}, {0.0f, 1.0f}};
+    int inside = (c0 < 0.0f) + (c1 < 0.0f) + (c2 < 0.0f) + (c3 < 0.0f);
+    if(inside == 0 || inside == 4){
+        return make_float2(0.5f, 0.5f);
+    }
+    float points[8][2];     //the walk around: each corner inside, then where its edge crosses the surface
+    int count = 0;
+    int firstOf[4];         //where each corner's run starts in points
+    for(int k = 0; k < 4; ++k){
+        int next = (k + 1) % 4;
+        firstOf[k] = count;
+        if(c[k] < 0.0f){
+            points[count][0] = corner[k][0];
+            points[count][1] = corner[k][1];
+            ++count;
+        }
+        if((c[k] < 0.0f) != (c[next] < 0.0f)){
+            float t = c[k] / (c[k] - c[next]);
+            points[count][0] = corner[k][0] + t*(corner[next][0] - corner[k][0]);
+            points[count][1] = corner[k][1] + t*(corner[next][1] - corner[k][1]);
+            ++count;
+        }
+    }
+    float area = 0.0f, mu = 0.0f, mw = 0.0f;
+    auto polygon = [&](const int* which, int n){    //the shoelace sums of a polygon of points, anticlockwise
+        for(int i = 0; i < n; ++i){
+            const float* a = points[which[i]];
+            const float* b = points[which[(i + 1) % n]];
+            float cross = a[0]*b[1] - b[0]*a[1];
+            area += cross;
+            mu += (a[0] + b[0])*cross;
+            mw += (a[1] + b[1])*cross;
+        }
+    };
+    if(inside == 2 && (c0 < 0.0f) == (c2 < 0.0f) && !(0.25f*(c0 + c1 + c2 + c3) < 0.0f)){
+        //two corners inside on a diagonal, apart: a triangle at each, the crossing before it, it, and the crossing after it (the walk's last before the first)
+        int first = c0 < 0.0f ? 0 : 1;
+        int a[3] = {(firstOf[first] + count - 1) % count, firstOf[first], firstOf[first] + 1};
+        int b[3] = {firstOf[first + 2] - 1, firstOf[first + 2], firstOf[first + 2] + 1};
+        polygon(a, 3);
+        polygon(b, 3);
+    }
+    else{
+        int all[8];
+        for(int i = 0; i < count; ++i){
+            all[i] = i;
+        }
+        polygon(all, count);
+    }
+    if(!(area > 0.0f)){
+        return make_float2(0.5f, 0.5f);
+    }
+    return make_float2(mu / (3.0f*area), mw / (3.0f*area));
+}
+
 //how open a cut voxel is, the mean of its faces: what scales its density correction (obstacleFaceFlux), as its row of the pressure equation is scaled.
 //Not how much fluid it holds at rest, which goes by volume (coveredFraction): for a corner a surface cuts off at x + y + z = c, the faces' mean is
 //c^2/4, the volume c^3/6
@@ -1486,7 +1546,8 @@ __device__ inline float coveredFraction(const float eighths[8], float h){
 
 static constexpr float ON_SURFACE = 1.0e-4f;    //of a voxel: a corner within this of an obstacle's surface is on it
 
-__device__ inline CutFaces cutFaces(const Obstacles& obstacles, const VoxelPlaces& places, int3 voxel){
+//and with centroids, its faces' solid parts' centroids into them, a near voxel's (obstacleCentroids)
+__device__ inline CutFaces cutFaces(const Obstacles& obstacles, const VoxelPlaces& places, int3 voxel, uint* centroids = nullptr){
     CutFaces cut;
     float distance;
     float3 normal;
@@ -1518,12 +1579,22 @@ __device__ inline CutFaces cutFaces(const Obstacles& obstacles, const VoxelPlace
             corners[corner] = -FLT_MIN;
         }
     }
+    uint words[3] = {0, 0, 0};
     for(int face = 0; face < 6; ++face){
         int axis = face/2, side = face % 2, u = (axis + 1) % 3, w = (axis + 2) % 3;
         auto at = [&](int du, int dw){
             return corners[side << axis | du << u | dw << w];
         };
         cut.open[face] = 1.0f - squareInside(at(0, 0), at(1, 0), at(1, 1), at(0, 1));
+        if(centroids != nullptr){
+            float2 centre = squareSolidCentroid(at(0, 0), at(1, 0), at(1, 1), at(0, 1));
+            words[axis] |= centroidHalf(centre.x, centre.y) << 16*side;
+        }
+    }
+    if(centroids != nullptr){
+        for(int axis = 0; axis < 3; ++axis){
+            centroids[axis] = words[axis];
+        }
     }
     cut.covered = coveredFraction(eighths, places.voxelSize());
     return cut;
@@ -1550,14 +1621,15 @@ __device__ inline float obstacleDivergence(const ObstacleState& obstacle, float3
 //their velocities run away (the hydrostatic head across a face 1% open drives it at metres a second), and advection would carry particles through them
 //many voxels a substep. The domain's walls stay the domain's
 __global__ void findSolidVoxels(Obstacles obstacles, VoxelPlaces places, const char* walls, const char* solveCodes, const uint* voxelOwners, char* solid, char* near, uint* opens,
-                                uint* nodes){
+                                uint* centroids, uint* nodes){
     uint node = blockIdx.x;
     uint first = node == 0 ? 0 : places.nodeVoxelEnds[node - 1];
     uint last = places.nodeVoxelEnds[node];
     uint cell = places.nodeCells[node];
     bool touches = false;   //whether this node's block has anything for the obstacle passes: a voxel within 1.5 voxels of a surface, or in one
     for(uint index = first + threadIdx.x; index < last; index += blockDim.x){
-        CutFaces cut = cutFaces(obstacles, places, places.voxelOf(cell, places.voxelSlots[index]));
+        uint centres[3];
+        CutFaces cut = cutFaces(obstacles, places, places.voxelOf(cell, places.voxelSlots[index]), centres);
         bool closed = true;
         int bits = cut.near ? NEAR_SURFACE : 0;
         uint words[3] = {0, 0, 0};
@@ -1572,6 +1644,9 @@ __global__ void findSolidVoxels(Obstacles obstacles, VoxelPlaces places, const c
                 opens[4*(size_t)index + axis] = words[axis];
             }
             opens[4*(size_t)index + 3] = __float2uint_rn(cut.covered*OPEN_FULL);
+            for(int axis = 0; axis < 3; ++axis){
+                centroids[3*(size_t)index + axis] = centres[axis];
+            }
         }
         bool empty = !solveCodes[voxelOwners[index]];    //no fluid reached it: it's no unknown, and the solve would take it for air
         solid[index] = !walls[index] && (closed || (empty && cut.centre < 0.0f));
@@ -1591,7 +1666,7 @@ __global__ void findSolidVoxels(Obstacles obstacles, VoxelPlaces places, const c
 //wall has no pressure equation, and is retired with the solid voxels.
 //An air voxel above that named it across a closed face no longer does, so the pressure update leaves that face to the obstacle; only the voxel below
 //writes that place
-__global__ void wallOffSolidNeighbors(Obstacles obstacles, VoxelPlaces places, const uint* nodes, char* solid, char* near, uint* opens, const char* solveCodes, uint* neighborNx,
+__global__ void wallOffSolidNeighbors(Obstacles obstacles, VoxelPlaces places, const uint* nodes, char* solid, char* near, uint* opens, uint* centroids, const char* solveCodes, uint* neighborNx,
                                       uint* neighborPx, uint* neighborNy, uint* neighborPy, uint* neighborNz, uint* neighborPz){
     for(uint listed = blockIdx.x; listed < nodes[0]; listed += gridDim.x){    //the nodes near obstacles (findSolidVoxels), a block each in turn
         uint node = nodes[1 + listed];
@@ -1642,6 +1717,7 @@ __global__ void wallOffSolidNeighbors(Obstacles obstacles, VoxelPlaces places, c
                 if(!(bits & NEAR_SURFACE)){     //no surface cut it, so it has no cached fractions yet: all its faces are open, and none of it covered
                     for(int axis = 0; axis < 3; ++axis){
                         opens[4*(size_t)index + axis] = (uint)OPEN_FULL | (uint)OPEN_FULL << 16;
+                        centroids[3*(size_t)index + axis] = centroidHalf(0.5f, 0.5f) | centroidHalf(0.5f, 0.5f) << 16;
                     }
                     opens[4*(size_t)index + 3] = 0;
                 }
@@ -1725,15 +1801,16 @@ void Particles::markObstacleSolids(){
     obstacleSolids.resizeAsync(numVoxels, stream);
     obstacleNear.resizeAsync(numVoxels, stream);
     obstacleOpen.resizeAsync(4*numVoxels, stream);
+    obstacleCentroids.resizeAsync(3*numVoxels, stream);
     obstacleNodes.resizeAsync(numStoredNodes + 1, stream);
     gpuErrchk(cudaMemsetAsync(obstacleNodes.devPtr(), 0, sizeof(uint), stream));    //the list starts empty
     if(numVoxels == 0){
         return;
     }
     findSolidVoxels<<<numStoredNodes, OBSTACLE_THREADS, 0, stream>>>(obstacles.state(), voxelPlaces(), solids.devPtr(), solveCodes.devPtr(), voxelOwners.devPtr(), obstacleSolids.devPtr(),
-        obstacleNear.devPtr(), obstacleOpen.devPtr(), obstacleNodes.devPtr());
+        obstacleNear.devPtr(), obstacleOpen.devPtr(), obstacleCentroids.devPtr(), obstacleNodes.devPtr());
     wallOffSolidNeighbors<<<obstacleBlocks(), OBSTACLE_THREADS, 0, stream>>>(obstacles.state(), voxelPlaces(), obstacleNodes.devPtr(), obstacleSolids.devPtr(), obstacleNear.devPtr(), obstacleOpen.devPtr(),
-        solveCodes.devPtr(), neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(), neighborPy.devPtr(), neighborNz.devPtr(), neighborPz.devPtr());
+        obstacleCentroids.devPtr(), solveCodes.devPtr(), neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(), neighborPy.devPtr(), neighborNz.devPtr(), neighborPz.devPtr());
     retireSolidVoxels<<<numVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numVoxels, obstacleSolids.devPtr(), solveCodes.devPtr(), neighborNx.devPtr(), neighborPx.devPtr(),
         neighborNy.devPtr(), neighborPy.devPtr(), neighborNz.devPtr(), neighborPz.devPtr());
     gpuErrchk(cudaPeekAtLastError());
@@ -1755,7 +1832,8 @@ void Particles::markObstacleSolids(){
 //correction cudaCalcDivU asked of a cut voxel is a source in its fluid, which only fills the open part of it: it's scaled by how open the voxel is, the
 //mean of its faces, as its row of the pressure equation is. A sliver of fluid would otherwise ask a whole voxel's worth of its few faces, and its
 //pressure, and their velocities, would run away
-__global__ void obstacleFaceFlux(Obstacles obstacles, VoxelPlaces places, uint3 domainVoxels, const uint* nodes, const char* near, const uint* opens, const char* solveCodes, const uint* neighborNx,
+__global__ void obstacleFaceFlux(Obstacles obstacles, VoxelPlaces places, uint3 domainVoxels, const uint* nodes, const char* near, const uint* opens, const uint* centroids,
+                                 const char* solveCodes, const uint* neighborNx,
                                  const uint* neighborPx, const uint* neighborNy, const uint* neighborPy, const uint* neighborNz, const uint* neighborPz, const float* ux, const float* uy, const float* uz,
                                  float* divU){
     for(uint listed = blockIdx.x; listed < nodes[0]; listed += gridDim.x){    //the nodes near obstacles (findSolidVoxels), a block each in turn
@@ -1821,7 +1899,13 @@ __global__ void obstacleFaceFlux(Obstacles obstacles, VoxelPlaces places, uint3 
                 }
                 int axis = face/2, side = face % 2;
                 uint neighbor = (side ? upper : lower)[axis][index];
-                float moving = solids[face] >= 0 ? component(obstacleVelocity(obstacles.items[solids[face]], points[face]), axis) : 0.0f;
+                //the obstacle moves across the face's solid part as that part's centroid does
+                float2 centre = cachedCentroid(centroids, index, face, near[index] & CLOSED_FACE << face);
+                float offset[3];
+                offset[axis] = side ? 1.0f : 0.0f;
+                offset[(axis + 1) % 3] = centre.x;
+                offset[(axis + 2) % 3] = centre.y;
+                float moving = solids[face] >= 0 ? component(obstacleVelocity(obstacles.items[solids[face]], places.point(voxel, offset[0], offset[1], offset[2])), axis) : 0.0f;
                 float fluid = neighbor == WALL_VOXEL ? 0.0f : side ? (neighbor < WALL_VOXEL ? velocities[axis][neighbor] : 0.0f) : velocities[axis][index];  //as cudaCalcDivU took it
                 float more = (1.0f - cut.open[face])*(moving - fluid);
                 flux += side ? more : -more;
@@ -1838,7 +1922,7 @@ void Particles::addObstacleFlux(){
     uint interiorWidth = 2<<refinementLevel;
     uint3 domainVoxels = make_uint3(grid.sizeX*interiorWidth, grid.sizeY*interiorWidth, grid.sizeZ*interiorWidth);
     obstacleFaceFlux<<<obstacleBlocks(), OBSTACLE_THREADS, 0, stream>>>(obstacles.state(), voxelPlaces(), domainVoxels, obstacleNodes.devPtr(), obstacleNear.devPtr(), obstacleOpen.devPtr(),
-        solveCodes.devPtr(), neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(),
+        obstacleCentroids.devPtr(), solveCodes.devPtr(), neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(),
         neighborPy.devPtr(), neighborNz.devPtr(), neighborPz.devPtr(), voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr(), divU.devPtr());
     gpuErrchk(cudaPeekAtLastError());
 }
@@ -1848,13 +1932,13 @@ void Particles::addObstacleFlux(){
 //fluid voxel missing from it, taken for part of the obstacle by its centre, had the fluid's face beside it set to the obstacle's velocity wherever the
 //liquid's edge ran along a node's), with the places no voxel is stored taken as inside an obstacle if their centres are, and each of its interior
 //voxels' faces with an obstacle on either side gets a velocity:
-//- a face between fluid and obstacle: the obstacle's velocity across it, the flow the pressure solve gave it (addObstacleFlux). (Where the obstacle
-//  has let go of the fluid's voxel, carryLetGoFaces then gives it the liquid's)
-//- a face inside the obstacle: the fluid's velocity along the surface from the faces of the same component next to it, blended towards the obstacle's
-//  by its friction; across the surface, the obstacle's. Layer 1 fills the faces next to fluid faces, layer 2 the faces next to those
+//- a face between fluid and obstacle, or inside the obstacle: a wall the fluid slips along (slipVelocity): across the surface, the obstacle's velocity,
+//  the flow the pressure solve gave it there (addObstacleFlux); along it, the fluid's from the faces of the same component next to it, held towards the
+//  obstacle's by its friction. (Where the obstacle has let go of the fluid's voxel, carryLetGoFaces then gives it the liquid's.) Layer 1 fills the faces
+//  between and the faces inside next to fluid faces, layer 2 the faces inside next to those
 __global__ void obstacleGhostFaces(int layer, Obstacles obstacles, VoxelPlaces places, const uint* nodes, uint numOwnNodes, uint numUsedGridNodes, const uint* cellToNode,
                                    const uint* interiorVoxels, const char* solid, const char* near, const float* beforeX, const float* beforeY, const float* beforeZ,
-                                   float* ux, float* uy, float* uz){
+                                   float* ux, float* uy, float* uz, BodyFriction friction){
     extern __shared__ float blockVelocities[];  //per component, a value per slot; then per slot, whether it's stored, whether it's solid, its near bits
     __shared__ uint tileNodes[27];
     int voxels1D = places.interiorWidth + 2*places.apronCells;
@@ -1958,55 +2042,71 @@ __global__ void obstacleGhostFaces(int layer, Obstacles obstacles, VoxelPlaces p
                 }
                 float3 face = faces[dim];
                 float3 normal = normals[dim];
-                float solidVelocity = component(obstacleVelocity(obstacles.items[obstacle], face), dim);
-                float value;
-                if(here != there[dim] || closed[dim]){     //between fluid and obstacle
-                    if(layer != 1){
-                        continue;
-                    }
-                    value = solidVelocity;
+                float3 solidMotion = obstacleVelocity(obstacles.items[obstacle], face);
+                bool between = here != there[dim] || closed[dim];   //between fluid and obstacle, which layer 1 does, or inside, in the layer it's in
+                if(between ? layer != 1 : nextToFluid(slot, dim) != (layer == 1)){
+                    continue;
                 }
-                else{
-                    bool firstLayer = nextToFluid(slot, dim);
-                    if(firstLayer != (layer == 1)){
-                        continue;
-                    }
+                //the fluid's velocity at the face, each component the mean of the faces of it there that have the fluid's: this one's from the faces of
+                //the same component around it, the others' from the four of theirs that meet it; one with none of the fluid's takes the obstacle's
+                auto counts = [&](int neighbor, int of){
+                    return neighbor >= 0 && (layer == 1 ? fluidFace(neighbor, of) : insideFace(neighbor, of) && nextToFluid(neighbor, of));
+                };
+                float fluid[3];
+                for(int of = 0; of < 3; ++of){
                     float sum = 0.0f;
                     int count = 0;
-                    for(int axis = 0; axis < 3; ++axis){
-                        for(int by = -1; by <= 1; by += 2){
-                            int neighbor = step(slot, axis, by);
-                            if(neighbor < 0){
-                                continue;
+                    if(of == dim){
+                        for(int axis = 0; axis < 3; ++axis){
+                            for(int by = -1; by <= 1; by += 2){
+                                int neighbor = step(slot, axis, by);
+                                if(counts(neighbor, dim)){
+                                    sum += blockVelocities[dim*voxels3D + neighbor];
+                                    ++count;
+                                }
                             }
-                            if(layer == 1 ? fluidFace(neighbor, dim) : insideFace(neighbor, dim) && nextToFluid(neighbor, dim)){
-                                sum += blockVelocities[dim*voxels3D + neighbor];
+                        }
+                    }
+                    else{
+                        int under = step(slot, dim, -1);
+                        int meeting[4] = {slot, step(slot, of, 1), under, under >= 0 ? step(under, of, 1) : -1};
+                        for(int neighbor : meeting){
+                            if(counts(neighbor, of)){
+                                sum += blockVelocities[of*voxels3D + neighbor];
                                 ++count;
                             }
                         }
                     }
-                    float tangential = 1.0f - component(normal, dim)*component(normal, dim);   //how much of this component runs along the surface
-                    float fluid = count > 0 ? sum / count : solidVelocity;
-                    value = solidVelocity + tangential*(1.0f - obstacles.items[obstacle].friction)*(fluid - solidVelocity);
+                    fluid[of] = count > 0 ? sum / count : component(solidMotion, of);
                 }
-                velocities[dim][index] = value;
+                float fluidAlong = alongSurface(make_float3(fluid[0], fluid[1], fluid[2]), normal, dim);
+                float holding = obstacles.items[obstacle].friction;
+                velocities[dim][index] = slipVelocity(solidMotion, normal, dim, fluidAlong, holding);
+                addFriction(friction, obstacle, dim, face, index, frictionPart(solidMotion, normal, dim, fluidAlong, holding));     //what a dynamic body's friction gave
             }
         }
         __syncthreads();    //before the next node reuses the shared memory
     }
 }
 
-//What crosses a face an obstacle cuts is the fluid's velocity over its open part w and the obstacle's over the rest: w u + (1 - w) u_obstacle, as the
-//divergence counts it (obstacleFaceFlux). That's what G2P and advection take there, FLIP's old velocity before the solve and the new one after it, rather
-//than the open part's alone: the solve holds only w u, and where a surface closes in on fluid, u at a face open a sliver runs to many times the obstacle's
-//speed (water a foot squeezes against the floor leaves through a corner of a face at tens of metres a second), which particles would carry off. Mixed, it
-//goes smoothly to the obstacle's velocity as w goes to 0, where the face closes and the ghost velocities give it just that. A face is the lower face of
-//the voxel above it, a block per node of this partition's own; the ghost pass after it rewrites the faces it owns (closed ones, ones into solids), and the
-//domain's walls stay walls
-__global__ void mixCutFaces(Obstacles obstacles, VoxelPlaces places, const uint* nodes, uint numOwnNodes, const char* near, const uint* opens, float* ux, float* uy,
-                            float* uz){
-    int voxels1D = places.interiorWidth + 2*places.apronCells;
+//What crosses a face an obstacle cuts is the fluid's velocity over its open part w and the obstacle's over the rest, as the divergence counts it
+//(obstacleFaceFlux), and that's what G2P and advection take there, FLIP's old velocity before the solve and the new one after it, rather than the open
+//part's alone: the solve holds only w u, and where a surface closes in on fluid, u at a face open a sliver runs to many times the obstacle's speed (water
+//a foot squeezes against the floor leaves through a corner of a face at tens of metres a second), which particles would carry off. Over the obstacle's
+//part the face takes what a face inside the obstacle does (slipVelocity): the obstacle's velocity across its surface, and along it the fluid's, held by
+//the obstacle's friction. The fluid's there is the mean over the open part of this face and of the six faces of the same component around it, each
+//weighed by how open it is, as they were before this pass: a sliver's flow counts for as little as the sliver is wide, so it can't jet, and a wall with
+//no friction lets the fluid slide past it (a spinning ball doesn't drag the water round). It goes smoothly to the obstacle's velocity across its
+//surface as w goes to 0, where the face closes and the ghost velocities give it just that. A face is the lower face of the voxel above it, a block per
+//node of this partition's own, reading its neighbours through the node's tile (liquidTile.hu); the ghost pass after it rewrites the faces it owns (closed
+//ones, ones into solids), and the domain's walls stay walls. A viscous liquid holds on at least as the walls do (stick). What a dynamic body's friction
+//gives the fluid adds up in friction (bodies.hu)
+__global__ void mixCutFaces(Obstacles obstacles, VoxelPlaces places, const uint* nodes, uint numOwnNodes, uint numUsedGridNodes, const uint* cellToNode, const uint* interiorVoxels,
+                            const char* solid, const char* near, const uint* opens, const uint* centroids, float stick, const float* beforeX, const float* beforeY, const float* beforeZ, float* ux,
+                            float* uy, float* uz, BodyFriction friction){
+    __shared__ uint tileNodes[27];
     float* velocities[3] = {ux, uy, uz};
+    const float* before[3] = {beforeX, beforeY, beforeZ};
     for(uint listed = blockIdx.x; listed < nodes[0]; listed += gridDim.x){    //the nodes near obstacles (findSolidVoxels), a block each in turn
         uint node = nodes[1 + listed];
         if(node >= numOwnNodes){    //another partition's, which it mixes itself
@@ -2015,19 +2115,21 @@ __global__ void mixCutFaces(Obstacles obstacles, VoxelPlaces places, const uint*
         uint first = node == 0 ? 0 : places.nodeVoxelEnds[node - 1];
         uint last = places.nodeVoxelEnds[node];
         uint cell = places.nodeCells[node];
+        loadTileNodes(tileNodes, cell, numUsedGridNodes, places.nodeCells, cellToNode, places.grid);
+        __syncthreads();
+        Tile tile(cell, places.grid, places.interiorWidth, places.apronCells);  //its slots are the node's block's
         for(uint index = first + threadIdx.x; index < last; index += blockDim.x){
             if(!(near[index] & NEAR_SURFACE)){
                 continue;
             }
             int slot = places.voxelSlots[index];
-            int x = slot % voxels1D, y = slot / voxels1D % voxels1D, z = slot / (voxels1D*voxels1D);
-            if(x < places.apronCells || y < places.apronCells || z < places.apronCells || x >= voxels1D - places.apronCells || y >= voxels1D - places.apronCells ||
-               z >= voxels1D - places.apronCells){
+            int3 t = tile.at(slot);
+            if(!tile.interior(t)){
                 continue;   //only the node's own voxels: their neighbours own the apron's
             }
             int3 voxel = places.voxelOf(cell, slot);
             CutFaces cut = cachedCut(opens, index);
-            float3 points[3];
+            float3 points[3], normals[3];
             int nearest[3];
             bool mixes[3];
             for(int dim = 0; dim < 3; ++dim){
@@ -2040,34 +2142,92 @@ __global__ void mixCutFaces(Obstacles obstacles, VoxelPlaces places, const uint*
             }
             for(int dim = 0; dim < 3; ++dim){   //looked up together, so their latencies overlap
                 float distance;
-                float3 normal;
-                nearest[dim] = mixes[dim] ? nearestObstacle(obstacles, points[dim], distance, normal) : -1;
+                nearest[dim] = mixes[dim] ? nearestObstacle(obstacles, points[dim], distance, normals[dim]) : -1;
             }
             for(int dim = 0; dim < 3; ++dim){
                 if(nearest[dim] < 0){
                     continue;
                 }
+                const ObstacleState& obstacle = obstacles.items[nearest[dim]];
                 float open = cut.open[2*dim];
-                float solid = component(obstacleVelocity(obstacles.items[nearest[dim]], points[dim]), dim);
-                velocities[dim][index] = open*velocities[dim][index] + (1.0f - open)*solid;
+                float2 centre = cachedCentroid(centroids, index, 2*dim, false);    //where its solid part is, which moves as the obstacle does there
+                float offset[3];
+                offset[dim] = 0.0f;
+                offset[(dim + 1) % 3] = centre.x;
+                offset[(dim + 2) % 3] = centre.y;
+                float3 solidMotion = obstacleVelocity(obstacle, places.point(voxel, offset[0], offset[1], offset[2]));
+                //a face's own velocity and how open it is, for the mean: the lower face along of of the voxel at a slot, with the voxel under it along of
+                //too; none where either is solid or past the domain
+                auto weigh = [&](int3 at, int of, float& sum, float& weight){
+                    int3 under = make_int3(at.x - (of == 0), at.y - (of == 1), at.z - (of == 2));
+                    if(!tile.inDomain(at) || !tile.inDomain(under)){
+                        return;
+                    }
+                    uint neighbor = tile.voxel(at, tileNodes, numUsedGridNodes, interiorVoxels);
+                    uint past = tile.voxel(under, tileNodes, numUsedGridNodes, interiorVoxels);
+                    if(neighbor == NO_VOXEL || solid[neighbor] || (past != NO_VOXEL && solid[past])){
+                        return;
+                    }
+                    float opening = !(near[neighbor] & NEAR_SURFACE) ? 1.0f : near[neighbor] & CLOSED_FACE << 2*of ? 0.0f : cachedCut(opens, neighbor).open[2*of];
+                    sum += opening*before[of][neighbor];
+                    weight += opening;
+                };
+                //the fluid's velocity at the face, each component the open-weighed mean: this one's over the face and the six of the same component
+                //around it, the others' over the four of theirs that meet it; one with nothing open takes the obstacle's
+                float fluid[3];
+                for(int of = 0; of < 3; ++of){
+                    float sum = of == dim ? open*before[dim][index] : 0.0f, weight = of == dim ? open : 0.0f;
+                    if(of == dim){
+                        for(int axis = 0; axis < 3; ++axis){
+                            for(int by = -1; by <= 1; by += 2){
+                                weigh(make_int3(t.x + (axis == 0)*by, t.y + (axis == 1)*by, t.z + (axis == 2)*by), dim, sum, weight);
+                            }
+                        }
+                    }
+                    else{
+                        int3 under = make_int3(t.x - (dim == 0), t.y - (dim == 1), t.z - (dim == 2));
+                        int3 meeting[4] = {t, make_int3(t.x + (of == 0), t.y + (of == 1), t.z + (of == 2)), under,
+                                           make_int3(under.x + (of == 0), under.y + (of == 1), under.z + (of == 2))};
+                        for(int3 at : meeting){
+                            weigh(at, of, sum, weight);
+                        }
+                    }
+                    fluid[of] = weight > 0.0f ? sum / weight : component(solidMotion, of);
+                }
+                float fluidAlong = alongSurface(make_float3(fluid[0], fluid[1], fluid[2]), normals[dim], dim);
+                float holding = fmaxf(obstacle.friction, stick);
+                velocities[dim][index] = open*before[dim][index] + (1.0f - open)*slipVelocity(solidMotion, normals[dim], dim, fluidAlong, holding);
+                addFriction(friction, nearest[dim], dim, points[dim], index, (1.0f - open)*frictionPart(solidMotion, normals[dim], dim, fluidAlong, holding));
             }
         }
+        __syncthreads();    //before the next node's tile
     }
 }
 
-void Particles::mixObstacleFaces(CudaVec<float>& ux, CudaVec<float>& uy, CudaVec<float>& uz){
+void Particles::mixObstacleFaces(CudaVec<float>& ux, CudaVec<float>& uy, CudaVec<float>& uz, float frictionShare){
     if(obstacles.count() == 0 || numOwnNodes == 0){
         return;
     }
-    mixCutFaces<<<obstacleBlocks(), OBSTACLE_THREADS, 0, stream>>>(obstacles.state(), voxelPlaces(), obstacleNodes.devPtr(), numOwnNodes, obstacleNear.devPtr(),
-        obstacleOpen.devPtr(), ux.devPtr(), uy.devPtr(), uz.devPtr());
+    //the faces as they are, which the mix reads its neighbours' from while it writes: the ghosts' their owners', so every partition reads the same
+    CudaVec<float>* velocity[3] = {&ux, &uy, &uz};
+    for(int dim = 0; dim < 3; ++dim){
+        context->fillGhosts(velocity[dim]->devPtr(), stream);
+        if(ghostBefore[dim].size() < ux.size()){
+            ghostBefore[dim].resizeAsync(ux.size(), stream);
+        }
+        gpuErrchk(cudaMemcpyAsync(ghostBefore[dim].devPtr(), velocity[dim]->devPtr(), sizeof(float)*ux.size(), cudaMemcpyDeviceToDevice, stream));
+    }
+    mixCutFaces<<<obstacleBlocks(), OBSTACLE_THREADS, 0, stream>>>(obstacles.state(), voxelPlaces(), obstacleNodes.devPtr(), numOwnNodes, numUsedGridNodes, cellToNode.devPtr(),
+        nodeInteriorVoxels.devPtr(), obstacleSolids.devPtr(), obstacleNear.devPtr(), obstacleOpen.devPtr(), obstacleCentroids.devPtr(), viscosity > 0.0 ? (float)wallStick() : 0.0f, ghostBefore[0].devPtr(),
+        ghostBefore[1].devPtr(), ghostBefore[2].devPtr(), ux.devPtr(), uy.devPtr(), uz.devPtr(),
+        bodies.frictionFor(frictionShare, 1.0 / restParticlesPerVoxel, voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr()));
     gpuErrchk(cudaPeekAtLastError());
     for(CudaVec<float>* velocity : {&ux, &uy, &uz}){   //the ghost pass next reads the ghosts' faces, as their owners mixed them
         context->fillGhosts(velocity->devPtr(), stream);
     }
 }
 
-void Particles::obstacleGhostVelocities(CudaVec<float>& ux, CudaVec<float>& uy, CudaVec<float>& uz){
+void Particles::obstacleGhostVelocities(CudaVec<float>& ux, CudaVec<float>& uy, CudaVec<float>& uz, float frictionShare){
     if(obstacles.count() == 0 || numOwnNodes == 0){
         return;
     }
@@ -2092,7 +2252,7 @@ void Particles::obstacleGhostVelocities(CudaVec<float>& ux, CudaVec<float>& uy, 
         }
         obstacleGhostFaces<<<obstacleBlocks(), OBSTACLE_THREADS, shared, stream>>>(layer, state, voxelPlaces(), obstacleNodes.devPtr(), numOwnNodes, numUsedGridNodes, cellToNode.devPtr(),
             nodeInteriorVoxels.devPtr(), obstacleSolids.devPtr(), obstacleNear.devPtr(), ghostBefore[0].devPtr(), ghostBefore[1].devPtr(), ghostBefore[2].devPtr(), ux.devPtr(), uy.devPtr(),
-            uz.devPtr());
+            uz.devPtr(), bodies.frictionFor(frictionShare, 1.0 / restParticlesPerVoxel, voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr()));
         gpuErrchk(cudaPeekAtLastError());
         for(CudaVec<float>* velocity : {&ux, &uy, &uz}){   //the next layer, and the ghosts, read what this one wrote
             context->fillGhosts(velocity->devPtr(), stream);

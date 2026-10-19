@@ -227,6 +227,9 @@ public:
     //what the fluid flows around (see obstacles.hu), and among them, what it moves too (dynamic ones, bodies.hu): weighed against the liquid's density,
     //kg/m^3. After setDomain
     void setObstacles(const std::vector<SceneObstacle>& descriptions, double liquidDensity = 1000.0);
+    void setCollisionSubsteps(int perFrame){    //the dynamic bodies' contact steps a frame, at least (Bodies::setCollisionSubsteps)
+        bodies.setCollisionSubsteps(perFrame);
+    }
 
     //the liquid's kinematic viscosity, in m^2/s: its dynamic viscosity over its density (water 1e-6, honey around 5e-3). 0, the default, for none:
     //the viscous solve (viscosity.cu) only runs with some
@@ -330,8 +333,10 @@ private:
     void markObstacleSolids();
     void addObstacleFlux();
     void weighCutCells(float scale);
-    void obstacleGhostVelocities(CudaVec<float>& ux, CudaVec<float>& uy, CudaVec<float>& uz);   //of these face velocities: the new ones, or FLIP's old
-    void mixObstacleFaces(CudaVec<float>& ux, CudaVec<float>& uy, CudaVec<float>& uz);          //the faces obstacles cut carry what crosses them all told
+    //of these face velocities: the new ones, or FLIP's old; with dynamic bodies, frictionShare of what their friction gives the particles is counted
+    //against them (Bodies::beginFriction): 1 after the solve, -flipRatio in FLIP's old, 0 where the pass is done again before G2P reads it
+    void obstacleGhostVelocities(CudaVec<float>& ux, CudaVec<float>& uy, CudaVec<float>& uz, float frictionShare);
+    void mixObstacleFaces(CudaVec<float>& ux, CudaVec<float>& uy, CudaVec<float>& uz, float frictionShare);      //the faces obstacles cut carry what crosses them all told
     void creditObstacleVolume();
     bool lettingGo() const;         //boundaries that let go of the liquid (boundaries.cu): whether there are any, which there aren't with the air simulated
     void holdEverything();          //before a solve
@@ -545,6 +550,7 @@ private:
                                     //of its faces are closed (bits, obstacles.cu)
     CudaVec<uint> obstacleOpen;     //per stored voxel near a surface: its six faces' open fractions and how much of it is covered this substep, in 16-bit
                                     //fixed point (obstacles.cu)
+    CudaVec<uint> obstacleCentroids;    //per stored voxel near a surface: where on each face its solid part is centred, in 8-bit fixed point (obstacles.hu)
     CudaVec<float> ghostBefore[3];  //the face velocities before a layer of obstacleGhostVelocities, which it reads while it writes the faces it sets
     CudaVec<uint> obstacleNodes;    //the stored nodes any voxel of whose block is solid or within 1.5 voxels of a surface: how many, then them. The obstacle passes
                                     //only visit those

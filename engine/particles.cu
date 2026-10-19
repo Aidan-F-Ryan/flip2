@@ -1274,14 +1274,15 @@ void Particles::particleVelToVoxels(){
     }
     retireDryUnknowns();    //sharp, the solve's liquid is the unknowns whose centres are in it
     findFaceDensities();    //two phases: how light each face is, for the pressure equations and the velocity update
-    obstacleGhostVelocities(voxelsUx, voxelsUy, voxelsUz);      //the faces in and beside obstacles, so FLIP's change over the solve is measured from the same kind of value there
+    obstacleGhostVelocities(voxelsUx, voxelsUy, voxelsUz, 0.0f);    //the faces in and beside obstacles, so FLIP's change over the solve is measured from the same kind of value there
     for(auto [velocity, before] : {std::pair{&voxelsUx, &voxelsUxOld}, {&voxelsUy, &voxelsUyOld}, {&voxelsUz, &voxelsUzOld}}){    //for FLIP's velocity change over the solve
         cudaMemcpyAsync(before->devPtr(), velocity->devPtr(), sizeof(float)*velocity->size(), cudaMemcpyDeviceToDevice, stream);
     }
     //and FLIP's old faces that obstacles cut as what crosses them all told, as the new ones will be, with the faces inside them from those. The solve's own
-    //take the open part alone, as it needs
-    mixObstacleFaces(voxelsUxOld, voxelsUyOld, voxelsUzOld);
-    obstacleGhostVelocities(voxelsUxOld, voxelsUyOld, voxelsUzOld);
+    //take the open part alone, as it needs. What a dynamic body's friction does to them, the particles take back from it (G2P's FLIP), less flipRatio
+    bodies.beginFriction();
+    mixObstacleFaces(voxelsUxOld, voxelsUyOld, voxelsUzOld, (float)-flipRatio);
+    obstacleGhostVelocities(voxelsUxOld, voxelsUyOld, voxelsUzOld, (float)-flipRatio);
 }
 
 void Particles::pressureSolve(){
@@ -1317,7 +1318,8 @@ void Particles::pressureSolve(){
     }
     findWhitewater();   //what the surface makes this substep, now its length is known: read from the grid as P2G left it, and nothing of the fluid's changes by it
     applyForces(forces, dt, elapsedTime, forceVoxels(), stream);
-    bodies.predict(dt, forces.gravity);     //the dynamic bodies fall as the fluid does, and the solve starts them from there
+    bodies.warmStart(dt, obstacles.state(), forces.gravity);    //the dynamic bodies held up by what they rested on, as they were last substep,
+    bodies.predict(dt, forces.gravity);     //and falling as the fluid does: the solve starts them from there
     floatInAir(dt);     //an air band: less the still air's weight
     if(surfaceTension > 0.0){
         applySurfaceTension();
@@ -1339,7 +1341,7 @@ void Particles::pressureSolve(){
     SolveTerm* coupling = nullptr;
     if(bodies.count() > 0){
         bodies.prepare(dt/(density*voxelSize*voxelSize), obstacleNodes.devPtr(), numOwnNodes, nodeCells.devPtr(), nodeInteriorVoxels.devPtr(), solveCodes.devPtr(), obstacleNear.devPtr(),
-                       obstacleOpen.devPtr(), grid, (int)interiorWidth, lettingGo());
+                       obstacleOpen.devPtr(), obstacleCentroids.devPtr(), grid, (int)interiorWidth, lettingGo());
         coupling = &bodies;
     }
     auto solve = [&](const char* bounded){   //bounded: the voxels to keep from going under the air's pressure, from the pressures the last solve left (boundaries.cu)
@@ -1434,8 +1436,9 @@ void Particles::updateVoxelVelocities(){
     lightenFaceUpdates(dt/(0.014*voxelSize*voxelSize));     //two phases, each face pushed as its own density lets the pressure push it
     extendLiquidVelocities();   //and the faces around the liquid that particles read carry its velocity on
     pinEmitterVelocities();     //an emitter's fluid leaves at its velocity, whatever the solve made of it
-    mixObstacleFaces(voxelsUx, voxelsUy, voxelsUz);         //the faces obstacles cut carry what crosses them all told, not the open part's alone
-    obstacleGhostVelocities(voxelsUx, voxelsUy, voxelsUz);  //the faces between fluid and obstacles take the obstacles' velocity across them; the faces inside continue the fluid's
+    mixObstacleFaces(voxelsUx, voxelsUy, voxelsUz, 1.0f);         //the faces obstacles cut carry what crosses them all told, not the open part's alone
+    obstacleGhostVelocities(voxelsUx, voxelsUy, voxelsUz, 1.0f);  //the faces between fluid and obstacles take the obstacles' velocity across them; the faces inside continue the fluid's
+    bodies.takeFriction();      //and what the dynamic bodies' friction gave the particles, the bodies give up
     if(anyLetGo && obstacles.lettingGo()){  //but the liquid's, where an obstacle let go of it; and in FLIP's old velocities, set before the solve said where
         carryLetGoFaces(voxelsUx, voxelsUy, voxelsUz);
         carryLetGoFaces(voxelsUxOld, voxelsUyOld, voxelsUzOld);
@@ -2124,7 +2127,9 @@ void Particles::solveFrame(double fps){
         updateVoxelVelocities();
         voxelVelsToParticles();   //also moves the particles; initialize re-bins them wherever they landed, reflecting any that crossed a wall
         stepWhitewater();         //the whitewater flies through the same grid, and what the surface made joins it: nothing of the fluid's changes by it
-        bodies.move(dt);          //the dynamic bodies move with what the substep left them with, before initialize places the obstacles
+        //the dynamic bodies' own steps through the substep: their contacts, and their moves, before initialize places the obstacles
+        bodies.step(dt, frameDt, obstacles.state(), make_float3(grid.negX, grid.negY, grid.negZ),
+                    make_float3(grid.negX + grid.sizeX*grid.cellSize, grid.negY + grid.sizeY*grid.cellSize, grid.negZ + grid.sizeZ*grid.cellSize), forces.gravity);
         ++substepIndex;
         initialize();
     }

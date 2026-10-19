@@ -17,7 +17,9 @@ Kinds:
 
 Keys: voxel (m, default 1/128), box (the tank's side, m, 0.5), depth (the water's, m, 0.25), radius (m, 0.08), size (the box's width, m, 0.12),
 density (kg/m^3), height (where its centre starts, m), tilt (degrees), frames (96), fps (24), solver (multigrid), freeSurface (footprint or sharp),
-air (0: no; 1: air simulated), spin (rad/s), shape (box: a cube in place of the ball)
+air (0: no; 1: air simulated), spin (rad/s), shape (box: a cube in place of the ball), friction (the water's hold on it, 0 to 1), pool (0: no water),
+bounce, contactFriction, velocity (x,y,z m/s), count (that many, stacked a voxel apart, each turned 7 degrees more about y), substeps (collision
+substeps a frame)
 """
 import json
 import math
@@ -55,6 +57,8 @@ def scene(kind, settings):
     else:
         obstacle = {"shape": "sphere", "centre": [0, 0, 0], "radius": radius}
     obstacle["transform"] = transform
+    if "friction" in settings:
+        obstacle["friction"] = float(settings["friction"])
     obstacle["dynamic"] = {"density": density}
     if kind == "spin":
         obstacle["dynamic"]["angularVelocity"] = [0, 0, float(settings.get("spin", 5))]
@@ -68,10 +72,30 @@ def scene(kind, settings):
         "obstacles": [obstacle],
         "output": {"dir": settings.get("dir", kind), "cache": False, "positions": False, "diagnostics": "diagnostics.jsonl"},
     }
+    if settings.get("pool", "1") == "0":    #no water: the body alone, against the walls
+        out["fluids"] = [{"shape": "box", "min": [0, 0, 0], "max": [voxel, voxel, voxel]}]
+    if "bounce" in settings:
+        obstacle["dynamic"]["bounce"] = float(settings["bounce"])
+    if "contactFriction" in settings:
+        obstacle["dynamic"]["contactFriction"] = float(settings["contactFriction"])
+    if "velocity" in settings:
+        obstacle["dynamic"]["velocity"] = [float(x) for x in settings["velocity"].split(",")]
+    if "count" in settings:     #a stack: count of them, one over another, a voxel apart, each turned a little more
+        bodies = []
+        for i in range(int(settings["count"])):
+            copy = json.loads(json.dumps(obstacle))
+            a = math.radians(7*i)
+            c2, s2 = math.cos(a), math.sin(a)
+            step = (2*size if kind == "capsize" else size if settings.get("shape") == "box" else 2*radius) + voxel
+            copy["transform"] = [c2, 0, s2, middle, 0, 1, 0, height + i*step, -s2, 0, c2, middle, 0, 0, 0, 1]
+            bodies.append(copy)
+        out["obstacles"] = bodies
     if kind == "spin":
         out["gravity"] = [0, 0, 0]
     if settings.get("freeSurface"):
         out["solver"]["freeSurface"] = settings["freeSurface"]
+    if "substeps" in settings:
+        out["solver"]["collisionSubsteps"] = int(settings["substeps"])
     if settings.get("air", "0") != "0":
         out["air"] = {"density": 1.2, "band": 8}
     return out

@@ -378,7 +378,8 @@ Scene loadScene(const std::string& path){
     }
 
     if(const Json* solver = read.object(root, "solver", "the scene")){
-        read.checkKeys(*solver, "solver", {"flipRatio", "cfl", "densityCorrectionTime", "pressureSolver", "advection", "dotProducts", "transfer", "viscousCfl", "freeSurface"});
+        read.checkKeys(*solver, "solver", {"flipRatio", "cfl", "densityCorrectionTime", "pressureSolver", "advection", "dotProducts", "transfer", "viscousCfl", "freeSurface",
+                                           "collisionSubsteps"});
         scene.flipRatio = read.number(*solver, "flipRatio", "solver", scene.flipRatio);
         scene.cfl = read.number(*solver, "cfl", "solver", scene.cfl);
         scene.densityCorrectionTime = read.number(*solver, "densityCorrectionTime", "solver", scene.densityCorrectionTime);
@@ -388,6 +389,10 @@ Scene loadScene(const std::string& path){
         scene.transfer = read.text(*solver, "transfer", "solver", scene.transfer);
         scene.viscousCfl = read.number(*solver, "viscousCfl", "solver", scene.viscousCfl);
         scene.freeSurface = read.text(*solver, "freeSurface", "solver", scene.freeSurface);
+        scene.collisionSubsteps = (int)read.number(*solver, "collisionSubsteps", "solver", scene.collisionSubsteps);
+        if(scene.collisionSubsteps < 1){
+            read.fail("solver.collisionSubsteps", "is at least 1");
+        }
         if(scene.pressureSolver != "multigrid" && scene.pressureSolver != "cg" && scene.pressureSolver != "jacobi" && scene.pressureSolver != "sor"){
             read.fail("solver.pressureSolver", "is multigrid, cg, jacobi or sor");
         }
@@ -792,10 +797,23 @@ Scene loadScene(const std::string& path){
         if(scene.obstacles.size() > 16){
             read.fail("obstacles", "can have up to 16 of them");
         }
+        bool dynamic = false;
         for(const SceneObstacle& obstacle : scene.obstacles){
             if(obstacle.dynamic && scene.pressureSolver == "sor"){  //a body's motion ties every unknown its surface cuts together, which SOR can't solve
                 read.fail("solver.pressureSolver", "dynamic obstacles need \"multigrid\", \"cg\" or \"jacobi\", not \"sor\"");
             }
+            dynamic = dynamic || obstacle.dynamic;
+        }
+        //A floating body is held up by the pressure on it, so it floats where the solve puts the liquid's surface: the footprint puts the pressure's 0 at
+        //the centres of the first air voxels past the particles' stencils, 2 to 2.5 voxels over the particles, and a half-density ball rode that much high;
+        //the sharp surface puts it on the level set through the particles (freesurface.cu), and with air there's no free surface to put
+        if(dynamic && !scene.air){
+            const Json* solver = root.find("solver");
+            if(solver != nullptr && solver->find("freeSurface") && scene.freeSurface != "sharp"){
+                read.fail("solver.freeSurface", "dynamic obstacles float at the liquid's surface only with the sharp free surface, or with air simulated: "
+                          "the footprint's surface is 2 to 2.5 voxels over the particles");
+            }
+            scene.freeSurface = "sharp";
         }
     }
 

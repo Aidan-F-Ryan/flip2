@@ -111,6 +111,10 @@ public:
         simulation.forEachPartition([&](Particles& partition){ partition.setObstacles(obstacles, liquidDensity); });
     }
 
+    void setCollisionSubsteps(int perFrame){
+        simulation.forEachPartition([&](Particles& partition){ partition.setCollisionSubsteps(perFrame); });
+    }
+
     void setSources(const Sources& sources){
         simulation.forEachPartition([&](Particles& partition){ partition.setSources(sources); });
     }
