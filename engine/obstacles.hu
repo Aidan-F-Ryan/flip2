@@ -352,6 +352,8 @@ struct BodyFriction{
 
 struct MeshField;   //a mesh's field and what building it takes (obstacles.cu)
 
+uint obstacleBlocks();  //blocks for the passes over the nodes near obstacles, each taking the listed ones in turn (obstacles.cu)
+
 //The obstacles of one partition, on its GPU: their distance fields, and where they are at any time. A mesh is voxelized at the simulation's voxel size
 //into a narrow band of 3 voxels around its surface (see MeshField in obstacles.cu), once if it's rigid, at every update if it deforms; boxes and spheres
 //are exact

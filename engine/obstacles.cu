@@ -1301,7 +1301,7 @@ static constexpr int OBSTACLE_THREADS = 512;
 
 //blocks for the passes over the nodes near obstacles: two per SM, each taking the listed nodes in turn. Launching a block per node would spend most of
 //the pass starting and ending the thousands of blocks with nothing to do
-static uint obstacleBlocks(){
+uint obstacleBlocks(){
     int device, processors;
     gpuErrchk(cudaGetDevice(&device));
     gpuErrchk(cudaDeviceGetAttribute(&processors, cudaDevAttrMultiProcessorCount, device));
