@@ -22,6 +22,7 @@
 //            costs too much
 
 #include "conjugateGradientFunctions.hu"
+#include "condensationFunctions.hu"
 #include "exactSum.hu"
 #include "multigridFunctions.hu"
 #include "voxelSolveFunctions.hu"     //NO_VOXEL
@@ -221,21 +222,23 @@ __global__ void nextIteration(DotProducts* dots){
 }
 
 //CG with the preconditioner handed in: precondition(r, z, partials) leaves z = M^-1*r, and with partials (perBlock only; null for exact) r*z's blocks'
-//shares in them. Finding the largest residual waits on the host, so like the SOR it's only checked every checkEvery iterations
+//shares in them. Finding the largest residual waits on the host, so like the SOR it's only checked every checkEvery iterations. waited() runs once the
+//host has first waited on the stream, before the first preconditioning: what was queued ahead of the solve can be read there
 //
 //Split between partitions, each holds its own unknowns and copies of its neighbours' next to them (ghosts, codes 3 and 4), and every step runs in all of
 //them at once. The sums and maxima cover each partition's own voxels, then every partition's; z's ghosts take their owners' values once it's made, which
 //keeps d's and p's ghosts equal to their owners' too, as they're only ever combined from z's; and q = A*d reads ghost d's
-template <typename Precondition>
+template <typename Precondition, typename Waited>
 static float conjugateGradient(const CudaVec<char>& solveCodes, Stencil A, const VoxelLayout& layout, DotProductSums sums, CudaVec<float>& divU, CudaVec<float>& p, CudaVec<float>& residuals,
                                 float tolerance, uint maxIterations, uint checkEvery, uint numOwnVoxels, PartitionContext& context, cudaStream_t stream, float* z, DotProducts* dots, SolveTerm* term,
-                                Precondition precondition){
+                                Precondition precondition, Waited waited){
     uint numUsedVoxels = p.size();
     uint blocks = numUsedVoxels / BLOCKSIZE + 1;
-    float maxDivergence = (float)context.maxOverPartitions(std::abs(divU.getMax(stream, true, numOwnVoxels)));
+    float maxDivergence = (float)context.maxOverPartitions(std::abs(divU.getMax(stream, true, numOwnVoxels)));   //waits for the GPU
     if(maxDivergence == 0.0f){
         return 0.0f;
     }
+    waited();
     float* r = residuals.devPtr();
     float* d;                   //the search direction
     float* q;                   //A*d
@@ -657,7 +660,7 @@ static float diagonallyPreconditioned(bool jacobi, const CudaVec<char>& solveCod
         if(jacobi || partials != nullptr){  //with no preconditioner, exact sums leave nothing for it to do
             preconditionByDiagonal<<<numUsedVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numUsedVoxels, numOwnVoxels, r, jacobi ? A.Adiag : nullptr, preconditioned, partials);
         }
-    });
+    }, [](){});
     if(jacobi){
         cudaFreeAsync(z, stream);
     }
@@ -689,16 +692,36 @@ float cudaMultigridConjugateGradient(const CudaVec<char>& solveCodes, const Cuda
     Stencil A = makeStencil(neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag);
     float* z;
     gpuErrchk(cudaMallocAsync((void**)&z, sizeof(float)*numUsedVoxels, stream));
+    //With a term, the unknowns it outweighs the stencil at are solved for with it exactly, and the V-cycle's grids are the rest's (condensationFunctions.cu).
+    //Found ahead of the solve's first wait, set up after it
+    Condensation* condensation = term != nullptr ? &term->condensation() : nullptr;
+    if(condensation != nullptr){
+        findTrapped(*condensation, A, solveCodes.devPtr(), layout, numUsedVoxels, *term, context, stream);
+    }
+    auto release = [&](){
+        cudaFreeAsync(z, stream);
+        if(condensation != nullptr){
+            releaseTrapped(*condensation, stream);
+        }
+    };
     if(bounded != nullptr){     //the V-cycle's grids are the free unknowns', and their equations are made again whenever which those are changes
         char* free;
         gpuErrchk(cudaMallocAsync((void**)&free, numUsedVoxels, stream));
         Multigrid multigrid = {};
         float residual = boundedConjugateGradient(solveCodes, A, layout, divU, p, residuals, bounded, free, tolerance, maxIterations, 2, numOwnVoxels, context, stream, z, term,
             [&](const float* r, float* preconditioned){
-                vCycle(multigrid, r, preconditioned, stream);
+                if(condensation != nullptr && condensation->numTrapped > 0){
+                    condensedVCycle(*condensation, multigrid, A, solveCodes.devPtr(), free, *term, r, preconditioned, numUsedVoxels, context, stream);
+                }
+                else{
+                    vCycle(multigrid, r, preconditioned, stream);
+                }
             }, [&](){
+                if(condensation != nullptr){    //the trapped among the free unknowns, and the colours of the rest
+                    condense(*condensation, A, layout, numUsedVoxels, free, *term, context, stream);
+                }
                 if(multigrid.numLevels == 0){
-                    multigrid = buildMultigrid(A, free, numUsedVoxels, layout, context, stream, true);
+                    multigrid = buildMultigrid(A, condensation != nullptr ? condensation->colors : free, numUsedVoxels, layout, context, stream, true);
                 }
                 else{
                     coarsenMultigrid(multigrid, stream);
@@ -707,23 +730,32 @@ float cudaMultigridConjugateGradient(const CudaVec<char>& solveCodes, const Cuda
         if(multigrid.numLevels != 0){
             freeMultigrid(multigrid, stream);
         }
-        cudaFreeAsync(z, stream);
         cudaFreeAsync(free, stream);
+        release();
         return residual;
     }
-    Multigrid multigrid = buildMultigrid(A, solveCodes.devPtr(), numUsedVoxels, layout, context, stream);
+    Multigrid multigrid = buildMultigrid(A, condensation != nullptr ? condensation->colors : solveCodes.devPtr(), numUsedVoxels, layout, context, stream, condensation != nullptr);
     DotProducts* dots;
     gpuErrchk(cudaMallocAsync((void**)&dots, sizeof(DotProducts), stream));
     //a V-cycle costs dozens of plain iterations and it should take few of them, so it checks sooner
     float residual = conjugateGradient(solveCodes, A, layout, sums, divU, p, residuals, tolerance, maxIterations, 2, numOwnVoxels, context, stream, z, dots, term,
                                        [&](const float* r, float* preconditioned, float* partials){
-        vCycle(multigrid, r, preconditioned, stream);
+        if(condensation != nullptr && condensation->numTrapped > 0){
+            condensedVCycle(*condensation, multigrid, A, solveCodes.devPtr(), nullptr, *term, r, preconditioned, numUsedVoxels, context, stream);
+        }
+        else{
+            vCycle(multigrid, r, preconditioned, stream);
+        }
         if(partials != nullptr){
             dotResidual<<<numUsedVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numOwnVoxels, r, preconditioned, partials);
         }
+    }, [&](){
+        if(condensation != nullptr){
+            condense(*condensation, A, layout, numUsedVoxels, nullptr, *term, context, stream);
+        }
     });
-    cudaFreeAsync(z, stream);
     cudaFreeAsync(dots, stream);
     freeMultigrid(multigrid, stream);
+    release();
     return residual;
 }

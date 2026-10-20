@@ -467,6 +467,91 @@ __global__ void applyBodyResponses(int numBodies, CouplingGrid where, const Body
     }
 }
 
+//T's own coefficient at each own unknown the bodies reach: s times, over the bodies across its faces, its row times M~^-1 times its row
+__global__ void addBodyDiagonal(CouplingGrid where, const BodyCoupling* couplings, double scale, float* diagonal){
+    uint lane = threadIdx.x % 32;
+    uint warps = gridDim.x*blockDim.x/32;
+    for(uint listed = (threadIdx.x + blockIdx.x*blockDim.x)/32; listed < where.nodes[0]; listed += warps){
+        uint node = where.nodes[1 + listed];
+        if(node >= where.numOwnNodes){
+            continue;
+        }
+        for(int half = 0; half < 2; ++half){
+            int3 at;
+            uint voxel = slotVoxel(where, node, lane + 32*half, at);
+            if(voxel == NO_VOXEL){
+                continue;
+            }
+            double sum = 0.0;
+            for(int body = nextBodyAcross(where, &voxel, 1, -1); body != INT_MAX; body = nextBodyAcross(where, &voxel, 1, body)){
+                float row[BODY_LANES];
+                if(!couplingRow(where, voxel, at, body, couplings[body].centre, row)){
+                    continue;
+                }
+                const BodyCoupling& coupling = couplings[body];
+                double turn[3] = {row[3], row[4], row[5]};
+                double turned[3];
+                times(coupling.inverseInertia, turn, turned);
+                sum += coupling.inverseMass*((double)row[0]*row[0] + (double)row[1]*row[1] + (double)row[2]*row[2]) + turn[0]*turned[0] + turn[1]*turned[1] + turn[2]*turned[2];
+            }
+            diagonal[voxel] += (float)(scale*sum);
+        }
+    }
+}
+
+//a symmetric 3x3's Cholesky factor, lower, from its lower half
+__device__ inline void choleskyOf(const double m[9], double l[9]){
+    l[0] = __dsqrt_rn(m[0]);
+    l[1] = l[2] = l[5] = 0.0;
+    l[3] = __ddiv_rn(m[3], l[0]);
+    l[4] = __dsqrt_rn(__fma_rn(-l[3], l[3], m[4]));
+    l[6] = __ddiv_rn(m[6], l[0]);
+    l[7] = __ddiv_rn(__fma_rn(-l[6], l[3], m[7]), l[4]);
+    l[8] = __dsqrt_rn(__fma_rn(-l[7], l[7], __fma_rn(-l[6], l[6], m[8])));
+}
+
+//T = W W^T, a thread a listed unknown: per body across its faces, in order, its row of B times s^1/2 and M~^-1's factor (the inverse mass's root for
+//V, the inverse inertia's Cholesky factor for w), at that body's six columns
+__global__ void writeFactorRows(uint count, CouplingGrid where, const BodyCoupling* couplings, double scale, const uint* voxels, const int3* places, uint* columns,
+                                double* values){
+    uint k = threadIdx.x + blockIdx.x*blockDim.x;
+    if(k >= count){
+        return;
+    }
+    uint voxel = voxels[k];
+    int3 at = places[k];
+    uint* rowColumns = columns + (size_t)k*TERM_ROW_ENTRIES;
+    double* rowValues = values + (size_t)k*TERM_ROW_ENTRIES;
+    double root = __dsqrt_rn(scale);
+    int entries = 0;
+    for(int body = nextBodyAcross(where, &voxel, 1, -1); body != INT_MAX; body = nextBodyAcross(where, &voxel, 1, body)){
+        float row[BODY_LANES];
+        if(!couplingRow(where, voxel, at, body, couplings[body].centre, row)){
+            continue;
+        }
+        const BodyCoupling& coupling = couplings[body];
+        double mass = __dmul_rn(root, __dsqrt_rn(coupling.inverseMass));
+        for(int axis = 0; axis < 3; ++axis){
+            rowColumns[entries] = (uint)(BODY_LANES*body + axis);
+            rowValues[entries++] = __dmul_rn(mass, (double)row[axis]);
+        }
+        double factor[9];
+        choleskyOf(coupling.inverseInertia, factor);
+        for(int axis = 0; axis < 3; ++axis){
+            double sum = 0.0;
+            for(int m = axis; m < 3; ++m){
+                sum = __fma_rn((double)row[3 + m], factor[3*m + axis], sum);
+            }
+            rowColumns[entries] = (uint)(BODY_LANES*body + 3 + axis);
+            rowValues[entries++] = __dmul_rn(root, sum);
+        }
+    }
+    for(; entries < TERM_ROW_ENTRIES; ++entries){
+        rowColumns[entries] = NO_TERM_COLUMN;
+        rowValues[entries] = 0.0;
+    }
+}
+
 //the friction the substep's faces gave the particles, every partition's, taken off each body: its momentum off the velocity, its moment off the turning
 __global__ void takeBodyFriction(int numBodies, BodyState* states, const BodyMass* masses, BodyFrame* frames, const BodyCoupling* couplings, const ExactSum* sums){
     int body = threadIdx.x + blockIdx.x*blockDim.x;
@@ -619,6 +704,7 @@ void Bodies::release(){
     obstacles.clear();
     names.clear();
     masses.clear();
+    freeCondensation(condensed);
 }
 
 Bodies::~Bodies(){
@@ -834,6 +920,18 @@ void Bodies::addTimes(const float* x, float* y, float sign, const uint* onlyIf, 
     (void)onStream;     //the bodies' own, which is the solve's
     sumShares(x, onlyIf);
     applyBodyResponses<<<couplingBlocks(), COUPLING_THREADS, 0, stream>>>(numBodies, where, couplings, responses, sign, onlyIf, y);
+    gpuErrchk(cudaPeekAtLastError());
+}
+
+void Bodies::addDiagonal(float* diagonal, cudaStream_t onStream){
+    (void)onStream;     //the bodies' own, which is the solve's
+    addBodyDiagonal<<<couplingBlocks(), COUPLING_THREADS, 0, stream>>>(where, couplings, scale, diagonal);
+    gpuErrchk(cudaPeekAtLastError());
+}
+
+void Bodies::factorRows(uint count, const uint* voxels, const int3* places, uint* columns, double* values, cudaStream_t onStream){
+    (void)onStream;
+    writeFactorRows<<<count / 128 + 1, 128, 0, stream>>>(count, where, couplings, scale, voxels, places, columns, values);
     gpuErrchk(cudaPeekAtLastError());
 }
 

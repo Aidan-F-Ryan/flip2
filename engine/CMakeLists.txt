@@ -52,7 +52,7 @@ add_library(particles STATIC
     cacheWriter.cu
 )
 
-target_link_libraries(particles ${cudaLibraries}  parallelPrefixSumKernels radixSortKernels reductionKernels particleToGridFunctions perVoxelParticleListFunctions voxelSolveFunctions conjugateGradientFunctions multigridFunctions Threads::Threads)
+target_link_libraries(particles ${cudaLibraries}  parallelPrefixSumKernels radixSortKernels reductionKernels particleToGridFunctions perVoxelParticleListFunctions voxelSolveFunctions conjugateGradientFunctions condensationFunctions multigridFunctions Threads::Threads)
 set_target_properties(particles PROPERTIES CUDA_ARCHITECTURES "${flip2Architectures}")
 
 # blosc compresses the cache's shards (cacheWriter.cu). Optional: without it they're written raw

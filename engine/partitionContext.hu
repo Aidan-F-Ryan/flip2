@@ -14,6 +14,14 @@ class PartitionContext{
 public:
     virtual ~PartitionContext() = default;
 
+    //which partition this is, of how many, in the order the sums take them
+    virtual int rank() const{
+        return 0;
+    }
+    virtual int numRanks() const{
+        return 1;
+    }
+
     //ghost voxels take their owners' values
     virtual void fillGhosts(float* values, cudaStream_t stream){}
     virtual void fillGhosts(char* values, cudaStream_t stream){}

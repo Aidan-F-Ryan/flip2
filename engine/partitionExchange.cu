@@ -35,6 +35,14 @@ __global__ void leastOfRanks(const float* gathered, int ranks, float* least){
     *least = found;
 }
 
+int PartitionExchange::rank() const{
+    return me.rank;
+}
+
+int PartitionExchange::numRanks() const{
+    return me.numRanks;
+}
+
 PartitionExchange::~PartitionExchange(){
     for(void* allocated : buffers){
         cudaFree(allocated);

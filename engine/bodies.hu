@@ -10,6 +10,7 @@
 #include "partitionContext.hu"
 #include "cudaVec.hu"
 #include "algorithms/conjugateGradientFunctions.hu"
+#include "algorithms/condensationFunctions.hu"
 #include "algorithms/exactSum.hu"
 #include "json.hpp"
 #include <initializer_list>
@@ -27,9 +28,10 @@
 //transpose: B^T p, in the solve's units. With the solve's scale s (dt over its density and the voxel's area, as cudaGetA has it) and the body's mass in
 //voxels of liquid (M~ = M / (rho dx^3)), its velocity after the solve is xi* + s M~^-1 B^T p, and the unknowns' equations become
 //    (A + s B M~^-1 B^T) p = -divU(u*, xi*)
-//symmetric and positive definite still: CG solves it as it does A alone (the term's part of each product is Bodies::addTimes), and the multigrid, which
-//preconditions A, needs nothing new. A light body is as stable as a heavy one, which a body pushed by the pressure from a solve that didn't know its
-//mass isn't: there, it overshoots by its added mass every substep.
+//symmetric and positive definite still: CG solves it as it does A alone (the term's part of each product is Bodies::addTimes), and the multigrid
+//preconditions A, but for the unknowns between touching bodies, where the term outweighs A: those it solves for with the term exactly
+//(condensationFunctions.cu, from the term's diagonal and its factor, addDiagonal and factorRows). A light body is as stable as a heavy one, which a
+//body pushed by the pressure from a solve that didn't know its mass isn't: there, it overshoots by its added mass every substep.
 //
 //Each body is one obstacle (obstacles.hu), its shape built once in its own space as a rigid obstacle's is; only where it is and how it moves, its
 //BodyFrame, is the GPU's, which moves it. Its state is in double, its mass, centre of mass and inertia come from integrating its density over the
@@ -249,6 +251,11 @@ public:
     void addTimes(const float* x, float* y, float sign, const uint* onlyIf, cudaStream_t stream) override;
     void addLastEnergy(double* total, cudaStream_t stream) override;
     float normBound() const override;
+    void addDiagonal(float* diagonal, cudaStream_t stream) override;
+    void factorRows(uint count, const uint* voxels, const int3* places, uint* columns, double* values, cudaStream_t stream) override;
+    Condensation& condensation() override{
+        return condensed;
+    }
 
     //from the state the host last read back: the fastest any body's surface moves, in m/s, and the most its velocity changed by per second
     float fastest() const;
@@ -336,6 +343,7 @@ private:
     size_t sortScratchBytes = 0;
     SolveBody* solveBodies = nullptr;   //per body, while the islands are solved
     double scale = 0.0;                 //the solve's, s
+    Condensation condensed;             //the multigrid's, for the unknowns the coupling outweighs the stencil at
     CudaVec<uint> faceBodyCodes;        //per stored voxel, six of findFaceBodies'
     CouplingGrid where = {};
     PartitionContext* context = nullptr;
