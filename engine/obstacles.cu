@@ -1196,23 +1196,6 @@ void ObstacleSet::update(double time){
 
 // ---- the index ----
 
-//an obstacle's reach box in the index's cells: the first and the last along each axis, as a point there finds its cell (indexCoordinate)
-__host__ __device__ inline void reachSpan(const ObstacleIndex& index, float3 low, float3 high, int3& first, int3& last){
-    first = make_int3(indexCoordinate(index, low.x, index.origin.x, index.cells.x), indexCoordinate(index, low.y, index.origin.y, index.cells.y),
-                      indexCoordinate(index, low.z, index.origin.z, index.cells.z));
-    last = make_int3(indexCoordinate(index, high.x, index.origin.x, index.cells.x), indexCoordinate(index, high.y, index.origin.y, index.cells.y),
-                     indexCoordinate(index, high.z, index.origin.z, index.cells.z));
-}
-
-__device__ inline void obstacleReach(const ObstacleState& obstacle, float3& low, float3& high){
-    low = obstacle.frame != nullptr ? obstacle.frame->reachLow : obstacle.reachLow;
-    high = obstacle.frame != nullptr ? obstacle.frame->reachHigh : obstacle.reachHigh;
-}
-
-__device__ inline uint spanCells(int3 first, int3 last){
-    return last.x < first.x || last.y < first.y || last.z < first.z ? 0u : (uint)(last.x - first.x + 1)*(uint)(last.y - first.y + 1)*(uint)(last.z - first.z + 1);
-}
-
 //per obstacle, how many cells its reach box meets
 __global__ void countReachCells(Obstacles obstacles, uint* counts){
     int index = threadIdx.x + blockIdx.x*blockDim.x;

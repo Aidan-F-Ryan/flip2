@@ -785,13 +785,6 @@ Scene loadScene(const std::string& path){
             }
             scene.obstacles.push_back(obstacle);
         }
-        size_t dynamics = 0;
-        for(const SceneObstacle& obstacle : scene.obstacles){
-            dynamics += obstacle.dynamic ? 1 : 0;
-        }
-        if(dynamics > MAX_SCENE_BODIES){    //any number of the others
-            read.fail("obstacles", "can have up to " + std::to_string(MAX_SCENE_BODIES) + " dynamic ones for now");
-        }
         bool dynamic = false;
         for(const SceneObstacle& obstacle : scene.obstacles){
             if(obstacle.dynamic && scene.pressureSolver == "sor"){  //a body's motion ties every unknown its surface cuts together, which SOR can't solve

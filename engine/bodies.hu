@@ -12,7 +12,9 @@
 #include "algorithms/conjugateGradientFunctions.hu"
 #include "algorithms/exactSum.hu"
 #include "json.hpp"
+#include <initializer_list>
 #include <string>
+#include <utility>
 #include <vector>
 
 //Two-way coupled rigid bodies: dynamic obstacles (SceneBody), which the liquid moves as they move it. Batty, Bertails and Bridson's variational
@@ -74,6 +76,9 @@ static constexpr int CONTACT_SLOTS = 4;
 struct BodyContact{
     int point;              //the body's surface point, or -1: the slot's empty
     int other;              //the partner's body, or -1 for a wall or an obstacle that's not a body
+    int body;               //the body, its partner (the walls 0 to 5, then 6 and an obstacle's number), and its place among the partner's CONTACT_SLOTS:
+    int partner;            //what it is wherever the substep's pairs put its slot (contacts.cu)
+    int k;
     float3 at;              //where, in the world
     float3 normal;          //out of the partner, towards the body
     float depth;            //how far apart they are along it: negative, how far the body's sunk in
@@ -90,6 +95,13 @@ struct BodyContact{
     float3 local;           //the point in the body's own space
     float dt;               //the substep its impulse was given over
     int color;              //its batch in the solve: no two contacts in one share a body
+};
+
+//one body as the contact solve takes it (contacts.cu): its velocity and turning, the push out's, and its inverse mass and inertia, as floats
+struct SolveBody{
+    float3 v, w, pv, pw;
+    float inverseMass;
+    float inverseInertia[9];
 };
 
 //one body as the coupling's kernels take it this substep: its centre of mass, and its inverse mass and inertia in voxels of liquid, in the world's axes
@@ -219,8 +231,9 @@ public:
     BodyFriction frictionFor(float share, double particleMass, const float* weightsX, const float* weightsY, const float* weightsZ);
     void takeFriction();
     //contacts (contacts.cu): the last substep's contacts' impulses again, for this one's dt, before predict, so what rests on something is held up
-    //through the pressure solve
-    void warmStart(double dt, const Obstacles& obstacles, float3 gravity);
+    //through the pressure solve; and the substep's pairs counted, for step to make: what each body can touch in it, the walls (low to high) among them,
+    //as fast as it and the rest move (the obstacles' fastest at obstacleSpeed)
+    void warmStart(double dt, const Obstacles& obstacles, float3 gravity, float obstacleSpeed, float3 low, float3 high);
     //After the friction, the bodies' own steps through the substep (contacts.cu): what gravity, the pressure and the friction gave each body since the
     //warm start taken back and given again a piece a step, as a steady push over the substep, and at each step, each body against the domain's walls
     //(low to high) and the obstacles where they are then, its contacts solved for, and it moves; then its state goes to the host. As many steps as the collision substeps ask (setCollisionSubsteps, frameDt the frame's length), and enough that no body's
@@ -271,10 +284,13 @@ private:
     void touch(double dt, const Obstacles& obstacles, float3 low, float3 high, float3 gravity);    //one contact step's contacts
     void moveOnce(double dt, double measureOver);   //and the move after it: how fast the bodies' velocities changed is measured over the whole substep
     void sumShares(const float* x, const uint* onlyIf);    //B^T x into the sums, every partition's, then s M~^-1 of it into responses
+    void makePairs(const Obstacles& obstacles, float3 low, float3 high);   //the substep's pairs, from the count warmStart made, and the last contacts in them
+    void reserve(size_t& capacity, size_t needed, std::initializer_list<std::pair<void**, size_t>> arrays);  //room for needed of each, kept if there is
 
     int numBodies = 0;
-    int partners = 6;                   //what each body has a manifold against: the walls, and every obstacle (setUpContacts)
+    int partners = 6;                   //what a body can touch: the walls, and every obstacle (setUpContacts)
     std::vector<int> obstacles;         //per body, its obstacle's place in the obstacle set
+    int* deviceObstacles = nullptr;     //and on the GPU
     std::vector<std::string> names;     //and its name in the scene
     std::vector<BodyMass> masses;
     BodyState* states = nullptr;        //on the GPU
@@ -291,11 +307,34 @@ private:
     float3* surfacePoints = nullptr;    //every body's surface points, in its own space, body after body (contacts.cu)
     int* surfaceBodies = nullptr;       //and whose each is
     int numSurfacePoints = 0;
-    unsigned long long* picks = nullptr;    //per slot, the point it picked this substep: how good, then which
-    BodyContact* contacts = nullptr;    //per slot: this substep's, and the last's to start from
-    BodyContact* lastContacts = nullptr;
-    int* contactOrder = nullptr;        //the slots in the solve's order, batch after batch, and where each batch starts
-    int* batchStarts = nullptr;
+    //Contacts (contacts.cu): each substep, the pairs of a body and a partner that can touch in it, a body's after another's, its partners in order,
+    //and CONTACT_SLOTS slots a pair; the last step's contacts, which the next starts from, numLast of them
+    float3* queryBoxes = nullptr;       //per body, warmStart's: where it and what it can touch can be in the substep, low then high
+    uint* pairEnds = nullptr;           //per body, the pairs counted up to it
+    uint* pairTotal = nullptr;          //pinned: their total, as warmStart counted them
+    cudaEvent_t pairsCounted = nullptr;
+    int* pairBodies = nullptr;          //per pair
+    int* pairPartners = nullptr;
+    size_t pairCapacity = 0;
+    int numPairs = 0;
+    unsigned long long* picks = nullptr;    //per slot, the point it picked this step: how good, then which
+    BodyContact* contacts = nullptr;    //per slot: this step's
+    BodyContact* lastContacts = nullptr;    //the last step's, which this one starts from
+    BodyContact* remapped = nullptr;    //the last substep's, in this one's slots
+    int numLast = 0;
+    size_t slotCapacity = 0;
+    ExactSum* pushSums = nullptr;       //per body, BODY_LANES: the impulses the warm start and the carry give it, and their moments, added up exactly
+    int* islands = nullptr;             //per body, the lowest body numbered among those its contacts join it to (union-find)
+    unsigned long long* islandKeys = nullptr;   //per slot: its island, then the slot, for sorting them by; and sorted
+    unsigned long long* sortedKeys = nullptr;
+    int* slotsIn = nullptr;             //the slots, and in that order
+    int* slotsSorted = nullptr;
+    int* contactOrder = nullptr;        //per island, its contacts batch after batch, from where its first is in sortedKeys
+    int* islandBatches = nullptr;       //per body that's an island's lowest: where in its range each batch starts, and its end
+    unsigned long long* bodyBatches = nullptr;  //per body, the batches its contacts are in so far, a bit each, while the islands are dealt into them
+    void* sortScratch = nullptr;
+    size_t sortScratchBytes = 0;
+    SolveBody* solveBodies = nullptr;   //per body, while the islands are solved
     double scale = 0.0;                 //the solve's, s
     CudaVec<uint> faceBodyCodes;        //per stored voxel, six of findFaceBodies'
     CouplingGrid where = {};

@@ -1350,7 +1350,8 @@ void Particles::pressureSolve(){
     }
     findWhitewater();   //what the surface makes this substep, now its length is known: read from the grid as P2G left it, and nothing of the fluid's changes by it
     applyForces(forces, dt, elapsedTime, forceVoxels(), stream);
-    bodies.warmStart(dt, obstacles.state(), forces.gravity);    //the dynamic bodies held up by what they rested on, as they were last substep,
+    bodies.warmStart(dt, obstacles.state(), forces.gravity, obstacles.fastest(), make_float3(grid.negX, grid.negY, grid.negZ),     //the dynamic bodies held up by
+        make_float3(grid.negX + grid.sizeX*grid.cellSize, grid.negY + grid.sizeY*grid.cellSize, grid.negZ + grid.sizeZ*grid.cellSize));   //what they rested on, as last substep,
     bodies.predict(dt, forces.gravity);     //and falling as the fluid does: the solve starts them from there
     floatInAir(dt);     //an air band: less the still air's weight
     if(surfaceTension > 0.0){

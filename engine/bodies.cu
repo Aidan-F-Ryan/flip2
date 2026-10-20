@@ -565,16 +565,21 @@ static uint couplingBlocks(){
 
 void Bodies::release(){
     for(void* device : {(void*)states, (void*)deviceMasses, (void*)frames, (void*)couplings, (void*)sums, (void*)responses, (void*)frictionSums, (void*)boundSums,
-                        (void*)bound, (void*)surfacePoints, (void*)surfaceBodies, (void*)picks, (void*)contacts, (void*)lastContacts, (void*)contactOrder,
-                        (void*)batchStarts}){
+                        (void*)bound, (void*)surfacePoints, (void*)surfaceBodies, (void*)picks, (void*)contacts, (void*)lastContacts, (void*)remapped, (void*)contactOrder,
+                        (void*)deviceObstacles, (void*)queryBoxes, (void*)pairEnds, (void*)pairBodies, (void*)pairPartners, (void*)pushSums, (void*)islands,
+                        (void*)islandKeys, (void*)sortedKeys, (void*)slotsIn, (void*)slotsSorted, (void*)islandBatches, (void*)bodyBatches, sortScratch,
+                        (void*)solveBodies}){
         if(device != nullptr){
             cudaFree(device);
         }
     }
-    for(void* host : {(void*)seen, (void*)seenBound}){
+    for(void* host : {(void*)seen, (void*)seenBound, (void*)pairTotal}){
         if(host != nullptr){
             cudaFreeHost(host);
         }
+    }
+    if(pairsCounted != nullptr){
+        cudaEventDestroy(pairsCounted);
     }
     states = nullptr;
     deviceMasses = nullptr;
@@ -591,10 +596,25 @@ void Bodies::release(){
     surfaceBodies = nullptr;
     numSurfacePoints = 0;
     picks = nullptr;
-    contacts = nullptr;
-    lastContacts = nullptr;
+    contacts = lastContacts = remapped = nullptr;
     contactOrder = nullptr;
-    batchStarts = nullptr;
+    deviceObstacles = nullptr;
+    queryBoxes = nullptr;
+    pairEnds = nullptr;
+    pairTotal = nullptr;
+    pairsCounted = nullptr;
+    pairBodies = pairPartners = nullptr;
+    pushSums = nullptr;
+    islands = nullptr;
+    islandKeys = sortedKeys = nullptr;
+    slotsIn = slotsSorted = nullptr;
+    islandBatches = nullptr;
+    bodyBatches = nullptr;
+    sortScratch = nullptr;
+    sortScratchBytes = 0;
+    solveBodies = nullptr;
+    pairCapacity = slotCapacity = 0;
+    numPairs = numLast = 0;
     numBodies = 0;
     obstacles.clear();
     names.clear();
@@ -922,7 +942,8 @@ static constexpr SavedField STATE_FIELDS[] = {
     {"before", offsetof(BodyState, before), BODY_LANES, 'd'}, {"acceleration", offsetof(BodyState, acceleration), 1, 'd'}, {"pseudo", offsetof(BodyState, pseudo), BODY_LANES, 'd'},
     {"held", offsetof(BodyState, held), BODY_LANES, 'd'}, {"perSecond", offsetof(BodyState, perSecond), BODY_LANES, 'd'}};
 static constexpr SavedField CONTACT_FIELDS[] = {
-    {"point", offsetof(BodyContact, point), 1, 'i'}, {"other", offsetof(BodyContact, other), 1, 'i'}, {"at", offsetof(BodyContact, at), 3, 'f'},
+    {"point", offsetof(BodyContact, point), 1, 'i'}, {"other", offsetof(BodyContact, other), 1, 'i'}, {"body", offsetof(BodyContact, body), 1, 'i'},
+    {"partner", offsetof(BodyContact, partner), 1, 'i'}, {"slot", offsetof(BodyContact, k), 1, 'i'}, {"at", offsetof(BodyContact, at), 3, 'f'},
     {"normal", offsetof(BodyContact, normal), 3, 'f'}, {"depth", offsetof(BodyContact, depth), 1, 'f'}, {"tangents", offsetof(BodyContact, tangents), 6, 'f'},
     {"partnerVelocity", offsetof(BodyContact, partnerVelocity), 3, 'f'}, {"lever", offsetof(BodyContact, lever), 6, 'f'}, {"mass", offsetof(BodyContact, mass), 3, 'f'},
     {"friction", offsetof(BodyContact, friction), 1, 'f'}, {"target", offsetof(BodyContact, target), 1, 'f'}, {"bias", offsetof(BodyContact, bias), 1, 'f'},
@@ -1002,25 +1023,27 @@ std::string Bodies::checkpoint(){
     if(numBodies == 0){
         return "";
     }
-    int slots = numBodies*partners*CONTACT_SLOTS;
     std::vector<BodyState> now(numBodies);
-    std::vector<BodyContact> carried(slots);    //the last contact step's, which the next substep starts from (touch swaps them in)
+    std::vector<BodyContact> carried(numLast);  //the last contact step's, which the next substep starts from, each saying whose it is
     gpuErrchk(cudaMemcpyAsync(now.data(), states, sizeof(BodyState)*numBodies, cudaMemcpyDeviceToHost, stream));
-    gpuErrchk(cudaMemcpyAsync(carried.data(), lastContacts, sizeof(BodyContact)*slots, cudaMemcpyDeviceToHost, stream));
+    if(numLast > 0){
+        gpuErrchk(cudaMemcpyAsync(carried.data(), lastContacts, sizeof(BodyContact)*numLast, cudaMemcpyDeviceToHost, stream));
+    }
     gpuErrchk(cudaStreamSynchronize(stream));
+    std::vector<std::vector<const BodyContact*>> owned(numBodies);
+    for(const BodyContact& contact : carried){
+        if(contact.point >= 0 && contact.body >= 0 && contact.body < numBodies){    //an empty slot, which nothing reads, isn't kept
+            owned[contact.body].push_back(&contact);
+        }
+    }
     std::string out = "[";
     for(int body = 0; body < numBodies; ++body){
         out += std::string(body ? ",\n  " : "\n  ") + "{\"obstacle\":" + std::to_string(obstacles[body]) + ",";
         writeFields(out, (const char*)&now[body], STATE_FIELDS, std::size(STATE_FIELDS));
         out += ",\"contacts\":[";
-        int written = 0;
-        for(int slot = body*partners*CONTACT_SLOTS; slot < (body + 1)*partners*CONTACT_SLOTS; ++slot){
-            if(carried[slot].point < 0){
-                continue;   //an empty slot, which nothing reads
-            }
-            out += std::string(written++ ? "," : "") + "{\"partner\":" + std::to_string(slot / CONTACT_SLOTS % partners) + ",\"slot\":" +
-                   std::to_string(slot % CONTACT_SLOTS) + ",";
-            writeFields(out, (const char*)&carried[slot], CONTACT_FIELDS, std::size(CONTACT_FIELDS));
+        for(size_t index = 0; index < owned[body].size(); ++index){
+            out += std::string(index ? "," : "") + "{";
+            writeFields(out, (const char*)owned[body][index], CONTACT_FIELDS, std::size(CONTACT_FIELDS));
             out += "}";
         }
         out += "]}";
@@ -1035,13 +1058,8 @@ std::string Bodies::restore(const Json& saved){
     if(numBodies == 0){
         return "";
     }
-    int slots = numBodies*partners*CONTACT_SLOTS;
     std::vector<BodyState> restored(seen, seen + numBodies);    //where setUp started them, for any field the record doesn't have
-    std::vector<BodyContact> carried(slots);
-    for(BodyContact& contact : carried){
-        contact = BodyContact{};
-        contact.point = -1;
-    }
+    std::vector<BodyContact> carried;   //the last step's contacts, for the first substep to put in its pairs (makePairs)
     try{
         for(int body = 0; body < numBodies; ++body){
             const Json& record = saved.items[body];
@@ -1055,17 +1073,14 @@ std::string Bodies::restore(const Json& saved){
             for(size_t index = 0; contacts != nullptr && index < contacts->items.size(); ++index){
                 const Json& entry = contacts->items[index];
                 std::string which = where + "'s contact " + std::to_string(index);
-                const Json* partner = entry.find("partner");
-                const Json* k = entry.find("slot");
-                if(partner == nullptr || k == nullptr || partner->kind != Json::NUMBER || k->kind != Json::NUMBER || partner->number < 0 ||
-                   partner->number >= partners || k->number < 0 || k->number >= CONTACT_SLOTS){
-                    return which + " has no partner and slot this build has";
-                }
-                BodyContact& contact = carried[(body*partners + (int)partner->number)*CONTACT_SLOTS + (int)k->number];
+                BodyContact contact = BodyContact{};
+                contact.point = -1;
+                contact.body = body;
                 readFields(entry, (char*)&contact, CONTACT_FIELDS, std::size(CONTACT_FIELDS), which);
-                if(contact.point < 0){
-                    return which + " has no surface point";
+                if(contact.point < 0 || contact.body != body || contact.partner < 0 || contact.partner >= partners || contact.k < 0 || contact.k >= CONTACT_SLOTS){
+                    return which + " has no surface point, or no partner and slot this scene's bodies have";
                 }
+                carried.push_back(contact);
             }
         }
     }
@@ -1074,7 +1089,14 @@ std::string Bodies::restore(const Json& saved){
     }
     std::memcpy(seen, restored.data(), sizeof(BodyState)*numBodies);   //what the first substep's timestep and contact steps go by, as the checkpoint's last left it
     gpuErrchk(cudaMemcpyAsync(states, seen, sizeof(BodyState)*numBodies, cudaMemcpyHostToDevice, stream));
-    gpuErrchk(cudaMemcpyAsync(lastContacts, carried.data(), sizeof(BodyContact)*slots, cudaMemcpyHostToDevice, stream));
+    reserve(slotCapacity, carried.size(), {{(void**)&picks, sizeof(unsigned long long)}, {(void**)&contacts, sizeof(BodyContact)}, {(void**)&lastContacts, sizeof(BodyContact)},
+                                           {(void**)&remapped, sizeof(BodyContact)}, {(void**)&islandKeys, sizeof(unsigned long long)},
+                                           {(void**)&sortedKeys, sizeof(unsigned long long)}, {(void**)&slotsIn, sizeof(int)}, {(void**)&slotsSorted, sizeof(int)},
+                                           {(void**)&contactOrder, sizeof(int)}});
+    if(!carried.empty()){
+        gpuErrchk(cudaMemcpyAsync(lastContacts, carried.data(), sizeof(BodyContact)*carried.size(), cudaMemcpyHostToDevice, stream));
+    }
+    numLast = (int)carried.size();
     gpuErrchk(cudaStreamSynchronize(stream));   //once, on resuming: before seen is written again, and carried is gone
     return "";
 }

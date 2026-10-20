@@ -9,7 +9,6 @@
 #include <memory>
 #include <vector>
 
-#define MAX_BODIES 16            //dynamic obstacles (bodies.hu), until their coupling and contacts take any number
 #define SDF_BRICK 8             //samples along a brick's side
 #define SDF_OUTSIDE -1          //a brick table entry for a brick with no samples, all of it outside
 #define SDF_INSIDE -2           //and all of it inside
@@ -99,6 +98,23 @@ struct Obstacles{
     const ObstacleState* items = nullptr;   //count of them, on the GPU
     ObstacleIndex index = {};
 };
+
+//an obstacle's reach box in the index's cells: the first and the last along each axis, as a point there finds its cell (indexCoordinate)
+__host__ __device__ inline void reachSpan(const ObstacleIndex& index, float3 low, float3 high, int3& first, int3& last){
+    first = make_int3(indexCoordinate(index, low.x, index.origin.x, index.cells.x), indexCoordinate(index, low.y, index.origin.y, index.cells.y),
+                      indexCoordinate(index, low.z, index.origin.z, index.cells.z));
+    last = make_int3(indexCoordinate(index, high.x, index.origin.x, index.cells.x), indexCoordinate(index, high.y, index.origin.y, index.cells.y),
+                     indexCoordinate(index, high.z, index.origin.z, index.cells.z));
+}
+
+__device__ inline void obstacleReach(const ObstacleState& obstacle, float3& low, float3& high){
+    low = obstacle.frame != nullptr ? obstacle.frame->reachLow : obstacle.reachLow;
+    high = obstacle.frame != nullptr ? obstacle.frame->reachHigh : obstacle.reachHigh;
+}
+
+__device__ inline uint spanCells(int3 first, int3 last){
+    return last.x < first.x || last.y < first.y || last.z < first.z ? 0u : (uint)(last.x - first.x + 1)*(uint)(last.y - first.y + 1)*(uint)(last.z - first.z + 1);
+}
 
 //an obstacle's dynamic body, or -1 (for none too)
 __device__ inline int bodyOf(const Obstacles& obstacles, int obstacle){
