@@ -32,6 +32,7 @@
 //  {"event":"done","frames":120,"seconds":5.2}                 every frame committed
 //  {"event":"verified","frames":121,"unfinished":0,"shards":121,"particles":150040000,"bytes":1712345678,"problems":0}
 //  {"event":"exported","frame":42,"particles":1240000,"file":"/shots/a/export/houdini/particles.0042.bgeo.sc"}
+//      with whitewater, and ...,"whitewater":310000,"whitewaterFile":"..."; with dynamic bodies, and ...,"bodies":3,"bodiesFile":".../bodies.0042.bgeo.sc"}
 //  {"event":"exportDone","frames":121,"exported":121,"seconds":9.8}
 //  {"event":"meshed","frame":42,"particles":1240000,"points":310000,"faces":309000,"bandCells":52000,"rounds":2,"seconds":0.05,"file":"/shots/a/export/houdini/surface.0042.bgeo.sc"}
 //      with --fields, and ...,"surfaceVoxels":90000,"velocityVoxels":180000,"fieldSeconds":0.01,"writeSeconds":0.05,"fields":"/shots/a/export/houdini/fields.0042.vdb"}
@@ -332,12 +333,14 @@ static std::string frameName(int frame){    //as the cache's folders and the exp
 
 //makes files of each of the cache's committed frames, for export and mesh: for every frame from first to last (or the bake's last, if last is -1) one of
 //whose files, targets(frame), is missing or older than the frame's commit record (a resume worked it out again), or every one with overwrite, reads its
-//shards, each checked against its commit record's XXH64, and has make(frame, shards, targets, why) write them (saying so as an event) or say why not. follow
+//shards, each checked against its commit record's XXH64, and has make(frame, shards, whitewater, record, targets, why) write them (saying so as an event)
+//or say why not, record being the frame's commit record. follow
 //waits for frames still to come, and for the cache itself if the bake hasn't started it, so a DCC can show a bake's frames as it commits them; it stops
 //when they've all been made. Ends with the event finished, counting the files written as written
 static int eachCommittedFrame(const std::string& directory, int first, int last, bool overwrite, bool follow, const char* finished, const char* written,
                               const std::function<std::vector<std::string>(int)>& targets,
-                              const std::function<bool(int, const std::vector<ShardData>&, const std::vector<ShardData>&, const std::vector<std::string>&, std::string&)>& make){
+                              const std::function<bool(int, const std::vector<ShardData>&, const std::vector<ShardData>&, const Json&, const std::vector<std::string>&,
+                                                       std::string&)>& make){
     auto start = std::chrono::steady_clock::now();
     size_t made = 0, problems = 0;
     std::vector<bool> done;     //per frame in range: made, or found already made
@@ -394,12 +397,13 @@ static int eachCommittedFrame(const std::string& directory, int first, int last,
             }
             std::string why;
             std::vector<ShardData> shards, whitewater;   //the frame's particles, and its whitewater if the bake made any
+            Json commit;
             try{
                 std::string contents;
                 if(!readFile(record, contents)){
                     why = record + ": unreadable";
                 }
-                Json commit = why.empty() ? JsonReader(contents, record).document() : Json();
+                commit = why.empty() ? JsonReader(contents, record).document() : Json();
                 const Json* list = commit.find("shards");
                 if(why.empty() && (newerThanKnown(commit) || list == nullptr)){
                     why = record + (list == nullptr ? ": no shards" : ": a version newer than this flip2 reads");
@@ -430,7 +434,7 @@ static int eachCommittedFrame(const std::string& directory, int first, int last,
                 std::error_code ignored;
                 std::filesystem::create_directories(std::filesystem::path(file).parent_path(), ignored);
             }
-            if(why.empty() && make(frame, shards, whitewater, files, why)){
+            if(why.empty() && make(frame, shards, whitewater, commit, files, why)){
                 ++made;
                 done[frame - first] = true;
             }
@@ -462,12 +466,50 @@ static bool makeDirectory(const std::string& path){
     return true;
 }
 
+//a frame's dynamic bodies from its commit record, as Houdini's RBD Simulation Points have them: orient x y z w where the record has w x y z, and null
+//(what wasn't finite) as NaN. Says why not if the record's are malformed
+static bool bodiesOf(const Json& record, std::vector<BgeoBody>& out, std::string& why){
+    if(record.kind != Json::ARRAY){
+        why = "\"bodies\" isn't a list";
+        return false;
+    }
+    for(size_t index = 0; index < record.items.size(); ++index){
+        const Json& body = record.items[index];
+        BgeoBody point;
+        const Json* name = body.find("name");
+        point.name = name != nullptr && name->kind == Json::STRING ? name->text : "";
+        auto read = [&](const char* key, float* into, int count){
+            const Json* values = body.find(key);
+            if(values == nullptr || values->kind != Json::ARRAY || (int)values->items.size() != count){
+                why = "body " + std::to_string(index) + " has no " + key + " of " + std::to_string(count) + " numbers";
+                return false;
+            }
+            for(int i = 0; i < count; ++i){
+                into[i] = values->items[i].kind == Json::NUMBER ? (float)values->items[i].number : NAN;
+            }
+            return true;
+        };
+        float orientation[4];
+        if(!read("position", point.position, 3) || !read("orientation", orientation, 4) || !read("pivot", point.pivot, 3) || !read("velocity", point.velocity, 3) ||
+           !read("angularVelocity", point.angularVelocity, 3)){
+            return false;
+        }
+        for(int i = 0; i < 3; ++i){
+            point.orientation[i] = orientation[i + 1];
+        }
+        point.orientation[3] = orientation[0];
+        out.push_back(point);
+    }
+    return true;
+}
+
 //flip2 export: the cache's committed frames, as files DCCs load natively. For now Houdini's: OUT/particles.NNNN.bgeo.sc (OUT is DIR/export/houdini
 //unless --out says; .bgeo, uncompressed, with format "bgeo"), each a frame's every shard in one point cloud, in rank order (the order one partition would
 //have held them), with P and v, and id and age if the cache's frames carry them (bgeo.cu). Frame NNNN is the cache's: frame 0 is the start, at time
 //0. A bake with whitewater has each frame's beside it, OUT/whitewater.NNNN.bgeo.sc, a point cloud too, with life, radius, kind, and the pscale its
-//particles are meant to be drawn at: half the spacing of what a voxel's volume of whitewater is drawn as. Frames are picked, redone and followed as
-//eachCommittedFrame says
+//particles are meant to be drawn at: half the spacing of what a voxel's volume of whitewater is drawn as. A bake with dynamic bodies has
+//OUT/bodies.NNNN.bgeo.sc too, a point per body as RBD Bullet Solver's Simulation Points have them, which Transform Pieces moves the pieces by
+//(writeBodiesBgeo). Frames are picked, redone and followed as eachCommittedFrame says
 static int exportCache(const std::string& directory, int first, int last, std::string out, bool overwrite, bool follow, const std::string& format){
     if(out.empty()){
         out = directory + "/export/houdini";
@@ -477,7 +519,8 @@ static int exportCache(const std::string& directory, int first, int last, std::s
     }
     return eachCommittedFrame(directory, first, last, overwrite, follow, "exportDone", "exported", [&](int frame){
         return std::vector<std::string>{out + "/particles." + frameName(frame) + "." + format};
-    }, [&](int frame, const std::vector<ShardData>& shards, const std::vector<ShardData>& whitewater, const std::vector<std::string>& targets, std::string& why){
+    }, [&](int frame, const std::vector<ShardData>& shards, const std::vector<ShardData>& whitewater, const Json& record, const std::vector<std::string>& targets,
+           std::string& why){
         const std::string& target = targets[0];
         std::vector<const ShardData*> pieces;
         unsigned long long particles = 0;
@@ -519,6 +562,18 @@ static int exportCache(const std::string& directory, int first, int last, std::s
                 return false;
             }
             also = ",\"whitewater\":" + std::to_string(points) + ",\"whitewaterFile\":" + ::quoted(file);
+        }
+        if(const Json* bodies = record.find("bodies")){     //a bake with dynamic bodies: each one where it is, as Houdini's RBD Simulation Points
+            std::vector<BgeoBody> points;
+            if(!bodiesOf(*bodies, points, why)){
+                why = frameName(frame) + "/commit.json: " + why;
+                return false;
+            }
+            std::string file = out + "/bodies." + frameName(frame) + "." + format;
+            if(!writeBodiesBgeo(file, points, std::string("flip2 ") + FLIP2_BUILD_ID, why)){
+                return false;
+            }
+            also += ",\"bodies\":" + std::to_string(points.size()) + ",\"bodiesFile\":" + ::quoted(file);
         }
         event("{\"event\":\"exported\",\"frame\":" + std::to_string(frame) + ",\"particles\":" + std::to_string(particles) + ",\"file\":" + ::quoted(target) + also + "}");
         return true;
@@ -568,7 +623,7 @@ static int meshCache(const std::string& directory, int first, int last, std::str
             files.push_back(out + "/fields." + frameName(frame) + ".vdb");
         }
         return files;
-    }, [&](int frame, const std::vector<ShardData>& shards, const std::vector<ShardData>&, const std::vector<std::string>& targets, std::string& why){
+    }, [&](int frame, const std::vector<ShardData>& shards, const std::vector<ShardData>&, const Json&, const std::vector<std::string>& targets, std::string& why){
         if(settings.separation <= 0.0f){
             std::string text;
             const Json* voxelSize = nullptr;
@@ -726,6 +781,7 @@ struct Checkpoint{
     std::vector<State> states;  //in rank order
     std::vector<State> whitewater;  //its ranks' whitewater, from a bake with any
     unsigned long long whitewaterNextId = 0;    //and the id the next of its particles gets
+    Json bodies;    //the dynamic bodies' states and contacts (Bodies::restore), from a bake with any; null from one made before checkpoints kept them
 };
 
 //the newest checkpoint in directory whose record is down; frame -1 if there's none
@@ -803,6 +859,9 @@ static bool newestCheckpoint(const std::string& directory, Checkpoint& out, std:
                 throw std::runtime_error(path + ": a whitewater shard without its file, rank and xxh64");
             }
             out.whitewater.push_back({std::string(name) + "/" + file->text, (int)rank->number, hash->text});
+        }
+        if(const Json* bodies = record.find("bodies")){
+            out.bodies = *bodies;
         }
     }
     catch(const std::exception& error){
@@ -1120,10 +1179,10 @@ int main(int argc, char** argv){
     }
     if(resuming){
         scene.writeCache = true;    //into the cache it resumes
-        for(const SceneObstacle& obstacle : scene.obstacles){
-            if(obstacle.dynamic){   //@TODO: the bodies' state in the checkpoints
-                return failure(scenePath + ": a bake with dynamic obstacles can't be resumed yet");
-            }
+        bool dynamic = std::any_of(scene.obstacles.begin(), scene.obstacles.end(), [](const SceneObstacle& obstacle){ return obstacle.dynamic; });
+        if(dynamic && checkpoint.bodies.kind == Json::NUL){
+            return failure(outputDirectory + ": its newest checkpoint, at frame " + std::to_string(checkpoint.frame) + ", is from a flip2 that didn't keep the dynamic "
+                           "bodies in its checkpoints, so the bake can't carry on from it: bake it again");
         }
     }
     if(const char* partitions = std::getenv("FLIP2_PARTITIONS")){
@@ -1357,6 +1416,12 @@ int main(int argc, char** argv){
     }
     simulation->setObstacles(scene.obstacles, scene.density);      //after setDomain: they're voxelized at its voxel size, and the dynamic ones weighed against the liquid
     simulation->setCollisionSubsteps(scene.collisionSubsteps);
+    if(resuming && checkpoint.bodies.kind != Json::NUL){    //the dynamic bodies as the checkpoint left them, in place of where the scene starts them
+        std::string why = simulation->restoreBodies(checkpoint.bodies);
+        if(!why.empty()){
+            return failure(outputDirectory + ": " + why);
+        }
+    }
     unsigned int wallsLetGo = 0;    //the walls that let go of the liquid, a bit each
     for(int face = 0; face < 6; ++face){
         wallsLetGo |= scene.wallHold[face] ? 0u : 1u << face;

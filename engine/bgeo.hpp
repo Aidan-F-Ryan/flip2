@@ -20,4 +20,18 @@ bool writeWhitewaterBgeo(const std::string& path, const std::vector<const ShardD
 //writes path, mesh's quads facing outwards, their points with P and v
 bool writeSurfaceBgeo(const std::string& path, const SurfaceMesh& mesh, const std::string& software, std::string& why);
 
+//a dynamic body in a frame, as Houdini's RBD Bullet Solver has one of its Simulation Points
+struct BgeoBody{
+    std::string name;
+    float position[3];          //its centre of mass
+    float orientation[4];       //x y z w, as Houdini's orient: its turn from where its pieces rest
+    float pivot[3];             //its centre of mass where its pieces rest
+    float velocity[3];
+    float angularVelocity[3];   //rad/s, about its centre of mass
+};
+
+//writes path, a frame's dynamic bodies as RBD Bullet Solver's Simulation Points: a point per body with name, P, orient, pivot, scale (1), v and w,
+//which Transform Pieces moves the pieces by, from where they rest: x' = orient (x - pivot) + P
+bool writeBodiesBgeo(const std::string& path, const std::vector<BgeoBody>& bodies, const std::string& software, std::string& why);
+
 #endif

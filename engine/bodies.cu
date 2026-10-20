@@ -4,10 +4,15 @@
 
 #include "bodies.hu"
 #include "algorithms/voxelSolveFunctions.hu"    //NO_VOXEL, WALL_VOXEL
+#include "cacheWriter.hu"     //BODY_PLACEMENT
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
+#include <iterator>
+#include <stdexcept>
 
 static constexpr int COUPLING_THREADS = 256;    //a warp per node in the coupling's passes
 static constexpr int MASS_THREADS = 256;
@@ -590,6 +595,7 @@ void Bodies::release(){
     batchStarts = nullptr;
     numBodies = 0;
     obstacles.clear();
+    names.clear();
     masses.clear();
 }
 
@@ -702,6 +708,7 @@ void Bodies::setUp(const std::vector<SceneObstacle>& descriptions, ObstacleSet& 
         std::cerr<<"Body "<<masses.size()<<" (obstacle "<<description<<"): "<<mass.mass<<" kg, "<<mass.volume<<" m^3 (density "<<density<<" kg/m^3, "
                  <<density / liquidDensity<<" of the liquid's), centre of mass ("<<state.position[0]<<", "<<state.position[1]<<", "<<state.position[2]<<")\n";
         obstacles.push_back(built);
+        names.push_back(obstacle.name);
         masses.push_back(mass);
         initial.push_back(state);
     }
@@ -892,4 +899,193 @@ float Bodies::acceleration() const{
         most = std::max(most, seen[body].acceleration);
     }
     return (float)most;
+}
+
+// ---- the cache ----
+
+static_assert(offsetof(BodyState, position) == 0 && offsetof(BodyState, orientation) == 3*sizeof(double) && offsetof(BodyState, velocity) == 7*sizeof(double) &&
+              offsetof(BodyState, angularVelocity) == 10*sizeof(double) && offsetof(BodyState, angularMomentum) == BODY_PLACEMENT*sizeof(double),
+              "a cache frame's body is the doubles BodyState starts with: position, orientation, velocity, angularVelocity (cacheWriter.hu)");
+
+void Bodies::copyPlacements(double* host){
+    if(numBodies == 0){
+        return;
+    }
+    gpuErrchk(cudaMemcpy2DAsync(host, BODY_PLACEMENT*sizeof(double), states, sizeof(BodyState), BODY_PLACEMENT*sizeof(double), numBodies, cudaMemcpyDeviceToHost, stream));
+}
+
+// ---- checkpoints ----
+
+//a field of a body's state or of a contact, as a checkpoint's record has it: its name, where it is, how many values, and of what (doubles, floats, ints)
+struct SavedField{
+    const char* name;
+    size_t offset;
+    int count;
+    char type;  //'d', 'f' or 'i'
+};
+
+//Every field of both, so a resume carries on from exactly what the substep after the checkpoint reads: the warm start's and the carry's of the contacts
+//(warmStartBodies, carryContacts), the state's, and the host's copy of it, which the timestep and the contact steps go by. A contact's slot is its
+//partner (the domain's 6 walls, then the obstacles) and its place among that partner's CONTACT_SLOTS, not its index, which the partners' count would change
+static constexpr SavedField STATE_FIELDS[] = {
+    {"position", offsetof(BodyState, position), 3, 'd'}, {"orientation", offsetof(BodyState, orientation), 4, 'd'}, {"velocity", offsetof(BodyState, velocity), 3, 'd'},
+    {"angularVelocity", offsetof(BodyState, angularVelocity), 3, 'd'}, {"angularMomentum", offsetof(BodyState, angularMomentum), 3, 'd'},
+    {"before", offsetof(BodyState, before), BODY_LANES, 'd'}, {"acceleration", offsetof(BodyState, acceleration), 1, 'd'}, {"pseudo", offsetof(BodyState, pseudo), BODY_LANES, 'd'},
+    {"held", offsetof(BodyState, held), BODY_LANES, 'd'}, {"perSecond", offsetof(BodyState, perSecond), BODY_LANES, 'd'}};
+static constexpr SavedField CONTACT_FIELDS[] = {
+    {"point", offsetof(BodyContact, point), 1, 'i'}, {"other", offsetof(BodyContact, other), 1, 'i'}, {"at", offsetof(BodyContact, at), 3, 'f'},
+    {"normal", offsetof(BodyContact, normal), 3, 'f'}, {"depth", offsetof(BodyContact, depth), 1, 'f'}, {"tangents", offsetof(BodyContact, tangents), 6, 'f'},
+    {"partnerVelocity", offsetof(BodyContact, partnerVelocity), 3, 'f'}, {"lever", offsetof(BodyContact, lever), 6, 'f'}, {"mass", offsetof(BodyContact, mass), 3, 'f'},
+    {"friction", offsetof(BodyContact, friction), 1, 'f'}, {"target", offsetof(BodyContact, target), 1, 'f'}, {"bias", offsetof(BodyContact, bias), 1, 'f'},
+    {"impulse", offsetof(BodyContact, impulse), 3, 'f'}, {"applied", offsetof(BodyContact, applied), 1, 'f'}, {"pseudo", offsetof(BodyContact, pseudo), 1, 'f'},
+    {"local", offsetof(BodyContact, local), 3, 'f'}, {"dt", offsetof(BodyContact, dt), 1, 'f'}, {"color", offsetof(BodyContact, color), 1, 'i'}};
+
+template<size_t N>
+static constexpr size_t savedBytes(const SavedField (&fields)[N]){
+    size_t bytes = 0;
+    for(size_t i = 0; i < N; ++i){
+        bytes += fields[i].count*(fields[i].type == 'd' ? sizeof(double) : sizeof(float));
+    }
+    return bytes;
+}
+static_assert(savedBytes(STATE_FIELDS) == sizeof(BodyState), "a field of BodyState that checkpoints don't keep: add it to STATE_FIELDS");
+static_assert(savedBytes(CONTACT_FIELDS) == sizeof(BodyContact), "a field of BodyContact that checkpoints don't keep: add it to CONTACT_FIELDS");
+
+//the fields of the struct at base as JSON, "name":value or "name":[values]: doubles and floats to the bit (%.17g reads back as the same double, and a
+//float's double is the float itself), ints as they are, and what isn't finite as null (only a body that's already blown up has any)
+static void writeFields(std::string& out, const char* base, const SavedField* fields, size_t numFields){
+    char text[32];
+    for(size_t f = 0; f < numFields; ++f){
+        const SavedField& field = fields[f];
+        out += std::string(f ? ",\"" : "\"") + field.name + "\":" + (field.count > 1 ? "[" : "");
+        const char* at = base + field.offset;
+        for(int i = 0; i < field.count; ++i){
+            double value = field.type == 'd' ? ((const double*)at)[i] : field.type == 'f' ? (double)((const float*)at)[i] : (double)((const int*)at)[i];
+            if(field.type == 'i'){
+                std::snprintf(text, sizeof(text), "%d", ((const int*)at)[i]);
+            }
+            else if(std::isfinite(value)){
+                std::snprintf(text, sizeof(text), "%.17g", value);
+            }
+            else{
+                std::snprintf(text, sizeof(text), "null");
+            }
+            out += (i ? "," : "") + std::string(text);
+        }
+        out += field.count > 1 ? "]" : "";
+    }
+}
+
+//and back into the struct at base: null as NaN, and a field the record doesn't have keeps what base had
+static void readFields(const Json& record, char* base, const SavedField* fields, size_t numFields, const std::string& where){
+    for(size_t f = 0; f < numFields; ++f){
+        const SavedField& field = fields[f];
+        const Json* value = record.find(field.name);
+        if(value == nullptr){
+            continue;
+        }
+        bool fits = field.count > 1 ? value->kind == Json::ARRAY && (int)value->items.size() == field.count : true;
+        for(int i = 0; fits && i < field.count; ++i){
+            const Json& item = field.count > 1 ? value->items[i] : *value;
+            fits = item.kind == Json::NUMBER || (item.kind == Json::NUL && field.type != 'i');
+        }
+        if(!fits){
+            throw std::runtime_error(where + ": \"" + field.name + "\" isn't " + (field.count > 1 ? std::to_string(field.count) + " numbers" : "a number"));
+        }
+        char* at = base + field.offset;
+        for(int i = 0; i < field.count; ++i){
+            const Json& item = field.count > 1 ? value->items[i] : *value;
+            double number = item.kind == Json::NUMBER ? item.number : NAN;
+            if(field.type == 'd'){
+                ((double*)at)[i] = number;
+            }
+            else if(field.type == 'f'){
+                ((float*)at)[i] = (float)number;
+            }
+            else{
+                ((int*)at)[i] = (int)number;
+            }
+        }
+    }
+}
+
+std::string Bodies::checkpoint(){
+    if(numBodies == 0){
+        return "";
+    }
+    int slots = numBodies*CONTACT_PARTNERS*CONTACT_SLOTS;
+    std::vector<BodyState> now(numBodies);
+    std::vector<BodyContact> carried(slots);    //the last contact step's, which the next substep starts from (touch swaps them in)
+    gpuErrchk(cudaMemcpyAsync(now.data(), states, sizeof(BodyState)*numBodies, cudaMemcpyDeviceToHost, stream));
+    gpuErrchk(cudaMemcpyAsync(carried.data(), lastContacts, sizeof(BodyContact)*slots, cudaMemcpyDeviceToHost, stream));
+    gpuErrchk(cudaStreamSynchronize(stream));
+    std::string out = "[";
+    for(int body = 0; body < numBodies; ++body){
+        out += std::string(body ? ",\n  " : "\n  ") + "{\"obstacle\":" + std::to_string(obstacles[body]) + ",";
+        writeFields(out, (const char*)&now[body], STATE_FIELDS, std::size(STATE_FIELDS));
+        out += ",\"contacts\":[";
+        int written = 0;
+        for(int slot = body*CONTACT_PARTNERS*CONTACT_SLOTS; slot < (body + 1)*CONTACT_PARTNERS*CONTACT_SLOTS; ++slot){
+            if(carried[slot].point < 0){
+                continue;   //an empty slot, which nothing reads
+            }
+            out += std::string(written++ ? "," : "") + "{\"partner\":" + std::to_string(slot / CONTACT_SLOTS % CONTACT_PARTNERS) + ",\"slot\":" +
+                   std::to_string(slot % CONTACT_SLOTS) + ",";
+            writeFields(out, (const char*)&carried[slot], CONTACT_FIELDS, std::size(CONTACT_FIELDS));
+            out += "}";
+        }
+        out += "]}";
+    }
+    return out + "]";
+}
+
+std::string Bodies::restore(const Json& saved){
+    if(saved.kind != Json::ARRAY || (int)saved.items.size() != numBodies){
+        return "its checkpoint has " + std::to_string(saved.items.size()) + " dynamic bodies, and the scene has " + std::to_string(numBodies);
+    }
+    if(numBodies == 0){
+        return "";
+    }
+    int slots = numBodies*CONTACT_PARTNERS*CONTACT_SLOTS;
+    std::vector<BodyState> restored(seen, seen + numBodies);    //where setUp started them, for any field the record doesn't have
+    std::vector<BodyContact> carried(slots);
+    for(BodyContact& contact : carried){
+        contact = BodyContact{};
+        contact.point = -1;
+    }
+    try{
+        for(int body = 0; body < numBodies; ++body){
+            const Json& record = saved.items[body];
+            std::string where = "its checkpoint's body " + std::to_string(body);
+            const Json* obstacle = record.find("obstacle");
+            if(obstacle == nullptr || obstacle->kind != Json::NUMBER || (int)obstacle->number != obstacles[body]){
+                return where + " is another of the scene's obstacles than the scene's body " + std::to_string(body);
+            }
+            readFields(record, (char*)&restored[body], STATE_FIELDS, std::size(STATE_FIELDS), where);
+            const Json* contacts = record.find("contacts");
+            for(size_t index = 0; contacts != nullptr && index < contacts->items.size(); ++index){
+                const Json& entry = contacts->items[index];
+                std::string which = where + "'s contact " + std::to_string(index);
+                const Json* partner = entry.find("partner");
+                const Json* k = entry.find("slot");
+                if(partner == nullptr || k == nullptr || partner->kind != Json::NUMBER || k->kind != Json::NUMBER || partner->number < 0 ||
+                   partner->number >= CONTACT_PARTNERS || k->number < 0 || k->number >= CONTACT_SLOTS){
+                    return which + " has no partner and slot this build has";
+                }
+                BodyContact& contact = carried[(body*CONTACT_PARTNERS + (int)partner->number)*CONTACT_SLOTS + (int)k->number];
+                readFields(entry, (char*)&contact, CONTACT_FIELDS, std::size(CONTACT_FIELDS), which);
+                if(contact.point < 0){
+                    return which + " has no surface point";
+                }
+            }
+        }
+    }
+    catch(const std::exception& error){
+        return error.what();
+    }
+    std::memcpy(seen, restored.data(), sizeof(BodyState)*numBodies);   //what the first substep's timestep and contact steps go by, as the checkpoint's last left it
+    gpuErrchk(cudaMemcpyAsync(states, seen, sizeof(BodyState)*numBodies, cudaMemcpyHostToDevice, stream));
+    gpuErrchk(cudaMemcpyAsync(lastContacts, carried.data(), sizeof(BodyContact)*slots, cudaMemcpyHostToDevice, stream));
+    gpuErrchk(cudaStreamSynchronize(stream));   //once, on resuming: before seen is written again, and carried is gone
+    return "";
 }

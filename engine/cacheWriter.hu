@@ -59,6 +59,19 @@ struct CacheDescription{
     bool ages = true;           //and "age"
     int keepCheckpoints = 2;    //the newest ones kept; older ones are deleted once a newer one is down
     int whitewaterPerVoxel = 0; //with whitewater, the particles a voxel's volume of it is drawn as, which sizes them for whatever draws them; 0 with none
+    struct Body{                //a dynamic body, as every frame's record names it (bodies.hu)
+        std::string name;       //its obstacle's in the scene
+        double pivot[3];        //its centre of mass in its own space, which its frames turn it about
+    };
+    std::vector<Body> bodies;
+};
+
+//A frame's dynamic bodies: where each is and how it moves, as BODY_PLACEMENT doubles (its centre of mass, its orientation as a quaternion, w x y z, its
+//velocity and its angular velocity), the ones a body's state starts with (Bodies::copyPlacements), body after body at offset in the frame's host buffer
+static constexpr int BODY_PLACEMENT = 13;
+struct CacheBodies{
+    size_t offset = 0;
+    int count = 0;      //only rank 0's frames carry them: every rank moves them alike
 };
 
 //what a checkpoint holds besides its particles: enough to carry on exactly as if the bake had never stopped
@@ -69,6 +82,7 @@ struct CheckpointState{
     unsigned long long nextId = 0;      //the id the next new particle gets
     double acceleration = 0.0;          //the most its last substep accelerated a face at, m/s^2, which limits the next substep (Particles::getCourantDt)
     unsigned long long whitewaterNextId = 0;    //with whitewater, the id the next of its particles gets
+    std::string bodies;     //with dynamic bodies, each one's state and contacts, as JSON (Bodies::checkpoint); empty without any
 };
 
 //one rank's part of a frame or a checkpoint in a host buffer: its attributes one after another (frameBytes, checkpointBytes), each a plane per component
@@ -118,6 +132,9 @@ public:
     static size_t checkpointBytes(size_t particles, bool apic){
         return (3*sizeof(double) + 3*sizeof(float) + (apic ? 9*sizeof(float) : 0) + sizeof(uint64_t) + sizeof(float))*particles;
     }
+    static size_t bodyBytes(int bodies){     //a frame's dynamic bodies (CacheBodies)
+        return BODY_PLACEMENT*sizeof(double)*(size_t)bodies;
+    }
     bool writesIds() const{
         return description.ids;
     }
@@ -133,8 +150,9 @@ public:
         return hostBuffers[buffer];
     }
     //writes and commits frame (at time seconds in) once every event in copies has completed; the events mustn't be recorded again until the buffer is free.
-    //whitewater: with whitewater, each rank's part of it in the same buffer, after the particles'
-    void submit(int buffer, int frame, double time, const std::vector<CacheShard>& shards, const std::vector<cudaEvent_t>& copies, const std::vector<CacheShard>& whitewater = {});
+    //whitewater: with whitewater, each rank's part of it in the same buffer, after the particles'; bodies: with dynamic bodies, rank 0's, in it too
+    void submit(int buffer, int frame, double time, const std::vector<CacheShard>& shards, const std::vector<cudaEvent_t>& copies, const std::vector<CacheShard>& whitewater = {},
+                const CacheBodies& bodies = {});
     void submitCheckpoint(int buffer, int frame, const CheckpointState& state, const std::vector<CacheShard>& shards, const std::vector<cudaEvent_t>& copies,
                           const std::vector<CacheShard>& whitewater = {});
     void flush();           //waits until every job submitted is written and committed, or has failed
@@ -155,6 +173,7 @@ private:
         std::vector<CacheShard> shards;
         std::vector<cudaEvent_t> copies;
         std::vector<CacheShard> whitewater;
+        CacheBodies bodies;         //a frame's
     };
     struct ShardRecord{
         int rank = 0;
@@ -172,7 +191,9 @@ private:
     bool readRecord(const std::string& path, int rank, ShardRecord& record);
     std::string shardsJson(const std::vector<ShardRecord>& records, const char* base) const;
     std::string whitewaterJson(const std::vector<ShardRecord>& whitewater, const std::string& more = "") const;
-    bool commit(const std::string& frameDirectory, int frame, double time, const std::vector<ShardRecord>& records, const std::vector<ShardRecord>& whitewater);
+    std::string bodiesJson(const Job& job) const;   //a frame's bodies for its record, from its buffer
+    bool commit(const std::string& frameDirectory, int frame, double time, const std::vector<ShardRecord>& records, const std::vector<ShardRecord>& whitewater,
+                const std::string& bodies);
     bool commitCheckpoint(const std::string& checkpointDirectory, const Job& job, const std::vector<ShardRecord>& records, const std::vector<ShardRecord>& whitewater);
     void pruneCheckpoints();
     bool describe();    //cache.json, as things are now

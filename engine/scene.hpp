@@ -48,8 +48,9 @@
 //                   "keyframes": [{"time": 0, "transform": [...]}, ...],                 //instead of a transform, it moves: linearly, rotations by slerp
 //                   "deforming": [{"time": 0, "mesh": "f1.obj"}, {"time": 0.04, "vertices": "f2.npy"}, ...],     //or it deforms: see SceneObstacle
 //                   "dynamic": {"density": 1000, "mass": 0, "velocity": [0, 0, 0], "angularVelocity": [0, 0, 0],      //or the liquid moves it, from where its
-//                               "bounce": 0, "contactFriction": 0.5}}],                                               //transform puts it: see SceneBody. Without
+//                               "bounce": 0, "contactFriction": 0.5},                                                 //transform puts it: see SceneBody. Without
 //                                                                                                                     //air, the free surface is then sharp
+//                   "name": "piece0"}],                                                   //what a DCC calls it: a dynamic one's frames in the cache carry it
 //    "forces": [{"type": "point", "position": [...], "strength": 9.8, "radius": 0, "falloff": 1},       //strength in m/s^2, towards it (negative: away)
 //               {"type": "vortex", "position": [...], "axis": [0, 1, 0], "strength": 5, "radius": 0, "falloff": 1},
 //               {"type": "turbulence", "strength": 2, "scale": 0.1, "speed": 0.5, "seed": 0},
@@ -126,6 +127,7 @@ struct SceneObstacle{
     std::shared_ptr<const SceneField> field;            //FIELD: its distances, and velocities if it came with a velocity grid (then it isn't placed)
     bool dynamic = false;       //whether the liquid moves it (body): it starts where its transform puts it, and moves itself from there
     SceneBody body;
+    std::string name;           //what a DCC calls it (a Houdini RBD piece's name), which a body's frames in the cache carry; may be empty
 };
 
 //a fluid, emitter or sink: a box or sphere in the world, or a closed mesh placed and moved as an obstacle is ("mesh" or "vertices" and "triangles", with

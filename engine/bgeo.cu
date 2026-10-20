@@ -364,9 +364,10 @@ void writeHeader(BinaryJson& json, uint64_t points, uint64_t vertices, uint64_t 
 }
 
 //a point attribute of size values per point, float32s or with integers int32s, whose values, every point's in order, the caller then writes with raw()
-//before endVector(). kind is what Houdini should take it for, which tells it how transforms and blends treat it: "point" (P), "vector" (v),
-//"nonarithmetic_integer" (id), or nullptr for a plain number
-void beginAttribute(BinaryJson& json, const char* name, uint64_t points, int size, bool integers, const char* kind){
+//before endVector(). kind is what Houdini should take it for, which tells it how transforms and blends treat it: "point" (P), "vector" (v), "normal"
+//(an angular velocity, w), "quaternion" (orient), "nonarithmetic_integer" (id), or nullptr for a plain number. defaults: a new point's value, one for
+//every component or one for all of them
+void beginAttribute(BinaryJson& json, const char* name, uint64_t points, int size, bool integers, const char* kind, const std::vector<double>& defaults = {0.0}){
     json.beginArray();
     json.beginArray();      //the definition
     json.string("scope");
@@ -396,16 +397,18 @@ void beginAttribute(BinaryJson& json, const char* name, uint64_t points, int siz
     json.string("defaults");
     json.beginArray();
     json.string("size");
-    json.integer(1);
+    json.integer((long long)defaults.size());
     json.string("storage");
     json.string(integers ? "int64" : "fpreal64");
     json.string("values");
     json.beginArray();
-    if(integers){
-        json.integer(0);
-    }
-    else{
-        json.real(0.0);
+    for(double value : defaults){
+        if(integers){
+            json.integer((long long)value);
+        }
+        else{
+            json.real(value);
+        }
     }
     json.endArray();
     json.endArray();
@@ -432,6 +435,59 @@ void beginVector(BinaryJson& json, const char* name, uint64_t points){
 }
 
 void endVector(BinaryJson& json){
+    json.endArray();
+    json.endArray();
+    json.endArray();
+}
+
+//a point attribute of strings, a value per point: each different one once, and every point's index among them, as Houdini lays one out
+void writeStrings(BinaryJson& json, const char* name, const std::vector<std::string>& values){
+    std::vector<std::string> strings;
+    std::vector<long long> indices;
+    for(const std::string& value : values){
+        auto found = std::find(strings.begin(), strings.end(), value);
+        indices.push_back(found - strings.begin());
+        if(found == strings.end()){
+            strings.push_back(value);
+        }
+    }
+    json.beginArray();
+    json.beginArray();      //the definition
+    json.string("scope");
+    json.string("public");
+    json.string("type");
+    json.string("string");
+    json.string("name");
+    json.string(name);
+    json.string("options");
+    json.beginMap();
+    json.endMap();
+    json.endArray();
+    json.beginArray();      //the values
+    json.string("size");
+    json.integer(1);
+    json.string("storage");
+    json.string("int32");
+    json.string("strings");
+    json.beginArray();
+    for(const std::string& text : strings){
+        json.string(text);
+    }
+    json.endArray();
+    json.string("indices");
+    json.beginArray();
+    json.string("size");
+    json.integer(1);
+    json.string("storage");
+    json.string("int32");
+    json.string("arrays");
+    json.beginArray();
+    json.beginArray();
+    for(long long index : indices){
+        json.integer(index);
+    }
+    json.endArray();
+    json.endArray();
     json.endArray();
     json.endArray();
     json.endArray();
@@ -643,6 +699,58 @@ bool writeSurfaceBgeo(const std::string& path, const SurfaceMesh& mesh, const st
             json.endArray();
             json.endArray();
         }
+        json.endArray();
+        json.endArray();
+    });
+}
+
+bool writeBodiesBgeo(const std::string& path, const std::vector<BgeoBody>& bodies, const std::string& software, std::string& why){
+    uint64_t points = bodies.size();
+    float low[3] = {INFINITY, INFINITY, INFINITY}, high[3] = {-INFINITY, -INFINITY, -INFINITY};
+    std::vector<std::string> names;
+    for(const BgeoBody& body : bodies){
+        names.push_back(body.name);
+        for(int axis = 0; axis < 3; ++axis){
+            low[axis] = std::min(low[axis], body.position[axis]);
+            high[axis] = std::max(high[axis], body.position[axis]);
+        }
+    }
+    return writeFile(path, why, [&](BinaryJson& json){
+        json.beginArray();
+        writeHeader(json, points, 0, 0, software, low, high);
+        json.string("topology");
+        json.beginArray();
+        json.string("pointref");
+        json.beginArray();
+        json.string("indices");
+        json.beginArray();
+        json.endArray();
+        json.endArray();
+        json.endArray();
+        json.string("attributes");
+        json.beginArray();
+        json.string("pointattributes");
+        json.beginArray();
+        //in the order RBD Bullet Solver's Simulation Points have them, each tagged as there: w is a normal, so a transform turns it as the axis it is
+        auto floats = [&](const char* name, int size, const char* kind, const std::vector<double>& defaults, auto value){
+            beginAttribute(json, name, points, size, false, kind, defaults);
+            for(const BgeoBody& body : bodies){
+                json.raw(value(body), sizeof(float)*size);
+            }
+            endVector(json);
+        };
+        static const float one[3] = {1.0f, 1.0f, 1.0f};
+        floats("P", 3, "point", {0.0}, [](const BgeoBody& body){ return body.position; });
+        writeStrings(json, "name", names);
+        floats("orient", 4, "quaternion", {0.0, 0.0, 0.0, 1.0}, [](const BgeoBody& body){ return body.orientation; });
+        floats("pivot", 3, nullptr, {0.0}, [](const BgeoBody& body){ return body.pivot; });
+        floats("scale", 3, nullptr, {1.0}, [](const BgeoBody&){ return one; });
+        floats("v", 3, "vector", {0.0}, [](const BgeoBody& body){ return body.velocity; });
+        floats("w", 3, "normal", {0.0}, [](const BgeoBody& body){ return body.angularVelocity; });
+        json.endArray();
+        json.endArray();
+        json.string("primitives");
+        json.beginArray();
         json.endArray();
         json.endArray();
     });

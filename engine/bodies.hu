@@ -11,6 +11,8 @@
 #include "cudaVec.hu"
 #include "algorithms/conjugateGradientFunctions.hu"
 #include "algorithms/exactSum.hu"
+#include "json.hpp"
+#include <string>
 #include <vector>
 
 //Two-way coupled rigid bodies: dynamic obstacles (SceneBody), which the liquid moves as they move it. Batty, Bertails and Bridson's variational
@@ -249,6 +251,18 @@ public:
     int obstacleOf(int body) const{
         return obstacles[body];
     }
+    const std::string& name(int body) const{    //its obstacle's name in the scene
+        return names[body];
+    }
+    //each body's placement for a cache frame, into pinned host memory: the BODY_PLACEMENT doubles its state starts with (cacheWriter.hu), on the
+    //stream, so an event recorded on it after this has them there
+    void copyPlacements(double* host);
+    //Checkpoints (flip2 resume): every body's state and its contacts as they are now, as JSON for the checkpoint's record ("bodies"), which restore
+    //carries on from exactly. It waits for the GPU: once a checkpoint, with the stream's work done (Simulation::writeCheckpoint has just waited on it)
+    std::string checkpoint();
+    //a checkpoint's bodies in place of where setUp started them, before resume places the obstacles (updateObstacles writes their frames from them):
+    //what's wrong with saved for this scene's bodies, if anything
+    std::string restore(const Json& saved);
 
 private:
     void release();
@@ -259,6 +273,7 @@ private:
 
     int numBodies = 0;
     std::vector<int> obstacles;         //per body, its obstacle's place in the obstacle set
+    std::vector<std::string> names;     //and its name in the scene
     std::vector<BodyMass> masses;
     BodyState* states = nullptr;        //on the GPU
     BodyMass* deviceMasses = nullptr;

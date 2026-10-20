@@ -343,6 +343,14 @@ void Simulation::startCache(const std::string& directory, CacheDescription descr
     description.domainMin[0] = first.grid.negX;
     description.domainMin[1] = first.grid.negY;
     description.domainMin[2] = first.grid.negZ;
+    for(int body = 0; body < first.bodies.count(); ++body){    //what every frame's record calls each dynamic body, and the pivot its turns are about
+        CacheDescription::Body about;
+        about.name = first.bodies.name(body);
+        for(int axis = 0; axis < 3; ++axis){
+            about.pivot[axis] = first.bodies.mass(body).centre[axis];
+        }
+        description.bodies.push_back(about);
+    }
     cacheWriter = std::make_unique<CacheWriter>(directory, description, ranks, committedBefore, std::move(done));
     cacheCopies.resize(partitions.size());
     whitewaterCopies.resize(partitions.size());
@@ -398,10 +406,17 @@ void Simulation::writeCacheFrame(int frame){
     for(uint count : whitewaterCounts){
         whitewaterTotal += count;
     }
-    int buffer = cacheWriter->acquire(fluidBytes + CacheWriter::whitewaterBytes(whitewaterTotal, false));  //emitters and sinks change the count from frame to frame
+    CacheBodies bodies;     //with dynamic bodies, rank 0's record has them after the whitewater: every partition moves them alike
+    bodies.offset = (fluidBytes + CacheWriter::whitewaterBytes(whitewaterTotal, false) + 7) / 8*8;
+    bodies.count = ranks[0] == 0 ? partitions[0]->bodies.count() : 0;
+    int buffer = cacheWriter->acquire(bodies.offset + CacheWriter::bodyBytes(bodies.count));     //emitters and sinks change the count from frame to frame
     char* host = cacheWriter->hostBuffer(buffer);
     std::vector<CacheShard> shards, whitewater;
     std::vector<cudaEvent_t> copies;
+    if(bodies.count > 0){   //on partition 0's stream before its frame's copies, so the event they record has the bodies there too
+        gpuErrchk(cudaSetDevice(partitions[0]->device()));
+        partitions[0]->bodies.copyPlacements((double*)(host + bodies.offset));
+    }
     size_t offset = 0;
     for(int index = 0; index < numPartitions(); ++index){   //each copies its own planes straight from its GPU
         Particles& partition = *partitions[index];
@@ -421,7 +436,7 @@ void Simulation::writeCacheFrame(int frame){
         offset += CacheWriter::whitewaterBytes(whitewaterCounts[index], false);
     }
     gpuErrchk(cudaSetDevice(partitions[0]->device()));
-    cacheWriter->submit(buffer, frame, partitions[0]->elapsedTime, shards, copies, whitewater);
+    cacheWriter->submit(buffer, frame, partitions[0]->elapsedTime, shards, copies, whitewater, bodies);
 }
 
 void Simulation::writeCheckpoint(int frame){
@@ -457,6 +472,9 @@ void Simulation::writeCheckpoint(int frame){
         offset += CacheWriter::whitewaterBytes(whitewaterCounts[index], true);
     }
     gpuErrchk(cudaSetDevice(partitions[0]->device()));
+    if(ranks[0] == 0){  //the record's: every partition moves the bodies alike, and its stream is done (acceleration waited on it)
+        state.bodies = partitions[0]->bodies.checkpoint();
+    }
     state.time = partitions[0]->elapsedTime;
     state.substep = partitions[0]->substepIndex;
     state.apic = apic;

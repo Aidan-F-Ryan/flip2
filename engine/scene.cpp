@@ -737,8 +737,9 @@ Scene loadScene(const std::string& path){
                 read.fail(where, "should be an object, {...}");
             }
             read.checkKeys(item, where, {"mesh", "vertices", "triangles", "vdb", "grid", "velocityGrid", "shape", "min", "max", "center", "centre", "radius", "transform", "keyframes",
-                                         "deforming", "friction", "thickness", "hold", "dynamic"});
+                                         "deforming", "friction", "thickness", "hold", "dynamic", "name"});
             SceneObstacle obstacle;
+            obstacle.name = read.text(item, "name", where, "");
             bool deforms = item.find("deforming") != nullptr;
             if(deforms && item.find("shape")){
                 read.fail(where, "a deforming obstacle is a mesh: it can't have a \"shape\" too");

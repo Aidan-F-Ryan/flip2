@@ -331,6 +331,18 @@ public:
         simulation.writeCheckpoint(frame);
     }
 
+    //a checkpoint's dynamic bodies in place of where setObstacles started them, before resume (Bodies::restore): what's wrong with them, if anything
+    std::string restoreBodies(const Json& saved){
+        std::string why;
+        simulation.forEachPartition([&](Particles& partition){
+            std::string wrong = partition.bodies.restore(saved);
+            if(why.empty()){
+                why = wrong;
+            }
+        });
+        return why;
+    }
+
     void resume(double time, unsigned long long substep, double acceleration){
         simulation.resume(time, substep, acceleration);
     }
