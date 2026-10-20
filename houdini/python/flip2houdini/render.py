@@ -1,14 +1,16 @@
 """flip2 Karma Setup: a flip2 bake, ready to render in Karma.
 
-Builds in /stage what a first render needs: the liquid's surface with a water material, the collision geometry, the bake's whitewater if it was baked
-with any (or else Houdini's, if flip2 Whitewater set it up), a ground under the domain, a sky, a camera that takes the domain in, Karma's render settings and a USD Render node to render with.
+Builds in /stage what a first render needs: the liquid's surface with a water material, the collision geometry, the RBD tab's pieces where the bake
+moved them (a body's own material), the bake's whitewater if it was baked with any (or else Houdini's, if flip2 Whitewater set it up), a ground under the
+domain, a sky, a camera that takes the domain in, Karma's render settings and a USD Render node to render with.
 
 One of those settings is the reason to have this at all. flip2's surface carries the liquid's velocity as v, which Solaris imports as USD's velocities,
 and Karma blurs a moving mesh by them, but only when its Velocity Blur says to, and it starts at No Velocity Blur: a flip2 surface renders with no
 motion blur at all until that's changed. Here it's on.
 
-Whitewater is rendered as points as wide as they are apart (the bake's own come sized so; Houdini's solver's pscale makes each twice that, which
-renders as beads), and the sun is on the
+The bake's own whitewater is rendered as its spray points, and each of its foam and bubble points as a cloud of fine specks: a point stands for a
+voxel's worth of bubbles, and drawn as one white ball as wide as the points are apart, a cloud of them reads as polystyrene beads. Houdini's is
+rendered as points as wide as they are apart (its solver's pscale makes each twice that, which renders as beads). The sun is on the
 camera's side: where Karma Physical Sky starts it, behind the scene, whitewater and everything else facing the camera is in shade, and reads as grey.
 """
 import math
@@ -23,9 +25,12 @@ LOOKS = {     #MaterialX standard surfaces
                   transmission_colorr=0.55, transmission_colorg=0.8, transmission_colorb=0.9),
     "whitewater": dict(base=1.0, base_colorr=0.95, base_colorg=0.97, base_colorb=1.0, specular=0.2, specular_roughness=0.6),
     "solid": dict(base=1.0, base_colorr=0.35, base_colorg=0.33, base_colorb=0.3, specular_roughness=0.5),
+    "body": dict(base=1.0, base_colorr=0.75, base_colorg=0.42, base_colorb=0.16, specular=0.4, specular_roughness=0.45),    #painted wood: what floats stands out
     "ground": dict(base=1.0, base_colorr=0.45, base_colorg=0.45, base_colorb=0.45, specular_roughness=0.7),
 }
 WHITEWATER_WIDTH = 0.5      #a whitewater point's radius, as a fraction of the whitewater's separation: so each is as wide as they are apart
+SPECKS = 24                 #each of the bake's own foam and bubble points drawn as this many white specks,
+SPECK_SIZE = 0.25           #each this fraction of the point's size (spread log-normally), scattered over the spacing of the points
 FOCAL_LENGTH, APERTURE, ASPECT = 30.0, 20.955, 16.0/9.0
 
 
@@ -35,6 +40,34 @@ def _domain(node):
         return node.evalParmTuple("domaincenter"), node.evalParmTuple("domainsize")
     box = node.node("container")
     return box.evalParmTuple("t"), box.evalParmTuple("size")
+
+
+def _specks(node, own):
+    """the bake's own whitewater as it's drawn, own being node's loader of it: spray (kind 0) as its points are, and each foam (1) and bubble (2)
+    point as SPECKS white specks scattered within the spacing of the points by its id, so each frame puts them in the same place. Built beside
+    node once: another Karma setup for the same node draws from the same nodes"""
+    parent = node.parent()
+    specks = parent.node(node.name() + "_whitewater_specks")
+    if specks is None:
+        merged = parent.createNode("object_merge", node.name() + "_whitewater_own")     #the loader is inside node: brought out beside it
+        merged.parm("objpath1").set(own.path())
+        merged.setPosition(node.position() + hou.Vector2(3.0, -1.0))
+        specks = parent.createNode("attribwrangle", node.name() + "_whitewater_specks")
+        specks.setInput(0, merged)
+        specks.parm("snippet").set(
+            "if(i@kind != 0){\n"
+            "    for(int k = 0; k < %d; k++){\n"
+            "        vector u = rand(set(float(i@id), float(k), 17.0));\n"
+            "        int speck = addpoint(0, @P + 2.0*f@pscale*sample_sphere_uniform(u));     // pscale is half the points' spacing\n"
+            "        float u1 = rand(set(float(i@id), float(k), 41.0)), u2 = rand(set(float(i@id), float(k), 43.0));\n"
+            "        setpointattrib(0, \"pscale\", speck, %g*f@pscale*exp(0.45*sqrt(-2.0*log(max(u1, 1e-6)))*cos(2.0*PI*u2)));\n"
+            "        setpointattrib(0, \"v\", speck, v@v);\n"
+            "        setpointattrib(0, \"kind\", speck, i@kind);\n"
+            "    }\n"
+            "    removepoint(0, @ptnum);\n"
+            "}\n" % (SPECKS, SPECK_SIZE))
+        specks.setPosition(merged.position() + hou.Vector2(0.0, -1.0))
+    return specks
 
 
 def create_render(node):
@@ -60,8 +93,8 @@ def create_render(node):
     folder = os.path.join(node.evalParm("outputdir").rstrip("/"), "bake") if kind == "solver" else node.evalParm("bakedir").rstrip("/")
     own = node.node(importer.WHITEWATER)
     whitewater = node.parent().node(prefix + "_whitewater")
-    if own is not None and importer.has_whitewater(os.path.join(folder, "export", "houdini")):     #the bake's own, its pscale already the size to draw
-        imported("whitewater", own, "whitewater")
+    if own is not None and importer.has_whitewater(os.path.join(folder, "export", "houdini")):     #the bake's own: its spray, and its foam and bubbles as specks
+        imported("whitewater", _specks(node, own), "whitewater")
     elif whitewater is not None:    #Houdini's, sized to render: the solver's pscale is the points' whole separation
         sized = node.parent().node(prefix + "_whitewater_render")
         if sized is None:
@@ -74,6 +107,9 @@ def create_render(node):
     collision = (node.node("COLLISION") if len(wired) > 1 and wired[1] is not None else None) if kind == "solver" else (wired[0] if wired else None)
     if collision is not None:
         imported("collisions", collision, "solid")
+    pieces = node.node("rbd_pieces")    #the RBD tab's pieces, the simulated ones where the bake moved them (importer.build_bodies)
+    if pieces is not None and (kind == "import" or (node.parm("rbdsop") is not None and node.evalParm("rbdsop").strip())):
+        imported("bodies", pieces, "body")
     centre, size = _domain(node)
     ground = stage.createNode("cube", prefix + "_ground")       #a slab under the domain, three times as wide
     ground.setInput(0, made[-1])
