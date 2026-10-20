@@ -259,10 +259,12 @@ static int verify(const std::string& directory){
                 problem((frame / "commit.json").string() + ": no shards");
                 continue;
             }
-            std::vector<const Json*> lists = {list};    //the particles' shards, and the whitewater's from a bake with any
-            const Json* whitewater = commit.find("whitewater");
-            if(whitewater != nullptr && whitewater->find("shards") != nullptr){
-                lists.push_back(whitewater->find("shards"));
+            std::vector<const Json*> lists = {list};    //the particles' shards, and the whitewater's and the bodies' from a bake with any
+            for(const char* key : {"whitewater", "bodies"}){
+                const Json* more = commit.find(key);
+                if(more != nullptr && more->kind == Json::OBJECT && more->find("shards") != nullptr){
+                    lists.push_back(more->find("shards"));
+                }
             }
             for(const Json* each : lists) for(const Json& shard : each->items){
                 const Json* file = shard.find("file");
@@ -466,38 +468,66 @@ static bool makeDirectory(const std::string& path){
     return true;
 }
 
-//a frame's dynamic bodies from its commit record, as Houdini's RBD Simulation Points have them: orient x y z w where the record has w x y z, and null
-//(what wasn't finite) as NaN. Says why not if the record's are malformed
-static bool bodiesOf(const Json& record, std::vector<BgeoBody>& out, std::string& why){
-    if(record.kind != Json::ARRAY){
-        why = "\"bodies\" isn't a list";
+//a frame's dynamic bodies, as Houdini's RBD Simulation Points have them: where each is and how it moves from the frame's bodies shard (its commit record's
+//"bodies"), its name and pivot from cache.json, and orient x y z w where the shard has w x y z. Says why not if anything's missing or malformed
+static bool bodiesOf(const std::string& directory, int frame, const Json& listing, std::vector<BgeoBody>& out, std::string& why){
+    const Json* shards = listing.kind == Json::OBJECT ? listing.find("shards") : nullptr;
+    const Json* file = shards != nullptr && shards->items.size() == 1 ? shards->items[0].find("file") : nullptr;
+    const Json* hash = shards != nullptr && shards->items.size() == 1 ? shards->items[0].find("xxh64") : nullptr;
+    if(file == nullptr || hash == nullptr){
+        why = "\"bodies\" has no shard with its file and xxh64";
         return false;
     }
-    for(size_t index = 0; index < record.items.size(); ++index){
-        const Json& body = record.items[index];
-        BgeoBody point;
-        const Json* name = body.find("name");
-        point.name = name != nullptr && name->kind == Json::STRING ? name->text : "";
-        auto read = [&](const char* key, float* into, int count){
-            const Json* values = body.find(key);
-            if(values == nullptr || values->kind != Json::ARRAY || (int)values->items.size() != count){
-                why = "body " + std::to_string(index) + " has no " + key + " of " + std::to_string(count) + " numbers";
-                return false;
-            }
-            for(int i = 0; i < count; ++i){
-                into[i] = values->items[i].kind == Json::NUMBER ? (float)values->items[i].number : NAN;
-            }
-            return true;
-        };
-        float orientation[4];
-        if(!read("position", point.position, 3) || !read("orientation", orientation, 4) || !read("pivot", point.pivot, 3) || !read("velocity", point.velocity, 3) ||
-           !read("angularVelocity", point.angularVelocity, 3)){
+    char name[16];
+    std::snprintf(name, sizeof(name), "%04d", frame);
+    ShardData shard;
+    if(!readShard(directory + "/frames/" + name + "/" + file->text, hash->text, shard, why)){
+        return false;
+    }
+    std::string text;
+    Json cache;
+    try{
+        if(!readFile(directory + "/cache.json", text)){
+            why = directory + "/cache.json: can't read it";
             return false;
         }
-        for(int i = 0; i < 3; ++i){
-            point.orientation[i] = orientation[i + 1];
+        cache = JsonReader(text, directory + "/cache.json").document();
+    }
+    catch(const std::exception& error){
+        why = error.what();
+        return false;
+    }
+    const Json* described = cache.find("bodies");
+    if(described == nullptr || described->kind != Json::ARRAY || described->items.size() != shard.particles){
+        why = directory + "/cache.json: its \"bodies\" don't name the frame's " + std::to_string(shard.particles);
+        return false;
+    }
+    const ShardData::Attribute* columns[4] = {shard.find("P"), shard.find("orient"), shard.find("v"), shard.find("w")};
+    const uint32_t components[4] = {3, 4, 3, 3};
+    for(int column = 0; column < 4; ++column){
+        if(columns[column] == nullptr || columns[column]->type != 2 || columns[column]->components != components[column]){
+            why = file->text + ": no float64 P, orient, v and w";
+            return false;
         }
-        point.orientation[3] = orientation[0];
+    }
+    size_t count = (size_t)shard.particles;
+    auto value = [&](int column, uint32_t component, size_t body){
+        return (float)((const double*)columns[column]->planes.data())[component*count + body];
+    };
+    for(size_t body = 0; body < count; ++body){
+        BgeoBody point;
+        const Json& about = described->items[body];
+        const Json* named = about.find("name");
+        const Json* pivot = about.find("pivot");
+        point.name = named != nullptr && named->kind == Json::STRING ? named->text : "";
+        for(int axis = 0; axis < 3; ++axis){
+            point.position[axis] = value(0, axis, body);
+            point.velocity[axis] = value(2, axis, body);
+            point.angularVelocity[axis] = value(3, axis, body);
+            point.pivot[axis] = pivot != nullptr && pivot->kind == Json::ARRAY && pivot->items.size() == 3 ? (float)pivot->items[axis].number : 0.0f;
+            point.orientation[axis] = value(1, axis + 1, body);
+        }
+        point.orientation[3] = value(1, 0, body);
         out.push_back(point);
     }
     return true;
@@ -565,8 +595,8 @@ static int exportCache(const std::string& directory, int first, int last, std::s
         }
         if(const Json* bodies = record.find("bodies")){     //a bake with dynamic bodies: each one where it is, as Houdini's RBD Simulation Points
             std::vector<BgeoBody> points;
-            if(!bodiesOf(*bodies, points, why)){
-                why = frameName(frame) + "/commit.json: " + why;
+            if(!bodiesOf(directory, frame, *bodies, points, why)){
+                why = frameName(frame) + ": " + why;
                 return false;
             }
             std::string file = out + "/bodies." + frameName(frame) + "." + format;
@@ -781,7 +811,8 @@ struct Checkpoint{
     std::vector<State> states;  //in rank order
     std::vector<State> whitewater;  //its ranks' whitewater, from a bake with any
     unsigned long long whitewaterNextId = 0;    //and the id the next of its particles gets
-    Json bodies;    //the dynamic bodies' states and contacts (Bodies::restore), from a bake with any; null from one made before checkpoints kept them
+    std::vector<State> bodies;      //the dynamic bodies' states (Bodies::restore), from a bake with any: one shard, none from one made before checkpoints kept them
+    std::vector<State> contacts;    //and the contacts their next substep starts from
 };
 
 //the newest checkpoint in directory whose record is down; frame -1 if there's none
@@ -860,8 +891,17 @@ static bool newestCheckpoint(const std::string& directory, Checkpoint& out, std:
             }
             out.whitewater.push_back({std::string(name) + "/" + file->text, (int)rank->number, hash->text});
         }
-        if(const Json* bodies = record.find("bodies")){
-            out.bodies = *bodies;
+        for(const char* key : {"bodies", "contacts"}){  //a bake with dynamic bodies: their states and contacts, a shard each
+            const Json* part = record.find(key);
+            const Json* listed = part != nullptr && part->kind == Json::OBJECT ? part->find("shards") : nullptr;
+            for(size_t index = 0; listed != nullptr && index < listed->items.size(); ++index){
+                const Json* file = listed->items[index].find("file");
+                const Json* hash = listed->items[index].find("xxh64");
+                if(file == nullptr || hash == nullptr){
+                    throw std::runtime_error(path + ": a " + key + " shard without its file and xxh64");
+                }
+                (std::string(key) == "bodies" ? out.bodies : out.contacts).push_back({std::string(name) + "/" + file->text, 0, hash->text});
+            }
         }
     }
     catch(const std::exception& error){
@@ -1180,9 +1220,9 @@ int main(int argc, char** argv){
     if(resuming){
         scene.writeCache = true;    //into the cache it resumes
         bool dynamic = std::any_of(scene.obstacles.begin(), scene.obstacles.end(), [](const SceneObstacle& obstacle){ return obstacle.dynamic; });
-        if(dynamic && checkpoint.bodies.kind == Json::NUL){
+        if(dynamic && (checkpoint.bodies.size() != 1 || checkpoint.contacts.size() != 1)){
             return failure(outputDirectory + ": its newest checkpoint, at frame " + std::to_string(checkpoint.frame) + ", is from a flip2 that didn't keep the dynamic "
-                           "bodies in its checkpoints, so the bake can't carry on from it: bake it again");
+                           "bodies in its checkpoints as shards, so the bake can't carry on from it: bake it again");
         }
     }
     if(const char* partitions = std::getenv("FLIP2_PARTITIONS")){
@@ -1416,8 +1456,14 @@ int main(int argc, char** argv){
     }
     simulation->setObstacles(scene.obstacles, scene.density);      //after setDomain: they're voxelized at its voxel size, and the dynamic ones weighed against the liquid
     simulation->setCollisionSubsteps(scene.collisionSubsteps);
-    if(resuming && checkpoint.bodies.kind != Json::NUL){    //the dynamic bodies as the checkpoint left them, in place of where the scene starts them
-        std::string why = simulation->restoreBodies(checkpoint.bodies);
+    if(resuming && checkpoint.bodies.size() == 1 && checkpoint.contacts.size() == 1){   //the dynamic bodies as the checkpoint left them, in place of where the scene starts them
+        ShardData bodies, contacts;
+        std::string why;
+        if(!readShard(outputDirectory + "/checkpoints/" + checkpoint.bodies[0].file, checkpoint.bodies[0].xxh64, bodies, why) ||
+           !readShard(outputDirectory + "/checkpoints/" + checkpoint.contacts[0].file, checkpoint.contacts[0].xxh64, contacts, why)){
+            return failure(why);
+        }
+        why = simulation->restoreBodies(bodies, contacts);
         if(!why.empty()){
             return failure(outputDirectory + ": " + why);
         }

@@ -12,15 +12,19 @@ DIR/
   frames/0042/commit.json           frame 42's commit record, written last
   frames/0042/particles.r003.f2p    rank 3's particles at frame 42 (a shard)
   frames/0042/whitewater.r003.f2p   rank 3's whitewater at frame 42, in a bake with whitewater
+  frames/0042/bodies.r000.f2p       the dynamic bodies at frame 42, in a bake with any
   checkpoints/0040/ckpt.json        checkpoint 40's record, written last
   checkpoints/0040/state.r003.f2p   rank 3's whole state at the end of frame 40 (a shard)
   checkpoints/0040/whitewater.r003.f2p   and its whitewater's
+  checkpoints/0040/bodies.r000.f2p  the dynamic bodies' states, in a bake with any
+  checkpoints/0040/contacts.r000.f2p     and the contacts their next substep starts from
   frames.discarded/0043/            frames a resume worked out again, kept for comparison
 ```
 
 - Frame and checkpoint directories are named by frame number in decimal, zero-padded to at least 4 digits. Frame 0 is the initial state.
 - Shards are named `<base>.r<rank>.f2p`, with the rank zero-padded to at least 3 digits. Each rank writes its own. A frame has one shard per rank, and every particle is in exactly one of them.
 - A bake with whitewater also has one `whitewater` shard per rank in every frame and checkpoint, even when it holds no particles. See [Whitewater](#whitewater).
+- A bake with dynamic obstacles also has one `bodies` shard in every frame, and a `bodies` and a `contacts` shard in every checkpoint, all rank 0's: every rank moves the bodies alike. In them each element is a body or a contact rather than a particle. See [Dynamic bodies](#dynamic-bodies).
 - Readers ignore any other file. Files ending in `.tmp` are writes in progress. `particles.rNNN.json`, `state.rNNN.json` and `whitewater.rNNN.json` are notes ranks leave for rank 0 while committing; they aren't part of the format and may or may not be there.
 
 ## Reading while the bake runs
@@ -51,6 +55,7 @@ DIR/
 | `gpu`, `sm`, `cudaRuntime`, `build` | The GPU and build that made it. |
 | `shards` | `format` `"f2p"`, `version` `1`, `compression` (`"blosc-zstd"`, `"blosc-lz4"` or `"none"`), and the attributes of frame shards. |
 | `whitewater` | Only in a bake with whitewater: `perVoxel`, the number of whitewater particles that stand for one voxel's volume of whitewater. |
+| `bodies` | Only in a bake with dynamic obstacles: one object per body, in the order the scene lists them and the frames' `bodies` shards hold them. `name` is the obstacle's `name` in the scene, or `""`. `pivot` is its centre of mass in its own space (the space its shape is given in), in metres, which its orientation turns it about. |
 
 ## commit.json
 
@@ -70,25 +75,9 @@ DIR/
 
 In a bake with whitewater the record also has `"whitewater":{"particles":310000,"shards":[...]}`: the frame's whitewater particle count, and its shards listed the same way.
 
-In a bake with dynamic obstacles the record also has `bodies`: each body's placement at the end of the frame, in the order the scene lists them.
+In a bake with dynamic obstacles the record also has `"bodies":{"count":12,"shards":[...]}`: how many bodies there are, and the frame's `bodies` shard, listed the same way. See [Dynamic bodies](#dynamic-bodies).
 
-```json
- "bodies":[{"name":"piece0","position":[0.25,0.24,0.25],"orientation":[1,0,0,0],"pivot":[0.25,0.25,0.25],
-            "velocity":[0,-0.01,0],"angularVelocity":[0,0,0]}, ...]
-```
-
-| Key | Meaning |
-|---|---|
-| `name` | The obstacle's `name` in the scene, or `""`. |
-| `position` | Its centre of mass, in metres. |
-| `orientation` | A unit quaternion, w x y z, that turns the body's own space (the space its shape is given in) into its orientation now. |
-| `pivot` | Its centre of mass in its own space, which `orientation` turns it about. A point `x` of its shape is at `orientation (x - pivot) + position`. |
-| `velocity` | Its centre of mass's velocity, m/s. |
-| `angularVelocity` | Its angular velocity about its centre of mass, rad/s, in world axes. |
-
-Numbers are written to the bit; a value that isn't finite is `null`. `flip2 export` writes each frame's bodies as `bodies.NNNN.bgeo.sc`: a point per body with `name`, `P`, `orient` (x y z w, Houdini's order), `pivot`, `scale`, `v` and `w`, as Houdini's RBD Bullet Solver has its Simulation Points. Transform Pieces moves the pieces by them from where they rest.
-
-`flip2 verify DIR` checks every committed frame's shards against their entries, whitewater shards included.
+`flip2 verify DIR` checks every committed frame's shards against their entries, whitewater and bodies shards included.
 
 ## Shards (.f2p)
 
@@ -184,6 +173,23 @@ A scene with a `whitewater` block bakes spray, foam and bubbles as a second set 
 
 **The particle limit.** `whitewater.maxParticles` in the scene limits how many each rank holds. At the limit the bake makes fewer new particles, thinned evenly over the surface, and reports how many it left out: in the `frame` events on its standard output as `whitewaterDropped`, and in the diagnostics file. A bake that reaches the limit gives different whitewater on a different number of ranks, since each rank has its own limit. The liquid is never affected.
 
+## Dynamic bodies
+
+A scene's dynamic obstacles move with the liquid, which moves them. Their shards have the usual header and layout, with an element per body (or per contact) in place of a particle, and the header's particle count the number of them.
+
+**Frame bodies shards** hold each body's placement at the end of the frame, in `cache.json`'s `bodies` order. Every attribute is float64, to the bit:
+
+| Name | Type | Components | Meaning |
+|---|---|---|---|
+| `P` | float64 | 3 | its centre of mass, in metres |
+| `orient` | float64 | 4 | a unit quaternion, w x y z, that turns the body's own space into its orientation now. A point `x` of its shape is at `orient (x - pivot) + P`, with `pivot` from `cache.json` |
+| `v` | float64 | 3 | its centre of mass's velocity, m/s |
+| `w` | float64 | 3 | its angular velocity about its centre of mass, rad/s, in world axes |
+
+`flip2 export` writes each frame's bodies as `bodies.NNNN.bgeo.sc`: a point per body with `name`, `P`, `orient` (x y z w, Houdini's order), `pivot`, `scale`, `v` and `w`, as Houdini's RBD Bullet Solver has its Simulation Points. Transform Pieces moves the pieces by them from where they rest.
+
+**Checkpoint bodies and contacts shards** hold the engine's own state for resuming, not an interface: their attributes can change between builds. A body's are every field of its state as the last substep left it, starting with `position` (its centre of mass; float64, 3), then `orientation` (w x y z), `velocity`, `angularVelocity`, `angularMomentum` and the contact solver's working values, and last `obstacle` (uint64), its obstacle's index in the engine's obstacle set. A contact's start with `at` (where it is; float32, 3), then its `body`, its `partner` (0–5 the domain's walls, then 6 plus an obstacle's index) and its `slot` among that partner's, and the solver's values. Doubles are float64, floats float32 and integers uint64.
+
 ## ckpt.json
 
 ```json
@@ -202,7 +208,7 @@ A scene with a `whitewater` block bakes spray, foam and bubbles as a second set 
 | `partitionPlanes` | The checkpoint's split, as in `cache.json`. A resume can use a different split. |
 | `states` | The state shards in rank order, listed like a commit record's `shards`. |
 | `whitewater` | Only in a bake with whitewater: `particles`, `nextId` (the id the next whitewater particle gets) and `shards`, listed the same way. |
-| `bodies` | Only in a bake with dynamic obstacles: one object per body, in the order the scene lists them. `obstacle` is its obstacle's index in the engine's obstacle set, followed by the body's state as the last substep left it: `position` (its centre of mass), `orientation` (a unit quaternion, w x y z), `velocity`, `angularVelocity`, `angularMomentum`, and the contact solver's working values. `contacts` lists the contacts the next substep starts from, each with its `partner` (0–5 the domain's walls, then 6 plus an obstacle's index) and its `slot` among that partner's. Numbers are written to the bit; a value that isn't finite is `null`. This is the engine's own state for resuming, not an interface: its fields can change between builds. |
+| `bodies`, `contacts` | Only in a bake with dynamic obstacles: `count` and `shards`, listed the same way: the bodies' states and the contacts their next substep starts from. See [Dynamic bodies](#dynamic-bodies). |
 
 `flip2 resume` carries on from the newest checkpoint and gives exactly the frames the uninterrupted bake would have, whatever split it resumes with. That includes the whitewater and the dynamic bodies. A checkpoint from a bake with dynamic bodies made before checkpoints kept them can't be resumed. The bake keeps its newest checkpoints, 2 by default. It deletes older ones once a newer one is committed.
 

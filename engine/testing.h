@@ -331,11 +331,12 @@ public:
         simulation.writeCheckpoint(frame);
     }
 
-    //a checkpoint's dynamic bodies in place of where setObstacles started them, before resume (Bodies::restore): what's wrong with them, if anything
-    std::string restoreBodies(const Json& saved){
+    //a checkpoint's dynamic bodies and their contacts (its bodies and contacts shards) in place of where setObstacles started them, before resume
+    //(Bodies::restore): what's wrong with them, if anything
+    std::string restoreBodies(const ShardData& bodies, const ShardData& contacts){
         std::string why;
         simulation.forEachPartition([&](Particles& partition){
-            std::string wrong = partition.bodies.restore(saved);
+            std::string wrong = partition.bodies.restore(bodies, contacts);
             if(why.empty()){
                 why = wrong;
             }

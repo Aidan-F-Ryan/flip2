@@ -26,6 +26,9 @@
 //  frames/0042/whitewater.r003.f2p     with whitewater (whitewater.hu), rank 3's at frame 42, a shard beside its particles', in the same commit record
 //  checkpoints/0040/state.r003.f2p     rank 3's whole state at the end of frame 40, as a shard: what flip2 resume carries on from, exactly
 //  checkpoints/0040/whitewater.r003.f2p    and its whitewater's
+//  frames/0042/bodies.r000.f2p         with dynamic bodies (bodies.hu), where each is and how it moves at frame 42, by rank 0, as a shard of one element a
+//                                      body; cache.json names them, and gives each one's pivot
+//  checkpoints/0040/bodies.r000.f2p    and their states at the end of frame 40, with contacts.r000.f2p, the contacts the next substep starts from
 //  checkpoints/0040/ckpt.json          written last, by rank 0, as commit.json is: the time, the substeps taken, the ranks' planes, and each state shard
 //
 //A shard (.f2p, version 1) is little-endian: a 64-byte header, a 64-byte entry per attribute, then each attribute's data. Header: "FLIP2SHD", version,
@@ -39,7 +42,9 @@
 //3c + a), "id", and "birth", float32, when each particle came to be. The particles' order changes from frame to frame: the ids say which is which. Floats
 //from a simulation are noisy: losslessly P and v come to about 17 bytes a particle (1.4x) with zstd and 18.5 with lz4, measured on the dam break.
 //A frame's whitewater: "P", "v", "id" and "age" as the particles', then float32 "life" (the seconds it has left as foam), "radius" (the droplet's or
-//the bubble's, metres) and "kind" (0 spray, 1 foam, 2 a bubble). A checkpoint's: "P" as float64, "id", "v", "birth", "life", "radius", "kind"
+//the bubble's, metres) and "kind" (0 spray, 1 foam, 2 a bubble). A checkpoint's: "P" as float64, "id", "v", "birth", "life", "radius", "kind".
+//A frame's bodies, in the scene's order, all float64: "P" (its centre of mass), "orient" (its turn from where it rests, a quaternion w x y z), "v" and
+//"w" (its angular velocity). A checkpoint's: every field of each body's state and each contact's, as the engine has them (Bodies::checkpoint)
 struct CacheDescription{
     std::string scenePath;      //as given
     std::string sceneHash;      //XXH64 of the scene file, hex
@@ -74,6 +79,21 @@ struct CacheBodies{
     int count = 0;      //only rank 0's frames carry them: every rank moves them alike
 };
 
+//records written as a shard, column by column: each column's name, components, bytes a value (4 or 8), and whether it's an integer (uint64, rather than a
+//float of that many bytes), then its planes, component after component, count values each, column after column. A checkpoint's bodies and their
+//contacts (Bodies::checkpoint), whose first column, as every shard's, is where they are, which bounds the shard
+struct ShardColumns{
+    struct Column{
+        std::string name;
+        int components;
+        int bytes;
+        bool integer;
+    };
+    std::vector<Column> columns;
+    size_t count = 0;
+    std::vector<char> planes;
+};
+
 //what a checkpoint holds besides its particles: enough to carry on exactly as if the bake had never stopped
 struct CheckpointState{
     double time = 0.0;                  //seconds simulated
@@ -82,7 +102,8 @@ struct CheckpointState{
     unsigned long long nextId = 0;      //the id the next new particle gets
     double acceleration = 0.0;          //the most its last substep accelerated a face at, m/s^2, which limits the next substep (Particles::getCourantDt)
     unsigned long long whitewaterNextId = 0;    //with whitewater, the id the next of its particles gets
-    std::string bodies;     //with dynamic bodies, each one's state and contacts, as JSON (Bodies::checkpoint); empty without any
+    ShardColumns bodies;    //with dynamic bodies, each one's state, and the contacts the next substep starts from (Bodies::checkpoint); none without any
+    ShardColumns contacts;
 };
 
 //one rank's part of a frame or a checkpoint in a host buffer: its attributes one after another (frameBytes, checkpointBytes), each a plane per component
@@ -191,10 +212,11 @@ private:
     bool readRecord(const std::string& path, int rank, ShardRecord& record);
     std::string shardsJson(const std::vector<ShardRecord>& records, const char* base) const;
     std::string whitewaterJson(const std::vector<ShardRecord>& whitewater, const std::string& more = "") const;
-    std::string bodiesJson(const Job& job) const;   //a frame's bodies for its record, from its buffer
+    std::string countedJson(const char* key, const std::vector<ShardRecord>& shards, const char* base) const;   //the bodies' or contacts' part of a record
     bool commit(const std::string& frameDirectory, int frame, double time, const std::vector<ShardRecord>& records, const std::vector<ShardRecord>& whitewater,
-                const std::string& bodies);
-    bool commitCheckpoint(const std::string& checkpointDirectory, const Job& job, const std::vector<ShardRecord>& records, const std::vector<ShardRecord>& whitewater);
+                const std::vector<ShardRecord>& bodies);
+    bool commitCheckpoint(const std::string& checkpointDirectory, const Job& job, const std::vector<ShardRecord>& records, const std::vector<ShardRecord>& whitewater,
+                          const std::vector<ShardRecord>& bodies, const std::vector<ShardRecord>& contacts);
     void pruneCheckpoints();
     bool describe();    //cache.json, as things are now
     std::string cacheJson() const;

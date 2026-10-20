@@ -1023,7 +1023,7 @@ void Bodies::copyPlacements(double* host){
 
 // ---- checkpoints ----
 
-//a field of a body's state or of a contact, as a checkpoint's record has it: its name, where it is, how many values, and of what (doubles, floats, ints)
+//a field of a body's state or of a contact, as a checkpoint's shards have it: its name, where it is, how many values, and of what (doubles, floats, ints)
 struct SavedField{
     const char* name;
     size_t offset;
@@ -1033,15 +1033,16 @@ struct SavedField{
 
 //Every field of both, so a resume carries on from exactly what the substep after the checkpoint reads: the warm start's and the carry's of the contacts
 //(warmStartBodies, carryContacts), the state's, and the host's copy of it, which the timestep and the contact steps go by. A contact's slot is its
-//partner (the domain's 6 walls, then the obstacles) and its place among that partner's CONTACT_SLOTS, not its index, which the partners' count would change
+//partner (the domain's 6 walls, then the obstacles) and its place among that partner's CONTACT_SLOTS, not its index, which the partners' count would
+//change. Each shard's first column is where its records are (a shard's bounds are its first column's): a body's position, a contact's point
 static constexpr SavedField STATE_FIELDS[] = {
     {"position", offsetof(BodyState, position), 3, 'd'}, {"orientation", offsetof(BodyState, orientation), 4, 'd'}, {"velocity", offsetof(BodyState, velocity), 3, 'd'},
     {"angularVelocity", offsetof(BodyState, angularVelocity), 3, 'd'}, {"angularMomentum", offsetof(BodyState, angularMomentum), 3, 'd'},
     {"before", offsetof(BodyState, before), BODY_LANES, 'd'}, {"acceleration", offsetof(BodyState, acceleration), 1, 'd'}, {"pseudo", offsetof(BodyState, pseudo), BODY_LANES, 'd'},
     {"held", offsetof(BodyState, held), BODY_LANES, 'd'}, {"perSecond", offsetof(BodyState, perSecond), BODY_LANES, 'd'}};
 static constexpr SavedField CONTACT_FIELDS[] = {
-    {"point", offsetof(BodyContact, point), 1, 'i'}, {"other", offsetof(BodyContact, other), 1, 'i'}, {"body", offsetof(BodyContact, body), 1, 'i'},
-    {"partner", offsetof(BodyContact, partner), 1, 'i'}, {"slot", offsetof(BodyContact, k), 1, 'i'}, {"at", offsetof(BodyContact, at), 3, 'f'},
+    {"at", offsetof(BodyContact, at), 3, 'f'}, {"point", offsetof(BodyContact, point), 1, 'i'}, {"other", offsetof(BodyContact, other), 1, 'i'},
+    {"body", offsetof(BodyContact, body), 1, 'i'}, {"partner", offsetof(BodyContact, partner), 1, 'i'}, {"slot", offsetof(BodyContact, k), 1, 'i'},
     {"normal", offsetof(BodyContact, normal), 3, 'f'}, {"depth", offsetof(BodyContact, depth), 1, 'f'}, {"tangents", offsetof(BodyContact, tangents), 6, 'f'},
     {"partnerVelocity", offsetof(BodyContact, partnerVelocity), 3, 'f'}, {"lever", offsetof(BodyContact, lever), 6, 'f'}, {"mass", offsetof(BodyContact, mass), 3, 'f'},
     {"friction", offsetof(BodyContact, friction), 1, 'f'}, {"target", offsetof(BodyContact, target), 1, 'f'}, {"bias", offsetof(BodyContact, bias), 1, 'f'},
@@ -1059,67 +1060,71 @@ static constexpr size_t savedBytes(const SavedField (&fields)[N]){
 static_assert(savedBytes(STATE_FIELDS) == sizeof(BodyState), "a field of BodyState that checkpoints don't keep: add it to STATE_FIELDS");
 static_assert(savedBytes(CONTACT_FIELDS) == sizeof(BodyContact), "a field of BodyContact that checkpoints don't keep: add it to CONTACT_FIELDS");
 
-//the fields of the struct at base as JSON, "name":value or "name":[values]: doubles and floats to the bit (%.17g reads back as the same double, and a
-//float's double is the float itself), ints as they are, and what isn't finite as null (only a body that's already blown up has any)
-static void writeFields(std::string& out, const char* base, const SavedField* fields, size_t numFields){
-    char text[32];
+//count records of stride bytes from records, as a column a field: doubles as float64, floats as float32, ints as uint64 (two's complement, to the bit)
+static void packFields(const char* records, size_t stride, size_t count, const SavedField* fields, size_t numFields, ShardColumns& out){
     for(size_t f = 0; f < numFields; ++f){
         const SavedField& field = fields[f];
-        out += std::string(f ? ",\"" : "\"") + field.name + "\":" + (field.count > 1 ? "[" : "");
-        const char* at = base + field.offset;
-        for(int i = 0; i < field.count; ++i){
-            double value = field.type == 'd' ? ((const double*)at)[i] : field.type == 'f' ? (double)((const float*)at)[i] : (double)((const int*)at)[i];
-            if(field.type == 'i'){
-                std::snprintf(text, sizeof(text), "%d", ((const int*)at)[i]);
+        int bytes = field.type == 'f' ? 4 : 8;
+        out.columns.push_back({field.name, field.count, bytes, field.type == 'i'});
+        for(int component = 0; component < field.count; ++component){
+            size_t at = out.planes.size();
+            out.planes.resize(at + (size_t)bytes*count);
+            char* plane = out.planes.data() + at;
+            for(size_t i = 0; i < count; ++i){
+                const char* value = records + i*stride + field.offset;
+                if(field.type == 'i'){
+                    int number;
+                    std::memcpy(&number, value + sizeof(int)*component, sizeof(int));
+                    uint64_t widened = (uint64_t)(int64_t)number;
+                    std::memcpy(plane + 8*i, &widened, 8);
+                }
+                else{
+                    std::memcpy(plane + (size_t)bytes*i, value + (size_t)bytes*component, bytes);
+                }
             }
-            else if(std::isfinite(value)){
-                std::snprintf(text, sizeof(text), "%.17g", value);
-            }
-            else{
-                std::snprintf(text, sizeof(text), "null");
-            }
-            out += (i ? "," : "") + std::string(text);
         }
-        out += field.count > 1 ? "]" : "";
     }
+    out.count = count;
 }
 
-//and back into the struct at base: null as NaN, and a field the record doesn't have keeps what base had
-static void readFields(const Json& record, char* base, const SavedField* fields, size_t numFields, const std::string& where){
+//and back from a shard's columns into the records: each one the shard has must be its field's type and size; a field it hasn't keeps what the records had
+static std::string unpackFields(const ShardData& shard, char* records, size_t stride, const SavedField* fields, size_t numFields, const std::string& where){
+    size_t count = (size_t)shard.particles;
     for(size_t f = 0; f < numFields; ++f){
         const SavedField& field = fields[f];
-        const Json* value = record.find(field.name);
-        if(value == nullptr){
+        const ShardData::Attribute* column = shard.find(field.name);
+        if(column == nullptr){
             continue;
         }
-        bool fits = field.count > 1 ? value->kind == Json::ARRAY && (int)value->items.size() == field.count : true;
-        for(int i = 0; fits && i < field.count; ++i){
-            const Json& item = field.count > 1 ? value->items[i] : *value;
-            fits = item.kind == Json::NUMBER || (item.kind == Json::NUL && field.type != 'i');
+        uint32_t type = field.type == 'd' ? 2 : field.type == 'f' ? 1 : 3;   //float64, float32, uint64
+        size_t bytes = field.type == 'f' ? 4 : 8;
+        if(column->type != type || (int)column->components != field.count || column->planes.size() != bytes*count*field.count){
+            return where + ": \"" + field.name + "\" isn't " + std::to_string(field.count) + " of the " + (field.type == 'i' ? "integers" : "numbers") + " it should be";
         }
-        if(!fits){
-            throw std::runtime_error(where + ": \"" + field.name + "\" isn't " + (field.count > 1 ? std::to_string(field.count) + " numbers" : "a number"));
-        }
-        char* at = base + field.offset;
-        for(int i = 0; i < field.count; ++i){
-            const Json& item = field.count > 1 ? value->items[i] : *value;
-            double number = item.kind == Json::NUMBER ? item.number : NAN;
-            if(field.type == 'd'){
-                ((double*)at)[i] = number;
-            }
-            else if(field.type == 'f'){
-                ((float*)at)[i] = (float)number;
-            }
-            else{
-                ((int*)at)[i] = (int)number;
+        for(int component = 0; component < field.count; ++component){
+            const char* plane = column->planes.data() + bytes*count*component;
+            for(size_t i = 0; i < count; ++i){
+                char* value = records + i*stride + field.offset;
+                if(field.type == 'i'){
+                    uint64_t widened;
+                    std::memcpy(&widened, plane + 8*i, 8);
+                    int number = (int)(int64_t)widened;
+                    std::memcpy(value + sizeof(int)*component, &number, sizeof(int));
+                }
+                else{
+                    std::memcpy(value + bytes*component, plane + bytes*i, bytes);
+                }
             }
         }
     }
+    return "";
 }
 
-std::string Bodies::checkpoint(){
+void Bodies::checkpoint(ShardColumns& bodyColumns, ShardColumns& contactColumns){
+    bodyColumns = ShardColumns();
+    contactColumns = ShardColumns();
     if(numBodies == 0){
-        return "";
+        return;
     }
     std::vector<BodyState> now(numBodies);
     std::vector<BodyContact> carried(numLast);  //the last contact step's, which the next substep starts from, each saying whose it is
@@ -1128,62 +1133,61 @@ std::string Bodies::checkpoint(){
         gpuErrchk(cudaMemcpyAsync(carried.data(), lastContacts, sizeof(BodyContact)*numLast, cudaMemcpyDeviceToHost, stream));
     }
     gpuErrchk(cudaStreamSynchronize(stream));
-    std::vector<std::vector<const BodyContact*>> owned(numBodies);
+    std::vector<BodyContact> kept;      //an empty slot, which nothing reads, isn't kept
     for(const BodyContact& contact : carried){
-        if(contact.point >= 0 && contact.body >= 0 && contact.body < numBodies){    //an empty slot, which nothing reads, isn't kept
-            owned[contact.body].push_back(&contact);
+        if(contact.point >= 0 && contact.body >= 0 && contact.body < numBodies){
+            kept.push_back(contact);
         }
     }
-    std::string out = "[";
+    packFields((const char*)now.data(), sizeof(BodyState), now.size(), STATE_FIELDS, std::size(STATE_FIELDS), bodyColumns);
+    bodyColumns.columns.push_back({"obstacle", 1, 8, true});    //and which of the scene's obstacles each is, which restore checks
     for(int body = 0; body < numBodies; ++body){
-        out += std::string(body ? ",\n  " : "\n  ") + "{\"obstacle\":" + std::to_string(obstacles[body]) + ",";
-        writeFields(out, (const char*)&now[body], STATE_FIELDS, std::size(STATE_FIELDS));
-        out += ",\"contacts\":[";
-        for(size_t index = 0; index < owned[body].size(); ++index){
-            out += std::string(index ? "," : "") + "{";
-            writeFields(out, (const char*)owned[body][index], CONTACT_FIELDS, std::size(CONTACT_FIELDS));
-            out += "}";
-        }
-        out += "]}";
+        uint64_t obstacle = (uint64_t)obstacles[body];
+        size_t at = bodyColumns.planes.size();
+        bodyColumns.planes.resize(at + 8);
+        std::memcpy(bodyColumns.planes.data() + at, &obstacle, 8);
     }
-    return out + "]";
+    packFields((const char*)kept.data(), sizeof(BodyContact), kept.size(), CONTACT_FIELDS, std::size(CONTACT_FIELDS), contactColumns);
 }
 
-std::string Bodies::restore(const Json& saved){
-    if(saved.kind != Json::ARRAY || (int)saved.items.size() != numBodies){
-        return "its checkpoint has " + std::to_string(saved.items.size()) + " dynamic bodies, and the scene has " + std::to_string(numBodies);
+std::string Bodies::restore(const ShardData& bodyShard, const ShardData& contactShard){
+    if((int)bodyShard.particles != numBodies){
+        return "its checkpoint has " + std::to_string(bodyShard.particles) + " dynamic bodies, and the scene has " + std::to_string(numBodies);
     }
     if(numBodies == 0){
         return "";
     }
-    std::vector<BodyState> restored(seen, seen + numBodies);    //where setUp started them, for any field the record doesn't have
-    std::vector<BodyContact> carried;   //the last step's contacts, for the first substep to put in its pairs (makePairs)
-    try{
-        for(int body = 0; body < numBodies; ++body){
-            const Json& record = saved.items[body];
-            std::string where = "its checkpoint's body " + std::to_string(body);
-            const Json* obstacle = record.find("obstacle");
-            if(obstacle == nullptr || obstacle->kind != Json::NUMBER || (int)obstacle->number != obstacles[body]){
-                return where + " is another of the scene's obstacles than the scene's body " + std::to_string(body);
-            }
-            readFields(record, (char*)&restored[body], STATE_FIELDS, std::size(STATE_FIELDS), where);
-            const Json* contacts = record.find("contacts");
-            for(size_t index = 0; contacts != nullptr && index < contacts->items.size(); ++index){
-                const Json& entry = contacts->items[index];
-                std::string which = where + "'s contact " + std::to_string(index);
-                BodyContact contact = BodyContact{};
-                contact.point = -1;
-                contact.body = body;
-                readFields(entry, (char*)&contact, CONTACT_FIELDS, std::size(CONTACT_FIELDS), which);
-                if(contact.point < 0 || contact.body != body || contact.partner < 0 || contact.partner >= partners || contact.k < 0 || contact.k >= CONTACT_SLOTS){
-                    return which + " has no surface point, or no partner and slot this scene's bodies have";
-                }
-                carried.push_back(contact);
-            }
+    const ShardData::Attribute* obstacle = bodyShard.find("obstacle");
+    if(obstacle == nullptr || obstacle->type != 3 || obstacle->planes.size() != 8*(size_t)numBodies){
+        return "its checkpoint's bodies don't say which obstacle each is";
+    }
+    for(int body = 0; body < numBodies; ++body){
+        uint64_t which;
+        std::memcpy(&which, obstacle->planes.data() + 8*(size_t)body, 8);
+        if(which != (uint64_t)obstacles[body]){
+            return "its checkpoint's body " + std::to_string(body) + " is another of the scene's obstacles than the scene's body " + std::to_string(body);
         }
     }
-    catch(const std::exception& error){
-        return error.what();
+    std::vector<BodyState> restored(seen, seen + numBodies);    //where setUp started them, for any field the checkpoint doesn't have
+    std::string why = unpackFields(bodyShard, (char*)restored.data(), sizeof(BodyState), STATE_FIELDS, std::size(STATE_FIELDS), "its checkpoint's bodies");
+    if(!why.empty()){
+        return why;
+    }
+    std::vector<BodyContact> carried(contactShard.particles);   //the last step's contacts, for the first substep to put in its pairs (makePairs)
+    for(BodyContact& contact : carried){
+        contact = BodyContact{};
+        contact.point = -1;
+        contact.body = -1;
+    }
+    why = unpackFields(contactShard, (char*)carried.data(), sizeof(BodyContact), CONTACT_FIELDS, std::size(CONTACT_FIELDS), "its checkpoint's contacts");
+    if(!why.empty()){
+        return why;
+    }
+    for(size_t index = 0; index < carried.size(); ++index){
+        const BodyContact& contact = carried[index];
+        if(contact.point < 0 || contact.body < 0 || contact.body >= numBodies || contact.partner < 0 || contact.partner >= partners || contact.k < 0 || contact.k >= CONTACT_SLOTS){
+            return "its checkpoint's contact " + std::to_string(index) + " has no surface point, or no body, partner and slot this scene's bodies have";
+        }
     }
     std::memcpy(seen, restored.data(), sizeof(BodyState)*numBodies);   //what the first substep's timestep and contact steps go by, as the checkpoint's last left it
     gpuErrchk(cudaMemcpyAsync(states, seen, sizeof(BodyState)*numBodies, cudaMemcpyHostToDevice, stream));

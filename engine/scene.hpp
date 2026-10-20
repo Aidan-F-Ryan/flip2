@@ -42,7 +42,8 @@
 //    "emitters": [{"shape": "box", "min": [...], "max": [...], "velocity": [0, 0, 2]}],   //inflow: keeps its shape full of fluid moving at velocity
 //    "sinks": [{"shape": "sphere", "center": [...], "radius": 0.1}],                       //outflow: deletes the fluid inside it
 //    "obstacles": [{"mesh": "rock.obj", "friction": 0, "thickness": 0, "hold": true,     //or "vertices": "v.npy", "triangles": "t.npy"; or a box or sphere;
-//                                                                                         //hold: as a wall's
+//                                                                                         //hold: as a wall's. Each .npy can be rows of one many share:
+//                                                                                         //{"file": "all.npy", "first": 1200, "count": 342}
 //                                                                                         //or "vdb": "rock.vdb", "grid": "surface", "velocityGrid": "vel"
 //                   "transform": [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1],                    //its own space to the world: row-major, acting on column vectors
 //                   "keyframes": [{"time": 0, "transform": [...]}, ...],                 //instead of a transform, it moves: linearly, rotations by slerp

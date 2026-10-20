@@ -472,8 +472,8 @@ void Simulation::writeCheckpoint(int frame){
         offset += CacheWriter::whitewaterBytes(whitewaterCounts[index], true);
     }
     gpuErrchk(cudaSetDevice(partitions[0]->device()));
-    if(ranks[0] == 0){  //the record's: every partition moves the bodies alike, and its stream is done (acceleration waited on it)
-        state.bodies = partitions[0]->bodies.checkpoint();
+    if(ranks[0] == 0){  //the bodies' shards: every partition moves the bodies alike, and its stream is done (acceleration waited on it)
+        partitions[0]->bodies.checkpoint(state.bodies, state.contacts);
     }
     state.time = partitions[0]->elapsedTime;
     state.substep = partitions[0]->substepIndex;

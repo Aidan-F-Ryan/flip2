@@ -230,20 +230,26 @@ static std::vector<double> loadNpy(const std::string& path){
     return values;
 }
 
-void loadNpyMesh(const std::string& verticesPath, const std::string& trianglesPath, std::vector<float>& vertices, std::vector<int>& triangles){
-    for(double value : loadNpy(verticesPath)){
+//a mesh from its vertices' and its triangles' rows, as .npy files (or slices of them) hold them, named for what's wrong
+static void npyMesh(const std::vector<double>& vertexRows, const std::vector<double>& triangleRows, const std::string& verticesName, const std::string& trianglesName,
+                    std::vector<float>& vertices, std::vector<int>& triangles){
+    for(double value : vertexRows){
         vertices.push_back((float)value);
     }
     int numVertices = (int)vertices.size() / 3;
-    for(double value : loadNpy(trianglesPath)){
+    for(double value : triangleRows){
         if(value < 0 || value >= numVertices){
-            throw std::runtime_error(trianglesPath + ": names vertex " + std::to_string((long long)value) + ", but " + verticesPath + " has " + std::to_string(numVertices));
+            throw std::runtime_error(trianglesName + ": names vertex " + std::to_string((long long)value) + ", but " + verticesName + " has " + std::to_string(numVertices));
         }
         triangles.push_back((int)value);
     }
     if(triangles.empty()){
-        throw std::runtime_error(trianglesPath + ": no triangles");
+        throw std::runtime_error(trianglesName + ": no triangles");
     }
+}
+
+void loadNpyMesh(const std::string& verticesPath, const std::string& trianglesPath, std::vector<float>& vertices, std::vector<int>& triangles){
+    npyMesh(loadNpy(verticesPath), loadNpy(trianglesPath), verticesPath, trianglesPath, vertices, triangles);
 }
 
 bool SceneShape::contains(const double point[3]) const{
@@ -478,6 +484,31 @@ Scene loadScene(const std::string& path){
     auto resolve = [&](const std::string& file){
         return file.empty() || file[0] == '/' ? file : directory + file;
     };
+    //An .npy's rows for "vertices" or "triangles": the whole file, its path, or rows [first, first + count) of a file many objects share,
+    //{"file": "geo/meshes_vertices.npy", "first": 1200, "count": 342} (the Houdini node packs every object's into one). Each file is read once,
+    //however many name it; what's named comes back as the file's name, with the rows if a slice
+    std::map<std::string, std::vector<double>> npyFiles;
+    auto npyRows = [&](const Json& item, const char* key, const std::string& where, std::string& named){
+        const Json* value = item.find(key);
+        if(value == nullptr || value->kind != Json::OBJECT){
+            named = resolve(read.text(item, key, where, ""));
+            return loadNpy(named);
+        }
+        std::string at = where + "." + key;
+        read.checkKeys(*value, at, {"file", "first", "count"});
+        std::string file = resolve(read.text(*value, "file", at, ""));
+        double first = read.number(*value, "first", at, -1.0), count = read.number(*value, "count", at, -1.0);
+        auto loaded = npyFiles.find(file);
+        if(loaded == npyFiles.end()){
+            loaded = npyFiles.emplace(file, loadNpy(file)).first;
+        }
+        size_t rows = loaded->second.size() / 3;
+        if(!(first >= 0.0) || !(count >= 0.0) || first != std::floor(first) || count != std::floor(count) || first + count > (double)rows){
+            read.fail(at, "should name rows of " + file + ", which has " + std::to_string(rows) + ": a whole \"first\" and \"count\" within them");
+        }
+        named = file + " rows " + std::to_string((size_t)first) + " to " + std::to_string((size_t)(first + count));
+        return std::vector<double>(loaded->second.begin() + 3*(size_t)first, loaded->second.begin() + 3*(size_t)(first + count));
+    };
     //runs load, saying where in the scene a file it reads was named if reading it fails
     auto naming = [&](const std::string& where, auto load){
         try{
@@ -510,7 +541,10 @@ Scene loadScene(const std::string& path){
                 loadObj(resolve(read.text(item, "mesh", where, "")), placed.vertices, placed.triangles);
             }
             else if(named){
-                loadNpyMesh(resolve(read.text(item, "vertices", where, "")), resolve(read.text(item, "triangles", where, "")), placed.vertices, placed.triangles);
+                std::string verticesName, trianglesName;
+                std::vector<double> vertexRows = npyRows(item, "vertices", where, verticesName);
+                std::vector<double> triangleRows = npyRows(item, "triangles", where, trianglesName);
+                npyMesh(vertexRows, triangleRows, verticesName, trianglesName, placed.vertices, placed.triangles);
             }
         });
         if(named){
@@ -594,7 +628,8 @@ Scene loadScene(const std::string& path){
                         loadObj(resolve(read.text(sample, "mesh", at, "")), vertices, triangles);
                     }
                     else{
-                        for(double value : loadNpy(resolve(read.text(sample, "vertices", at, "")))){
+                        std::string named;
+                        for(double value : npyRows(sample, "vertices", at, named)){
                             vertices.push_back((float)value);
                         }
                     }

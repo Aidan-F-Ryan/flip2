@@ -13,6 +13,7 @@
 #include "algorithms/condensationFunctions.hu"
 #include "algorithms/exactSum.hu"
 #include "json.hpp"
+#include "cacheWriter.hu"       //ShardColumns, ShardData
 #include <initializer_list>
 #include <string>
 #include <utility>
@@ -278,12 +279,13 @@ public:
     //each body's placement for a cache frame, into pinned host memory: the BODY_PLACEMENT doubles its state starts with (cacheWriter.hu), on the
     //stream, so an event recorded on it after this has them there
     void copyPlacements(double* host);
-    //Checkpoints (flip2 resume): every body's state and its contacts as they are now, as JSON for the checkpoint's record ("bodies"), which restore
-    //carries on from exactly. It waits for the GPU: once a checkpoint, with the stream's work done (Simulation::writeCheckpoint has just waited on it)
-    std::string checkpoint();
-    //a checkpoint's bodies in place of where setUp started them, before resume places the obstacles (updateObstacles writes their frames from them):
-    //what's wrong with saved for this scene's bodies, if anything
-    std::string restore(const Json& saved);
+    //Checkpoints (flip2 resume): every body's state and the contacts the next substep starts from, as they are now, as columns for the checkpoint's
+    //bodies and contacts shards, which restore carries on from exactly. It waits for the GPU: once a checkpoint, with the stream's work done
+    //(Simulation::writeCheckpoint has just waited on it)
+    void checkpoint(ShardColumns& bodyColumns, ShardColumns& contactColumns);
+    //a checkpoint's bodies and contacts shards in place of where setUp started the bodies, before resume places the obstacles (updateObstacles writes
+    //their frames from them): what's wrong with them for this scene's bodies, if anything
+    std::string restore(const ShardData& bodyShard, const ShardData& contactShard);
 
 private:
     void release();

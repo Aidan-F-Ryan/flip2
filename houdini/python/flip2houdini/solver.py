@@ -84,6 +84,9 @@ VOLUMES = 'if(primintrinsic(0, "typename", @primnum) != "VDB") removeprim(0, @pr
 VECTORS = 'if(!match("vec3*", primintrinsic(0, "vdb_value_type", @primnum))) removeprim(0, @primnum, 1);'     #of VDBs, only those of vectors
 VOLUME_FILE = "collision_volumes.vdb"
 FORCE_FILE = "force_volumes.vdb"
+MESH_VERTICES = "meshes_vertices.npy"       #every object's vertices where it starts, one after another (_Packer)
+MESH_TRIANGLES = "meshes_triangles.npy"     #and their triangles, each numbering its own vertices from 0
+DEFORMING_FILE = "deforming_f%d.npy"        #every deforming object's vertices at a frame
 SETTINGS = (("friction", "flip2_friction", float), ("hold", "flip2_hold", int), ("thickness", "flip2_thickness", float))  #a collision object's own, as primitive attributes
 FORCE_LIMIT = 16    #and the forces
 FIELD_TYPES = ("point", "vortex", "turbulence", "wind")     #the Forces tab's force fields, as the scene names them
@@ -96,7 +99,9 @@ FIELD_SETTINGS = {  #each one's scene keys, and the parameters of a Force Fields
 SURFACE_DEFAULTS = {"influencescale": (3.0,), "radiusscale": (0.8,), "smoothing": (4,)}     #flip2 mesh's own
 OLD_SURFACE_DEFAULTS = {"influencescale": 2.0, "radiusscale": 0.6, "smoothing": 2}         #what they were, which left the surface dimpled
 _jobs = {}      #per node path, its bake's processes, while this session runs them
-GEO_FILE = re.compile(r"^((%s)\d+_(triangles|vertices|f-?\d+)\.npy|(collision|force)_volumes\.vdb)$" % "|".join(ROLES + ("rbd",)))   #the files write_scene writes into geo/
+#the files write_scene writes into geo/, and the ones an object each it wrote before it packed them
+GEO_FILE = re.compile(r"^((%s)\d+_(triangles|vertices|f-?\d+)\.npy|meshes_(vertices|triangles)\.npy|deforming_f-?\d+\.npy|(collision|force)_volumes\.vdb)$"
+                      % "|".join(ROLES + ("rbd",)))
 RBD_DEFAULTS = {"density": 1000.0, "friction": 1.0, "bounce": 0.25}     #RBD Bullet Solver's, for a piece without the attribute
 PIECE_TAG = '''//a packed piece's name, as a point attribute or its primitive's, which unpacking hands its geometry
 string piece = point(0, "name", @ptnum);
@@ -740,23 +745,40 @@ def _motion(samples, tolerance):
     return "rigid", transforms
 
 
-def _write_object(samples, motion, prefix, geo_dir, frames, fps):
-    """an object's files, and its scene entry: still, moving rigidly with a transform every frame, or deforming with its vertices every frame"""
-    import numpy
+class _Packer:
+    """The scene's meshes, packed: every object's vertices where it starts in one file and its triangles in another, and every deforming object's
+    vertices at a frame in a file a frame, which the scene names rows of ({"file", "first", "count"}), rather than files an object: a scene of a
+    thousand pieces is a handful of files to write, copy to a farm and read back"""
+
+    def __init__(self):
+        self.arrays = {}    #per file, its arrays in the order they go in, and its rows so far
+        self.rows = {}
+
+    def add(self, name, values):
+        """values (n x 3), at the end of the file name, and the rows they take there"""
+        first = self.rows.get(name, 0)
+        self.arrays.setdefault(name, []).append(values)
+        self.rows[name] = first + len(values)
+        return {"file": "geo/" + name, "first": first, "count": len(values)}
+
+    def write(self, geo_dir):
+        import numpy
+        for name, arrays in self.arrays.items():
+            kind = numpy.int32 if name == MESH_TRIANGLES else numpy.float32
+            numpy.save(os.path.join(geo_dir, name), numpy.concatenate([numpy.asarray(values, dtype=kind).reshape(-1, 3) for values in arrays]))
+
+
+def _write_object(samples, motion, packer, frames, fps):
+    """an object's scene entry, its geometry packed: still, moving rigidly with a transform every frame, or deforming with its vertices every frame"""
     kind, transforms = motion
-    numpy.save(os.path.join(geo_dir, prefix + "_triangles.npy"), samples["triangles"])
-    entry = {"vertices": "geo/%s_vertices.npy" % prefix, "triangles": "geo/%s_triangles.npy" % prefix}
+    triangles = packer.add(MESH_TRIANGLES, samples["triangles"])
     if kind != "deforming":
-        numpy.save(os.path.join(geo_dir, prefix + "_vertices.npy"), samples["frames"][0])
+        entry = {"vertices": packer.add(MESH_VERTICES, samples["frames"][0]), "triangles": triangles}
         if kind == "rigid":
             entry["keyframes"] = [{"time": (frame - frames[0]) / fps, "transform": transform} for frame, transform in zip(frames, transforms)]
         return entry
-    deforming = []
-    for frame, positions in zip(frames, samples["frames"]):
-        name = "%s_f%d.npy" % (prefix, frame)
-        numpy.save(os.path.join(geo_dir, name), positions)
-        deforming.append({"time": (frame - frames[0]) / fps, "vertices": "geo/" + name})
-    return {"vertices": deforming[0]["vertices"], "triangles": entry["triangles"], "deforming": deforming}
+    deforming = [{"time": (frame - frames[0]) / fps, "vertices": packer.add(DEFORMING_FILE % frame, positions)} for frame, positions in zip(frames, samples["frames"])]
+    return {"vertices": deforming[0]["vertices"], "triangles": triangles, "deforming": deforming}
 
 
 def _volume_state(volume):
@@ -987,13 +1009,14 @@ def write_scene(node):
                             "surface is a voxel or two over the liquid, and pieces float that much high. Set Free Surface on the Simulation tab")
     tolerance = 0.01*2*separation      #a hundredth of a voxel: less than the fluid can feel
     made = []
+    packer = _Packer()
     for role in roles:
         objects = [(samples, _motion(samples, tolerance)) for samples in sampled_roles[role]]   #each object on its own, still, rigid or deforming
         kinds = [kind for _, (kind, _) in objects] + (["volume"]*len(volumes) if role == "collision" else [])
         made.append("%s: %s" % (LABELS[ROLES.index(role)].lower(), ", ".join("%d %s" % (kinds.count(kind), kind) for kind in ("still", "rigid", "deforming", "volume")
                                                                                if kind in kinds) or "nothing"))
         for index, (samples, motion) in enumerate(objects):
-            entry = _write_object(samples, motion, "%s%d" % (role, index), geo_dir, frames[:len(samples["frames"])], fps)
+            entry = _write_object(samples, motion, packer, frames[:len(samples["frames"])], fps)
             if role == "fluid":
                 entry = {key: entry[key] for key in ("vertices", "triangles")}
                 scene["fluids"].append(entry)
@@ -1021,7 +1044,7 @@ def write_scene(node):
         scene["obstacles"].append(entry)
     for index, samples in enumerate(simulated):     #the RBD tab's simulated pieces, each a dynamic body starting where the start frame has it
         settings = samples["rbd"]
-        entry = _write_object(samples, ("still", None), "rbd%d" % index, geo_dir, frames[:1], fps)
+        entry = _write_object(samples, ("still", None), packer, frames[:1], fps)
         dynamic = {"velocity": settings["v"], "angularVelocity": settings["w"], "bounce": settings["bounce"], "contactFriction": settings["friction"]}
         dynamic.update({"mass": settings["mass"]} if settings["mass"] > 0.0 else {"density": settings["density"]})
         entry.update({"name": samples["name"], "dynamic": dynamic, "friction": samples["settings"].get("friction", node.evalParm("friction"))})
@@ -1030,6 +1053,7 @@ def write_scene(node):
         scene["obstacles"].append(entry)
     if rbd:
         made.append("rbd: %d simulated, %d colliding" % (len(simulated), len(rbd) - len(simulated)))
+    packer.write(geo_dir)
     if simulated and node.parm("collisionsubsteps") is not None:
         scene["solver"]["collisionSubsteps"] = node.evalParm("collisionsubsteps")
     forces, said = _force_volumes(node, frames[0], geo_dir)

@@ -348,7 +348,7 @@ private:
     void findSealedPockets();       //fluid no air reaches (pockets.cu): labelled once a substep, settled across partitions, its divergence balanced before each solve
     void settleSealedPockets();
     void balanceSealedPockets();
-    void pocketRound(long long* summed);
+    void pocketRound(long long* summed, long long* roots);
     VoxelPlaces voxelPlaces();
     //How far the liquid holds to what's solid, 0 to 1: c/(1 + c), c = nu/(24 dx^2), how many voxels' worth viscosity spreads a wall's grip in a 24th of
     //a second. The viscous solve holds the faces to the walls whatever the viscosity, but particles read the faces past a wall as mirror images, and
@@ -566,6 +566,7 @@ private:
     CudaVec<double> pocketWords;    //the pockets' bookkeeping, in 64-bit words
     long long* pocketSeen = nullptr;    //pinned: the counts the host reads back
     long long pocketUnknowns = 0;   //unknowns no air reaches this substep
+    uint pocketEntries = 0;         //and the room the table has for their pockets
     double viscosity = 0.0;         //kinematic, m^2/s
     double surfaceTension = 0.0;    //over the density, m^3/s^2
     double wallWetting[6] = {0.5, 0.5, 0.5, 0.5, 0.5, 0.5};     //the cosine of the angle the liquid meets each wall at: 60 degrees
