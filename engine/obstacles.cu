@@ -2332,12 +2332,14 @@ __global__ void obstacleGhostFaces(int layer, Obstacles obstacles, float stick, 
 //a foot squeezes against the floor leaves through a corner of a face at tens of metres a second), which particles would carry off. Over the obstacle's
 //part the face takes what a face inside the obstacle does (slipVelocity): the obstacle's velocity across its surface, and along it the fluid's, held by
 //the obstacle's friction. The fluid's there is the mean over the open part of this face and of the six faces of the same component around it, each
-//weighed by how open it is, as they were before this pass: a sliver's flow counts for as little as the sliver is wide, so it can't jet, and a wall with
-//no friction lets the fluid slide past it (a spinning ball doesn't drag the water round). It goes smoothly to the obstacle's velocity across its
-//surface as w goes to 0, where the face closes and the ghost velocities give it just that. A face is the lower face of the voxel above it, a block per
-//node of this partition's own, reading its neighbours through the node's tile (liquidTile.hu); the ghost pass after it rewrites the faces it owns (closed
-//ones, ones into solids), and the domain's walls stay walls. A viscous liquid holds on at least as the walls do (stick). What a dynamic body's friction
-//gives the fluid adds up in friction (bodies.hu)
+//weighed by how open it is, as they were before this pass, and where those are open by less than a whole face between them, the obstacle's motion makes
+//up the rest: a sliver's flow counts for as little as the sliver is wide, so it can't jet, among slivers alone too (between touching bodies, faces open
+//a few parts in 65535 take the pressure's jump across them at thousands of metres a second, and a mean of those alone handed it to the particles at
+//over a hundred), and a wall with no friction lets the fluid slide past it (a spinning ball doesn't drag the water round). It goes smoothly to the
+//obstacle's velocity across its surface as w goes to 0, where the face closes and the ghost velocities give it just that. A face is the lower face of
+//the voxel above it, a block per node of this partition's own, reading its neighbours through the node's tile (liquidTile.hu); the ghost pass after it
+//rewrites the faces it owns (closed ones, ones into solids), and the domain's walls stay walls. A viscous liquid holds on at least as the walls do
+//(stick). What a dynamic body's friction gives the fluid adds up in friction (bodies.hu)
 __global__ void mixCutFaces(Obstacles obstacles, VoxelPlaces places, const uint* nodes, uint numOwnNodes, uint numUsedGridNodes, const uint* cellToNode, const uint* interiorVoxels,
                             const char* solid, const char* near, const uint* opens, const uint* centroids, float stick, const float* beforeX, const float* beforeY, const float* beforeZ, float* ux,
                             float* uy, float* uz, BodyFriction friction){
@@ -2410,7 +2412,8 @@ __global__ void mixCutFaces(Obstacles obstacles, VoxelPlaces places, const uint*
                     weight += opening;
                 };
                 //the fluid's velocity at the face, each component the open-weighed mean: this one's over the face and the six of the same component
-                //around it, the others' over the four of theirs that meet it; one with nothing open takes the obstacle's
+                //around it, the others' over the four of theirs that meet it; less than a whole face open among them, the obstacle's motion over the
+                //rest of one, and with nothing open, the obstacle's
                 float fluid[3];
                 for(int of = 0; of < 3; ++of){
                     float sum = of == dim ? open*before[dim][index] : 0.0f, weight = of == dim ? open : 0.0f;
@@ -2429,7 +2432,7 @@ __global__ void mixCutFaces(Obstacles obstacles, VoxelPlaces places, const uint*
                             weigh(at, of, sum, weight);
                         }
                     }
-                    fluid[of] = weight > 0.0f ? sum / weight : component(solidMotion, of);
+                    fluid[of] = weight >= 1.0f ? sum / weight : weight > 0.0f ? sum + (1.0f - weight)*component(solidMotion, of) : component(solidMotion, of);
                 }
                 float fluidAlong = alongSurface(make_float3(fluid[0], fluid[1], fluid[2]), normals[dim], dim);
                 float holding = fmaxf(obstacle.friction, stick);

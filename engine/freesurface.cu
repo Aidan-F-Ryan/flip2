@@ -29,7 +29,10 @@
 //4. The velocity update takes the same pressures past those faces (correctSurfaceFaces, after cudaVelocityUpdate), so the velocities are the ones the
 //   equations solved for.
 //5. The faces that particles read but no pressure reaches, around the liquid, take the liquid's velocity carried out from its faces, EXTEND_LAYERS voxels
-//   deep (extendLiquidVelocities), after the solve. FLIP's old velocities stay as P2G left them there, the particles' own, so the particles just outside
+//   deep (extendLiquidVelocities), after the solve, each face it's carried from counting for as much of a face as is open, as in the obstacle pass's
+//   mean (mixCutFaces): with less than a whole face open among those it takes from, a face keeps its own velocity for the rest, so a sliver between
+//   touching bodies, whose open part the pressure's jump drives at hundreds of metres a second, carries out only what crosses it. FLIP's old
+//   velocities stay as P2G left them there, the particles' own, so the particles just outside
 //   the liquid end up with the liquid's velocity plus what each differed by from the ones around it: they move with the surface. (With the old
 //   velocities carried out too, they kept their own and took only the liquid's change, and a film crept out along the floor from a drop's edge with
 //   nothing to bring it back.) Further out, spray's faces keep what P2G gave them and the forces, so it flies on its own.
@@ -268,13 +271,15 @@ __global__ void correctSurfaceFacesKernel(uint numVoxels, const char* solveCodes
 //The faces around the liquid, a block per node of this partition's own on a tile of its voxels and EXTEND_LAYERS more on every side (liquidTile.hu), from
 //before, the face velocities as they were (other blocks write their own nodes' meanwhile). The faces the solve gives a velocity are the liquid's: a liquid
 //unknown's that aren't a wall's, and an air voxel's above a liquid unknown. Each layer, a face that isn't takes the mean of those of its six neighbours of
-//the same component that are, or that took one in an earlier layer, and EXTEND_LAYERS layers leave the node's own faces as passes over the whole grid
-//would. An air voxel's face on one of the domain's walls is set at rest, as cudaVelocityUpdate leaves the unknowns', and the obstacles' faces (closed, or
-//with a solid voxel either side) are left for the obstacle passes, which set them after this
+//the same component that are, or that took one in an earlier layer, each weighed by how much of a face it counts for (a solved one as much as it's open,
+//one that took a value as much as it took, at most a face), with its own velocity for what's short of a whole face among them; EXTEND_LAYERS layers
+//leave the node's own faces as passes over the whole grid would. An air voxel's face on one of the domain's walls is set at rest, as cudaVelocityUpdate
+//leaves the unknowns', and the obstacles' faces (closed, or with a solid voxel either side) are left for the obstacle passes, which set them after this
 __global__ void extendVelocities(uint numUsedGridNodes, const uint* nodeCells, const uint* cellToNode, const uint* interiorVoxels, Grid grid, const char* solveCodes,
-                                 const uint* neighborNx, const uint* neighborNy, const uint* neighborNz, const char* solid, const char* near, const float* before, uint numVoxels,
-                                 float* ux, float* uy, float* uz){
+                                 const uint* neighborNx, const uint* neighborNy, const uint* neighborNz, const char* solid, const char* near, const uint* opens, const float* before,
+                                 uint numVoxels, float* ux, float* uy, float* uz){
     __shared__ float values[3][EXTEND_SLOTS];
+    extern __shared__ float weights[];      //with obstacles, how much of a face each counts for, 3*EXTEND_SLOTS: without, every face counts for one
     __shared__ unsigned char states[3][EXTEND_SLOTS];
     __shared__ char solidSlots[EXTEND_SLOTS];
     __shared__ uint nodes[27];
@@ -290,22 +295,32 @@ __global__ void extendVelocities(uint numUsedGridNodes, const uint* nodeCells, c
         int coordinates[3] = {g.x, g.y, g.z};
         bool inSolid = voxel != NO_VOXEL && solid != nullptr && solid[voxel];
         solidSlots[slot] = inSolid;
+        bool cut = voxel != NO_VOXEL && near != nullptr && (near[voxel] & NEAR_SURFACE);
+        CutFaces faces;
+        if(cut){
+            faces = cachedCut(opens, voxel);
+        }
         #pragma unroll
         for(int dim = 0; dim < 3; ++dim){
             unsigned char state = FACE_KEPT;
             float value = 0.0f;
+            float weight = 1.0f;
             if(voxel != NO_VOXEL){
                 value = before[dim*(size_t)numVoxels + voxel];
                 uint below = lower[dim][voxel];
                 bool liquid = solveCodes[voxel];
                 if(liquid ? below != WALL_VOXEL : below < WALL_VOXEL){
                     state = FACE_SOLVED;
+                    weight = !cut ? 1.0f : near[voxel] & CLOSED_FACE << 2*dim ? 0.0f : faces.open[2*dim];
                 }
                 else if(!liquid && coordinates[dim] > 0 && !inSolid && !(near != nullptr && (near[voxel] & CLOSED_FACE << 2*dim))){
                     state = FACE_OPEN;
                 }
             }
             values[dim][slot] = value;
+            if(near != nullptr){
+                weights[dim*EXTEND_SLOTS + slot] = weight;
+            }
             states[dim][slot] = state;
         }
     }
@@ -338,7 +353,7 @@ __global__ void extendVelocities(uint numUsedGridNodes, const uint* nodeCells, c
                     if(states[dim][slot] != FACE_OPEN){
                         continue;
                     }
-                    float sum = 0.0f;
+                    float sum = 0.0f, weight = 0.0f;
                     int count = 0;
                     #pragma unroll
                     for(int axis = 0; axis < 3; ++axis){
@@ -350,13 +365,18 @@ __global__ void extendVelocities(uint numUsedGridNodes, const uint* nodeCells, c
                             }
                             int neighbor = slot + step*strides[axis];
                             if(states[dim][neighbor] < layer){
-                                sum += values[dim][neighbor];
+                                float counts = near != nullptr ? weights[dim*EXTEND_SLOTS + neighbor] : 1.0f;
+                                sum += counts*values[dim][neighbor];
+                                weight += counts;
                                 ++count;
                             }
                         }
                     }
-                    if(count > 0){
-                        values[dim][slot] = sum / count;
+                    if(count > 0){  //less than a whole face's worth beside it, its own velocity for the rest
+                        values[dim][slot] = weight >= 1.0f ? sum / weight : sum + (1.0f - weight)*values[dim][slot];
+                        if(near != nullptr){
+                            weights[dim*EXTEND_SLOTS + slot] = fminf(weight, 1.0f);
+                        }
                         states[dim][slot] = (unsigned char)layer;
                     }
                 }
@@ -470,9 +490,10 @@ void Particles::extendLiquidVelocities(){
             gpuErrchk(cudaMemcpyAsync(before + dim*(size_t)numVoxels, velocities[dim]->devPtr(), sizeof(float)*numVoxels, cudaMemcpyDeviceToDevice, stream));
         }
         bool near = obstacles.count() > 0;
-        extendVelocities<<<numOwnNodes, EXTEND_THREADS, 0, stream>>>(numUsedGridNodes, nodeCells.devPtr(), cellToNode.devPtr(), nodeInteriorVoxels.devPtr(), grid, solveCodes.devPtr(),
-            neighborNx.devPtr(), neighborNy.devPtr(), neighborNz.devPtr(), near ? obstacleSolids.devPtr() : nullptr, near ? obstacleNear.devPtr() : nullptr, before, numVoxels,
-            ux.devPtr(), uy.devPtr(), uz.devPtr());
+        size_t weighing = near ? 3*EXTEND_SLOTS*sizeof(float) : 0;     //with no obstacles every face counts for one, and the tile keeps its old size
+        extendVelocities<<<numOwnNodes, EXTEND_THREADS, weighing, stream>>>(numUsedGridNodes, nodeCells.devPtr(), cellToNode.devPtr(), nodeInteriorVoxels.devPtr(), grid, solveCodes.devPtr(),
+            neighborNx.devPtr(), neighborNy.devPtr(), neighborNz.devPtr(), near ? obstacleSolids.devPtr() : nullptr, near ? obstacleNear.devPtr() : nullptr,
+            near ? obstacleOpen.devPtr() : nullptr, before, numVoxels, ux.devPtr(), uy.devPtr(), uz.devPtr());
         gpuErrchk(cudaPeekAtLastError());
         gpuErrchk(cudaFreeAsync(before, stream));
     }
