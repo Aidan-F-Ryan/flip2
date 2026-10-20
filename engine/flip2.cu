@@ -1395,16 +1395,16 @@ int main(int argc, char** argv){
         }
     }
     simulation->setForceFields(fields, volumes);
-    Sources sources;
+    SourceSettings sources;
     sources.latticePerSide = scene.particlesPerVoxel == 27 ? 3 : scene.particlesPerVoxel == 8 ? 2 : 1;
     sources.seed = scene.seed;
     sources.openFaces = scene.openFaces;
     std::vector<SceneObstacle> sourceMeshes;
     for(const SceneShape& emitter : scene.emitters){
-        sources.emitters[sources.numEmitters++] = toFluidShape(emitter, sourceMeshes);
+        sources.emitters.push_back(toFluidShape(emitter, sourceMeshes));
     }
     for(const SceneShape& sink : scene.sinks){
-        sources.sinks[sources.numSinks++] = toFluidShape(sink, sourceMeshes);
+        sources.sinks.push_back(toFluidShape(sink, sourceMeshes));
     }
     simulation->setSources(sources);
     std::vector<FluidShape> fluids;

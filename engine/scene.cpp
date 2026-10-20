@@ -715,19 +715,6 @@ Scene loadScene(const std::string& path){
     if(scene.air && scene.freeSurface == "levelSet"){       //its pressure is 0 on the liquid's surface, and with air that's solved for
         read.fail("air", "doesn't go with the levelSet free surface yet: with air, the surface is where the two fluids meet, and voxel is used");
     }
-    if(scene.emitters.size() > 16 || scene.sinks.size() > 16){
-        read.fail("the scene", "can have up to 16 emitters and 16 sinks");
-    }
-    size_t meshes = 0, meshFluids = 0;
-    for(const std::vector<SceneShape>* shapes : {&scene.fluids, &scene.emitters, &scene.sinks}){
-        for(const SceneShape& shape : *shapes){
-            meshes += shape.kind == SceneShape::MESH;
-            meshFluids += shape.kind == SceneShape::MESH && shapes == &scene.fluids;
-        }
-    }
-    if(meshes > 16 || (meshFluids > 0 && scene.fluids.size() > 16)){
-        read.fail("the scene", "can have up to 16 meshes among its fluids, emitters and sinks, and up to 16 fluids if any is a mesh");
-    }
 
     if(const Json* obstacles = read.array(root, "obstacles", "the scene")){
         for(size_t index = 0; index < obstacles->items.size(); ++index){
@@ -798,8 +785,12 @@ Scene loadScene(const std::string& path){
             }
             scene.obstacles.push_back(obstacle);
         }
-        if(scene.obstacles.size() > 16){
-            read.fail("obstacles", "can have up to 16 of them");
+        size_t dynamics = 0;
+        for(const SceneObstacle& obstacle : scene.obstacles){
+            dynamics += obstacle.dynamic ? 1 : 0;
+        }
+        if(dynamics > MAX_SCENE_BODIES){    //any number of the others
+            read.fail("obstacles", "can have up to " + std::to_string(MAX_SCENE_BODIES) + " dynamic ones for now");
         }
         bool dynamic = false;
         for(const SceneObstacle& obstacle : scene.obstacles){

@@ -11,8 +11,8 @@ Each input is one object, or with a "name" primitive attribute, one per name. A 
 attributes with one value per object: flip2_friction, flip2_hold (0 or 1) and flip2_thickness; without them it gets the Collisions tab's. Packed
 geometry is unpacked, every primitive turned into polygons and the polygons into triangles. An object is sampled every frame of the range, and goes to flip2 as what it does: still, its vertices once; moving rigidly (no
 vertex further than a hundredth of a voxel from where a turn and a shift put it), its vertices once and a transform per frame, which flip2 turns it
-through exactly; or deforming, its vertices every frame, which flip2 re-voxelizes between, so its points and triangles mustn't change. flip2 takes 16
-collisions: with more names than that, the still ones go as one object, and if need be the moving ones as another.
+through exactly; or deforming, its vertices every frame, which flip2 re-voxelizes between, so its points and triangles mustn't change. flip2 takes
+any number of collisions, each named object on its own.
 
 VDBs in the Collisions input stay volumes: a level set that's still (with a velocity VDB beside it, if there is one: named after it with "vel" on the
 end, or "vel" or "v") or moved rigidly goes to flip2 as it is. One that changes shape over time flip2 can't take yet.
@@ -20,8 +20,8 @@ end, or "vel" or "v") or moved rigidly goes to flip2 as it is. One that changes 
 RBD pieces come from a SOP named on the RBD tab (a subnet has only the four inputs), as RBD Bullet Solver's Geometry input takes them: packed
 pieces with a name each, and its point attributes meaning what they mean to it (active, density or mass, friction, bounce, v, w; its defaults without
 them). flip2 simulates the active ones with the liquid, two-way: each piece moves the liquid as the liquid moves it, and they collide with each other,
-the walls and the collisions, Collision Substeps times a frame at least. The others collide, as the Collisions input's objects do. The pieces count
-towards flip2's 16 objects.
+the walls and the collisions, Collision Substeps times a frame at least. The others collide, as the Collisions input's objects do. flip2 simulates
+up to 16 pieces for now; any number collide.
 
 Forces are set on the Forces tab, 16 in all. Force Fields are made there: a point that pulls the fluid in or pushes it out, a vortex that swirls it
 around an axis, turbulence that stirs it, or wind that drags its surface along. Force Volumes come from a SOP too, but one named on the tab, as a
@@ -84,7 +84,7 @@ VOLUMES = 'if(primintrinsic(0, "typename", @primnum) != "VDB") removeprim(0, @pr
 VECTORS = 'if(!match("vec3*", primintrinsic(0, "vdb_value_type", @primnum))) removeprim(0, @primnum, 1);'     #of VDBs, only those of vectors
 VOLUME_FILE = "collision_volumes.vdb"
 FORCE_FILE = "force_volumes.vdb"
-LIMIT = 16      #the obstacles flip2 takes, and the meshes among its fluids, emitters and sinks
+BODY_LIMIT = 16     #the simulated RBD pieces flip2 takes, for now (collisions, fluids, emitters and sinks are any number)
 SETTINGS = (("friction", "flip2_friction", float), ("hold", "flip2_hold", int), ("thickness", "flip2_thickness", float))  #a collision object's own, as primitive attributes
 FORCE_LIMIT = 16    #and the forces
 FIELD_TYPES = ("point", "vortex", "turbulence", "wind")     #the Forces tab's force fields, as the scene names them
@@ -314,8 +314,8 @@ def _interface(node):
                                                     "(0: it doesn't move itself, but collides, still or animated as the geometry has it; without the "
                                                     "attribute, simulated), density in kg/m3 (1000 without it) or mass in kg, friction (1), bounce (0.25), "
                                                     "and v and w, its velocity and spin at the start frame, as they are there. The liquid slips along "
-                                                    "them and holds to them as the Collisions tab says. flip2 takes 16 objects in all, these and the "
-                                                    "collisions. The node's sixth output has the pieces where flip2 moved them, as RBD Bullet Solver's "
+                                                    "them and holds to them as the Collisions tab says. flip2 simulates up to 16 pieces for now, and "
+                                                    "any number collide. The node's sixth output has the pieces where flip2 moved them, as RBD Bullet Solver's "
                                                     "Geometry output; its seventh the Simulation Points they were moved by"))
     rbd.addParmTemplate(hou.IntParmTemplate("collisionsubsteps", "Collision Substeps", 1, default_value=(5,), min=1, max=100,
                                             help="How many times a frame, at least, the pieces' contacts with each other, the walls and the collisions "
@@ -741,36 +741,6 @@ def _motion(samples, tolerance):
     return "rigid", transforms
 
 
-def _merge(objects):
-    """several sampled objects as one: at every frame their vertices one after another, and their triangles. Their own settings have to agree, as the
-    one object gets one set"""
-    import numpy
-    triangles, offset = [], 0
-    for samples in objects:
-        triangles.append(samples["triangles"] + offset)
-        offset += len(samples["frames"][0])
-    settings = objects[0]["settings"]
-    if any(samples["settings"] != settings for samples in objects):
-        raise hou.NodeError("Collisions: more than %d objects, so flip2 takes some of them as one, and they don't share their flip2_friction, flip2_hold "
-                            "and flip2_thickness attributes: give them the same, or fewer objects" % LIMIT)
-    return {"name": "", "triangles": numpy.concatenate(triangles), "points": numpy.concatenate([samples["points"] for samples in objects]),
-            "frames": [numpy.concatenate([samples["frames"][frame] for samples in objects]) for frame in range(len(objects[0]["frames"]))], "settings": settings}
-
-
-def _within(objects, limit, tolerance):
-    """objects with how each moves, no more than limit of them: as they are if they fit; otherwise the still ones as one object, and if that's still too
-    many, the moving ones as another (together they deform)"""
-    moving = [(samples, _motion(samples, tolerance)) for samples in objects]
-    if len(moving) <= limit:
-        return moving
-    still = [samples for samples, (kind, _) in moving if kind == "still"]
-    rest = [(samples, motion) for samples, motion in moving if motion[0] != "still"]
-    if len(rest) + min(len(still), 1) > limit:
-        merged = _merge([samples for samples, _ in rest])
-        rest = [(merged, _motion(merged, tolerance))]
-    return ([(_merge(still), ("still", None))] if still else []) + rest
-
-
 def _write_object(samples, motion, prefix, geo_dir, frames, fps):
     """an object's files, and its scene entry: still, moving rigidly with a transform every frame, or deforming with its vertices every frame"""
     import numpy
@@ -1013,19 +983,16 @@ def write_scene(node):
     if len(simulated) < len(rbd):
         sampled_roles.setdefault("collision", []).extend(samples for samples in rbd if not samples["rbd"]["active"])
         roles = [role for role in ROLES if role in sampled_roles]
-    collisions = 1 if sampled_roles.get("collision") else 0     #at least one object, however many go as one
-    if len(volumes) + len(simulated) + collisions > LIMIT:
-        raise hou.NodeError("flip2 takes up to %d objects in all, and this has %d simulated RBD pieces and %d collision volumes%s: fewer pieces, or "
-                            "pack several as one" % (LIMIT, len(simulated), len(volumes), " besides the other collisions" if collisions else ""))
+    if len(simulated) > BODY_LIMIT:
+        raise hou.NodeError("flip2 simulates up to %d RBD pieces for now, and RBD Geometry has %d active: make the rest inactive (active 0), and they "
+                            "collide, or pack several as one" % (BODY_LIMIT, len(simulated)))
     if simulated and scene["solver"]["freeSurface"] == "voxel" and not (node.parm("phases") is not None and node.evalParm("phases") == 1):
         raise hou.NodeError("RBD: a simulated piece floats at the right height only with the Level Set free surface, or with Liquid and Air: the Voxel "
                             "surface is a voxel or two over the liquid, and pieces float that much high. Set Free Surface on the Simulation tab")
     tolerance = 0.01*2*separation      #a hundredth of a voxel: less than the fluid can feel
-    crowded = sum(len(sampled_roles.get(role, ())) for role in ("fluid", "source", "sink")) > LIMIT    #flip2's limit is on the three together
-    limits = {"collision": LIMIT - len(volumes) - len(simulated), "fluid": 1 if crowded else LIMIT, "source": 2 if crowded else LIMIT, "sink": 2 if crowded else LIMIT}
     made = []
     for role in roles:
-        objects = _within(sampled_roles[role], limits[role], tolerance)
+        objects = [(samples, _motion(samples, tolerance)) for samples in sampled_roles[role]]   #each object on its own, still, rigid or deforming
         kinds = [kind for _, (kind, _) in objects] + (["volume"]*len(volumes) if role == "collision" else [])
         made.append("%s: %s" % (LABELS[ROLES.index(role)].lower(), ", ".join("%d %s" % (kinds.count(kind), kind) for kind in ("still", "rigid", "deforming", "volume")
                                                                                if kind in kinds) or "nothing"))

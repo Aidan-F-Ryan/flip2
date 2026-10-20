@@ -2399,6 +2399,9 @@ Particles::~Particles(){     //with its GPU the current one
     if(viscousSeen != nullptr){
         cudaFreeHost(viscousSeen);
     }
+    if(sourceTable != nullptr){
+        cudaFree(sourceTable);
+    }
     for(int field = 0; field < forces.numFields; ++field){
         freeForceVolume(forces.fields[field].volume);
     }

@@ -92,6 +92,8 @@ struct SceneField{
     double high[3] = {0.0, 0.0, 0.0};
 };
 
+static constexpr size_t MAX_SCENE_BODIES = 16;     //dynamic obstacles a scene can have, until the bodies' coupling and contacts take any number (MAX_BODIES)
+
 //A dynamic obstacle's own (bodies.cu): a rigid body the liquid moves as it moves the liquid, falling under gravity, pushed by the pressure on it and
 //kept out of the walls and the other obstacles. Its mass is its density over the volume inside it, or the mass given; its centre of mass and inertia
 //follow from where that mass is

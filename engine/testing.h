@@ -115,7 +115,7 @@ public:
         simulation.forEachPartition([&](Particles& partition){ partition.setCollisionSubsteps(perFrame); });
     }
 
-    void setSources(const Sources& sources){
+    void setSources(const SourceSettings& sources){
         simulation.forEachPartition([&](Particles& partition){ partition.setSources(sources); });
     }
 

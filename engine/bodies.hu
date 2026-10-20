@@ -65,10 +65,9 @@ struct BodyMass{
     float contactFriction;
 };
 
-//Contacts (contacts.cu): a body touches the domain's six walls, then any obstacle, another body among them, each a partner. Against each it keeps a
-//manifold of up to CONTACT_SLOTS of its surface points: the deepest, the farthest from it, the one making the largest triangle with those, and the one
-//farthest from all three, enough for a box to rest flat
-static constexpr int CONTACT_PARTNERS = 6 + MAX_OBSTACLES;
+//Contacts (contacts.cu): a body touches the domain's six walls, then any obstacle, another body among them, each a partner: 6 and the obstacles' count
+//in all (Bodies::partners). Against each it keeps a manifold of up to CONTACT_SLOTS of its surface points: the deepest, the farthest from it, the one
+//making the largest triangle with those, and the one farthest from all three, enough for a box to rest flat
 static constexpr int CONTACT_SLOTS = 4;
 
 //one contact: a point of a body's surface against a partner. Its slot is (body, partner, k), its identity the surface point
@@ -111,15 +110,14 @@ struct CouplingGrid{
     const char* near;           //obstacleNear's bits
     const uint* opens;          //obstacleOpen's fractions
     const uint* centroids;      //obstacleCentroids: where on each face its solid part is
-    const uint* faceBodies;     //per near unknown: per face, 5 bits: the body across it, plus 1, or 0
+    const uint* faceBodies;     //per stored voxel, six faces: the body across each that's near an unknown's, plus 1, or 0
     Grid grid;
     int interiorWidth;
 };
 
-//a face's friction into its body's sums, if a dynamic body is across it: the momentum the particles take from the face's change, along the face's axis
-//at the face's centre, and its moment about the body's centre of mass, which the body gives up (Bodies::takeFriction)
-__device__ inline void addFriction(const BodyFriction& friction, int obstacle, int axis, float3 point, uint voxel, float change){
-    int body = obstacle >= 0 ? friction.of[obstacle] : -1;
+//a face's friction into its body's sums, if a dynamic body is across it (body, or -1: bodyOf): the momentum the particles take from the face's change,
+//along the face's axis at the face's centre, and its moment about the body's centre of mass, which the body gives up (Bodies::takeFriction)
+__device__ inline void addFriction(const BodyFriction& friction, int body, int axis, float3 point, uint voxel, float change){
     if(friction.sums == nullptr || body < 0 || change == 0.0f){
         return;
     }
@@ -251,6 +249,9 @@ public:
     int obstacleOf(int body) const{
         return obstacles[body];
     }
+    uint bodyBlocks() const{    //for a kernel taking a body a thread, in warps
+        return (uint)(numBodies + 31) / 32;
+    }
     const std::string& name(int body) const{    //its obstacle's name in the scene
         return names[body];
     }
@@ -272,6 +273,7 @@ private:
     void sumShares(const float* x, const uint* onlyIf);    //B^T x into the sums, every partition's, then s M~^-1 of it into responses
 
     int numBodies = 0;
+    int partners = 6;                   //what each body has a manifold against: the walls, and every obstacle (setUpContacts)
     std::vector<int> obstacles;         //per body, its obstacle's place in the obstacle set
     std::vector<std::string> names;     //and its name in the scene
     std::vector<BodyMass> masses;
@@ -295,7 +297,7 @@ private:
     int* contactOrder = nullptr;        //the slots in the solve's order, batch after batch, and where each batch starts
     int* batchStarts = nullptr;
     double scale = 0.0;                 //the solve's, s
-    CudaVec<uint> faceBodyCodes;        //per stored voxel, findFaceBodies'
+    CudaVec<uint> faceBodyCodes;        //per stored voxel, six of findFaceBodies'
     CouplingGrid where = {};
     PartitionContext* context = nullptr;
     cudaStream_t stream = nullptr;

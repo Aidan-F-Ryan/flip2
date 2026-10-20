@@ -18,6 +18,7 @@
 #include "particles.hu"
 #include "liquidTile.hu"
 #include "algorithms/voxelSolveFunctions.hu"   //NO_VOXEL, WALL_VOXEL
+#include "algorithms/parallelPrefixSumKernels.hu"
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
@@ -1051,33 +1052,76 @@ void ObstacleSet::rigidAt(const Built& obstacle, double time, double matrix[12],
     }
 }
 
+//The states that changed go into the table through a kernel that takes up to STATE_BATCH of them as its argument and writes them there: what a launch is
+//given is copied as it's launched, so the host can write its copy again at the next update with nothing waited for
+static constexpr int STATE_BATCH = 24;
+struct StateBatch{
+    int count;
+    int which[STATE_BATCH];
+    ObstacleState states[STATE_BATCH];
+};
+
+__global__ void writeObstacleStates(StateBatch batch, ObstacleState* table){
+    if((int)threadIdx.x < batch.count){
+        table[batch.which[threadIdx.x]] = batch.states[threadIdx.x];
+    }
+}
+
+void ObstacleSet::upload(const std::vector<int>& which){
+    for(size_t first = 0; first < which.size(); first += STATE_BATCH){
+        StateBatch batch;
+        batch.count = (int)std::min(which.size() - first, (size_t)STATE_BATCH);
+        for(int i = 0; i < batch.count; ++i){
+            batch.which[i] = which[first + i];
+            batch.states[i] = states[which[first + i]];
+        }
+        writeObstacleStates<<<1, STATE_BATCH, 0, stream>>>(batch, table);
+    }
+    gpuErrchk(cudaPeekAtLastError());
+}
+
 void ObstacleSet::update(double time){
     current.count = (int)built.size();
     current.moving = false;
     fastestSurface = 0.0f;
+    std::vector<int> changed;
     for(size_t index = 0; index < built.size(); ++index){
         Built& obstacle = built[index];
-        ObstacleState& state = current.items[index];
-        if(obstacle.field != nullptr && obstacle.field->deforms()){
+        ObstacleState& state = states[index];
+        bool deforming = obstacle.field != nullptr && obstacle.field->deforms();
+        if(deforming){
             obstacle.field->deformTo(time, stream);
             obstacle.sdf = obstacle.field->sdf();
             current.moving = current.moving || obstacle.field->movesAt(time);
             fastestSurface = std::max(fastestSurface, obstacle.field->speed);
         }
-        state.kind = obstacle.kind;
-        state.sdf = obstacle.sdf;
-        bool deforming = obstacle.field != nullptr && obstacle.field->deforms();
         if(obstacle.sdf.velocities != nullptr && !deforming){   //a level set with velocities: its surface moves as they say, where it is
             current.moving = true;
             fastestSurface = std::max(fastestSurface, obstacle.fieldSpeed);
         }
+        if(!fresh && obstacle.frame != nullptr){    //a dynamic body: the GPU moves it, and its frame says where it is (bodies.cu)
+            current.moving = true;
+            if(state.frame != obstacle.frame || state.body != obstacle.body){   //given since the last update
+                state.frame = obstacle.frame;
+                state.body = obstacle.body;
+                changed.push_back((int)index);
+            }
+            continue;
+        }
+        if(!fresh && !deforming && obstacle.keyTimes.size() < 2){
+            continue;   //it never moves: as the first update left it
+        }
+        state.kind = obstacle.kind;
+        state.sdf = obstacle.sdf;
         state.low = obstacle.low;
         state.high = obstacle.high;
         state.radius = obstacle.radius;
         state.friction = obstacle.friction;
         state.letsGo = obstacle.letsGo;
         state.frame = obstacle.frame;
-        if(obstacle.frame != nullptr){  //a dynamic body: the GPU moves it, and its frame says where it is (bodies.cu)
+        state.body = obstacle.body;
+        changed.push_back((int)index);
+        if(obstacle.frame != nullptr){
             current.moving = true;
             continue;
         }
@@ -1146,6 +1190,150 @@ void ObstacleSet::update(double time){
             state.velocity[i] = (float)velocity[i];
         }
     }
+    fresh = false;
+    upload(changed);
+}
+
+// ---- the index ----
+
+//an obstacle's reach box in the index's cells: the first and the last along each axis, as a point there finds its cell (indexCoordinate)
+__host__ __device__ inline void reachSpan(const ObstacleIndex& index, float3 low, float3 high, int3& first, int3& last){
+    first = make_int3(indexCoordinate(index, low.x, index.origin.x, index.cells.x), indexCoordinate(index, low.y, index.origin.y, index.cells.y),
+                      indexCoordinate(index, low.z, index.origin.z, index.cells.z));
+    last = make_int3(indexCoordinate(index, high.x, index.origin.x, index.cells.x), indexCoordinate(index, high.y, index.origin.y, index.cells.y),
+                     indexCoordinate(index, high.z, index.origin.z, index.cells.z));
+}
+
+__device__ inline void obstacleReach(const ObstacleState& obstacle, float3& low, float3& high){
+    low = obstacle.frame != nullptr ? obstacle.frame->reachLow : obstacle.reachLow;
+    high = obstacle.frame != nullptr ? obstacle.frame->reachHigh : obstacle.reachHigh;
+}
+
+__device__ inline uint spanCells(int3 first, int3 last){
+    return last.x < first.x || last.y < first.y || last.z < first.z ? 0u : (uint)(last.x - first.x + 1)*(uint)(last.y - first.y + 1)*(uint)(last.z - first.z + 1);
+}
+
+//per obstacle, how many cells its reach box meets
+__global__ void countReachCells(Obstacles obstacles, uint* counts){
+    int index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(index < obstacles.count){
+        float3 low, high;
+        obstacleReach(obstacles.items[index], low, high);
+        int3 first, last;
+        reachSpan(obstacles.index, low, high, first, last);
+        counts[index] = spanCells(first, last);
+    }
+}
+
+//each (obstacle, cell its reach meets): an entry, obstacle after obstacle, each one's cells x fastest; the cells counted up. Entry p's obstacle is the
+//first whose running count (ends) is past p
+__global__ void placeIndexEntries(Obstacles obstacles, const uint* ends, size_t capacity, uint* cellCounts, uint* pairCells, int* pairObstacles){
+    uint total = obstacles.count > 0 ? ends[obstacles.count - 1] : 0;
+    for(size_t p = threadIdx.x + (size_t)blockIdx.x*blockDim.x; p < total && p < capacity; p += (size_t)blockDim.x*gridDim.x){
+        int lowest = 0, highest = obstacles.count - 1;
+        while(lowest < highest){
+            int middle = (lowest + highest) / 2;
+            if(ends[middle] > p){
+                highest = middle;
+            }
+            else{
+                lowest = middle + 1;
+            }
+        }
+        float3 low, high;
+        obstacleReach(obstacles.items[lowest], low, high);
+        int3 first, last;
+        reachSpan(obstacles.index, low, high, first, last);
+        uint k = (uint)p - (lowest == 0 ? 0u : ends[lowest - 1]);
+        uint nx = (uint)(last.x - first.x + 1), ny = (uint)(last.y - first.y + 1);
+        uint cell = (uint)first.x + k % nx + (uint)obstacles.index.cells.x*((uint)first.y + k / nx % ny + (uint)obstacles.index.cells.y*((uint)first.z + k / (nx*ny)));
+        pairCells[p] = cell;
+        pairObstacles[p] = lowest;
+        atomicAdd(&cellCounts[cell], 1u);
+    }
+}
+
+//every entry into its cell's list, in whatever order they come
+__global__ void fillIndexCells(Obstacles obstacles, const uint* ends, size_t capacity, const uint* cellEnds, uint* cursors, const uint* pairCells, const int* pairObstacles,
+                               int* entries){
+    uint total = obstacles.count > 0 ? ends[obstacles.count - 1] : 0;
+    for(size_t p = threadIdx.x + (size_t)blockIdx.x*blockDim.x; p < total && p < capacity; p += (size_t)blockDim.x*gridDim.x){
+        uint cell = pairCells[p];
+        entries[(cell == 0 ? 0u : cellEnds[cell - 1]) + atomicAdd(&cursors[cell], 1u)] = pairObstacles[p];
+    }
+}
+
+//and each cell's list into the order its obstacles are numbered, so whatever asks them asks them in that order
+__global__ void sortIndexCells(uint numCells, const uint* cellEnds, int* entries){
+    uint cell = threadIdx.x + blockIdx.x*blockDim.x;
+    if(cell < numCells){
+        uint first = cell == 0 ? 0u : cellEnds[cell - 1], last = cellEnds[cell];
+        for(uint i = first + 1; i < last; ++i){
+            int which = entries[i];
+            uint j = i;
+            for(; j > first && entries[j - 1] > which; --j){
+                entries[j] = entries[j - 1];
+            }
+            entries[j] = which;
+        }
+    }
+}
+
+size_t ObstacleSet::reachCells(int index) const{
+    const Built& obstacle = built[index];
+    const ObstacleIndex& grid = current.index;
+    int extent[3];
+    if(obstacle.frame != nullptr || obstacle.keyTimes.size() > 1){
+        //moving rigidly: within a cube about the middle of its own bounds, as wide as their diagonal and the reach either way; a body turns about its centre
+        //of mass, which is inside its bounds, so within twice that
+        float3 span = obstacle.objectHigh - obstacle.objectLow;
+        double side = (obstacle.frame != nullptr ? 2.0 : 1.0)*std::sqrt((double)dot(span, span)) + 6.0*voxel;
+        int cells[3] = {grid.cells.x, grid.cells.y, grid.cells.z};
+        for(int axis = 0; axis < 3; ++axis){
+            extent[axis] = (int)std::min<double>(cells[axis], std::floor(side / grid.size) + 3.0);    //a cell more than it can be, for rounding
+        }
+    }
+    else{   //still, or deforming within its bounds: the cells they meet
+        int3 first, last;
+        reachSpan(grid, states[index].reachLow, states[index].reachHigh, first, last);
+        extent[0] = std::max(0, last.x - first.x + 2);    //and here, a cell more than they meet, in case the GPU's rounding differs
+        extent[1] = std::max(0, last.y - first.y + 2);
+        extent[2] = std::max(0, last.z - first.z + 2);
+    }
+    return (size_t)extent[0]*extent[1]*extent[2];
+}
+
+void ObstacleSet::index(){
+    if(built.empty()){
+        return;
+    }
+    size_t needed = 0;
+    for(size_t obstacle = 0; obstacle < built.size(); ++obstacle){
+        needed += reachCells((int)obstacle);
+    }
+    if(needed > capacity){  //bodies given frames, or deforming meshes, reach further: room for the most they can
+        for(void* old : {(void*)entries, (void*)pairCells, (void*)pairObstacles}){
+            if(old != nullptr){
+                gpuErrchk(cudaFreeAsync(old, stream));
+            }
+        }
+        capacity = needed;
+        gpuErrchk(cudaMallocAsync((void**)&entries, sizeof(int)*std::max<size_t>(capacity, 1), stream));
+        gpuErrchk(cudaMallocAsync((void**)&pairCells, sizeof(uint)*std::max<size_t>(capacity, 1), stream));
+        gpuErrchk(cudaMallocAsync((void**)&pairObstacles, sizeof(int)*std::max<size_t>(capacity, 1), stream));
+        current.index.entries = entries;
+    }
+    uint count = (uint)built.size();
+    countReachCells<<<count / 256 + 1, 256, 0, stream>>>(current, obstacleEnds);
+    cudaParallelPrefixSum(count, obstacleEnds, stream);
+    gpuErrchk(cudaMemsetAsync(cellEnds, 0, sizeof(uint)*numCells, stream));
+    gpuErrchk(cudaMemsetAsync(cellCursors, 0, sizeof(uint)*numCells, stream));
+    uint blocks = (uint)std::min<size_t>(capacity / 256 + 1, 4096);
+    placeIndexEntries<<<blocks, 256, 0, stream>>>(current, obstacleEnds, capacity, cellEnds, pairCells, pairObstacles);
+    cudaParallelPrefixSum(numCells, cellEnds, stream);
+    fillIndexCells<<<blocks, 256, 0, stream>>>(current, obstacleEnds, capacity, cellEnds, cellCursors, pairCells, pairObstacles, entries);
+    sortIndexCells<<<numCells / 256 + 1, 256, 0, stream>>>(numCells, cellEnds, entries);
+    gpuErrchk(cudaPeekAtLastError());
 }
 
 void ObstacleSet::bounds(int index, double low[3], double high[3]) const{
@@ -1156,33 +1344,38 @@ void ObstacleSet::bounds(int index, double low[3], double high[3]) const{
 }
 
 void ObstacleSet::release(){     //with its GPU the current one; its stream may be gone already, as Particles destroys it before its members
-    bool fields = false;
-    for(const Built& obstacle : built){
-        fields = fields || obstacle.field != nullptr;
-    }
-    if(fields){
+    if(!built.empty()){
         cudaDeviceSynchronize();    //nothing queued still reads them
     }
     for(Built& obstacle : built){
         delete obstacle.field;
     }
+    for(void* device : {(void*)table, (void*)cellEnds, (void*)cellCursors, (void*)entries, (void*)obstacleEnds, (void*)pairCells, (void*)pairObstacles}){
+        if(device != nullptr){
+            cudaFree(device);
+        }
+    }
+    table = nullptr;
+    cellEnds = cellCursors = obstacleEnds = pairCells = nullptr;
+    entries = pairObstacles = nullptr;
+    capacity = 0;
+    numCells = 0;
     built.clear();
-    current.count = 0;
+    states.clear();
+    fresh = true;
+    current = Obstacles();
 }
 
 ObstacleSet::~ObstacleSet(){
     release();
 }
 
-void ObstacleSet::build(const std::vector<SceneObstacle>& obstacles, double voxelSize, cudaStream_t stream){
+void ObstacleSet::build(const std::vector<SceneObstacle>& obstacles, double voxelSize, const Grid& grid, cudaStream_t stream){
     release();
     this->stream = stream;
     voxel = voxelSize;
     builtIndex.assign(obstacles.size(), -1);
-    if(obstacles.size() > MAX_OBSTACLES){
-        std::cerr<<"ObstacleSet: only the first "<<MAX_OBSTACLES<<" obstacles count\n";
-    }
-    for(size_t index = 0; index < obstacles.size() && index < MAX_OBSTACLES; ++index){
+    for(size_t index = 0; index < obstacles.size(); ++index){
         const SceneObstacle& obstacle = obstacles[index];
         Built made;
         made.kind = obstacle.kind == SceneObstacle::MESH || obstacle.kind == SceneObstacle::FIELD ? OBSTACLE_MESH : obstacle.kind == SceneObstacle::BOX ? OBSTACLE_BOX : OBSTACLE_SPHERE;
@@ -1290,7 +1483,30 @@ void ObstacleSet::build(const std::vector<SceneObstacle>& obstacles, double voxe
         builtIndex[index] = (int)built.size();
         built.push_back(std::move(made));
     }
+    if(built.empty()){
+        return;
+    }
+    //the table, and the index's cells: a node's, or twice that as often as it takes to keep to MAX_INDEX_CELLS
+    states.assign(built.size(), ObstacleState{});
+    gpuErrchk(cudaMalloc((void**)&table, sizeof(ObstacleState)*built.size()));
+    gpuErrchk(cudaMalloc((void**)&obstacleEnds, sizeof(uint)*built.size()));
+    uint factor = 1;
+    auto cellsAcross = [&](uint nodes){
+        return (nodes + factor - 1) / factor;
+    };
+    while((size_t)cellsAcross(grid.sizeX)*cellsAcross(grid.sizeY)*cellsAcross(grid.sizeZ) > MAX_INDEX_CELLS){
+        factor *= 2;
+    }
+    current.items = table;
+    current.index.origin = make_float3(grid.negX, grid.negY, grid.negZ);
+    current.index.size = grid.cellSize*factor;
+    current.index.cells = make_int3((int)cellsAcross(grid.sizeX), (int)cellsAcross(grid.sizeY), (int)cellsAcross(grid.sizeZ));
+    numCells = (uint)cellsAcross(grid.sizeX)*cellsAcross(grid.sizeY)*cellsAcross(grid.sizeZ);
+    gpuErrchk(cudaMalloc((void**)&cellEnds, sizeof(uint)*numCells));
+    gpuErrchk(cudaMalloc((void**)&cellCursors, sizeof(uint)*numCells));
+    current.index.ends = cellEnds;
     update(0.0);
+    index();
 }
 
 // ---- what the simulation does with them ----
@@ -1312,25 +1528,28 @@ static uint obstacleBlocks(){
 
 void Particles::setObstacles(const std::vector<SceneObstacle>& descriptions, double liquidDensity){
     double voxelSize = grid.cellSize / (2<<refinementLevel);
-    obstacles.build(descriptions, voxelSize, stream);
+    obstacles.build(descriptions, voxelSize, grid, stream);
     bodies.setUp(descriptions, obstacles, liquidDensity, voxelSize, context, stream);  //the dynamic ones: their mass, where they start, and their frames
     obstacles.update(elapsedTime);
+    obstacles.index();
 }
 
 void Particles::updateObstacles(){
     if(obstacles.count() > 0){
         obstacles.update(elapsedTime);
         bodies.writeFrames();   //and the dynamic ones where they've moved to
+        obstacles.index();      //then where each one reaches
     }
     placeSourceMeshes();    //meshes of emitters, sinks and fluids move as obstacles do
 }
 
 //a particle inside an obstacle goes back out along the way out, a twentieth of a voxel past the surface, and loses the part of its velocity relative to
-//the obstacle that points into it
+//the obstacle that points into it. Each obstacle whose reach could hold it, in the order they're numbered, from where the ones before put it
 __global__ void pushOutOfObstacles(uint numParticles, double* px, double* py, double* pz, float* vx, float* vy, float* vz, Obstacles obstacles, float clearance){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
     if(index < numParticles){
-        for(int which = 0; which < obstacles.count; ++which){
+        for(int which = nextObstacleAt(obstacles, make_float3((float)px[index], (float)py[index], (float)pz[index]), -1); which >= 0;
+            which = nextObstacleAt(obstacles, make_float3((float)px[index], (float)py[index], (float)pz[index]), which)){
             const ObstacleState& obstacle = obstacles.items[which];
             float3 x = make_float3((float)px[index], (float)py[index], (float)pz[index]);
             float3 normal;
@@ -1968,7 +2187,7 @@ void Particles::addObstacleFlux(){
 //  the flow the pressure solve gave it there (addObstacleFlux); along it, the fluid's from the faces of the same component next to it, held towards the
 //  obstacle's by its friction. (Where the obstacle has let go of the fluid's voxel, carryLetGoFaces then gives it the liquid's.) Layer 1 fills the faces
 //  between and the faces inside next to fluid faces, layer 2 the faces inside next to those
-__global__ void obstacleGhostFaces(int layer, Obstacles obstacles, VoxelPlaces places, const uint* nodes, uint numOwnNodes, uint numUsedGridNodes, const uint* cellToNode,
+__global__ void obstacleGhostFaces(int layer, Obstacles obstacles, float stick, VoxelPlaces places, const uint* nodes, uint numOwnNodes, uint numUsedGridNodes, const uint* cellToNode,
                                    const uint* interiorVoxels, const char* solid, const char* near, const float* beforeX, const float* beforeY, const float* beforeZ,
                                    float* ux, float* uy, float* uz, BodyFriction friction){
     extern __shared__ float blockVelocities[];  //per component, a value per slot; then per slot, whether it's stored, whether it's solid, its near bits
@@ -2115,9 +2334,9 @@ __global__ void obstacleGhostFaces(int layer, Obstacles obstacles, VoxelPlaces p
                     fluid[of] = count > 0 ? sum / count : component(solidMotion, of);
                 }
                 float fluidAlong = alongSurface(make_float3(fluid[0], fluid[1], fluid[2]), normal, dim);
-                float holding = obstacles.items[obstacle].friction;
+                float holding = fmaxf(obstacles.items[obstacle].friction, stick);
                 velocities[dim][index] = slipVelocity(solidMotion, normal, dim, fluidAlong, holding);
-                addFriction(friction, obstacle, dim, face, index, frictionPart(solidMotion, normal, dim, fluidAlong, holding));     //what a dynamic body's friction gave
+                addFriction(friction, bodyOf(obstacles, obstacle), dim, face, index, frictionPart(solidMotion, normal, dim, fluidAlong, holding));     //what a dynamic body's friction gave
             }
         }
         __syncthreads();    //before the next node reuses the shared memory
@@ -2232,7 +2451,7 @@ __global__ void mixCutFaces(Obstacles obstacles, VoxelPlaces places, const uint*
                 float fluidAlong = alongSurface(make_float3(fluid[0], fluid[1], fluid[2]), normals[dim], dim);
                 float holding = fmaxf(obstacle.friction, stick);
                 velocities[dim][index] = open*before[dim][index] + (1.0f - open)*slipVelocity(solidMotion, normals[dim], dim, fluidAlong, holding);
-                addFriction(friction, nearest[dim], dim, points[dim], index, (1.0f - open)*frictionPart(solidMotion, normals[dim], dim, fluidAlong, holding));
+                addFriction(friction, bodyOf(obstacles, nearest[dim]), dim, points[dim], index, (1.0f - open)*frictionPart(solidMotion, normals[dim], dim, fluidAlong, holding));
             }
         }
         __syncthreads();    //before the next node's tile
@@ -2269,11 +2488,7 @@ void Particles::obstacleGhostVelocities(CudaVec<float>& ux, CudaVec<float>& uy, 
     int voxels1D = (2<<refinementLevel) + 2*GHOST_REACH;
     size_t shared = (3*sizeof(float) + 3)*voxels1D*voxels1D*voxels1D;
     Obstacles state = obstacles.state();
-    if(viscosity > 0.0){    //a viscous liquid holds to them at least as much as to the walls
-        for(int obstacle = 0; obstacle < state.count; ++obstacle){
-            state.items[obstacle].friction = std::max(state.items[obstacle].friction, (float)wallStick());
-        }
-    }
+    float stick = viscosity > 0.0 ? (float)wallStick() : 0.0f;  //a viscous liquid holds to them at least as much as to the walls
     //Each layer reads the faces as they were before it and writes the faces it sets: a block reads faces other blocks are setting
     for(CudaVec<float>& before : ghostBefore){
         if(before.size() < ux.size()){
@@ -2285,7 +2500,7 @@ void Particles::obstacleGhostVelocities(CudaVec<float>& ux, CudaVec<float>& uy, 
         for(int dim = 0; dim < 3; ++dim){
             gpuErrchk(cudaMemcpyAsync(ghostBefore[dim].devPtr(), velocity[dim]->devPtr(), sizeof(float)*ux.size(), cudaMemcpyDeviceToDevice, stream));
         }
-        obstacleGhostFaces<<<obstacleBlocks(), OBSTACLE_THREADS, shared, stream>>>(layer, state, voxelPlaces(), obstacleNodes.devPtr(), numOwnNodes, numUsedGridNodes, cellToNode.devPtr(),
+        obstacleGhostFaces<<<obstacleBlocks(), OBSTACLE_THREADS, shared, stream>>>(layer, state, stick, voxelPlaces(), obstacleNodes.devPtr(), numOwnNodes, numUsedGridNodes, cellToNode.devPtr(),
             nodeInteriorVoxels.devPtr(), obstacleSolids.devPtr(), obstacleNear.devPtr(), ghostBefore[0].devPtr(), ghostBefore[1].devPtr(), ghostBefore[2].devPtr(), ux.devPtr(), uy.devPtr(),
             uz.devPtr(), bodies.frictionFor(frictionShare, 1.0 / restParticlesPerVoxel, voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr()));
         gpuErrchk(cudaPeekAtLastError());

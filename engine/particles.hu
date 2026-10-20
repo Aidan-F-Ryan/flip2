@@ -216,9 +216,7 @@ public:
         forces.gravity = gravity;
     }
 
-    void setSources(const Sources& emittersAndSinks){   //what adds fluid and what takes it away (see sources.hu)
-        sources = emittersAndSinks;
-    }
+    void setSources(const SourceSettings& emittersAndSinks);    //what adds fluid and what takes it away (see sources.hu)
 
     //the meshes the emitters, sinks and fluids use: a FluidShape of kind MESH names its place in meshes, which are voxelized at the domain's voxel
     //size and moved as obstacles are. fluids is every fluid the scene starts with, in order: emitParticles seeds the meshes among them on the GPU,
@@ -329,6 +327,7 @@ private:
     bool removing() const;      //whether this initialize removes any particles: sinks, open faces, or at the start, fluid inside obstacles
     void updateObstacles();
     void placeSourceMeshes();
+    void uploadSources();   //the shapes into sourceTable, and the kernels' views of them
     void pushOutParticles();
     void markParticlesInsideObstacles();
     void markObstacleSolids();
@@ -542,12 +541,15 @@ private:
     Forces forces;              //gravity and the force fields
     double fieldAcceleration = 0.0;     //the most the fields can accelerate a face along an axis, m/s^2, for the timestep: what they give at their
     double fieldDrag = 0.0;             //strongest, and per second, times the fluid's own speed, for those that pull it towards a velocity (addFieldLimits)
-    Sources sources;            //emitters, sinks and open faces
+    Sources sources;            //emitters, sinks and open faces, for the kernels: their shapes in sourceTable
     CudaVec<char> removedFlags; //per particle, while initialize runs: whether a sink or an open face takes it
     ObstacleSet obstacles;      //what the fluid flows around
     Bodies bodies;              //and the dynamic ones among them, which it moves too
     ObstacleSet sourceMeshes;   //the meshes of the emitters, sinks and fluids
-    FluidShapes fluids;         //the fluid to start with (setSourceMeshes)
+    FluidShapes fluids;         //the fluid to start with (setSourceMeshes), likewise
+    std::vector<FluidShape> emitterShapes, sinkShapes, fluidShapes;     //the host's, what sourceTable holds
+    FluidShape* sourceTable = nullptr;  //on the GPU: the emitters, then the sinks, then the fluids
+    size_t sourceTableSize = 0;
     CudaVec<char> obstacleSolids;   //per stored voxel: whether obstacles close every face of it
     CudaVec<char> occupiedVoxels;   //per stored voxel, while markObstacleSolids runs: whether a particle sits in it
     CudaVec<char> obstacleNear;     //per stored voxel: whether a surface passes close enough to cut its faces, so the other passes can skip the rest, and which

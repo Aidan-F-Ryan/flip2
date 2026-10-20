@@ -6,6 +6,7 @@
 #include "algorithms/voxelSolveFunctions.hu"    //NO_VOXEL, WALL_VOXEL
 #include "cacheWriter.hu"     //BODY_PLACEMENT
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
@@ -217,13 +218,9 @@ __global__ void moveBodies(int numBodies, BodyState* states, const BodyMass* mas
 // ---- which body is across each face of an unknown ----
 
 //Per near unknown, a block per node near obstacles: each face obstacleFaceFlux counts an obstacle's flow through, the body nearest its centre if that's a
-//dynamic one, plus 1, in 5 bits a face (0: none). The same faces and the same lookups as obstacleFaceFlux, so the coupling's B is the flow the divergence
+//dynamic one, plus 1 (0: none), six a voxel. The same faces and the same lookups as obstacleFaceFlux, so the coupling's B is the flow the divergence
 //took. Only this partition's own nodes: the sums and the products are over its own unknowns
-struct BodiesOf{
-    signed char of[MAX_OBSTACLES];  //per obstacle, its body, or -1
-};
-
-__global__ void findFaceBodiesKernel(Obstacles obstacles, BodiesOf bodies, VoxelPlaces places, uint3 domainVoxels, const uint* nodes, uint numOwnNodes, const char* solveCodes,
+__global__ void findFaceBodiesKernel(Obstacles obstacles, VoxelPlaces places, uint3 domainVoxels, const uint* nodes, uint numOwnNodes, const char* solveCodes,
                                      const char* near, const uint* opens, const uint* neighborNx, const uint* neighborPx, const uint* neighborNy, const uint* neighborPy,
                                      const uint* neighborNz, const uint* neighborPz, uint* faceBodies){
     for(uint listed = blockIdx.x; listed < nodes[0]; listed += gridDim.x){
@@ -244,7 +241,7 @@ __global__ void findFaceBodiesKernel(Obstacles obstacles, BodiesOf bodies, Voxel
             int3 voxel = places.voxelOf(cell, places.voxelSlots[index]);
             int coordinates[3] = {voxel.x, voxel.y, voxel.z};
             CutFaces cut = cachedCut(opens, index);
-            uint code = 0;
+            uint codes[6] = {0, 0, 0, 0, 0, 0};
             for(int face = 0; face < 6; ++face){
                 if(near[index] & CLOSED_FACE << face){
                     cut.open[face] = 0.0f;
@@ -260,12 +257,11 @@ __global__ void findFaceBodiesKernel(Obstacles obstacles, BodiesOf bodies, Voxel
                 float distance;
                 float3 normal;
                 int obstacle = nearestObstacle(obstacles, places.point(voxel, offset[0], offset[1], offset[2]), distance, normal);
-                int body = obstacle >= 0 ? bodies.of[obstacle] : -1;
-                if(body >= 0){
-                    code |= (uint)(body + 1) << 5*face;
-                }
+                codes[face] = (uint)(bodyOf(obstacles, obstacle) + 1);
             }
-            faceBodies[index] = code;
+            for(int face = 0; face < 6; ++face){
+                faceBodies[6*(size_t)index + face] = codes[face];
+            }
         }
     }
 }
@@ -280,14 +276,14 @@ __device__ inline bool couplingRow(const CouplingGrid& where, uint voxel, int3 a
     for(int lane = 0; lane < BODY_LANES; ++lane){
         row[lane] = 0.0f;
     }
-    uint faces = where.faceBodies[voxel];
+    const uint* faces = where.faceBodies + 6*(size_t)voxel;
     bool any = false;
     float h = where.grid.cellSize / where.interiorWidth;
     float corner[3] = {(float)at.x, (float)at.y, (float)at.z};
     float origin[3] = {where.grid.negX, where.grid.negY, where.grid.negZ};
     float c[3] = {centre.x, centre.y, centre.z};
     for(int face = 0; face < 6; ++face){
-        if((int)(faces >> 5*face & 31u) != body + 1){
+        if(faces[face] != (uint)(body + 1)){
             continue;
         }
         any = true;
@@ -324,24 +320,45 @@ __device__ inline uint slotVoxel(const CouplingGrid& where, uint node, int slot,
     at = make_int3((int)(cell % where.grid.sizeX)*w + slot % w, (int)(cell / where.grid.sizeX % where.grid.sizeY)*w + slot / w % w,
                    (int)(cell / (where.grid.sizeX*where.grid.sizeY))*w + slot / (w*w));
     uint voxel = where.interiorVoxels[(size_t)node*w*w*w + slot];
-    return voxel != NO_VOXEL && where.solveCodes[voxel] && (where.near[voxel] & NEAR_SURFACE) && where.faceBodies[voxel] != 0 ? voxel : NO_VOXEL;
+    if(voxel == NO_VOXEL || !where.solveCodes[voxel] || !(where.near[voxel] & NEAR_SURFACE)){
+        return NO_VOXEL;
+    }
+    const uint* faces = where.faceBodies + 6*(size_t)voxel;
+    return faces[0] | faces[1] | faces[2] | faces[3] | faces[4] | faces[5] ? voxel : NO_VOXEL;
+}
+
+//the lowest body numbered after `after` across a face of these voxels (NO_VOXEL for none), or INT_MAX
+__device__ inline int nextBodyAcross(const CouplingGrid& where, const uint* voxels, int count, int after){
+    int lowest = INT_MAX;
+    for(int which = 0; which < count; ++which){
+        if(voxels[which] == NO_VOXEL){
+            continue;
+        }
+        const uint* faces = where.faceBodies + 6*(size_t)voxels[which];
+        for(int face = 0; face < 6; ++face){
+            int body = (int)faces[face] - 1;
+            lowest = body > after && body < lowest ? body : lowest;
+        }
+    }
+    return lowest;
+}
+
+//and over a warp's lanes: the bodies a node's voxels see, one at a time, in order; -1 past the last
+__device__ inline int nextBodyInWarp(const CouplingGrid& where, const uint voxels[2], int after){
+    int lowest = nextBodyAcross(where, voxels, 2, after);
+    for(int lanes = 16; lanes > 0; lanes >>= 1){
+        lowest = min(lowest, __shfl_xor_sync(0xffffffffu, lowest, lanes));
+    }
+    return lowest == INT_MAX ? -1 : lowest;
 }
 
 //B^T x into each body's exact sums: a warp per own node near obstacles, its lanes taking interior slots lane and lane + 32 (a node's 64), each body's six
 //shares paired off in a fixed tree, then in exactly, as the CG's dot products are (addNodeDotShares): a node's share depends only on its own values,
-//so the sums are the same however the nodes are stored or split between partitions
+//so the sums are the same however the nodes are stored or split between partitions, and in whatever order they're added
 __global__ void addBodyShares(int numBodies, CouplingGrid where, const BodyCoupling* couplings, const float* x, const uint* onlyIf, ExactSum* sums){
-    __shared__ ExactSum blockSums[MAX_OBSTACLES*BODY_LANES];
     if(onlyIf != nullptr && !*onlyIf){
         return;
     }
-    for(int i = threadIdx.x; i < numBodies*BODY_LANES; i += blockDim.x){
-        for(int digit = 0; digit < EXACT_DIGITS; ++digit){
-            blockSums[i].digits[digit] = 0;
-        }
-        blockSums[i].nonFinite = 0;
-    }
-    __syncthreads();
     uint lane = threadIdx.x % 32;
     uint warps = gridDim.x*blockDim.x/32;
     for(uint listed = (threadIdx.x + blockIdx.x*blockDim.x)/32; listed < where.nodes[0]; listed += warps){     //the same for the whole warp
@@ -351,22 +368,10 @@ __global__ void addBodyShares(int numBodies, CouplingGrid where, const BodyCoupl
         }
         int3 at[2];
         uint voxels[2];
-        uint present = 0;   //the bodies across this lane's voxels' faces, a bit each
         for(int half = 0; half < 2; ++half){
             voxels[half] = slotVoxel(where, node, lane + 32*half, at[half]);
-            if(voxels[half] != NO_VOXEL){
-                uint faces = where.faceBodies[voxels[half]];
-                for(int face = 0; face < 6; ++face){
-                    uint code = faces >> 5*face & 31u;
-                    present |= code ? 1u << (code - 1) : 0u;
-                }
-            }
         }
-        for(int lanes = 16; lanes > 0; lanes >>= 1){
-            present |= __shfl_xor_sync(0xffffffffu, present, lanes);
-        }
-        for(uint mask = present; mask != 0; mask &= mask - 1){
-            int body = __ffs(mask) - 1;
+        for(int body = nextBodyInWarp(where, voxels, -1); body >= 0; body = nextBodyInWarp(where, voxels, body)){
             float terms[2][BODY_LANES];
             for(int half = 0; half < 2; ++half){
                 float row[BODY_LANES];
@@ -382,31 +387,23 @@ __global__ void addBodyShares(int numBodies, CouplingGrid where, const BodyCoupl
                     share = __fadd_rn(share, __shfl_xor_sync(0xffffffffu, share, lanes));
                 }
                 if(lane == 0){
-                    addExactly(share, blockSums[BODY_LANES*body + k]);
+                    addExactly(share, sums[BODY_LANES*body + k]);
                 }
             }
         }
     }
-    __syncthreads();
-    for(int i = threadIdx.x; i < numBodies*BODY_LANES; i += blockDim.x){
-        for(int digit = 0; digit < EXACT_DIGITS; ++digit){
-            if(blockSums[i].digits[digit] != 0){
-                atomicAdd((unsigned long long*)sums[i].digits + digit, (unsigned long long)blockSums[i].digits[digit]);
-            }
-        }
-        if(blockSums[i].nonFinite){
-            atomicAdd((unsigned long long*)&sums[i].nonFinite, (unsigned long long)blockSums[i].nonFinite);
-        }
-    }
 }
 
-//each body's B^T x, every partition's, as doubles, and the response to it, s M~^-1 B^T x; after them, the energy (B^T x).(s M~^-1 B^T x)
+//each body's B^T x, every partition's, as doubles, and the response to it, s M~^-1 B^T x; after them, the energy (B^T x).(s M~^-1 B^T x), in a fixed
+//tree over one block of FINISH_THREADS, so it's the same however many bodies each thread took
+static constexpr int FINISH_THREADS = 256;
 __global__ void finishBodyShares(int numBodies, const ExactSum* sums, const BodyCoupling* couplings, double scale, const uint* onlyIf, double* responses){
+    __shared__ double energies[FINISH_THREADS];
     if(onlyIf != nullptr && !*onlyIf){
         return;
     }
     double energy = 0.0;
-    for(int body = 0; body < numBodies; ++body){
+    for(int body = threadIdx.x; body < numBodies; body += blockDim.x){
         double shares[BODY_LANES];
         for(int k = 0; k < BODY_LANES; ++k){
             shares[k] = exactValue(sums[BODY_LANES*body + k]);
@@ -424,7 +421,17 @@ __global__ void finishBodyShares(int numBodies, const ExactSum* sums, const Body
             energy += shares[k]*response[k];
         }
     }
-    responses[BODY_LANES*numBodies] = energy;
+    energies[threadIdx.x] = energy;
+    __syncthreads();
+    for(int stride = FINISH_THREADS/2; stride > 0; stride /= 2){
+        if((int)threadIdx.x < stride){
+            energies[threadIdx.x] += energies[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if(threadIdx.x == 0){
+        responses[BODY_LANES*numBodies] = energies[0];
+    }
 }
 
 //y += sign B (s M~^-1 B^T x) on the own unknowns: each body's response, through its row, a voxel a lane
@@ -446,7 +453,7 @@ __global__ void applyBodyResponses(int numBodies, CouplingGrid where, const Body
                 continue;
             }
             float sum = 0.0f;
-            for(int body = 0; body < numBodies; ++body){
+            for(int body = nextBodyAcross(where, &voxel, 1, -1); body != INT_MAX; body = nextBodyAcross(where, &voxel, 1, body)){     //its faces' bodies, in order
                 float row[BODY_LANES];
                 if(!couplingRow(where, voxel, at, body, couplings[body].centre, row)){
                     continue;
@@ -491,14 +498,6 @@ __global__ void addBodyEnergy(int numBodies, const double* responses, double* to
 
 //the term's norm, bounded by its trace: s times the sum over each body's unknowns of B_i M~^-1 B_i^T, in exact sums as addBodyShares takes them
 __global__ void addBodyBounds(int numBodies, CouplingGrid where, const BodyCoupling* couplings, ExactSum* sums){
-    __shared__ ExactSum blockSums[MAX_OBSTACLES];
-    for(int i = threadIdx.x; i < numBodies; i += blockDim.x){
-        for(int digit = 0; digit < EXACT_DIGITS; ++digit){
-            blockSums[i].digits[digit] = 0;
-        }
-        blockSums[i].nonFinite = 0;
-    }
-    __syncthreads();
     uint lane = threadIdx.x % 32;
     uint warps = gridDim.x*blockDim.x/32;
     for(uint listed = (threadIdx.x + blockIdx.x*blockDim.x)/32; listed < where.nodes[0]; listed += warps){
@@ -511,7 +510,7 @@ __global__ void addBodyBounds(int numBodies, CouplingGrid where, const BodyCoupl
         for(int half = 0; half < 2; ++half){
             voxels[half] = slotVoxel(where, node, lane + 32*half, at[half]);
         }
-        for(int body = 0; body < numBodies; ++body){
+        for(int body = nextBodyInWarp(where, voxels, -1); body >= 0; body = nextBodyInWarp(where, voxels, body)){
             float terms[2];
             for(int half = 0; half < 2; ++half){
                 float row[BODY_LANES];
@@ -530,26 +529,29 @@ __global__ void addBodyBounds(int numBodies, CouplingGrid where, const BodyCoupl
                 share = __fadd_rn(share, __shfl_xor_sync(0xffffffffu, share, lanes));
             }
             if(lane == 0){
-                addExactly(share, blockSums[body]);
-            }
-        }
-    }
-    __syncthreads();
-    for(int i = threadIdx.x; i < numBodies; i += blockDim.x){
-        for(int digit = 0; digit < EXACT_DIGITS; ++digit){
-            if(blockSums[i].digits[digit] != 0){
-                atomicAdd((unsigned long long*)sums[i].digits + digit, (unsigned long long)blockSums[i].digits[digit]);
+                addExactly(share, sums[body]);
             }
         }
     }
 }
 
 __global__ void finishBodyBound(int numBodies, const ExactSum* sums, double scale, double* bound){
+    __shared__ double totals[FINISH_THREADS];
     double total = 0.0;
-    for(int body = 0; body < numBodies; ++body){
+    for(int body = threadIdx.x; body < numBodies; body += blockDim.x){
         total += exactValue(sums[body]);
     }
-    *bound = 1.01*scale*total;     //a little over, for the floats it was summed from
+    totals[threadIdx.x] = total;
+    __syncthreads();
+    for(int stride = FINISH_THREADS/2; stride > 0; stride /= 2){
+        if((int)threadIdx.x < stride){
+            totals[threadIdx.x] += totals[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if(threadIdx.x == 0){
+        *bound = 1.01*scale*totals[0];     //a little over, for the floats it was summed from
+    }
 }
 
 // ---- the host's side ----
@@ -618,7 +620,7 @@ void Bodies::setUp(const std::vector<SceneObstacle>& descriptions, ObstacleSet& 
         }
         //its shape where its own space is the world's, sampled a quarter voxel apart over its bounds and a voxel past them (an open mesh's shell
         //reaches past its triangles), or coarser for a body so large that would be more than MAX_MASS_SAMPLES
-        ObstacleState shape = obstacleSet.state().items[built];
+        ObstacleState shape = obstacleSet.hostState(built);
         for(int i = 0; i < 12; ++i){
             shape.worldToObject[i] = i % 5 == 0 ? 1.0f : 0.0f;
         }
@@ -735,7 +737,7 @@ void Bodies::setUp(const std::vector<SceneObstacle>& descriptions, ObstacleSet& 
     gpuErrchk(cudaMemsetAsync(responses, 0, sizeof(double)*(BODY_LANES*numBodies + 1), stream));
     gpuErrchk(cudaStreamSynchronize(stream));   //before seen is written again, and masses' copy is gone
     for(int body = 0; body < numBodies; ++body){
-        obstacleSet.setFrame(obstacles[body], frames + body);
+        obstacleSet.setFrame(obstacles[body], frames + body, body);
     }
     setUpContacts(obstacleSet, voxelSize);
     writeFrames();
@@ -745,7 +747,7 @@ void Bodies::writeFrames(){
     if(numBodies == 0){
         return;
     }
-    writeBodyFrames<<<1, 32, 0, stream>>>(numBodies, states, deviceMasses, frames, couplings, voxel);
+    writeBodyFrames<<<bodyBlocks(), 32, 0, stream>>>(numBodies, states, deviceMasses, frames, couplings, voxel);
     gpuErrchk(cudaPeekAtLastError());
 }
 
@@ -753,7 +755,7 @@ void Bodies::predict(double dt, float3 gravity){
     if(numBodies == 0){
         return;
     }
-    predictBodies<<<1, 32, 0, stream>>>(numBodies, states, frames, dt, make_double3(gravity.x, gravity.y, gravity.z));
+    predictBodies<<<bodyBlocks(), 32, 0, stream>>>(numBodies, states, frames, dt, make_double3(gravity.x, gravity.y, gravity.z));
     gpuErrchk(cudaPeekAtLastError());
 }
 
@@ -762,20 +764,13 @@ void Bodies::findFaceBodies(const Obstacles& obstacleState, const VoxelPlaces& p
     if(numBodies == 0){
         return;
     }
-    faceBodyCodes.resizeAsync(numVoxels, stream);
+    faceBodyCodes.resizeAsync(6*numVoxels, stream);
     if(numVoxels == 0){
         return;
     }
-    BodiesOf of;
-    for(int obstacle = 0; obstacle < MAX_OBSTACLES; ++obstacle){
-        of.of[obstacle] = -1;
-    }
-    for(int body = 0; body < numBodies; ++body){
-        of.of[obstacles[body]] = (signed char)body;
-    }
     uint* faceBodies = faceBodyCodes.devPtr();
-    gpuErrchk(cudaMemsetAsync(faceBodies, 0, sizeof(uint)*numVoxels, stream));
-    findFaceBodiesKernel<<<couplingBlocks(), 512, 0, stream>>>(obstacleState, of, places, domainVoxels, nodes, numOwnNodes, solveCodes, near, opens, neighbors[0], neighbors[1],
+    gpuErrchk(cudaMemsetAsync(faceBodies, 0, 6*sizeof(uint)*numVoxels, stream));
+    findFaceBodiesKernel<<<couplingBlocks(), 512, 0, stream>>>(obstacleState, places, domainVoxels, nodes, numOwnNodes, solveCodes, near, opens, neighbors[0], neighbors[1],
         neighbors[2], neighbors[3], neighbors[4], neighbors[5], faceBodies);
     gpuErrchk(cudaPeekAtLastError());
 }
@@ -801,7 +796,7 @@ void Bodies::prepare(double solveScale, const uint* nodes, uint numOwnNodes, con
         gpuErrchk(cudaMemsetAsync(boundSums, 0, sizeof(ExactSum)*numBodies, stream));
         addBodyBounds<<<couplingBlocks(), COUPLING_THREADS, 0, stream>>>(numBodies, where, couplings, boundSums);
         context->sumOverPartitions((long long*)boundSums, numBodies*EXACT_WORDS, stream);
-        finishBodyBound<<<1, 1, 0, stream>>>(numBodies, boundSums, scale, bound);
+        finishBodyBound<<<1, FINISH_THREADS, 0, stream>>>(numBodies, boundSums, scale, bound);
         gpuErrchk(cudaMemcpyAsync(seenBound, bound, sizeof(double), cudaMemcpyDeviceToHost, stream));
         gpuErrchk(cudaPeekAtLastError());
     }
@@ -811,7 +806,7 @@ void Bodies::sumShares(const float* x, const uint* onlyIf){
     gpuErrchk(cudaMemsetAsync(sums, 0, sizeof(ExactSum)*BODY_LANES*numBodies, stream));
     addBodyShares<<<couplingBlocks(), COUPLING_THREADS, 0, stream>>>(numBodies, where, couplings, x, onlyIf, sums);
     context->sumOverPartitions((long long*)sums, BODY_LANES*numBodies*EXACT_WORDS, stream);
-    finishBodyShares<<<1, 1, 0, stream>>>(numBodies, sums, couplings, scale, onlyIf, responses);
+    finishBodyShares<<<1, FINISH_THREADS, 0, stream>>>(numBodies, sums, couplings, scale, onlyIf, responses);
     gpuErrchk(cudaPeekAtLastError());
 }
 
@@ -837,7 +832,7 @@ void Bodies::takePressure(const float* p){
         return;
     }
     sumShares(p, nullptr);
-    takeBodyImpulses<<<1, 32, 0, stream>>>(numBodies, states, deviceMasses, frames, responses);
+    takeBodyImpulses<<<bodyBlocks(), 32, 0, stream>>>(numBodies, states, deviceMasses, frames, responses);
     gpuErrchk(cudaPeekAtLastError());
 }
 
@@ -849,17 +844,11 @@ void Bodies::beginFriction(){
 
 BodyFriction Bodies::frictionFor(float share, double particleMass, const float* weightsX, const float* weightsY, const float* weightsZ){
     BodyFriction friction = {};
-    for(int obstacle = 0; obstacle < MAX_OBSTACLES; ++obstacle){
-        friction.of[obstacle] = -1;
-    }
     if(numBodies == 0 || share == 0.0f){
         return friction;
     }
     friction.sums = frictionSums;
     friction.couplings = couplings;
-    for(int body = 0; body < numBodies; ++body){
-        friction.of[obstacles[body]] = (signed char)body;
-    }
     friction.weights[0] = weightsX;
     friction.weights[1] = weightsY;
     friction.weights[2] = weightsZ;
@@ -872,12 +861,12 @@ void Bodies::takeFriction(){
         return;
     }
     context->sumOverPartitions((long long*)frictionSums, BODY_LANES*numBodies*EXACT_WORDS, stream);
-    takeBodyFriction<<<1, 32, 0, stream>>>(numBodies, states, deviceMasses, frames, couplings, frictionSums);
+    takeBodyFriction<<<bodyBlocks(), 32, 0, stream>>>(numBodies, states, deviceMasses, frames, couplings, frictionSums);
     gpuErrchk(cudaPeekAtLastError());
 }
 
 void Bodies::moveOnce(double dt, double measureOver){
-    moveBodies<<<1, 32, 0, stream>>>(numBodies, states, deviceMasses, dt, measureOver);
+    moveBodies<<<bodyBlocks(), 32, 0, stream>>>(numBodies, states, deviceMasses, dt, measureOver);
     gpuErrchk(cudaPeekAtLastError());
 }
 
@@ -1013,7 +1002,7 @@ std::string Bodies::checkpoint(){
     if(numBodies == 0){
         return "";
     }
-    int slots = numBodies*CONTACT_PARTNERS*CONTACT_SLOTS;
+    int slots = numBodies*partners*CONTACT_SLOTS;
     std::vector<BodyState> now(numBodies);
     std::vector<BodyContact> carried(slots);    //the last contact step's, which the next substep starts from (touch swaps them in)
     gpuErrchk(cudaMemcpyAsync(now.data(), states, sizeof(BodyState)*numBodies, cudaMemcpyDeviceToHost, stream));
@@ -1025,11 +1014,11 @@ std::string Bodies::checkpoint(){
         writeFields(out, (const char*)&now[body], STATE_FIELDS, std::size(STATE_FIELDS));
         out += ",\"contacts\":[";
         int written = 0;
-        for(int slot = body*CONTACT_PARTNERS*CONTACT_SLOTS; slot < (body + 1)*CONTACT_PARTNERS*CONTACT_SLOTS; ++slot){
+        for(int slot = body*partners*CONTACT_SLOTS; slot < (body + 1)*partners*CONTACT_SLOTS; ++slot){
             if(carried[slot].point < 0){
                 continue;   //an empty slot, which nothing reads
             }
-            out += std::string(written++ ? "," : "") + "{\"partner\":" + std::to_string(slot / CONTACT_SLOTS % CONTACT_PARTNERS) + ",\"slot\":" +
+            out += std::string(written++ ? "," : "") + "{\"partner\":" + std::to_string(slot / CONTACT_SLOTS % partners) + ",\"slot\":" +
                    std::to_string(slot % CONTACT_SLOTS) + ",";
             writeFields(out, (const char*)&carried[slot], CONTACT_FIELDS, std::size(CONTACT_FIELDS));
             out += "}";
@@ -1046,7 +1035,7 @@ std::string Bodies::restore(const Json& saved){
     if(numBodies == 0){
         return "";
     }
-    int slots = numBodies*CONTACT_PARTNERS*CONTACT_SLOTS;
+    int slots = numBodies*partners*CONTACT_SLOTS;
     std::vector<BodyState> restored(seen, seen + numBodies);    //where setUp started them, for any field the record doesn't have
     std::vector<BodyContact> carried(slots);
     for(BodyContact& contact : carried){
@@ -1069,10 +1058,10 @@ std::string Bodies::restore(const Json& saved){
                 const Json* partner = entry.find("partner");
                 const Json* k = entry.find("slot");
                 if(partner == nullptr || k == nullptr || partner->kind != Json::NUMBER || k->kind != Json::NUMBER || partner->number < 0 ||
-                   partner->number >= CONTACT_PARTNERS || k->number < 0 || k->number >= CONTACT_SLOTS){
+                   partner->number >= partners || k->number < 0 || k->number >= CONTACT_SLOTS){
                     return which + " has no partner and slot this build has";
                 }
-                BodyContact& contact = carried[(body*CONTACT_PARTNERS + (int)partner->number)*CONTACT_SLOTS + (int)k->number];
+                BodyContact& contact = carried[(body*partners + (int)partner->number)*CONTACT_SLOTS + (int)k->number];
                 readFields(entry, (char*)&contact, CONTACT_FIELDS, std::size(CONTACT_FIELDS), which);
                 if(contact.point < 0){
                     return which + " has no surface point";

@@ -79,7 +79,7 @@ void Bodies::setUpContacts(const ObstacleSet& obstacleSet, double voxelSize){
     std::vector<float3> allPoints;
     std::vector<int> allBodies;
     for(int body = 0; body < numBodies; ++body){
-        ObstacleState shape = obstacleSet.state().items[obstacles[body]];    //in its own space: the world's taken for it
+        ObstacleState shape = obstacleSet.hostState(obstacles[body]);    //in its own space: the world's taken for it
         for(int i = 0; i < 12; ++i){
             shape.worldToObject[i] = i % 5 == 0 ? 1.0f : 0.0f;
         }
@@ -124,7 +124,8 @@ void Bodies::setUpContacts(const ObstacleSet& obstacleSet, double voxelSize){
         std::cerr<<"Body "<<body<<": "<<found<<" surface points for its contacts, "<<h / voxelSize<<" voxels apart\n";
     }
     numSurfacePoints = (int)allPoints.size();
-    int slots = numBodies*CONTACT_PARTNERS*CONTACT_SLOTS;
+    partners = 6 + obstacleSet.count();
+    int slots = numBodies*partners*CONTACT_SLOTS;
     gpuErrchk(cudaMalloc((void**)&surfacePoints, sizeof(float3)*std::max(numSurfacePoints, 1)));
     gpuErrchk(cudaMalloc((void**)&surfaceBodies, sizeof(int)*std::max(numSurfacePoints, 1)));
     gpuErrchk(cudaMalloc((void**)&picks, sizeof(unsigned long long)*slots));
@@ -150,9 +151,9 @@ void Bodies::setUpContacts(const ObstacleSet& obstacleSet, double voxelSize){
 
 //what the contact passes need of the world: the obstacles where they are (the bodies' frames among them), which body each obstacle is, the domain
 struct ContactWorld{
-    Obstacles obstacles;
-    signed char bodyOf[MAX_OBSTACLES];      //per obstacle, its body, or -1
-    signed char obstacleOf[MAX_OBSTACLES];  //per body, its obstacle
+    Obstacles obstacles;                    //each one's body, if it's dynamic, in its state
+    int obstacleOf[MAX_BODIES];             //per body, its obstacle
+    int partners;                           //the walls and the obstacles: 6 and their count (Bodies::partners)
     float3 low, high;   //the domain's walls
     float voxel;
     float dt;
@@ -208,7 +209,7 @@ __global__ void pickContacts(int pass, ContactWorld world, const float3* points,
         const ObstacleState& self = world.obstacles.items[world.obstacleOf[body]];
         float3 p = surfacePoint(world, body, points[index]);
         float3 moving = obstacleVelocity(self, p);
-        for(int partner = 0; partner < 6 + world.obstacles.count; ++partner){
+        for(int partner = 0; partner < world.partners; ++partner){
             if(partner >= 6 && partner - 6 == world.obstacleOf[body]){
                 continue;
             }
@@ -225,7 +226,7 @@ __global__ void pickContacts(int pass, ContactWorld world, const float3* points,
             if(!(distance < 0.75f*world.voxel + world.dt*closing)){
                 continue;
             }
-            int first = (body*CONTACT_PARTNERS + partner)*CONTACT_SLOTS;
+            int first = (body*world.partners + partner)*CONTACT_SLOTS;
             float score = distance;
             if(pass > 0){
                 float3 picked[CONTACT_SLOTS - 1];
@@ -313,7 +314,7 @@ __global__ void buildContacts(ContactWorld world, const float3* points, const Bo
         return;
     }
     int k = slot % CONTACT_SLOTS, manifold = slot / CONTACT_SLOTS;
-    int body = manifold / CONTACT_PARTNERS, partner = manifold % CONTACT_PARTNERS;
+    int body = manifold / world.partners, partner = manifold % world.partners;
     int point = (int)(key & 0xFFFFFFFFull);
     float3 p = nearestToPartner(world, body, partner, surfacePoint(world, body, points[point]));
     for(int earlier = 0; earlier < k; ++earlier){
@@ -360,7 +361,7 @@ __global__ void buildContacts(ContactWorld world, const float3* points, const Bo
             normal = -1.0f*own;
         }
     }
-    int other = partner >= 6 ? world.bodyOf[partner - 6] : -1;
+    int other = partner >= 6 ? world.obstacles.items[partner - 6].body : -1;
     contact.point = point;
     contact.other = other;
     contact.at = p;
@@ -453,7 +454,7 @@ __device__ inline float3 contactImpulse(const BodyContact& contact){
 
 //The last substep's contacts carried into this one's, one thread, in slot order: what the substep's start gave each (warmStartBodies) is taken back
 //where it was given, and one found again (same slot, same surface point) starts from that push along its own normal, given where it is now. Then the batches: each contact, in slot order, in the first batch none of its bodies is in yet
-__global__ void carryContacts(int numBodies, int numSlots, float dt, BodyState* states, const BodyCoupling* couplings, const BodyContact* last, BodyContact* contacts,
+__global__ void carryContacts(int numBodies, int partners, int numSlots, float dt, BodyState* states, const BodyCoupling* couplings, const BodyContact* last, BodyContact* contacts,
                               int* order, int* batchStarts){
     for(int slot = 0; slot < numSlots; ++slot){
         const BodyContact& before = last[slot];
@@ -470,7 +471,7 @@ __global__ void carryContacts(int numBodies, int numSlots, float dt, BodyState* 
         //what the substep's start gave, if it did, taken back where it was given; and what carries over, for this step's length, given where the
         //contact is now
         float3 given = contactImpulse(before);
-        int body = slot / (CONTACT_PARTNERS*CONTACT_SLOTS);
+        int body = slot / (partners*CONTACT_SLOTS);
         if(before.applied != 0.0f){
             push(states[body], couplings[body], before.lever[0], -1.0f*given);
             if(before.other >= 0){
@@ -489,7 +490,7 @@ __global__ void carryContacts(int numBodies, int numSlots, float dt, BodyState* 
             }
         }
     }
-    unsigned long long used[MAX_OBSTACLES][MAX_BATCHES / 64] = {};
+    unsigned long long used[MAX_BODIES][MAX_BATCHES / 64] = {};
     int counts[MAX_BATCHES] = {};
     int batches = 0;
     for(int slot = 0; slot < numSlots; ++slot){
@@ -497,7 +498,7 @@ __global__ void carryContacts(int numBodies, int numSlots, float dt, BodyState* 
         if(contact.point < 0){
             continue;
         }
-        int body = slot / (CONTACT_PARTNERS*CONTACT_SLOTS);
+        int body = slot / (partners*CONTACT_SLOTS);
         int batch = 0;
         while(batch < MAX_BATCHES - 1 && (used[body][batch / 64] >> batch % 64 & 1ull || (contact.other >= 0 && used[contact.other][batch / 64] >> batch % 64 & 1ull))){
             ++batch;
@@ -530,10 +531,10 @@ __global__ void carryContacts(int numBodies, int numSlots, float dt, BodyState* 
 //(symmetric Gauss-Seidel), VELOCITY_ITERATIONS times; then
 //the push out of what they're sunk into, on velocities of its own, POSITION_ITERATIONS times. Then the bodies take their new velocities, and their
 //angular momentum and frames follow
-__global__ void solveContacts(int numBodies, BodyState* states, const BodyMass* masses, const BodyCoupling* couplings, BodyFrame* frames, BodyContact* contacts,
+__global__ void solveContacts(int numBodies, int partners, BodyState* states, const BodyMass* masses, const BodyCoupling* couplings, BodyFrame* frames, BodyContact* contacts,
                               const int* order, const int* batchStarts){
-    __shared__ float3 v[MAX_OBSTACLES], w[MAX_OBSTACLES], pv[MAX_OBSTACLES], pw[MAX_OBSTACLES];
-    __shared__ float inverseMass[MAX_OBSTACLES], inverseInertia[MAX_OBSTACLES][9];
+    __shared__ float3 v[MAX_BODIES], w[MAX_BODIES], pv[MAX_BODIES], pw[MAX_BODIES];
+    __shared__ float inverseMass[MAX_BODIES], inverseInertia[MAX_BODIES][9];
     for(int body = threadIdx.x; body < numBodies; body += blockDim.x){
         const BodyState& state = states[body];
         v[body] = make_float3((float)state.velocity[0], (float)state.velocity[1], (float)state.velocity[2]);
@@ -562,7 +563,7 @@ __global__ void solveContacts(int numBodies, BodyState* states, const BodyMass* 
             int batch = pass % 2 ? batches - 1 - turn : turn;     //forwards, then backwards: no contact is always first
             for(int i = batchStarts[batch] + threadIdx.x; i < batchStarts[batch + 1]; i += blockDim.x){
                 BodyContact& contact = contacts[order[i]];
-                int body = order[i] / (CONTACT_PARTNERS*CONTACT_SLOTS), other = contact.other;
+                int body = order[i] / (partners*CONTACT_SLOTS), other = contact.other;
                 auto apart = [&](){     //how fast they separate at the contact, body less partner
                     float3 speed = linear[body] + cross(angular[body], contact.lever[0]);
                     return other >= 0 ? speed - (linear[other] + cross(angular[other], contact.lever[1])) : pushing ? speed : speed - contact.partnerVelocity;
@@ -644,7 +645,7 @@ __global__ void warmStartBodies(int numBodies, int numSlots, BodyState* states, 
         contact.impulse[2] = 0.0f;
         contact.dt = world.dt;
         contact.applied = 1.0f;
-        int body = slot / (CONTACT_PARTNERS*CONTACT_SLOTS);
+        int body = slot / (world.partners*CONTACT_SLOTS);
         float3 at = surfacePoint(world, body, contact.local);   //where it is now, the bodies having moved
         const BodyState& state = states[body];
         contact.lever[0] = at - make_float3((float)state.position[0], (float)state.position[1], (float)state.position[2]);
@@ -674,13 +675,12 @@ __global__ void warmStartBodies(int numBodies, int numSlots, BodyState* states, 
 static ContactWorld contactWorld(const Obstacles& obstacleState, const std::vector<int>& obstacles, float3 low, float3 high, double voxel, double dt, float stillSpeed){
     ContactWorld world;
     world.obstacles = obstacleState;
-    for(int i = 0; i < MAX_OBSTACLES; ++i){
-        world.bodyOf[i] = -1;
+    world.partners = 6 + obstacleState.count;
+    for(int i = 0; i < MAX_BODIES; ++i){
         world.obstacleOf[i] = -1;
     }
     for(size_t body = 0; body < obstacles.size(); ++body){
-        world.bodyOf[obstacles[body]] = (signed char)body;
-        world.obstacleOf[body] = (signed char)obstacles[body];
+        world.obstacleOf[body] = obstacles[body];
     }
     world.low = low;
     world.high = high;
@@ -738,9 +738,9 @@ void Bodies::step(double dt, double frameDt, const Obstacles& obstacleState, flo
     double reach = ((double)fastest() + (double)acceleration()*dt)*dt;
     int steps = std::max({(int)std::ceil(dt / perStep - 1e-9), (int)std::ceil(reach / (0.5*voxel) - 1e-9), 1});
     double small = dt / steps;
-    spreadBodies<<<1, 32, 0, stream>>>(numBodies, states, deviceMasses, dt);
+    spreadBodies<<<bodyBlocks(), 32, 0, stream>>>(numBodies, states, deviceMasses, dt);
     for(int stepIndex = 0; stepIndex < steps; ++stepIndex){
-        driveBodies<<<1, 32, 0, stream>>>(numBodies, states, deviceMasses, small);
+        driveBodies<<<bodyBlocks(), 32, 0, stream>>>(numBodies, states, deviceMasses, small);
         touch(small, obstacleState, low, high, gravity);
         moveOnce(small, dt);
         writeFrames();      //where they are for the next step's contacts
@@ -755,7 +755,7 @@ void Bodies::warmStart(double dt, const Obstacles& obstacleState, float3 gravity
     }
     float g = sqrtf(gravity.x*gravity.x + gravity.y*gravity.y + gravity.z*gravity.z);
     ContactWorld world = contactWorld(obstacleState, obstacles, make_float3(0.0f, 0.0f, 0.0f), make_float3(0.0f, 0.0f, 0.0f), voxel, dt, 2.0f*g*(float)dt);
-    warmStartBodies<<<1, 1, 0, stream>>>(numBodies, numBodies*CONTACT_PARTNERS*CONTACT_SLOTS, states, deviceMasses, couplings, world, lastContacts);
+    warmStartBodies<<<1, 1, 0, stream>>>(numBodies, numBodies*partners*CONTACT_SLOTS, states, deviceMasses, couplings, world, lastContacts);
     gpuErrchk(cudaPeekAtLastError());
 }
 
@@ -765,15 +765,15 @@ void Bodies::touch(double dt, const Obstacles& obstacleState, float3 low, float3
     }
     float g = sqrtf(gravity.x*gravity.x + gravity.y*gravity.y + gravity.z*gravity.z);
     ContactWorld world = contactWorld(obstacleState, obstacles, low, high, voxel, dt, 2.0f*g*(float)dt);
-    int slots = numBodies*CONTACT_PARTNERS*CONTACT_SLOTS;
+    int slots = numBodies*partners*CONTACT_SLOTS;
     gpuErrchk(cudaMemsetAsync(picks, 0xFF, sizeof(unsigned long long)*slots, stream));
     uint blocks = std::min((uint)numSurfacePoints / CONTACT_THREADS + 1, 1024u);
     for(int pass = 0; pass < CONTACT_SLOTS; ++pass){
         pickContacts<<<blocks, CONTACT_THREADS, 0, stream>>>(pass, world, surfacePoints, surfaceBodies, numSurfacePoints, picks);
     }
     buildContacts<<<slots / CONTACT_THREADS + 1, CONTACT_THREADS, 0, stream>>>(world, surfacePoints, states, deviceMasses, couplings, picks, slots, contacts);
-    carryContacts<<<1, 1, 0, stream>>>(numBodies, slots, (float)dt, states, couplings, lastContacts, contacts, contactOrder, batchStarts);
-    solveContacts<<<1, CONTACT_THREADS, 0, stream>>>(numBodies, states, deviceMasses, couplings, frames, contacts, contactOrder, batchStarts);
+    carryContacts<<<1, 1, 0, stream>>>(numBodies, partners, slots, (float)dt, states, couplings, lastContacts, contacts, contactOrder, batchStarts);
+    solveContacts<<<1, CONTACT_THREADS, 0, stream>>>(numBodies, partners, states, deviceMasses, couplings, frames, contacts, contactOrder, batchStarts);
     gpuErrchk(cudaPeekAtLastError());
     std::swap(contacts, lastContacts);  //this substep's are what the next starts from
 }

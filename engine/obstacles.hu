@@ -9,7 +9,7 @@
 #include <memory>
 #include <vector>
 
-#define MAX_OBSTACLES 16
+#define MAX_BODIES 16            //dynamic obstacles (bodies.hu), until their coupling and contacts take any number
 #define SDF_BRICK 8             //samples along a brick's side
 #define SDF_OUTSIDE -1          //a brick table entry for a brick with no samples, all of it outside
 #define SDF_INSIDE -2           //and all of it inside
@@ -55,6 +55,7 @@ struct ObstacleState{
     bool letsGo;                //whether it only pushes on the liquid, and never pulls (boundaries.cu)
     float3 reachLow, reachHigh; //the box in the world past which nothing asks its distance: around its surface, 3 voxels wider every way
     const BodyFrame* frame;     //a dynamic body's place, motion and reach, on the GPU, which hold in place of the three above; nullptr for the others
+    int body;                   //a dynamic one's place among the bodies (bodies.hu), or -1
 };
 
 //an obstacle's transform, velocity and reach, wherever they're kept
@@ -66,12 +67,43 @@ __device__ inline const float* velocityMatrix(const ObstacleState& obstacle){
     return obstacle.frame != nullptr ? obstacle.frame->velocity : obstacle.velocity;
 }
 
-//every obstacle, as one kernel argument
+//Where in the domain each obstacle's reach is, so a question about a point asks only the obstacles near it, however many there are: the domain in cells
+//of size (a node's, or a power of two of them, so a big domain has no more than MAX_INDEX_CELLS), each listing the obstacles whose reach box meets it, in
+//the order they're numbered. A point past the domain takes the cell at its edge, as a reach box past it does, so it finds every obstacle whose reach
+//holds it. ObstacleSet::index builds it on the GPU, after the dynamic bodies have moved
+static constexpr uint MAX_INDEX_CELLS = 1u << 21;
+struct ObstacleIndex{
+    float3 origin;          //the domain's low corner
+    float size;             //a cell's side
+    int3 cells;             //how many along each axis
+    const uint* ends;       //per cell, x fastest: where its list ends, so cell c's runs from ends[c - 1] (0 for the first) to ends[c]
+    const int* entries;     //the lists, one after another
+};
+
+//the cell of a coordinate along an axis, clamped to the domain's
+__host__ __device__ inline int indexCoordinate(const ObstacleIndex& index, float value, float origin, int cells){
+    int cell = (int)floorf((value - origin) / index.size);
+    return cell < 0 ? 0 : cell >= cells ? cells - 1 : cell;
+}
+
+__device__ inline uint obstacleCell(const ObstacleIndex& index, float3 x){
+    int cx = indexCoordinate(index, x.x, index.origin.x, index.cells.x), cy = indexCoordinate(index, x.y, index.origin.y, index.cells.y);
+    int cz = indexCoordinate(index, x.z, index.origin.z, index.cells.z);
+    return (uint)cx + (uint)index.cells.x*((uint)cy + (uint)index.cells.y*(uint)cz);
+}
+
+//every obstacle, for the kernels: small, as the obstacles themselves are in a table in the GPU's memory (ObstacleSet), with their index
 struct Obstacles{
     int count = 0;
     bool moving = false;        //whether any of them moves
-    ObstacleState items[MAX_OBSTACLES];
+    const ObstacleState* items = nullptr;   //count of them, on the GPU
+    ObstacleIndex index = {};
 };
+
+//an obstacle's dynamic body, or -1 (for none too)
+__device__ inline int bodyOf(const Obstacles& obstacles, int obstacle){
+    return obstacle >= 0 ? obstacles.items[obstacle].body : -1;
+}
 
 //obstacleNear's bits, per stored voxel: whether a surface passes near enough to cut its faces, (CLOSED_FACE << face) whether each face is closed,
 //the faces in the neighbour arrays' order (-x, +x, -y, +y, -z, +z), and whether every obstacle on it lets go of the liquid (boundaries.cu)
@@ -293,12 +325,35 @@ __device__ inline float3 obstacleVelocity(const ObstacleState& obstacle, float3 
     return make_float3(v[0]*x.x + v[1]*x.y + v[2]*x.z + v[3], v[4]*x.x + v[5]*x.y + v[6]*x.z + v[7], v[8]*x.x + v[9]*x.y + v[10]*x.z + v[11]);
 }
 
+//the first obstacle numbered after `after` (-1: from the first) whose reach could hold x, from the list of x's cell; -1 if there's none
+__device__ inline int nextObstacleAt(const Obstacles& obstacles, float3 x, int after){
+    if(obstacles.count == 0){
+        return -1;
+    }
+    uint cell = obstacleCell(obstacles.index, x);
+    uint end = obstacles.index.ends[cell];
+    for(uint entry = cell == 0 ? 0 : obstacles.index.ends[cell - 1]; entry < end; ++entry){
+        int which = obstacles.index.entries[entry];
+        if(which > after){
+            return which;
+        }
+    }
+    return -1;
+}
+
 //the obstacle a point is deepest inside, or nearest to: its index and the distance and normal there. Obstacles whose reach the point is outside are passed
-//over, as every question asked of them is about inside or within a voxel or two of them; -1, and an infinite distance, if it's outside every one's
+//over, as every question asked of them is about inside or within a voxel or two of them; -1, and an infinite distance, if it's outside every one's. Only
+//those its cell lists are asked, in the order they're numbered
 __device__ inline int nearestObstacle(const Obstacles& obstacles, float3 x, float& distance, float3& normal){
     int nearest = -1;
     distance = INFINITY;
-    for(int index = 0; index < obstacles.count; ++index){
+    if(obstacles.count == 0){
+        return nearest;
+    }
+    uint cell = obstacleCell(obstacles.index, x);
+    uint end = obstacles.index.ends[cell];
+    for(uint entry = cell == 0 ? 0 : obstacles.index.ends[cell - 1]; entry < end; ++entry){
+        int index = obstacles.index.entries[entry];
         const ObstacleState& obstacle = obstacles.items[index];
         float3 low = obstacle.frame != nullptr ? obstacle.frame->reachLow : obstacle.reachLow;
         float3 high = obstacle.frame != nullptr ? obstacle.frame->reachHigh : obstacle.reachHigh;
@@ -344,7 +399,6 @@ struct BodyCoupling;
 struct BodyFriction{
     ExactSum* sums;                 //per body, its six lanes: the momentum, and its moment about the body's centre of mass
     const BodyCoupling* couplings;  //each body's centre of mass, there
-    signed char of[MAX_OBSTACLES];  //per obstacle, its body, or -1
     const float* weights[3];        //P2G's weight sums at each face
     float scale;                    //a particle's mass in voxels of liquid, times the share of the pass's change the particles take (G2P): all of it in
                                     //the new velocities, less the FLIP ratio in FLIP's old
@@ -352,9 +406,10 @@ struct BodyFriction{
 
 struct MeshField;   //a mesh's field and what building it takes (obstacles.cu)
 
-//The obstacles of one partition, on its GPU: their distance fields, and where they are at any time. A mesh is voxelized at the simulation's voxel size
-//into a narrow band of 3 voxels around its surface (see MeshField in obstacles.cu), once if it's rigid, at every update if it deforms; boxes and spheres
-//are exact
+//The obstacles of one partition, on its GPU: their distance fields, and where they are at any time, as many as there's memory for. A mesh is voxelized at
+//the simulation's voxel size into a narrow band of 3 voxels around its surface (see MeshField in obstacles.cu), once if it's rigid, at every update if it
+//deforms; boxes and spheres are exact. Each one's state is in a table in the GPU's memory, which the kernels read through Obstacles, with an index of
+//where each one reaches (ObstacleIndex)
 class ObstacleSet{
 public:
     ObstacleSet() = default;
@@ -362,14 +417,21 @@ public:
     ObstacleSet& operator=(const ObstacleSet&) = delete;
     ~ObstacleSet();
 
-    //builds every obstacle's distance field on the current GPU, at voxelSize, on stream, which updates use too; replaces any there were
-    void build(const std::vector<SceneObstacle>& obstacles, double voxelSize, cudaStream_t stream);
+    //builds every obstacle's distance field on the current GPU, at voxelSize, on stream, which updates use too, and their index over grid's domain;
+    //replaces any there were
+    void build(const std::vector<SceneObstacle>& obstacles, double voxelSize, const Grid& grid, cudaStream_t stream);
 
-    //where they are and how they move at time; a deforming mesh's field is rebuilt there, queued on the stream without waiting for it
+    //where they are and how they move at time: the table takes the states that changed; a deforming mesh's field is rebuilt there, queued on the stream
+    //without waiting for it. Then index()
     void update(double time);
+    //the index as the obstacles are now, built on the GPU without waiting for it: after update, and after the dynamic bodies have moved (bodies.cu)
+    void index();
 
-    const Obstacles& state() const{
+    const Obstacles& state() const{     //for the kernels
         return current;
+    }
+    const ObstacleState& hostState(int index) const{   //an obstacle's state as the last update left it, the host's copy of the table's
+        return states[index];
     }
 
     int count() const{
@@ -378,8 +440,8 @@ public:
 
     //whether any of them lets go of the liquid (boundaries.cu)
     bool lettingGo() const{
-        for(int index = 0; index < current.count; ++index){
-            if(current.items[index].letsGo){
+        for(const ObstacleState& state : states){
+            if(state.letsGo){
                 return true;
             }
         }
@@ -394,15 +456,16 @@ public:
     //where an obstacle can be at the last update, in the world: around a rigid one where it is now, and a deforming one wherever it goes
     void bounds(int index, double low[3], double high[3]) const;
 
-    //which obstacle build made of the description at index, or -1 if it left it out (a mesh whose triangles have no area, or past MAX_OBSTACLES)
+    //which obstacle build made of the description at index, or -1 if it left it out (a mesh whose triangles have no area)
     int builtFrom(size_t description) const{
         return description < builtIndex.size() ? builtIndex[description] : -1;
     }
 
-    //a dynamic body's frame, on the GPU, which the kernels read for where it is from the next update on (bodies.cu); its own bounds, and where its first
-    //transform puts it (a unit quaternion, w x y z, and a translation, its own space to the world)
-    void setFrame(int index, const BodyFrame* frame){
+    //a dynamic body's frame, on the GPU, which the kernels read for where it is from the next update on, and its place among the bodies (bodies.cu); its
+    //own bounds, and where its first transform puts it (a unit quaternion, w x y z, and a translation, its own space to the world)
+    void setFrame(int index, const BodyFrame* frame, int body){
         built[index].frame = frame;
+        built[index].body = body;
     }
     void objectBounds(int index, float3& low, float3& high) const{
         low = built[index].objectLow;
@@ -433,14 +496,28 @@ private:
         float friction;
         bool letsGo;
         const BodyFrame* frame = nullptr;   //a dynamic body's (setFrame)
+        int body = -1;
     };
     void release();
     void rigidAt(const Built& obstacle, double time, double matrix[12], int interval = -1) const;
+    void upload(const std::vector<int>& which);     //those states into the table
+    size_t reachCells(int index) const;     //the most cells of the index the obstacle's reach can meet, wherever it goes
 
     std::vector<Built> built;
     std::vector<int> builtIndex;    //per description given to build: its place in built, or -1
     double voxel = 0.0;             //the size build voxelized at
     Obstacles current;
+    std::vector<ObstacleState> states;  //the table's states, on the host
+    bool fresh = true;              //whether no update has filled the table yet
+    ObstacleState* table = nullptr;
+    uint* cellEnds = nullptr;       //the index's (ObstacleIndex), and what building it takes: per cell, how many entries go in it
+    uint* cellCursors = nullptr;
+    int* entries = nullptr;
+    uint* obstacleEnds = nullptr;   //per obstacle, the cells its reach meets, summed up to it
+    uint* pairCells = nullptr;      //per entry: its cell, and its obstacle
+    int* pairObstacles = nullptr;
+    size_t capacity = 0;            //entries there's room for: the most the obstacles' reaches can meet
+    uint numCells = 0;
     float fastestSurface = 0.0f;
     cudaStream_t stream = nullptr;
 };

@@ -455,7 +455,9 @@ __global__ void finishWhitewater(WhitewaterGrid g, WhitewaterFluids fluids, Whit
     for(int sink = 0; sink < sources.numSinks && !gone; ++sink){
         gone = sources.sinks[sink].contains(*position[0], *position[1], *position[2]);
     }
-    for(int which = 0; which < obstacles.count && !gone; ++which){
+    //each obstacle whose reach could hold it, in the order they're numbered, from where the ones before put it
+    for(int which = nextObstacleAt(obstacles, make_float3((float)*position[0], (float)*position[1], (float)*position[2]), -1); which >= 0 && !gone;
+        which = nextObstacleAt(obstacles, make_float3((float)*position[0], (float)*position[1], (float)*position[2]), which)){
         const ObstacleState& obstacle = obstacles.items[which];
         float3 x = make_float3((float)*position[0], (float)*position[1], (float)*position[2]);
         float3 normal;
