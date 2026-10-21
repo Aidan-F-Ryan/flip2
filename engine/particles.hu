@@ -45,12 +45,18 @@ static constexpr uint PARTICLE_NUMBER = 0x3FFFFFFFu;
 //Escaped particles, after PF-FLIP's section 3.4. A particle on the wrong side of the interface, where the grid's voxels are the other fluid's, is too
 //small a piece of its own fluid for the grid to move: the grid's velocity there is the other fluid's, and by it a drop of water in air would have no
 //weight of its own and a bubble under water no lift. So it's marked (ESCAPED_PARTICLE) and moves as what it is, a ball of its fluid in the other
-//(flyEscaped, particles.cu). It's judged each substep by its own fluid's share where it is: the liquid's is the liquid's density over its density
-//at rest, found per voxel (liquidShare; none where the pressure solve has every face of the voxel as air: findLiquidShare, twophase.cu) and weighed
-//at the particle by its own weights on the voxels (shareAround, particles.cu), and the air's is what's left. Where its fluid's share is under
-//ESCAPE_SHARE a particle escapes, and back where it's over REJOIN_SHARE it's the grid's again, with the velocity it arrives with: where a substep
-//finds it (G2P), and where its flight during one takes it to such a place, which is where the flight ends. PF-FLIP's phase is the square root of
-//the density, and the two numbers are its 0.5 - 0.2 and 0.5, squared.
+//(flyEscaped, particles.cu). It's judged each substep by its own fluid's share where it is, weighed at the particle by its own weights on the voxels
+//(shareAround, gridSampling.hu). The liquid's is the liquid's density over its density at rest, found per voxel (liquidShare; none where the
+//pressure solve has every face of the voxel as air: findLiquidShare, twophase.cu). The air's is the air the grid resolves: what of a voxel isn't
+//liquid, in the voxels nearly free of liquid and the voxels beside them (AIR_RESOLVED), and nothing elsewhere. The grid gives air a velocity of its
+//own only where the faces carry next to no liquid, since a face's velocity is its momentum over its mass, and liquid has the density ratio times the
+//air's: air anywhere else, dispersed through the liquid, or in a film or a strand thinner than the grid's surface between the two takes to spread
+//(about three voxels), rides the mixture's velocity, which is the liquid's. With no way to rise through the water it stays mixed into it (a dam
+//break's pool held 15% of air two seconds after the wave, the light crates in it floating 3 to 8 cm deep against 1 to 3), so it's bubbles, and they
+//rise out. Where its fluid's share is under ESCAPE_SHARE a particle escapes, and
+//back where it's over REJOIN_SHARE it's the grid's again, with the velocity it arrives with: where a substep finds it (G2P), and where its flight
+//during one takes it to such a place, which is where the flight ends. PF-FLIP's phase is the square root of the density, and the two numbers are its
+//0.5 - 0.2 and 0.5, squared.
 //- A droplet, liquid in air, takes no part in P2G or the pressure solve: the air still carries spray, but the spray doesn't push the air.
 //- A bubble, air in liquid, stays in P2G with its weight and its room: the liquid it's in is that much lighter, which is all a bubble does to the
 //  liquid around it (the lift on it comes back as the weight the liquid is short of), and no liquid closes in where it is. It was removed instead,
@@ -59,6 +65,12 @@ static constexpr uint PARTICLE_NUMBER = 0x3FFFFFFFu;
 //What the grid resolves isn't touched: a pocket of air a few voxels across is air on the grid, and stays in the solve
 static constexpr float ESCAPE_SHARE = 0.09f;
 static constexpr float REJOIN_SHARE = 0.25f;
+
+//airResolved's bits, per stored voxel (findFaceDensities, twophase.cu): the liquid is at most ESCAPE_SHARE of what both fluids weigh on its faces,
+//which is air with no liquid of its own to the grid (there liquid flies as droplets); the voxel is one of those or beside one (any of the 26 around
+//it): its air is air the grid resolves, a pocket or the air over the liquid, with the voxels its surface passes through
+static constexpr char AIR_CORE = 1;
+static constexpr char AIR_RESOLVED = 2;
 
 struct TwoPhase{
     bool on = false;
@@ -86,6 +98,8 @@ struct EscapedFlight{
     float viscosity;    //of the fluid around it, kinematic
     float density;      //the ball's over that of the fluid around it: the density ratio for a droplet, 1 over it for a bubble
     float bluff;        //the drag coefficient it levels at as it speeds up: a ball's 0.44, a bubble's what its flattening makes it
+    float liquid;       //the liquid's density and the air's over that of the fluid around it, which make what the mixture there weighs from its share
+    float air;          //of liquid (EscapedPath): 1 and 1 over the density ratio for a bubble, the density ratio and 1 for a droplet
 };
 
 //the air band (TwoPhase::band, twophase.cu): a node cell's ring is how many nodes it is from one holding liquid, and this is one no ring reached
@@ -585,6 +599,7 @@ private:
     CudaVec<float> liquidShare;         //with escaping particles or whitewater, per stored voxel: the liquid's density there over its density at rest, where the walls
                                         //leave room for it (beside an obstacle over both fluids'); 0 where the pressure solve's faces are all air, and
                                         //none (NaN) in a voxel obstacles close (findLiquidShare, twophase.cu)
+    CudaVec<char> airResolved;          //with escaping particles, per stored voxel: whether its air is air the grid resolves (AIR_CORE, AIR_RESOLVED)
     WhitewaterSettings whitewater;
     WhitewaterPool whitewaterPool;
     unsigned int wallsLetGo = 0;    //the domain's walls that let go of the liquid, a bit each (boundaries.cu)

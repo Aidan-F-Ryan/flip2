@@ -39,8 +39,12 @@ __device__ inline Spline3 quadraticBSpline(float q){
 //of the domain, inside an obstacle (nan) or where nothing is stored (nan, or off the block or tile) a voxel is no part of either fluid and has no
 //share, so the share is of the fluid the particle's reach holds, as findLiquidShare's own is of the room a voxel's faces have. Judged by its voxel's
 //share alone, a particle half a voxel outside a drop's surface could be in a voxel whose centre is a whole voxel outside it, and a droplet by that:
-//which it was by where the surface sat in the voxels, not by where it was. nan where the reach holds nothing known: nothing to judge by
-__device__ inline float shareAround(const float* shares, int width, float3 point, int3 origin, int3 domainVoxels){
+//which it was by where the surface sat in the voxels, not by where it was. nan where the reach holds nothing known: nothing to judge by.
+//FOLDED: the shares are G2P's block's or the flight's tile's, whose voxels carry the sign where their air is air the grid resolves (AIR_RESOLVED,
+//particles.hu), and what's asked for is the particle's own fluid's share: the liquid's, or for air what of that air the grid resolves, a voxel's
+//share of air where its sign is set and none elsewhere
+template<bool FOLDED = false>
+__device__ inline float shareAround(const float* shares, int width, float3 point, int3 origin, int3 domainVoxels, bool air = false){
     float q[3] = {point.x, point.y, point.z};
     int first[3] = {origin.x, origin.y, origin.z}, size[3] = {domainVoxels.x, domainVoxels.y, domainVoxels.z};
     Spline3 on[3];
@@ -66,6 +70,9 @@ __device__ inline float shareAround(const float* shares, int width, float3 point
                 if(w > 0.0f){
                     float share = shares[on[0].base + i + width*(on[1].base + j + width*(on[2].base + k))];
                     if(!isnan(share)){
+                        if constexpr(FOLDED){
+                            share = air ? (signbit(share) ? fmaxf(1.0f - fabsf(share), 0.0f) : 0.0f) : fabsf(share);
+                        }
                         weighed += w*share;
                         weight += w;
                     }
@@ -169,14 +176,18 @@ __device__ inline float3 velocityThrough(const float* tile, int tileWidth, float
 }
 
 //An escaped particle's flight through a substep, from the velocity it starts with: a ball of its fluid in the other. With s the ball's density over
-//that of the fluid around it,
-//    (s + 1/2) dv/dt = (s - 1) g + 3/2 a + (s + 1/2) (around - v) / tau
-//which is its weight less its buoyancy; the pressure gradient that gives the fluid around it its acceleration a, on the ball's volume; that fluid's
-//part in the ball's own acceleration, half the ball's volume of it, which has to move when the ball does (the added mass: the halves); and the drag
-//towards that fluid's velocity, tau = 2 (s + 1/2) r^2 / (9 nu C): Stokes' on a ball, C times over, which is Schiller and Naumann's
-//1 + 0.15 Re^0.687 until the drag coefficient levels (EscapedFlight::bluff). A droplet's s is the density ratio, and all but gravity and the drag is a
-//thousandth of them. A bubble's is 1 over it, and what pulls it is 3 a - 2 g: up at 2 g in liquid at rest, not at all in liquid falling freely, and
-//towards the inside of a turn.
+//that of the fluid around it, and m that of the mixture of the two fluids the grid holds there (mixture, from its share of liquid; 1 in that fluid
+//alone),
+//    (s + 1/2) dv/dt = (s - m) g + (m + 1/2) a + (s + 1/2) (around - v) / tau
+//which is its weight; the pressure gradient on the ball's volume, which is what gives the mixture around it its acceleration a: -grad p = m (a - g),
+//in the fluid's density (with the weight, its weight less its buoyancy where the fluid is at rest); that fluid's part in the ball's own acceleration,
+//half the ball's volume of it, which has to move when the ball does (the added mass: the halves); and the drag towards that fluid's velocity,
+//tau = 2 (s + 1/2) r^2 / (9 nu C): Stokes' on a ball, C times over, which is Schiller and Naumann's 1 + 0.15 Re^0.687 until the drag coefficient
+//levels (EscapedFlight::bluff). A droplet's s is the density ratio, and all but gravity and the drag is a thousandth of them. A bubble's is 1 over
+//it, and what pulls it in liquid alone is 3 a - 2 g: up at 2 g in liquid at rest, not at all in liquid falling freely, and towards the inside of a
+//turn. In a froth the mixture weighs less than the liquid, and so does the pressure gradient holding it up: bubbles crowded together rise slower than
+//one alone (2 to 3 mm bubbles, 0.23 m/s alone, 0.19 in a froth 30% air and 0.17 in one half air), as two-fluid models have the buoyancy of the
+//dispersed phase, and that's most of what slows a swarm.
 //The fluid's velocity and acceleration are the grid's where the substep finds the particle, and the equation is solved exactly for those and one tau:
 //the one its speed through that fluid at the end of the substep gives. The drag sets that speed and the speed the drag, so it's the speed the two agree
 //on, found by halving. A bubble's tau is some milliseconds, often less than the substep: by the tau of the speed it starts with, it ends one substep
@@ -186,7 +197,7 @@ struct EscapedPath{
     float start[3], around[3], pull[3];     //its velocity as it starts, the velocity of the fluid around it, and what pulls it other than the drag
     double tau;
 
-    __device__ EscapedPath(float3 velocity, float3 aroundVelocity, float3 aroundAcceleration, const EscapedFlight& flight, float dt)
+    __device__ EscapedPath(float3 velocity, float3 aroundVelocity, float3 aroundAcceleration, const EscapedFlight& flight, float dt, float mixture = 1.0f)
     : start{velocity.x, velocity.y, velocity.z}
     , around{aroundVelocity.x, aroundVelocity.y, aroundVelocity.z}
     {
@@ -197,7 +208,7 @@ struct EscapedPath{
         float fastest = 0.0f, pulled = 0.0f;
         #pragma unroll
         for(int axis = 0; axis < 3; ++axis){
-            pull[axis] = ((flight.density - 1.0f)*gravity[axis] + 1.5f*acceleration[axis]) / heavy;
+            pull[axis] = ((flight.density - mixture)*gravity[axis] + (mixture + 0.5f)*acceleration[axis]) / heavy;
             through[axis] = start[axis] - around[axis];
             fastest += through[axis]*through[axis];
             pulled += pull[axis]*pull[axis];

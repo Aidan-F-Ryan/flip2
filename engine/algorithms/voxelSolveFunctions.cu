@@ -141,25 +141,29 @@ __global__ void extrapolateAirFaces(uint numUsedVoxels, const char* solveCodes, 
 void cudaExtrapolateUnreachedFaces(const CudaVec<char>& solveCodes, const CudaVec<uint>& neighborNx, const CudaVec<uint>& neighborPx, const CudaVec<uint>& neighborNy, const CudaVec<uint>& neighborPy, const CudaVec<uint>& neighborNz, const CudaVec<uint>& neighborPz,
     const CudaVec<float>& voxelWeightsX, const CudaVec<float>& voxelWeightsY, const CudaVec<float>& voxelWeightsZ, CudaVec<float>& voxelsUx, CudaVec<float>& voxelsUy, CudaVec<float>& voxelsUz,
     PartitionContext& context, cudaStream_t stream){
-    if(solveCodes.size() == 0){
-        return;
-    }
+    uint numVoxels = solveCodes.size();     //none in a partition the fluid hasn't reached, which still takes its turn in the ghosts' exchanges below
     unsigned char* marks;
-    gpuErrchk(cudaMallocAsync((void**)&marks, solveCodes.size(), stream));
+    gpuErrchk(cudaMallocAsync((void**)&marks, numVoxels > 0 ? numVoxels : 1, stream));
     for(int pass = 0; pass < EXTRAPOLATION_PASSES; ++pass){
-        extrapolateUnreachedFaces<<<solveCodes.size() / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(solveCodes.size(), solveCodes.devPtr(), neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(), neighborPy.devPtr(), neighborNz.devPtr(), neighborPz.devPtr(),
-            voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), pass == 0, marks, voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr());
+        if(numVoxels > 0){
+            extrapolateUnreachedFaces<<<numVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numVoxels, solveCodes.devPtr(), neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(), neighborPy.devPtr(), neighborNz.devPtr(), neighborPz.devPtr(),
+                voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), pass == 0, marks, voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr());
+        }
         for(CudaVec<float>* velocity : {&voxelsUx, &voxelsUy, &voxelsUz}){
             context.fillGhosts(velocity->devPtr(), stream);
         }
         if(pass + 1 < EXTRAPOLATION_PASSES){    //and the ghosts' marks, as their owners have them, for the next pass
-            settleFaceMarks<<<solveCodes.size() / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(solveCodes.size(), marks);
+            if(numVoxels > 0){
+                settleFaceMarks<<<numVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numVoxels, marks);
+            }
             context.fillGhosts((char*)marks, stream);
         }
     }
     gpuErrchk(cudaFreeAsync(marks, stream));
-    extrapolateAirFaces<<<solveCodes.size() / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(solveCodes.size(), solveCodes.devPtr(), neighborNx.devPtr(), neighborNy.devPtr(), neighborNz.devPtr(),
-        voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr());
+    if(numVoxels > 0){
+        extrapolateAirFaces<<<numVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numVoxels, solveCodes.devPtr(), neighborNx.devPtr(), neighborNy.devPtr(), neighborNz.devPtr(),
+            voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr());
+    }
     for(CudaVec<float>* velocity : {&voxelsUx, &voxelsUy, &voxelsUz}){
         context.fillGhosts(velocity->devPtr(), stream);
     }

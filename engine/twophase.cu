@@ -100,11 +100,14 @@ __global__ void settleFacesOfOneFluid(uint numVoxels, const float* massX, const 
 //one. In a voxel an obstacle's surface passes near (near not nullptr), part of each face's reach is inside the obstacle the same way, with no telling
 //how much: there it's over what both fluids weigh on the faces instead, the room the obstacle leaves. Against the density at rest, the half voxel of
 //water over a paddle's top read as too thin for the grid, and so did the water in the voxels a pillar cuts at the waterline: droplets, falling down its
-//side. A voxel obstacles close has no room for either fluid, and no share (closed not nullptr): what isn't liquid there isn't air
+//side. A voxel obstacles close has no room for either fluid, and no share (closed not nullptr): what isn't liquid there isn't air.
+//With escaping particles (resolved not nullptr) each voxel's bits for the air the grid resolves start here (resolveAir): AIR_CORE where there's air
+//and the liquid is at most ESCAPE_SHARE of what both fluids weigh on its faces, which needs no room (a voxel with nothing in it, as inside an
+//obstacle, isn't air)
 __global__ void findLiquidShare(uint numVoxels, const char* solveCodes, const uint* neighborNx, const uint* neighborPx, const uint* neighborNy, const uint* neighborPy,
                                 const uint* neighborNz, const uint* neighborPz, const char* near, const char* closed,
                                 const float* massX, const float* massY, const float* massZ, const int* liquidX, const int* liquidY, const int* liquidZ, float liquidUnit,
-                                float ratio, float rest, float* share){
+                                float ratio, float rest, float* share, char* resolved){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
     if(index < numVoxels){
         const uint* lower[3] = {neighborNx, neighborNy, neighborNz};
@@ -115,10 +118,10 @@ __global__ void findLiquidShare(uint numVoxels, const char* solveCodes, const ui
         #pragma unroll
         for(int axis = 0; axis < 3; ++axis){
             int low = 2, high = 2;  //the voxels between this one and the wall below it, and above: 2 for any more, which no face's reach crosses
-            if(solveCodes[index]){
+            if(solveCodes[index]){  //an unknown's neighbours are its own to read, and so are an unknown neighbour's: anything else's upper ones were never written
                 uint below = lower[axis][index], above = upper[axis][index];
-                low = below == WALL_VOXEL ? 0 : below < WALL_VOXEL && lower[axis][below] == WALL_VOXEL ? 1 : 2;
-                high = above == WALL_VOXEL ? 0 : above < WALL_VOXEL && upper[axis][above] == WALL_VOXEL ? 1 : 2;
+                low = below == WALL_VOXEL ? 0 : below < WALL_VOXEL && solveCodes[below] && lower[axis][below] == WALL_VOXEL ? 1 : 2;
+                high = above == WALL_VOXEL ? 0 : above < WALL_VOXEL && solveCodes[above] && upper[axis][above] == WALL_VOXEL ? 1 : 2;
             }
             inside[axis][0] = 1.0f - pastWall(2*low) - pastWall(2*high + 2);
             inside[axis][1] = 1.0f - pastWall(2*low + 1) - pastWall(2*high + 1);
@@ -141,7 +144,54 @@ __global__ void findLiquidShare(uint numVoxels, const char* solveCodes, const ui
             }
         }
         bool beside = near != nullptr && (near[index] & NEAR_SURFACE);
-        share[index] = closed != nullptr && closed[index] ? nanf("") : beside ? (ofBoth > 0.0f ? ofLiquid / ofBoth : 0.0f) : ofLiquid / (room*rest);
+        bool shut = closed != nullptr && closed[index];
+        share[index] = shut ? nanf("") : beside ? (ofBoth > 0.0f ? ofLiquid / ofBoth : 0.0f) : ofLiquid / (room*rest);
+        if(resolved != nullptr){
+            resolved[index] = !shut && ofBoth > ofLiquid && ofLiquid <= ESCAPE_SHARE*ofBoth ? AIR_CORE : 0;
+        }
+    }
+}
+
+//Which air the grid resolves (escaping particles, particles.hu): a block per stored node, whose block of voxels, its own and its apron's, takes
+//each stored voxel's AIR_CORE from its owner (none where no voxel is stored: past what the particles' stencils reach, or inside an obstacle), and
+//each of the node's own voxels with AIR_CORE in it or in any of the 26 around it, all in the node's block, is AIR_RESOLVED. Reading only AIR_CORE,
+//the other nodes' blocks read the same meanwhile.
+//By a voxel nearly free of liquid, the grid's surface between the fluids spread as particles' B-spline weights spread it, a structure of air has
+//to be about three voxels across to have one at all. Judged instead by a 2x2x2 block of voxels at least half air, a dam break's froth (voxels 25 to
+//75% air) held such blocks all through it, and it kept them: with the voxels beside them it was all "resolved", and never cleared. The voxels beside
+//the ones free of liquid are the surface's: without them over calm water and at a ball of air's surface, the air in the voxels the surface passes
+//through would escape there and rejoin a step later
+__global__ void resolveAir(uint numVoxels1D, int apronCells, const uint* numVoxelsEachNode, const uint* voxelIDs, const uint* voxelOwners, char* bits){
+    extern __shared__ char cores[];     //per slot of the node's block: whether it's AIR_CORE
+    int voxels1D = numVoxels1D;
+    int voxels3D = voxels1D*voxels1D*voxels1D;
+    uint startVoxel = blockIdx.x == 0 ? 0 : numVoxelsEachNode[blockIdx.x - 1];
+    uint endVoxel = numVoxelsEachNode[blockIdx.x];
+    for(int slot = threadIdx.x; slot < voxels3D; slot += blockDim.x){
+        cores[slot] = 0;
+    }
+    __syncthreads();
+    for(uint i = startVoxel + threadIdx.x; i < endVoxel; i += blockDim.x){
+        cores[voxelIDs[i]] = (bits[voxelOwners[i]] & AIR_CORE) != 0;
+    }
+    __syncthreads();
+    for(uint i = startVoxel + threadIdx.x; i < endVoxel; i += blockDim.x){
+        int slot = voxelIDs[i];
+        int x = slot % voxels1D, y = slot / voxels1D % voxels1D, z = slot / (voxels1D*voxels1D);
+        if(x < apronCells || y < apronCells || z < apronCells || x >= voxels1D - apronCells || y >= voxels1D - apronCells || z >= voxels1D - apronCells){
+            continue;   //the apron's voxels are other nodes' to set
+        }
+        bool beside = false;
+        for(int dz = -1; dz <= 1; ++dz){
+            for(int dy = -1; dy <= 1; ++dy){
+                for(int dx = -1; dx <= 1; ++dx){
+                    beside = beside || cores[slot + dx + dy*voxels1D + dz*voxels1D*voxels1D];
+                }
+            }
+        }
+        if(beside){
+            bits[i] |= AIR_RESOLVED;
+        }
     }
 }
 
@@ -224,11 +274,21 @@ void Particles::findFaceDensities(){
         context->fillGhosts(lightness, stream);
     }
     if(twoPhase.escaping() || whitewater.on){   //from the faces as the ghosts' exchange left them: a voxel's upper faces are its neighbours'
+        char* resolved = twoPhase.escaping() ? airResolved.devPtr() : nullptr;
         findLiquidShare<<<blocks, BLOCKSIZE, 0, stream>>>(numVoxels, solveCodes.devPtr(), neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(), neighborPy.devPtr(),
             neighborNz.devPtr(), neighborPz.devPtr(), beside ? obstacleNear.devPtr() : nullptr, beside ? obstacleSolids.devPtr() : nullptr, voxelWeightsX.devPtr(),
             voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), (const int*)liquidWeights[0].devPtr(), (const int*)liquidWeights[1].devPtr(), (const int*)liquidWeights[2].devPtr(),
-            liquidWeightUnit, ratio, (float)restParticlesPerVoxel, liquidShare.devPtr());
+            liquidWeightUnit, ratio, (float)restParticlesPerVoxel, liquidShare.devPtr(), resolved);
         context->fillGhosts(liquidShare.devPtr(), stream);
+        if(twoPhase.escaping()){    //and which air the grid resolves, over every stored node, each reading its neighbours as their owners left them (a partition
+                                    //with no voxels has nothing to resolve, and still takes its turn in the exchanges)
+            context->fillGhosts(resolved, stream);
+            if(numStoredNodes > 0){
+                resolveAir<<<numStoredNodes, 64, numVoxelsPerNode, stream>>>(numVoxels1D, (int)std::floor(radius), nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(),
+                    voxelOwners.devPtr(), resolved);
+            }
+            context->fillGhosts(resolved, stream);
+        }
     }
     gpuErrchk(cudaPeekAtLastError());
 }

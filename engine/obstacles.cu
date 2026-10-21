@@ -2445,30 +2445,35 @@ __global__ void mixCutFaces(Obstacles obstacles, VoxelPlaces places, const uint*
 }
 
 void Particles::mixObstacleFaces(CudaVec<float>& ux, CudaVec<float>& uy, CudaVec<float>& uz, float frictionShare){
-    if(obstacles.count() == 0 || numOwnNodes == 0){
+    if(obstacles.count() == 0){
         return;
     }
-    //the faces as they are, which the mix reads its neighbours' from while it writes: the ghosts' their owners', so every partition reads the same
+    //the faces as they are, which the mix reads its neighbours' from while it writes: the ghosts' their owners', so every partition reads the same. A
+    //partition with no nodes of its own has nothing to mix, and still takes its turn in the ghosts' exchanges
     CudaVec<float>* velocity[3] = {&ux, &uy, &uz};
     for(int dim = 0; dim < 3; ++dim){
         context->fillGhosts(velocity[dim]->devPtr(), stream);
         if(ghostBefore[dim].size() < ux.size()){
             ghostBefore[dim].resizeAsync(ux.size(), stream);
         }
-        gpuErrchk(cudaMemcpyAsync(ghostBefore[dim].devPtr(), velocity[dim]->devPtr(), sizeof(float)*ux.size(), cudaMemcpyDeviceToDevice, stream));
+        if(ux.size() > 0){
+            gpuErrchk(cudaMemcpyAsync(ghostBefore[dim].devPtr(), velocity[dim]->devPtr(), sizeof(float)*ux.size(), cudaMemcpyDeviceToDevice, stream));
+        }
     }
-    mixCutFaces<<<obstacleBlocks(), OBSTACLE_THREADS, 0, stream>>>(obstacles.state(), voxelPlaces(), obstacleNodes.devPtr(), numOwnNodes, numUsedGridNodes, cellToNode.devPtr(),
-        nodeInteriorVoxels.devPtr(), obstacleSolids.devPtr(), obstacleNear.devPtr(), obstacleOpen.devPtr(), obstacleCentroids.devPtr(), viscosity > 0.0 ? (float)wallStick() : 0.0f, ghostBefore[0].devPtr(),
-        ghostBefore[1].devPtr(), ghostBefore[2].devPtr(), ux.devPtr(), uy.devPtr(), uz.devPtr(),
-        bodies.frictionFor(frictionShare, 1.0 / restParticlesPerVoxel, voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr()));
-    gpuErrchk(cudaPeekAtLastError());
+    if(numOwnNodes > 0){
+        mixCutFaces<<<obstacleBlocks(), OBSTACLE_THREADS, 0, stream>>>(obstacles.state(), voxelPlaces(), obstacleNodes.devPtr(), numOwnNodes, numUsedGridNodes, cellToNode.devPtr(),
+            nodeInteriorVoxels.devPtr(), obstacleSolids.devPtr(), obstacleNear.devPtr(), obstacleOpen.devPtr(), obstacleCentroids.devPtr(), viscosity > 0.0 ? (float)wallStick() : 0.0f, ghostBefore[0].devPtr(),
+            ghostBefore[1].devPtr(), ghostBefore[2].devPtr(), ux.devPtr(), uy.devPtr(), uz.devPtr(),
+            bodies.frictionFor(frictionShare, 1.0 / restParticlesPerVoxel, voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr()));
+        gpuErrchk(cudaPeekAtLastError());
+    }
     for(CudaVec<float>* velocity : {&ux, &uy, &uz}){   //the ghost pass next reads the ghosts' faces, as their owners mixed them
         context->fillGhosts(velocity->devPtr(), stream);
     }
 }
 
 void Particles::obstacleGhostVelocities(CudaVec<float>& ux, CudaVec<float>& uy, CudaVec<float>& uz, float frictionShare){
-    if(obstacles.count() == 0 || numOwnNodes == 0){
+    if(obstacles.count() == 0){     //a partition with no nodes of its own sets no faces, and still takes its turn in the ghosts' exchanges
         return;
     }
     int voxels1D = (2<<refinementLevel) + 2*GHOST_REACH;
@@ -2482,14 +2487,16 @@ void Particles::obstacleGhostVelocities(CudaVec<float>& ux, CudaVec<float>& uy, 
         }
     }
     for(int layer = 1; layer <= 2; ++layer){
-        CudaVec<float>* velocity[3] = {&ux, &uy, &uz};
-        for(int dim = 0; dim < 3; ++dim){
-            gpuErrchk(cudaMemcpyAsync(ghostBefore[dim].devPtr(), velocity[dim]->devPtr(), sizeof(float)*ux.size(), cudaMemcpyDeviceToDevice, stream));
+        if(numOwnNodes > 0){
+            CudaVec<float>* velocity[3] = {&ux, &uy, &uz};
+            for(int dim = 0; dim < 3; ++dim){
+                gpuErrchk(cudaMemcpyAsync(ghostBefore[dim].devPtr(), velocity[dim]->devPtr(), sizeof(float)*ux.size(), cudaMemcpyDeviceToDevice, stream));
+            }
+            obstacleGhostFaces<<<obstacleBlocks(), OBSTACLE_THREADS, shared, stream>>>(layer, state, stick, voxelPlaces(), obstacleNodes.devPtr(), numOwnNodes, numUsedGridNodes, cellToNode.devPtr(),
+                nodeInteriorVoxels.devPtr(), obstacleSolids.devPtr(), obstacleNear.devPtr(), ghostBefore[0].devPtr(), ghostBefore[1].devPtr(), ghostBefore[2].devPtr(), ux.devPtr(), uy.devPtr(),
+                uz.devPtr(), bodies.frictionFor(frictionShare, 1.0 / restParticlesPerVoxel, voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr()));
+            gpuErrchk(cudaPeekAtLastError());
         }
-        obstacleGhostFaces<<<obstacleBlocks(), OBSTACLE_THREADS, shared, stream>>>(layer, state, stick, voxelPlaces(), obstacleNodes.devPtr(), numOwnNodes, numUsedGridNodes, cellToNode.devPtr(),
-            nodeInteriorVoxels.devPtr(), obstacleSolids.devPtr(), obstacleNear.devPtr(), ghostBefore[0].devPtr(), ghostBefore[1].devPtr(), ghostBefore[2].devPtr(), ux.devPtr(), uy.devPtr(),
-            uz.devPtr(), bodies.frictionFor(frictionShare, 1.0 / restParticlesPerVoxel, voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr()));
-        gpuErrchk(cudaPeekAtLastError());
         for(CudaVec<float>* velocity : {&ux, &uy, &uz}){   //the next layer, and the ghosts, read what this one wrote
             context->fillGhosts(velocity->devPtr(), stream);
         }

@@ -258,7 +258,7 @@ bool Particles::letGoOfSuction(){
 //with the level set surface, where particles can be in it, the obstacles' faces are carried every substep (carryLetGoFaces)
 void Particles::letGoOfAir(){
     uint numVoxels = voxelIDsUsed.size();
-    if(!lettingGo() || letGo.size() == 0){
+    if(!lettingGo()){   //a partition with no voxels has none to let go of, and still takes its turn in the ghosts' exchange
         return;
     }
     if(numOwnNodes > 0 && numVoxels > 0){
