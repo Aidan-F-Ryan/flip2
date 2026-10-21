@@ -7,7 +7,7 @@
 //  flip2 verify DIR
 //  flip2 export DIR [--frames A-B] [--out DIR] [--overwrite] [--follow] [--format bgeo.sc|bgeo]
 //  flip2 mesh DIR [--frames A-B] [--out DIR] [--overwrite] [--follow] [--format bgeo.sc|bgeo] [--separation S] [--voxel-scale S] [--influence-scale S]
-//             [--radius-scale S] [--smoothing N] [--fields] [--field-voxel-scale S] [--no-surface]
+//             [--radius-scale S] [--smoothing N] [--fields] [--field-voxel-scale S] [--no-surface] [--workers N]
 //  flip2 info
 //
 //bake runs the scene (see scene.hpp) and writes into the output directory its cache (cacheWriter.hu: cache.json, frames/NNNN/, which a DCC can read
@@ -56,6 +56,7 @@
 #include "ncclTransport.hu"
 #endif
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -113,7 +114,7 @@ static int usage(){
                "       flip2 verify DIR\n"
                "       flip2 export DIR [--frames A-B] [--out DIR] [--overwrite] [--follow] [--format bgeo.sc|bgeo]\n"
                "       flip2 mesh DIR [--frames A-B] [--out DIR] [--overwrite] [--follow] [--format bgeo.sc|bgeo] [--separation S] [--voxel-scale S]\n"
-               "                  [--influence-scale S] [--radius-scale S] [--smoothing N] [--fields] [--field-voxel-scale S] [--no-surface]\n"
+               "                  [--influence-scale S] [--radius-scale S] [--smoothing N] [--fields] [--field-voxel-scale S] [--no-surface] [--workers N]\n"
                "       flip2 info\n";
     return 2;
 }
@@ -333,19 +334,50 @@ static std::string frameName(int frame){    //as the cache's folders and the exp
     return name;
 }
 
+//the memory this machine has free for a process to take, in bytes, as Linux counts it (MemAvailable); 0 where it can't be read
+static unsigned long long availableMemory(){
+    std::ifstream meminfo("/proc/meminfo");
+    std::string key;
+    unsigned long long kilobytes = 0;
+    while(meminfo >> key){
+        if(key == "MemAvailable:" && meminfo >> kilobytes){
+            return 1024ULL*kilobytes;
+        }
+        meminfo.ignore(1 << 10, '\n');
+    }
+    return 0;
+}
+
+//the particles frame's commit record says it has, 0 if it can't be read
+static unsigned long long committedParticles(const std::string& directory, int frame){
+    std::string text, record = directory + "/frames/" + frameName(frame) + "/commit.json";
+    try{
+        if(readFile(record, text)){
+            const Json* count = JsonReader(text, record).document().find("particles");
+            return count != nullptr ? (unsigned long long)count->number : 0;
+        }
+    }
+    catch(const std::exception&){
+    }
+    return 0;
+}
+
 //makes files of each of the cache's committed frames, for export and mesh: for every frame from first to last (or the bake's last, if last is -1) one of
 //whose files, targets(frame), is missing or older than the frame's commit record (a resume worked it out again), or every one with overwrite, reads its
 //shards, each checked against its commit record's XXH64, and has make(frame, shards, whitewater, record, targets, why) write them (saying so as an event)
 //or say why not, record being the frame's commit record. follow
 //waits for frames still to come, and for the cache itself if the bake hasn't started it, so a DCC can show a bake's frames as it commits them; it stops
-//when they've all been made. Ends with the event finished, counting the files written as written
+//when they've all been made. Ends with the event finished, counting the files written as written. With workers over 1 it works on up to that many frames
+//at once, each read and made on a thread of its own, which make must allow: fewer when the frames' memory, bytesPerParticle for each particle of the first
+//of them, would come to more than half of what the machine has free (asked each time it looks for frames)
 static int eachCommittedFrame(const std::string& directory, int first, int last, bool overwrite, bool follow, const char* finished, const char* written,
-                              const std::function<std::vector<std::string>(int)>& targets,
+                              int workers, unsigned long long bytesPerParticle, const std::function<std::vector<std::string>(int)>& targets,
                               const std::function<bool(int, const std::vector<ShardData>&, const std::vector<ShardData>&, const Json&, const std::vector<std::string>&,
                                                        std::string&)>& make){
     auto start = std::chrono::steady_clock::now();
     size_t made = 0, problems = 0;
     std::vector<bool> done;     //per frame in range: made, or found already made
+    std::mutex tally;           //made, problems and done, with frames made at once
     for(;;){
         std::string text;
         if(!readFile(directory + "/cache.json", text)){
@@ -374,13 +406,12 @@ static int eachCommittedFrame(const std::string& directory, int first, int last,
         }
         done.resize(end - first + 1, false);
         size_t waiting = 0;
+        std::vector<int> todo;      //committed frames to make
         for(int frame = first; frame <= end; ++frame){
             if(done[frame - first]){
                 continue;
             }
-            std::string name = frameName(frame);
-            std::string record = directory + "/frames/" + name + "/commit.json";
-            std::vector<std::string> files = targets(frame);
+            std::string record = directory + "/frames/" + frameName(frame) + "/commit.json";
             std::error_code missing;
             auto committedAt = std::filesystem::last_write_time(record, missing);
             if(missing){
@@ -388,7 +419,7 @@ static int eachCommittedFrame(const std::string& directory, int first, int last,
                 continue;
             }
             bool current = !overwrite;
-            for(const std::string& file : files){
+            for(const std::string& file : targets(frame)){
                 std::error_code absent;
                 auto madeAt = std::filesystem::last_write_time(file, absent);
                 current = current && !absent && madeAt >= committedAt;
@@ -397,6 +428,19 @@ static int eachCommittedFrame(const std::string& directory, int first, int last,
                 done[frame - first] = true;
                 continue;
             }
+            todo.push_back(frame);
+        }
+        unsigned long long running = std::min<unsigned long long>(std::max(workers, 1), todo.size());
+        if(running > 1 && bytesPerParticle > 0){
+            unsigned long long free = availableMemory(), each = bytesPerParticle*committedParticles(directory, todo[0]);
+            if(free > 0 && each > 0){
+                running = std::max(1ULL, std::min(running, free/2/each));
+            }
+        }
+        auto makeFrame = [&](int frame){
+            std::string name = frameName(frame);
+            std::string record = directory + "/frames/" + name + "/commit.json";
+            std::vector<std::string> files = targets(frame);
             std::string why;
             std::vector<ShardData> shards, whitewater;   //the frame's particles, and its whitewater if the bake made any
             Json commit;
@@ -436,15 +480,41 @@ static int eachCommittedFrame(const std::string& directory, int first, int last,
                 std::error_code ignored;
                 std::filesystem::create_directories(std::filesystem::path(file).parent_path(), ignored);
             }
-            if(why.empty() && make(frame, shards, whitewater, commit, files, why)){
+            bool fine = false;
+            try{
+                fine = why.empty() && make(frame, shards, whitewater, commit, files, why);
+            }
+            catch(const std::exception& error){     //on a thread of its own, nothing above it would catch it
+                why = error.what();
+            }
+            std::lock_guard<std::mutex> lock(tally);
+            done[frame - first] = true;     //made, or not tried again
+            if(fine){
                 ++made;
-                done[frame - first] = true;
             }
             else{
                 ++problems;
-                done[frame - first] = true;     //not tried again
                 event("{\"event\":\"error\",\"message\":" + quoted("frame " + std::to_string(frame) + ": " + why) + "}");
                 std::cerr<<"frame "<<frame<<": "<<why<<"\n";
+            }
+        };
+        if(running <= 1){
+            for(int frame : todo){
+                makeFrame(frame);
+            }
+        }
+        else{
+            std::atomic<size_t> next{0};
+            std::vector<std::thread> pool;
+            for(unsigned long long worker = 0; worker < running; ++worker){
+                pool.emplace_back([&](){
+                    for(size_t index = next++; index < todo.size(); index = next++){
+                        makeFrame(todo[index]);
+                    }
+                });
+            }
+            for(std::thread& thread : pool){
+                thread.join();
             }
         }
         if(!follow || waiting == 0){
@@ -547,7 +617,7 @@ static int exportCache(const std::string& directory, int first, int last, std::s
     if(!makeDirectory(out)){
         return 1;
     }
-    return eachCommittedFrame(directory, first, last, overwrite, follow, "exportDone", "exported", [&](int frame){
+    return eachCommittedFrame(directory, first, last, overwrite, follow, "exportDone", "exported", 1, 0, [&](int frame){
         return std::vector<std::string>{out + "/particles." + frameName(frame) + "." + format};
     }, [&](int frame, const std::vector<ShardData>& shards, const std::vector<ShardData>& whitewater, const Json& record, const std::vector<std::string>& targets,
            std::string& why){
@@ -614,9 +684,12 @@ static int exportCache(const std::string& directory, int first, int last, std::s
 //format as for export): closed quads facing outwards, their points carrying the liquid's velocity v for motion blur. With fields, also OUT/fields.NNNN.vdb, the
 //liquid's fields as Houdini's FLIP outputs them for its whitewater: "surface", a level set, and "vel", its velocity (surface.hu, volumes.hpp); with
 //surface false, only them. The particle separation is the bake's (half its voxel size) unless settings give one. Frames are picked, redone and
-//followed as eachCommittedFrame says
+//followed as eachCommittedFrame says, up to workers at once: each frame's reading, gathering and writing on its thread, and its meshing on the GPU
+//in turns, on one mesher, since that's the least of a frame's time and one mesher's memory is what the GPU can spare beside a bake
+static const unsigned long long MESH_BYTES_PER_PARTICLE = 80;   //what a frame being meshed holds in memory: its shards (P, v, id and age, 36 bytes a
+                                                                //particle), its positions and velocities gathered (24) and its mesh and file (under 20)
 static int meshCache(const std::string& directory, int first, int last, std::string out, bool overwrite, bool follow, const std::string& format,
-                     SurfaceSettings settings, bool surface, bool fields, const FieldSettings& fieldSettings){
+                     SurfaceSettings settings, bool surface, bool fields, const FieldSettings& fieldSettings, int workers){
     SurfaceSettings checked = settings;
     if(checked.separation <= 0.0f){
         checked.separation = 1.0f;      //the bake's, which can only be checked once there's a cache
@@ -637,14 +710,14 @@ static int meshCache(const std::string& directory, int first, int last, std::str
     if(!makeDirectory(out)){
         return 1;
     }
-    if(const char* device = std::getenv("FLIP2_DEVICE")){
-        cudaSetDevice(std::atoi(device));
+    int device = -1;    //the GPU FLIP2_DEVICE names, which every thread that meshes has to choose for itself
+    if(const char* chosen = std::getenv("FLIP2_DEVICE")){
+        device = std::atoi(chosen);
+        cudaSetDevice(device);
     }
     std::unique_ptr<SurfaceMesher> mesher;      //made at the first frame, on the GPU: so not at all, if there's nothing to mesh
-    std::vector<float> positions, velocities;
-    SurfaceMesh mesh;
-    FluidFields fluidFields;
-    return eachCommittedFrame(directory, first, last, overwrite, follow, "meshDone", "meshed", [&](int frame){
+    std::mutex turn;                            //the mesher's, and the separation's while it's still to be read from the cache
+    return eachCommittedFrame(directory, first, last, overwrite, follow, "meshDone", "meshed", workers, MESH_BYTES_PER_PARTICLE, [&](int frame){
         std::vector<std::string> files;
         if(surface){
             files.push_back(out + "/surface." + frameName(frame) + "." + format);
@@ -654,26 +727,6 @@ static int meshCache(const std::string& directory, int first, int last, std::str
         }
         return files;
     }, [&](int frame, const std::vector<ShardData>& shards, const std::vector<ShardData>&, const Json&, const std::vector<std::string>& targets, std::string& why){
-        if(settings.separation <= 0.0f){
-            std::string text;
-            const Json* voxelSize = nullptr;
-            Json cache;
-            try{
-                if(readFile(directory + "/cache.json", text)){
-                    cache = JsonReader(text, directory + "/cache.json").document();
-                    voxelSize = cache.find("voxelSize");
-                }
-            }
-            catch(const std::exception& error){
-                why = error.what();
-                return false;
-            }
-            if(voxelSize == nullptr || !(voxelSize->number > 0.0)){
-                why = directory + "/cache.json: no voxelSize, so no particle separation to mesh with";
-                return false;
-            }
-            settings.separation = (float)(voxelSize->number/2.0);
-        }
         unsigned long long particles = 0;
         for(const ShardData& shard : shards){
             const ShardData::Attribute* p = shard.find("P");
@@ -686,8 +739,7 @@ static int meshCache(const std::string& directory, int first, int last, std::str
             }
             particles += shard.particles;
         }
-        positions.resize(3*particles);
-        velocities.resize(3*particles);
+        std::vector<float> positions(3*particles), velocities(3*particles);
         float low[3] = {INFINITY, INFINITY, INFINITY}, high[3] = {-INFINITY, -INFINITY, -INFINITY};
         unsigned long long offset = 0;
         for(const ShardData& shard : shards){   //every shard's planes into one x, y and z plane each
@@ -703,22 +755,57 @@ static int meshCache(const std::string& directory, int first, int last, std::str
             }
             offset += shard.particles;
         }
-        try{
-            if(!mesher){
-                mesher.reset(new SurfaceMesher);
+        SurfaceMesh mesh;
+        FluidFields fluidFields;
+        size_t bandCells = 0;
+        int rounds = 0;
+        double seconds = 0.0, fieldSeconds = 0.0;
+        {
+            std::lock_guard<std::mutex> lock(turn);
+            if(settings.separation <= 0.0f){
+                std::string text;
+                const Json* voxelSize = nullptr;
+                Json cache;
+                try{
+                    if(readFile(directory + "/cache.json", text)){
+                        cache = JsonReader(text, directory + "/cache.json").document();
+                        voxelSize = cache.find("voxelSize");
+                    }
+                }
+                catch(const std::exception& error){
+                    why = error.what();
+                    return false;
+                }
+                if(voxelSize == nullptr || !(voxelSize->number > 0.0)){
+                    why = directory + "/cache.json: no voxelSize, so no particle separation to mesh with";
+                    return false;
+                }
+                settings.separation = (float)(voxelSize->number/2.0);
             }
-            mesher->mesh(positions.data(), velocities.data(), particles, low, high, settings, mesh);
-            if(fields){
-                mesher->fields(fieldSettings, fluidFields);
+            try{
+                if(device >= 0){
+                    cudaSetDevice(device);
+                }
+                if(!mesher){
+                    mesher.reset(new SurfaceMesher);
+                }
+                mesher->mesh(positions.data(), velocities.data(), particles, low, high, settings, mesh);
+                if(fields){
+                    mesher->fields(fieldSettings, fluidFields);     //of the particles it has just meshed
+                }
             }
-        }
-        catch(const std::exception& error){
-            why = error.what();
-            return false;
+            catch(const std::exception& error){
+                why = error.what();
+                return false;
+            }
+            bandCells = mesher->bandCells;
+            rounds = mesher->rounds;
+            seconds = mesher->seconds;
+            fieldSeconds = mesher->fieldSeconds;
         }
         char numbers[200];
         std::snprintf(numbers, sizeof(numbers), ",\"particles\":%llu,\"points\":%zu,\"faces\":%zu,\"bandCells\":%zu,\"rounds\":%d,\"seconds\":%.4f",
-                      particles, mesh.points.size()/3, mesh.quads.size()/4, mesher->bandCells, mesher->rounds, mesher->seconds);
+                      particles, mesh.points.size()/3, mesh.quads.size()/4, bandCells, rounds, seconds);
         std::string said = "{\"event\":\"meshed\",\"frame\":" + std::to_string(frame) + numbers;
         if(surface){
             if(!writeSurfaceBgeo(targets[0], mesh, std::string("flip2 ") + FLIP2_BUILD_ID, why)){
@@ -732,7 +819,7 @@ static int meshCache(const std::string& directory, int first, int last, std::str
                 return false;
             }
             std::snprintf(numbers, sizeof(numbers), ",\"surfaceVoxels\":%zu,\"velocityVoxels\":%zu,\"fieldSeconds\":%.4f,\"writeSeconds\":%.4f,\"fields\":",
-                          fluidFields.distances.size(), fluidFields.velocities.size()/3, mesher->fieldSeconds,
+                          fluidFields.distances.size(), fluidFields.velocities.size()/3, fieldSeconds,
                           std::chrono::duration<double>(std::chrono::steady_clock::now() - writing).count());
             said += numbers + ::quoted(targets.back());
         }
@@ -1069,9 +1156,19 @@ int main(int argc, char** argv){
         FieldSettings fieldSettings;
         bool meshSurface = true, fields = false;
         std::string format = "bgeo.sc";
+        int workers = std::max(1, std::min(8, (int)std::thread::hardware_concurrency()/2));    //frames meshed at once: the GPU's part is small, the rest isn't
         for(int arg = 3; arg < argc; ++arg){
             std::string option = argv[arg];
-            if(option == "--format" && arg + 1 < argc){
+            if(meshing && option == "--workers" && arg + 1 < argc){
+                char* end = nullptr;
+                std::string given = argv[++arg];
+                long count = std::strtol(given.c_str(), &end, 10);
+                if(end == given.c_str() || *end != '\0' || count < 1 || count > 256){
+                    return usage();
+                }
+                workers = (int)count;
+            }
+            else if(option == "--format" && arg + 1 < argc){
                 format = argv[++arg];
                 if(format != "bgeo" && format != "bgeo.sc"){
                     return usage();
@@ -1135,7 +1232,7 @@ int main(int argc, char** argv){
                 return usage();
             }
         }
-        return meshing ? meshCache(argv[2], first, last, out, overwrite, follow, format, surface, meshSurface, fields, fieldSettings)
+        return meshing ? meshCache(argv[2], first, last, out, overwrite, follow, format, surface, meshSurface, fields, fieldSettings, workers)
                        : exportCache(argv[2], first, last, out, overwrite, follow, format);
     }
     if(argc < 3 || (std::string(argv[1]) != "bake" && std::string(argv[1]) != "resume")){
