@@ -8,6 +8,11 @@ One of those settings is the reason to have this at all. flip2's surface carries
 and Karma blurs a moving mesh by them, but only when its Velocity Blur says to, and it starts at No Velocity Blur: a flip2 surface renders with no
 motion blur at all until that's changed. Here it's on.
 
+The liquid gives way to what it overlaps. flip2 mesh carries the water's surface a voxel or so into the collision objects and RBD pieces it touches,
+so that where it meets them there's no water surface of its own to see, and Karma takes, where refractive objects overlap, the one with the highest
+dielectric priority (0 is the highest, and every object's own): the liquid is set to 1, so glass, ice or anything else see-through shows its own
+surface to the water. (With the Solver node's Water at Collisions at Cut, nothing overlaps and the setting does nothing.)
+
 The bake's own whitewater is rendered as its spray points, and each of its foam and bubble points as a cloud of fine specks: a point stands for a
 voxel's worth of bubbles, and drawn as one white ball as wide as the points are apart, a cloud of them reads as polystyrene beads. Houdini's is
 rendered as points as wide as they are apart (its solver's pscale makes each twice that, which renders as beads). The sun is on the
@@ -90,6 +95,12 @@ def create_render(node):
         looks["/" + lop.name()] = look
 
     imported("liquid", node.node("surface"), "water")     #the surface itself, whatever the node's Show says
+    priority = stage.createNode("rendergeometrysettings", prefix + "_liquid_priority")     #under every other object's where they overlap
+    priority.setInput(0, made[-1])
+    priority.parm("primpattern").set("/" + made[-1].name())
+    priority.parm("xn__primvarskarmaobjectdielectricpriority_control_ffcfg").set("set")
+    priority.parm("xn__primvarskarmaobjectdielectricpriority_e1bfg").set(1)
+    made.append(priority)
     folder = os.path.join(node.evalParm("outputdir").rstrip("/"), "bake") if kind == "solver" else node.evalParm("bakedir").rstrip("/")
     own = node.node(importer.WHITEWATER)
     whitewater = node.parent().node(prefix + "_whitewater")
@@ -111,11 +122,14 @@ def create_render(node):
     if pieces is not None and (kind == "import" or (node.parm("rbdsop") is not None and node.evalParm("rbdsop").strip())):
         imported("bodies", pieces, "body")
     centre, size = _domain(node)
-    ground = stage.createNode("cube", prefix + "_ground")       #a slab under the domain, three times as wide
+    #a slab under the domain, three times as wide, its top a thousandth of the domain's height over the floor: the liquid's surface lies flat on the
+    #floor (flip2 mesh cuts it there), so it's inside the slab and hidden. With the slab's top under the floor instead, the liquid's flat bottom is water
+    #over a hair's gap of air, which mirrors the water above it at a grazing look (total internal reflection), as a bright band across its lower part
+    ground = stage.createNode("cube", prefix + "_ground")
     ground.setInput(0, made[-1])
     ground.parm("size").set(1.0)
     ground.parmTuple("s").set((3.0*size[0], 0.01*size[1], 3.0*max(size[2], size[0])))
-    ground.parmTuple("t").set((centre[0], centre[1] - 0.5*size[1] - 0.006*size[1], centre[2]))
+    ground.parmTuple("t").set((centre[0], centre[1] - 0.5*size[1] - 0.004*size[1], centre[2]))
     made.append(ground)
     looks[ground.evalParm("primpath")] = "ground"
     library = stage.createNode("materiallibrary", prefix + "_materials")

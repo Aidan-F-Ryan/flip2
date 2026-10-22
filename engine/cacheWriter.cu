@@ -881,6 +881,13 @@ std::string CacheWriter::cacheJson() const{
     for(size_t i = 0; i < d.partitionPlanes.size(); ++i){
         planes += (i ? "," : "") + std::to_string(d.partitionPlanes[i]);
     }
+    std::string open;       //the domain's faces the fluid can leave by, as the scene names them
+    const char* faces[6] = {"-x", "+x", "-y", "+y", "-z", "+z"};
+    for(int face = 0; face < 6; ++face){
+        if(d.openFaces >> face & 1){
+            open += std::string(open.empty() ? "" : ",") + "\"" + faces[face] + "\"";
+        }
+    }
     std::string bodies;     //with dynamic bodies, each one's name and pivot, in the order the frames' bodies shards have them
     for(size_t body = 0; body < d.bodies.size(); ++body){
         const double* pivot = d.bodies[body].pivot;
@@ -893,7 +900,8 @@ std::string CacheWriter::cacheJson() const{
            std::to_string(lastCheckpoint) + ",\n"
            " \"worldSize\":" + std::to_string(d.worldSize) + ",\"partitionPlanes\":[" + planes + "],\n"
            " \"nodes\":[" + std::to_string(d.nodes[0]) + "," + std::to_string(d.nodes[1]) + "," + std::to_string(d.nodes[2]) + "],\"nodeSize\":" + number(d.nodeSize) +
-           ",\"voxelSize\":" + number(d.voxelSize) + ",\"domainMin\":[" + number(d.domainMin[0]) + "," + number(d.domainMin[1]) + "," + number(d.domainMin[2]) + "],\n"
+           ",\"voxelSize\":" + number(d.voxelSize) + ",\"domainMin\":[" + number(d.domainMin[0]) + "," + number(d.domainMin[1]) + "," + number(d.domainMin[2]) + "],\"open\":[" +
+           open + "],\n"
            " \"gpu\":" + quoted(d.gpu) + ",\"sm\":" + std::to_string(d.sm) + ",\"cudaRuntime\":" + std::to_string(d.cudaRuntime) + ",\"build\":" + quoted(FLIP2_BUILD_ID) + ",\n"
            " \"shards\":{\"format\":\"f2p\",\"version\":1,\"compression\":\"" + (d.compression == "none" ? std::string("none") : "blosc-" + d.compression) + "\","
            "\"attributes\":[{\"name\":\"P\",\"type\":\"float32\",\"components\":3},{\"name\":\"v\",\"type\":\"float32\",\"components\":3}" +

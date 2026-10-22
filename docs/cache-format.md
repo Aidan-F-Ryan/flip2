@@ -52,6 +52,7 @@ DIR/
 | `worldSize` | Ranks (partitions) writing the bake. |
 | `partitionPlanes` | `worldSize + 1` numbers: each rank's first node plane along z, then the last rank's end. Rank *r* holds the particles with node z in `[planes[r], planes[r+1])`. |
 | `nodes`, `nodeSize`, `voxelSize`, `domainMin` | The simulation grid: node counts along x, y, z, node size in metres (4 voxels), voxel size, and the domain's minimum corner. |
+| `open` | The domain's faces the fluid can leave by, as the scene's `domain.open` names them (`"-x"`, `"+x"`, `"-y"`, `"+y"`, `"-z"`, `"+z"`); every other face is a wall. The domain is `domainMin` to `domainMin` + `nodes` × `nodeSize`. Caches written before it have no `open`, and their faces are all taken as walls. |
 | `gpu`, `sm`, `cudaRuntime`, `build` | The GPU and build that made it. |
 | `shards` | `format` `"f2p"`, `version` `1`, `compression` (`"blosc-zstd"`, `"blosc-lz4"` or `"none"`), and the attributes of frame shards. |
 | `whitewater` | Only in a bake with whitewater: `perVoxel`, the number of whitewater particles that stand for one voxel's volume of whitewater. |

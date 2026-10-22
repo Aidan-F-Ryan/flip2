@@ -34,7 +34,9 @@ running bake commits frames to, and export/houdini/ beside it) and logs/. The ba
 surface, its particles or both (Show).
 
 The surface is meshed on the GPU as each frame is committed (flip2 mesh, beside flip2 export), with the Surface tab's settings: closed quads facing
-outwards, their points carrying v for motion blur. Mesh Bake meshes a bake's frames again, with other settings or after a bake made without them.
+outwards, their points carrying v for motion blur, flat against the domain's walls, and carried on into the collisions and RBD pieces where the water
+touches them (or cut at their surfaces: Water at Collisions). Mesh Bake meshes a bake's frames again, with other settings or after a bake made without
+them.
 
 Its outputs: 1, the bake's surface, particles or both (Show); 2, its fluid fields, with Output Fluid Fields (surface, a level set, and vel, as Houdini's
 FLIP outputs them); 3, the domain, and 4, the collisions, both as Houdini's own FLIP nodes make them from the domain, the Collisions input and the RBD
@@ -368,6 +370,15 @@ def _interface(node):
                                                        "the liquid's volume at an influence scale of 3 (0.6 at 2). Less than the influence scale"))
     surface.addParmTemplate(hou.IntParmTemplate("smoothing", "Smoothing", 1, default_value=SURFACE_DEFAULTS["smoothing"], min=0, max=10,
                                                 help="Passes of a smoothing filter over the surface before it's meshed"))
+    surface.addParmTemplate(hou.MenuParmTemplate("surfacesolids", "Water at Collisions", ("overlap", "cut"),
+                                                 ("Overlap (Karma Setup Resolves It)", "Cut at Their Surfaces"), default_value=0,
+                                                 help="Where the water touches a collision object or an RBD piece. Overlap carries the water's surface a "
+                                                      "voxel or so into the object, which hides it; for glass, ice or anything else see-through, flip2 "
+                                                      "Karma Setup gives the water a lower dielectric priority than every other object, so Karma "
+                                                      "renders the object's own surface against the water. Cut stops the water exactly at the "
+                                                      "object's surface: for renderers without dielectric priorities, where the two surfaces in "
+                                                      "one place can show specks with see-through objects. Either way the domain's walls cut the "
+                                                      "water flat, as a cutaway shows it"))
     surface.addParmTemplate(hou.ToggleParmTemplate("outputfields", "Output Fluid Fields", default_value=False,
                                                    help="Write the liquid's surface level set and velocity field each frame too (surface and vel, as Houdini's FLIP "
                                                         "outputs them): the node's second output, for Whitewater Source"))
@@ -1315,6 +1326,8 @@ def _mesh_options(node):
         raise hou.NodeError("the surface's influence scale can be at most 8 times its voxel scale")
     options = ["--format", node.parm("exportformat").evalAsString(), "--voxel-scale", repr(voxel), "--influence-scale", repr(influence),
                "--radius-scale", repr(radius), "--smoothing", str(smoothing)]
+    if node.parm("surfacesolids") is not None and node.parm("surfacesolids").evalAsString() == "cut":    #overlap is flip2 mesh's own
+        options += ["--solids", "cut"]
     if fields:
         if node.evalParm("fieldvoxelscale") <= 0:
             raise hou.NodeError("the fields' voxel scale has to be positive")

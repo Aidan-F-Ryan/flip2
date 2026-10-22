@@ -56,6 +56,7 @@ struct CacheDescription{
     double nodeSize = 0.0;
     double voxelSize = 0.0;
     double domainMin[3] = {0.0, 0.0, 0.0};
+    unsigned int openFaces = 0; //the domain's faces the fluid can leave by (bits: -x, +x, -y, +y, -z, +z); the rest are walls
     std::string gpu;
     int sm = 0;
     int cudaRuntime = 0;
