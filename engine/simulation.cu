@@ -4,6 +4,7 @@
 #include <algorithm>
 #include "diagnostics.hu"
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -84,9 +85,11 @@ Simulation::~Simulation(){
                 cudaEventDestroy(copied);
             }
         }
-        if(index < (int)cacheCopies.size()){
-            for(cudaEvent_t copied : cacheCopies[index]){
-                cudaEventDestroy(copied);
+        for(std::vector<std::vector<cudaEvent_t>>* copies : {&cacheCopies, &whitewaterCopies, &bubbleCopies}){
+            if(index < (int)copies->size()){
+                for(cudaEvent_t copied : (*copies)[index]){
+                    cudaEventDestroy(copied);
+                }
             }
         }
         contexts[index].reset();
@@ -351,13 +354,16 @@ void Simulation::startCache(const std::string& directory, CacheDescription descr
         }
         description.bodies.push_back(about);
     }
+    //with air whose particles escape, frames carry its bubbles, each the air of one particle: as many as a voxel holds at rest make a voxel's worth
+    description.bubblesPerVoxel = first.twoPhase.escaping() ? (int)std::lround(first.restParticlesPerVoxel) : 0;
     cacheWriter = std::make_unique<CacheWriter>(directory, description, ranks, committedBefore, std::move(done));
     cacheCopies.resize(partitions.size());
     whitewaterCopies.resize(partitions.size());
+    bubbleCopies.resize(partitions.size());
     for(size_t index = 0; index < partitions.size(); ++index){
         gpuErrchk(cudaSetDevice(partitions[index]->device()));
         for(int buffer = 0; buffer < cacheWriter->numBuffers(); ++buffer){
-            for(std::vector<std::vector<cudaEvent_t>>* copies : {&cacheCopies, &whitewaterCopies}){
+            for(std::vector<std::vector<cudaEvent_t>>* copies : {&cacheCopies, &whitewaterCopies, &bubbleCopies}){
                 cudaEvent_t copied;
                 gpuErrchk(cudaEventCreateWithFlags(&copied, cudaEventDisableTiming));
                 (*copies)[index].push_back(copied);
@@ -406,12 +412,21 @@ void Simulation::writeCacheFrame(int frame){
     for(uint count : whitewaterCounts){
         whitewaterTotal += count;
     }
-    CacheBodies bodies;     //with dynamic bodies, rank 0's record has them after the whitewater: every partition moves them alike
-    bodies.offset = (fluidBytes + CacheWriter::whitewaterBytes(whitewaterTotal, false) + 7) / 8*8;
+    size_t bubblesAt = (fluidBytes + CacheWriter::whitewaterBytes(whitewaterTotal, false) + 7) / 8*8;
+    std::vector<uint> bubbleCounts;     //with escaping air, each partition's bubbles (counted with its particles), which go in after the whitewater, each on
+    size_t bubbleBytes = 0;             //an 8-byte boundary
+    if(cacheWriter->writesBubbles()){
+        for(const std::unique_ptr<Particles>& partition : partitions){
+            bubbleCounts.push_back(partition->frameBubbleCount());
+            bubbleBytes += (CacheWriter::bubbleBytes(bubbleCounts.back()) + 7) / 8*8;
+        }
+    }
+    CacheBodies bodies;     //with dynamic bodies, rank 0's record has them after the bubbles: every partition moves them alike
+    bodies.offset = bubblesAt + bubbleBytes;
     bodies.count = ranks[0] == 0 ? partitions[0]->bodies.count() : 0;
     int buffer = cacheWriter->acquire(bodies.offset + CacheWriter::bodyBytes(bodies.count));     //emitters and sinks change the count from frame to frame
     char* host = cacheWriter->hostBuffer(buffer);
-    std::vector<CacheShard> shards, whitewater;
+    std::vector<CacheShard> shards, whitewater, bubbles;
     std::vector<cudaEvent_t> copies;
     if(bodies.count > 0){   //on partition 0's stream before its frame's copies, so the event they record has the bodies there too
         gpuErrchk(cudaSetDevice(partitions[0]->device()));
@@ -435,8 +450,17 @@ void Simulation::writeCacheFrame(int frame){
         copies.push_back(whitewaterCopies[index][buffer]);
         offset += CacheWriter::whitewaterBytes(whitewaterCounts[index], false);
     }
+    offset = bubblesAt;
+    for(size_t index = 0; index < bubbleCounts.size(); ++index){
+        Particles& partition = *partitions[index];
+        gpuErrchk(cudaSetDevice(partition.device()));
+        partition.copyFrameBubblesToHost(host + offset, bubbleCopies[index][buffer]);
+        bubbles.push_back({ranks[index], bubbleCounts[index], offset});
+        copies.push_back(bubbleCopies[index][buffer]);
+        offset += (CacheWriter::bubbleBytes(bubbleCounts[index]) + 7) / 8*8;
+    }
     gpuErrchk(cudaSetDevice(partitions[0]->device()));
-    cacheWriter->submit(buffer, frame, partitions[0]->elapsedTime, shards, copies, whitewater, bodies);
+    cacheWriter->submit(buffer, frame, partitions[0]->elapsedTime, shards, copies, whitewater, bodies, bubbles);
 }
 
 void Simulation::writeCheckpoint(int frame){

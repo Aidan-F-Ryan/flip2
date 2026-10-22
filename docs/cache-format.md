@@ -12,6 +12,7 @@ DIR/
   frames/0042/commit.json           frame 42's commit record, written last
   frames/0042/particles.r003.f2p    rank 3's particles at frame 42 (a shard)
   frames/0042/whitewater.r003.f2p   rank 3's whitewater at frame 42, in a bake with whitewater
+  frames/0042/bubbles.r003.f2p      rank 3's bubbles at frame 42, in a bake with air whose particles escape
   frames/0042/bodies.r000.f2p       the dynamic bodies at frame 42, in a bake with any
   checkpoints/0040/ckpt.json        checkpoint 40's record, written last
   checkpoints/0040/state.r003.f2p   rank 3's whole state at the end of frame 40 (a shard)
@@ -24,8 +25,9 @@ DIR/
 - Frame and checkpoint directories are named by frame number in decimal, zero-padded to at least 4 digits. Frame 0 is the initial state.
 - Shards are named `<base>.r<rank>.f2p`, with the rank zero-padded to at least 3 digits. Each rank writes its own. A frame has one shard per rank, and every particle is in exactly one of them.
 - A bake with whitewater also has one `whitewater` shard per rank in every frame and checkpoint, even when it holds no particles. See [Whitewater](#whitewater).
+- A bake with air whose particles escape (a scene with an `air` block, unless its `escaped` is false) also has one `bubbles` shard per rank in every frame, even when it holds none. Checkpoints have none: their state shards hold the air already. See [Bubbles](#bubbles).
 - A bake with dynamic obstacles also has one `bodies` shard in every frame, and a `bodies` and a `contacts` shard in every checkpoint, all rank 0's: every rank moves the bodies alike. In them each element is a body or a contact rather than a particle. See [Dynamic bodies](#dynamic-bodies).
-- Readers ignore any other file. Files ending in `.tmp` are writes in progress. `particles.rNNN.json`, `state.rNNN.json` and `whitewater.rNNN.json` are notes ranks leave for rank 0 while committing; they aren't part of the format and may or may not be there.
+- Readers ignore any other file. Files ending in `.tmp` are writes in progress. `particles.rNNN.json`, `state.rNNN.json`, `whitewater.rNNN.json` and `bubbles.rNNN.json` are notes ranks leave for rank 0 while committing; they aren't part of the format and may or may not be there.
 
 ## Reading while the bake runs
 
@@ -56,6 +58,7 @@ DIR/
 | `gpu`, `sm`, `cudaRuntime`, `build` | The GPU and build that made it. |
 | `shards` | `format` `"f2p"`, `version` `1`, `compression` (`"blosc-zstd"`, `"blosc-lz4"` or `"none"`), and the attributes of frame shards. |
 | `whitewater` | Only in a bake with whitewater: `perVoxel`, the number of whitewater particles that stand for one voxel's volume of whitewater. |
+| `bubbles` | Only in a bake with air whose particles escape: `perVoxel`, the number of bubbles that stand for one voxel's volume of air (each is one air particle's). |
 | `bodies` | Only in a bake with dynamic obstacles: one object per body, in the order the scene lists them and the frames' `bodies` shards hold them. `name` is the obstacle's `name` in the scene, or `""`. `pivot` is its centre of mass in its own space (the space its shape is given in), in metres, which its orientation turns it about. |
 
 ## commit.json
@@ -75,6 +78,8 @@ DIR/
 - the bounds of its positions.
 
 In a bake with whitewater the record also has `"whitewater":{"particles":310000,"shards":[...]}`: the frame's whitewater particle count, and its shards listed the same way.
+
+In a bake with air whose particles escape the record also has `"bubbles":{"particles":21000,"shards":[...]}`: the frame's bubble count, and its shards listed the same way.
 
 In a bake with dynamic obstacles the record also has `"bodies":{"count":12,"shards":[...]}`: how many bodies there are, and the frame's `bodies` shard, listed the same way. See [Dynamic bodies](#dynamic-bodies).
 
@@ -174,6 +179,27 @@ A scene with a `whitewater` block bakes spray, foam and bubbles as a second set 
 
 **The particle limit.** `whitewater.maxParticles` in the scene limits how many each rank holds. At the limit the bake makes fewer new particles, thinned evenly over the surface, and reports how many it left out: in the `frame` events on its standard output as `whitewaterDropped`, and in the diagnostics file. A bake that reaches the limit gives different whitewater on a different number of ranks, since each rank has its own limit. The liquid is never affected.
 
+## Bubbles
+
+A scene with an `air` block simulates the air as particles too. Air the grid can't resolve, mixed into the liquid finer than its voxels, leaves the grid and flies through the liquid as bubbles until it reaches air the grid resolves again. A frame's particle shards hold the liquid alone. The bubbles are in their own shards, `bubbles.rNNN.f2p`, beside each frame's particle shards, with the same header and layout. Air the grid resolves isn't in the frames: its pockets are the holes in the liquid.
+
+**Frame bubbles shards** have these attributes:
+
+| Name | Type | Components | Meaning |
+|---|---|---|---|
+| `P` | float32 | 3 | position in metres |
+| `v` | float32 | 3 | velocity in metres per second |
+| `id` | uint64 | 1 | the bubble's id (below) |
+| `radius` | float32 | 1 | the radius of the bubble it flies as, in metres: the scene's `air.bubbleRadius`, or a ball of one particle's air |
+
+**What a bubble is.** Each one is the air of one particle: a voxel's volume divided by `cache.json`'s `bubbles.perVoxel`. That sets how large to draw it, as for whitewater: `flip2 export` writes half of `voxelSize / cbrt(perVoxel)` as `pscale`. A bubble is drawn best as a cloud of much finer ones, as whitewater's bubbles are.
+
+**Ids.** A bubble's id is its air particle's number. The air a scene starts with is numbered after the liquid, in the order the scene gives it. Air the bake makes later takes a number when a frame first finds it a bubble: a hash of where it is, the same however the domain is split. A particle keeps its number from then on, through any number of times it leaves and rejoins the grid. Air ids are separate from the liquid's and the whitewater's, and two bubbles can share one, rarely. `flip2 export` writes them to Houdini as int32 `id`.
+
+**Order.** As with the liquid, concatenating a frame's bubbles shards in rank order gives the order a single partition would have held them in.
+
+`flip2 export` writes each frame's bubbles as `bubbles.NNNN.bgeo.sc`, points as the whitewater's bubbles are: `P`, `v`, `id`, `radius`, `pscale`, `kind` 2 and `life` 0.
+
 ## Dynamic bodies
 
 A scene's dynamic obstacles move with the liquid, which moves them. Their shards have the usual header and layout, with an element per body (or per contact) in place of a particle, and the header's particle count the number of them.
@@ -220,7 +246,7 @@ Version 1 is frozen. Later versions keep these rules:
 - **Adding an attribute** to frame or checkpoint shards doesn't change any version. Particle ids arrived this way, as `id` of type uint64, with `age` and `birth`.
 - **Readers skip attributes they don't know,** including ones whose type is reserved above. They rely only on the attributes listed here.
 - **Adding a key** to a JSON record doesn't change its version. Readers ignore keys they don't know.
-- **Adding a kind of shard** beside a frame's or a checkpoint's doesn't change any version. Whitewater arrived this way, listed under its own key in the records.
+- **Adding a kind of shard** beside a frame's or a checkpoint's doesn't change any version. Whitewater and bubbles arrived this way, each listed under its own key in the records.
 - **Any other change bumps a version:**
   - the shard header's `version`, for a change to its binary layout;
   - the record's `version`, for a change to a JSON record's meaning.

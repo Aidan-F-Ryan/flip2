@@ -94,6 +94,7 @@ private:
     std::unique_ptr<CacheWriter> cacheWriter;       //writes the cache from a background thread, in every process
     std::vector<std::vector<cudaEvent_t>> cacheCopies;  //per partition here, per cache buffer, as frameCopies
     std::vector<std::vector<cudaEvent_t>> whitewaterCopies;     //and the same for its whitewater's part of the buffer
+    std::vector<std::vector<cudaEvent_t>> bubbleCopies;         //and its bubbles'
     std::vector<uint> planes;   //each rank's first node plane along z, and the last one's end (setDomain)
     CudaVec<float> gatheredFrame;   //across processes, where rank 0 gathers every rank's positions
     double lastFrameSeconds = 0.0;  //wall time of the last solveFrame, for diagnostics

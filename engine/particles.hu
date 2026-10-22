@@ -167,8 +167,17 @@ public:
         return twoPhase.on ? PARTICLE_NUMBER : 0xFFFFFFFFu;
     }
     //how many of this partition's particles a cache frame takes, which copyFrameColumnsToHost then packs: all of them, or with air the liquid's alone
-    //(nothing that reads a frame has a use for the air). With air it counts them, waiting for the GPU
+    //(the air's own frames are its bubbles, below). With air it counts them, and with air whose particles escape its bubbles too, waiting for the GPU once
     uint countFrameParticles();
+    //with air whose particles escape: how many of this partition's countFrameParticles found to be bubbles, the air's particles flying through the
+    //liquid on their own (ESCAPED_PARTICLE), which a cache frame carries beside the liquid's and copyFrameBubblesToHost packs. A bubble without a
+    //number took one then (flagBubbles), so the frames after tell it by its id
+    uint frameBubbleCount() const{
+        return frameBubbles;
+    }
+    //those bubbles for the cache, into pinned host memory (CacheWriter::bubbleBytes): float32 P x, y, z and v x, y, z, the id (64 bits) and the radius
+    //each flies as, each a plane of every bubble's value, recording copied once they're there
+    void copyFrameBubblesToHost(char* host, cudaEvent_t copied);
     //this partition's whole state for a checkpoint, into pinned host memory (CacheWriter::checkpointBytes), recording copied once it's there
     void copyCheckpointToHost(char* host, cudaEvent_t copied);
     //carries on from a checkpoint taken at time, after substep substeps, in place of initialize: its particles set as setParticles does
@@ -631,6 +640,9 @@ private:
     CudaVec<float> frameColumns;            //a frame's P and v planes, packed for the cache's copy to the host
     CudaVec<uint> frameEnds;                //with air, per particle: how many of the particles up to and including it are the liquid's (countFrameParticles)
     uint frameParticles = 0;                //and how many there are in all
+    CudaVec<uint> bubbleEnds;               //with escaping air, per particle: how many of the particles up to and including it are bubbles (countFrameParticles)
+    uint frameBubbles = 0;                  //and how many there are in all
+    double particleBall() const;            //the radius of a ball of the fluid one particle stands for at rest: an escaped one's, unless the scene gives one
     cudaStream_t frameStream = nullptr;     //copies frames to the host alongside the simulation
     cudaEvent_t framePacked = nullptr;
     cudaEvent_t frameCopied = nullptr;      //framePositions has been copied out, so it can take the next frame

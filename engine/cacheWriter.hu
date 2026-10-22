@@ -24,6 +24,9 @@
 //  frames/0042/commit.json             written last, by rank 0, once every rank's shard is on the disk: each shard's size and XXH64. A frame without one
 //                                      is unfinished, and a reader skips it
 //  frames/0042/whitewater.r003.f2p     with whitewater (whitewater.hu), rank 3's at frame 42, a shard beside its particles', in the same commit record
+//  frames/0042/bubbles.r003.f2p        with air whose particles escape (particles.hu, ESCAPED_PARTICLE), rank 3's bubbles at frame 42: the air's
+//                                      particles flying through the liquid on their own, as the liquid's are in particles.r003.f2p (a checkpoint's
+//                                      state has them already: it holds the air too)
 //  checkpoints/0040/state.r003.f2p     rank 3's whole state at the end of frame 40, as a shard: what flip2 resume carries on from, exactly
 //  checkpoints/0040/whitewater.r003.f2p    and its whitewater's
 //  frames/0042/bodies.r000.f2p         with dynamic bodies (bodies.hu), where each is and how it moves at frame 42, by rank 0, as a shard of one element a
@@ -43,6 +46,8 @@
 //from a simulation are noisy: losslessly P and v come to about 17 bytes a particle (1.4x) with zstd and 18.5 with lz4, measured on the dam break.
 //A frame's whitewater: "P", "v", "id" and "age" as the particles', then float32 "life" (the seconds it has left as foam), "radius" (the droplet's or
 //the bubble's, metres) and "kind" (0 spray, 1 foam, 2 a bubble). A checkpoint's: "P" as float64, "id", "v", "birth", "life", "radius", "kind".
+//A frame's bubbles: "P" and "v" as the particles', "id" (its air particle's number, which the air the scene seeded has from the start and any other
+//takes when a frame first finds it a bubble, and keeps) and float32 "radius" (the bubble's it flies as, metres).
 //A frame's bodies, in the scene's order, all float64: "P" (its centre of mass), "orient" (its turn from where it rests, a quaternion w x y z), "v" and
 //"w" (its angular velocity). A checkpoint's: every field of each body's state and each contact's, as the engine has them (Bodies::checkpoint)
 struct CacheDescription{
@@ -65,6 +70,8 @@ struct CacheDescription{
     bool ages = true;           //and "age"
     int keepCheckpoints = 2;    //the newest ones kept; older ones are deleted once a newer one is down
     int whitewaterPerVoxel = 0; //with whitewater, the particles a voxel's volume of it is drawn as, which sizes them for whatever draws them; 0 with none
+    int bubblesPerVoxel = 0;    //with air whose particles escape, which frames' bubbles then are: how many of them make a voxel's volume of air (each is
+                                //one particle's), which sizes them for whatever draws them; 0 with none
     struct Body{                //a dynamic body, as every frame's record names it (bodies.hu)
         std::string name;       //its obstacle's in the scene
         double pivot[3];        //its centre of mass in its own space, which its frames turn it about
@@ -151,6 +158,9 @@ public:
     static size_t whitewaterBytes(size_t particles, bool checkpoint){   //a rank's whitewater, in a frame or a checkpoint
         return (checkpoint ? 3*sizeof(double) + sizeof(uint64_t) + 7*sizeof(float) : 6*sizeof(float) + sizeof(uint64_t) + 4*sizeof(float))*particles;
     }
+    static size_t bubbleBytes(size_t particles){    //a rank's bubbles in a frame
+        return (6*sizeof(float) + sizeof(uint64_t) + sizeof(float))*particles;
+    }
     static size_t checkpointBytes(size_t particles, bool apic){
         return (3*sizeof(double) + 3*sizeof(float) + (apic ? 9*sizeof(float) : 0) + sizeof(uint64_t) + sizeof(float))*particles;
     }
@@ -163,6 +173,9 @@ public:
     bool writesAges() const{
         return description.ages;
     }
+    bool writesBubbles() const{
+        return description.bubblesPerVoxel > 0;
+    }
 
     int numBuffers() const{
         return (int)hostBuffers.size();
@@ -172,9 +185,10 @@ public:
         return hostBuffers[buffer];
     }
     //writes and commits frame (at time seconds in) once every event in copies has completed; the events mustn't be recorded again until the buffer is free.
-    //whitewater: with whitewater, each rank's part of it in the same buffer, after the particles'; bodies: with dynamic bodies, rank 0's, in it too
+    //whitewater: with whitewater, each rank's part of it in the same buffer, after the particles'; bodies: with dynamic bodies, rank 0's, in it too;
+    //bubbles: with escaping air, each rank's, in it too
     void submit(int buffer, int frame, double time, const std::vector<CacheShard>& shards, const std::vector<cudaEvent_t>& copies, const std::vector<CacheShard>& whitewater = {},
-                const CacheBodies& bodies = {});
+                const CacheBodies& bodies = {}, const std::vector<CacheShard>& bubbles = {});
     void submitCheckpoint(int buffer, int frame, const CheckpointState& state, const std::vector<CacheShard>& shards, const std::vector<cudaEvent_t>& copies,
                           const std::vector<CacheShard>& whitewater = {});
     void flush();           //waits until every job submitted is written and committed, or has failed
@@ -196,6 +210,7 @@ private:
         std::vector<cudaEvent_t> copies;
         std::vector<CacheShard> whitewater;
         CacheBodies bodies;         //a frame's
+        std::vector<CacheShard> bubbles;    //a frame's
     };
     struct ShardRecord{
         int rank = 0;
@@ -214,8 +229,9 @@ private:
     std::string shardsJson(const std::vector<ShardRecord>& records, const char* base) const;
     std::string whitewaterJson(const std::vector<ShardRecord>& whitewater, const std::string& more = "") const;
     std::string countedJson(const char* key, const std::vector<ShardRecord>& shards, const char* base) const;   //the bodies' or contacts' part of a record
+    std::string bubblesJson(const std::vector<ShardRecord>& bubbles) const;
     bool commit(const std::string& frameDirectory, int frame, double time, const std::vector<ShardRecord>& records, const std::vector<ShardRecord>& whitewater,
-                const std::vector<ShardRecord>& bodies);
+                const std::vector<ShardRecord>& bodies, const std::vector<ShardRecord>& bubbles);
     bool commitCheckpoint(const std::string& checkpointDirectory, const Job& job, const std::vector<ShardRecord>& records, const std::vector<ShardRecord>& whitewater,
                           const std::vector<ShardRecord>& bodies, const std::vector<ShardRecord>& contacts);
     void pruneCheckpoints();

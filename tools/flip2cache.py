@@ -102,14 +102,16 @@ def _column(planes, kind="f"):
     return columns
 
 
-def read_frame(directory, frame, attributes=("P", "v"), whitewater=False):
+def read_frame(directory, frame, attributes=("P", "v"), whitewater=False, bubbles=False):
     """a committed frame's attributes, every rank's shard in rank order: the order one partition would hold them in. One of attributes the frame doesn't
     carry ("id" and "age" can be left out of a bake) is left out of what comes back. With whitewater, the frame's whitewater instead of its particles
-    (which also has "life", "radius" and "kind": 0 spray, 1 foam, 2 a bubble); nothing of it in a bake that made none"""
+    (which also has "life", "radius" and "kind": 0 spray, 1 foam, 2 a bubble); with bubbles, the bubbles of its air (P, v, id and "radius"); nothing
+    of either in a bake that made none"""
     commit = read_commit(directory, frame)
     planes = {}
     kinds = {}
-    shards = commit.get("whitewater", {}).get("shards", []) if whitewater else commit["shards"]
+    shards = (commit.get("whitewater", {}).get("shards", []) if whitewater else commit.get("bubbles", {}).get("shards", []) if bubbles
+              else commit["shards"])
     for entry in sorted(shards, key=lambda shard: shard["rank"]):
         shard = read_shard(os.path.join(frame_directory(directory, frame), entry["file"]))
         for name in attributes:

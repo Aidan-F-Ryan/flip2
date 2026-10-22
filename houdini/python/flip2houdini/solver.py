@@ -41,7 +41,8 @@ them.
 Its outputs: 1, the bake's surface, particles or both (Show); 2, its fluid fields, with Output Fluid Fields (surface, a level set, and vel, as Houdini's
 FLIP outputs them); 3, the domain, and 4, the collisions, both as Houdini's own FLIP nodes make them from the domain, the Collisions input and the RBD
 pieces where they've been moved. Outputs 2 to 4 are what Whitewater Source takes as its Liquid Simulation, Container and Collisions: flip2 Whitewater
-(whitewater.py) sets Houdini's up on them. 5, the bake's own whitewater. 6 and 7 are as RBD Bullet Solver's Geometry and Simulation Points outputs: the
+(whitewater.py) sets Houdini's up on them. 5, the bake's own whitewater, and with air the air's own bubbles as whitewater bubbles (kind 2): the air
+mixed into the liquid finer than its voxels. 6 and 7 are as RBD Bullet Solver's Geometry and Simulation Points outputs: the
 RBD pieces moved where flip2 moved them (the simulated ones by Transform Pieces from the start frame; the others as the geometry has them), and the
 points that moved them, one per piece with name, P, orient, pivot, scale, v and w.
 
@@ -1504,7 +1505,7 @@ def _refresh(node, job):
     """reloads the frame on show, surface and particles, where its file has arrived or changed since it was loaded"""
     if not node.evalParm("load"):
         return
-    for name in (importer.SURFACE, importer.PARTICLES, importer.FIELDS, importer.WHITEWATER, importer.BODIES):
+    for name in (importer.SURFACE, importer.PARTICLES, importer.FIELDS, importer.WHITEWATER, importer.BUBBLES, importer.BODIES):
         loader = node.node(name)
         if loader is None:
             continue

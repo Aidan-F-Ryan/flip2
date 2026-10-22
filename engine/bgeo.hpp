@@ -17,6 +17,10 @@ bool writeParticlesBgeo(const std::string& path, const std::vector<const ShardDa
 //the same, half the spacing the particles stand for
 bool writeWhitewaterBgeo(const std::string& path, const std::vector<const ShardData*>& shards, float pscale, const std::string& software, std::string& why);
 
+//writes path, a frame's bubbles (the air's, from a bake whose air escapes: its shards as writeParticlesBgeo has the particles'), as the whitewater's
+//bubbles are: P, v, id, radius (the bubble's it flies as, metres) and pscale as theirs, kind 2 and life 0
+bool writeBubblesBgeo(const std::string& path, const std::vector<const ShardData*>& shards, float pscale, const std::string& software, std::string& why);
+
 //writes path, mesh's quads facing outwards, their points with P and v
 bool writeSurfaceBgeo(const std::string& path, const SurfaceMesh& mesh, const std::string& software, std::string& why);
 

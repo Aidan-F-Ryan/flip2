@@ -2122,9 +2122,7 @@ void Particles::voxelVelsToParticles(){
         (float)(cfl*grid.cellSize / (2<<refinementLevel)));     //the air goes at most as far as the liquid may, the tile's reach
     gpuErrchk(cudaPeekAtLastError());
     if(twoPhase.escaping()){    //then the escaped ones, which that left where they were
-        double voxelSize = grid.cellSize / (2<<refinementLevel);
-        //a droplet's or a bubble's radius, unless the scene gives one: a ball of the fluid one particle stands for
-        double ball = voxelSize*std::cbrt(3.0 / (4.0*3.14159265358979323846*restParticlesPerVoxel));
+        double ball = particleBall();   //a droplet's or a bubble's radius, unless the scene gives one
         double dropletRadius = twoPhase.dropletRadius > 0.0f ? twoPhase.dropletRadius : ball;
         double bubbleRadius = twoPhase.bubbleRadius > 0.0f ? twoPhase.bubbleRadius : ball;
         //A bubble flattens as it rises, the more the larger it is against the surface tension that rounds it: by its Eotvos number, its buoyancy over
@@ -2302,13 +2300,45 @@ __global__ void flagLiquid(uint numParticles, const uint* ids, uint* liquid){
     }
 }
 
+//A bubble's number, for the frames to tell it by: a hash of where it is when a frame first finds it a bubble, the same however the domain is split.
+//It goes in an air particle's number bits, which mean nothing to the simulation (the air takes no numbers from the count). Never 0, which is what the
+//air's band makes its particles with
+__device__ inline uint bubbleNumber(double x, double y, double z){
+    unsigned long long hash = mixBits64(mixBits64(mixBits64((unsigned long long)__double_as_longlong(x)) ^ (unsigned long long)__double_as_longlong(y)) ^
+                                        (unsigned long long)__double_as_longlong(z));
+    uint number = (uint)(hash >> 34);   //PARTICLE_NUMBER's 30 bits
+    return number != 0 ? number : 1;
+}
+
+//which particles are bubbles, the air's escaped ones, into bubbles (1 or 0). One without a number takes one (bubbleNumber), for good: the air the scene
+//seeded has the number its seeding gave it, and what the air's band has made since has none
+__global__ void flagBubbles(uint numParticles, const double* px, const double* py, const double* pz, uint* ids, uint* bubbles){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(index < numParticles){
+        uint id = ids[index];
+        bool bubble = (id & (AIR_PARTICLE | ESCAPED_PARTICLE)) == (AIR_PARTICLE | ESCAPED_PARTICLE);
+        if(bubble && !(id & PARTICLE_NUMBER)){
+            ids[index] = id | bubbleNumber(px[index], py[index], pz[index]);
+        }
+        bubbles[index] = bubble;
+    }
+}
+
 uint Particles::countFrameParticles(){
     frameParticles = size;
+    frameBubbles = 0;
     if(twoPhase.on && size > 0){
         frameEnds.resizeAsync(size, stream);
         flagLiquid<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, particleIds.devPtr(), frameEnds.devPtr());
         gpuErrchk(cudaPeekAtLastError());
         cudaParallelPrefixSum(size, frameEnds.devPtr(), stream);
+        if(twoPhase.escaping()){    //and the bubbles, for frameBubbleCount: both counted before either is copied, so the copies wait once
+            bubbleEnds.resizeAsync(size, stream);
+            flagBubbles<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, px.devPtr(), py.devPtr(), pz.devPtr(), particleIds.devPtr(), bubbleEnds.devPtr());
+            gpuErrchk(cudaPeekAtLastError());
+            cudaParallelPrefixSum(size, bubbleEnds.devPtr(), stream);
+            gpuErrchk(cudaMemcpyAsync(&frameBubbles, bubbleEnds.devPtr() + size - 1, sizeof(uint), cudaMemcpyDeviceToHost, stream));
+        }
         gpuErrchk(cudaMemcpyAsync(&frameParticles, frameEnds.devPtr() + size - 1, sizeof(uint), cudaMemcpyDeviceToHost, stream));
         gpuErrchk(cudaStreamSynchronize(stream));
     }
@@ -2336,6 +2366,46 @@ void Particles::copyFrameColumnsToHost(float* planes, bool ids, bool ages, cudaE
     }
     gpuErrchk(cudaEventRecord(columnsCopied, frameStream));
     gpuErrchk(cudaEventRecord(copied, frameStream));
+}
+
+double Particles::particleBall() const{
+    double voxelSize = grid.cellSize / (2<<refinementLevel);
+    return voxelSize*std::cbrt(3.0 / (4.0*3.14159265358979323846*restParticlesPerVoxel));
+}
+
+//the bubbles countFrameParticles counted, closed up in the order they're in (ends: how many there are up to each particle; count: in all), as
+//CacheWriter::bubbleBytes has them: P and v as float32s, the id (the number alone, as a frame's particles have theirs) and the radius each flies as
+__global__ void packBubbles(uint numParticles, const double* px, const double* py, const double* pz, const float* vx, const float* vy, const float* vz,
+                            const uint* ids, const uint* ends, uint count, float radius, char* planes){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(index < numParticles && ends[index] != (index == 0 ? 0 : ends[index - 1])){
+        size_t n = count;
+        size_t at = ends[index] - 1;
+        float* floats = (float*)planes;
+        floats[at] = (float)px[index];
+        floats[n + at] = (float)py[index];
+        floats[2*n + at] = (float)pz[index];
+        floats[3*n + at] = vx[index];
+        floats[4*n + at] = vy[index];
+        floats[5*n + at] = vz[index];
+        ((unsigned long long*)planes)[3*n + at] = ids[index] & PARTICLE_NUMBER;     //6n floats in, so on an 8-byte boundary
+        floats[8*n + at] = radius;
+    }
+}
+
+void Particles::copyFrameBubblesToHost(char* host, cudaEvent_t copied){
+    if(frameBubbles > 0){
+        size_t bytes = (size_t)frameBubbles*36;
+        char* planes;
+        gpuErrchk(cudaMallocAsync((void**)&planes, bytes, stream));
+        float radius = (float)(twoPhase.bubbleRadius > 0.0f ? twoPhase.bubbleRadius : particleBall());     //as their flight has it
+        packBubbles<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(),
+            particleIds.devPtr(), bubbleEnds.devPtr(), frameBubbles, radius, planes);
+        gpuErrchk(cudaPeekAtLastError());
+        gpuErrchk(cudaMemcpyAsync(host, planes, bytes, cudaMemcpyDeviceToHost, stream));
+        gpuErrchk(cudaFreeAsync(planes, stream));
+    }
+    gpuErrchk(cudaEventRecord(copied, stream));
 }
 
 //each particle's id as the cache has it, in 64 bits

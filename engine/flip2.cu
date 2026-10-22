@@ -32,7 +32,8 @@
 //  {"event":"done","frames":120,"seconds":5.2}                 every frame committed
 //  {"event":"verified","frames":121,"unfinished":0,"shards":121,"particles":150040000,"bytes":1712345678,"problems":0}
 //  {"event":"exported","frame":42,"particles":1240000,"file":"/shots/a/export/houdini/particles.0042.bgeo.sc"}
-//      with whitewater, and ...,"whitewater":310000,"whitewaterFile":"..."; with dynamic bodies, and ...,"bodies":3,"bodiesFile":".../bodies.0042.bgeo.sc"}
+//      with whitewater, and ...,"whitewater":310000,"whitewaterFile":"..."; with escaping air, and ...,"bubbles":21000,"bubblesFile":"..."; with dynamic
+//      bodies, and ...,"bodies":3,"bodiesFile":".../bodies.0042.bgeo.sc"}
 //  {"event":"exportDone","frames":121,"exported":121,"seconds":9.8}
 //  {"event":"meshed","frame":42,"particles":1240000,"points":310000,"faces":309000,"bandCells":52000,"rounds":2,"seconds":0.05,"file":"/shots/a/export/houdini/surface.0042.bgeo.sc"}
 //      with --fields, and ...,"surfaceVoxels":90000,"velocityVoxels":180000,"fieldSeconds":0.01,"writeSeconds":0.05,"fields":"/shots/a/export/houdini/fields.0042.vdb"}
@@ -261,8 +262,8 @@ static int verify(const std::string& directory){
                 problem((frame / "commit.json").string() + ": no shards");
                 continue;
             }
-            std::vector<const Json*> lists = {list};    //the particles' shards, and the whitewater's and the bodies' from a bake with any
-            for(const char* key : {"whitewater", "bodies"}){
+            std::vector<const Json*> lists = {list};    //the particles' shards, and the whitewater's, the bodies' and the bubbles' from a bake with any
+            for(const char* key : {"whitewater", "bodies", "bubbles"}){
                 const Json* more = commit.find(key);
                 if(more != nullptr && more->kind == Json::OBJECT && more->find("shards") != nullptr){
                     lists.push_back(more->find("shards"));
@@ -608,7 +609,8 @@ static bool bodiesOf(const std::string& directory, int frame, const Json& listin
 //unless --out says; .bgeo, uncompressed, with format "bgeo"), each a frame's every shard in one point cloud, in rank order (the order one partition would
 //have held them), with P and v, and id and age if the cache's frames carry them (bgeo.cu). Frame NNNN is the cache's: frame 0 is the start, at time
 //0. A bake with whitewater has each frame's beside it, OUT/whitewater.NNNN.bgeo.sc, a point cloud too, with life, radius, kind, and the pscale its
-//particles are meant to be drawn at: half the spacing of what a voxel's volume of whitewater is drawn as. A bake with dynamic bodies has
+//particles are meant to be drawn at: half the spacing of what a voxel's volume of whitewater is drawn as. A bake whose air escapes has each frame's
+//bubbles, OUT/bubbles.NNNN.bgeo.sc, as the whitewater's bubbles are (writeBubblesBgeo): pscale half the spacing of its particles. A bake with dynamic bodies has
 //OUT/bodies.NNNN.bgeo.sc too, a point per body as RBD Bullet Solver's Simulation Points have them, which Transform Pieces moves the pieces by
 //(writeBodiesBgeo). Frames are picked, redone and followed as eachCommittedFrame says
 static int exportCache(const std::string& directory, int first, int last, std::string out, bool overwrite, bool follow, const std::string& format){
@@ -633,14 +635,15 @@ static int exportCache(const std::string& directory, int first, int last, std::s
             return false;
         }
         std::string also;
-        if(!whitewater.empty()){    //drawn at half the spacing of what cache.json says a voxel's volume of it is drawn as
+        //the radius to draw whitewater or bubbles at (key: which): half the spacing of what cache.json says a voxel's volume of them is drawn as
+        auto drawnAt = [&](const char* key, float& pscale){
             double voxelSize = 0.0, perVoxel = 0.0;
             std::string text;
             if(readFile(directory + "/cache.json", text)){
                 try{
                     Json cache = JsonReader(text, directory + "/cache.json").document();
                     const Json* size = cache.find("voxelSize");
-                    const Json* described = cache.find("whitewater");
+                    const Json* described = cache.find(key);
                     const Json* count = described != nullptr ? described->find("perVoxel") : nullptr;
                     voxelSize = size != nullptr ? size->number : 0.0;
                     perVoxel = count != nullptr ? count->number : 0.0;
@@ -649,7 +652,15 @@ static int exportCache(const std::string& directory, int first, int last, std::s
                 }
             }
             if(!(voxelSize > 0.0) || !(perVoxel > 0.0)){
-                why = directory + "/cache.json: no voxelSize and whitewater.perVoxel to size the whitewater by";
+                why = directory + "/cache.json: no voxelSize and " + key + ".perVoxel to size the " + key + " by";
+                return false;
+            }
+            pscale = (float)(0.5*voxelSize / std::cbrt(perVoxel));
+            return true;
+        };
+        if(!whitewater.empty()){
+            float pscale;
+            if(!drawnAt("whitewater", pscale)){
                 return false;
             }
             std::vector<const ShardData*> more;
@@ -659,10 +670,35 @@ static int exportCache(const std::string& directory, int first, int last, std::s
                 points += shard.particles;
             }
             std::string file = out + "/whitewater." + frameName(frame) + "." + format;
-            if(!writeWhitewaterBgeo(file, more, (float)(0.5*voxelSize / std::cbrt(perVoxel)), std::string("flip2 ") + FLIP2_BUILD_ID, why)){
+            if(!writeWhitewaterBgeo(file, more, pscale, std::string("flip2 ") + FLIP2_BUILD_ID, why)){
                 return false;
             }
             also = ",\"whitewater\":" + std::to_string(points) + ",\"whitewaterFile\":" + ::quoted(file);
+        }
+        if(const Json* bubbles = record.find("bubbles")){   //a bake whose air escapes: its bubbles, which its shards hold as the commit record lists them
+            const Json* list = bubbles->find("shards");
+            std::vector<ShardData> read(list != nullptr ? list->items.size() : 0);
+            std::vector<const ShardData*> more;
+            unsigned long long points = 0;
+            for(size_t index = 0; index < read.size(); ++index){
+                const Json* shardFile = list->items[index].find("file");
+                const Json* hash = list->items[index].find("xxh64");
+                if(shardFile == nullptr || hash == nullptr || !readShard(directory + "/frames/" + frameName(frame) + "/" + shardFile->text, hash->text, read[index], why)){
+                    why = why.empty() ? frameName(frame) + ": a bubbles shard without its file and xxh64" : why;
+                    return false;
+                }
+                more.push_back(&read[index]);
+                points += read[index].particles;
+            }
+            float pscale;
+            if(!drawnAt("bubbles", pscale)){
+                return false;
+            }
+            std::string file = out + "/bubbles." + frameName(frame) + "." + format;
+            if(!writeBubblesBgeo(file, more, pscale, std::string("flip2 ") + FLIP2_BUILD_ID, why)){
+                return false;
+            }
+            also += ",\"bubbles\":" + std::to_string(points) + ",\"bubblesFile\":" + ::quoted(file);
         }
         if(const Json* bodies = record.find("bodies")){     //a bake with dynamic bodies: each one where it is, as Houdini's RBD Simulation Points
             std::vector<BgeoBody> points;

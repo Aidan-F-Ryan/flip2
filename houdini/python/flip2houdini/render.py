@@ -1,7 +1,8 @@
 """flip2 Karma Setup: a flip2 bake, ready to render in Karma.
 
 Builds in /stage what a first render needs: the liquid's surface with a water material, the collision geometry, the RBD tab's pieces where the bake
-moved them (a body's own material), the bake's whitewater if it was baked with any (or else Houdini's, if flip2 Whitewater set it up), a ground under the
+moved them (a body's own material), the bake's whitewater if it was baked with any (or else Houdini's, if flip2 Whitewater set it up) and its air's
+bubbles if it was baked with air, a ground under the
 domain, a sky, a camera that takes the domain in, Karma's render settings and a USD Render node to render with.
 
 One of those settings is the reason to have this at all. flip2's surface carries the liquid's velocity as v, which Solaris imports as USD's velocities,
@@ -14,7 +15,9 @@ dielectric priority (0 is the highest, and every object's own): the liquid is se
 surface to the water. (With the Solver node's Water at Collisions at Cut, nothing overlaps and the setting does nothing.)
 
 The bake's own whitewater is rendered as its spray points, and each of its foam and bubble points as a cloud of fine specks: a point stands for a
-voxel's worth of bubbles, and drawn as one white ball as wide as the points are apart, a cloud of them reads as polystyrene beads. Houdini's is
+voxel's worth of bubbles, and drawn as one white ball as wide as the points are apart, a cloud of them reads as polystyrene beads. A bake with air
+has its air's own bubbles drawn the same way, with its whitewater or Houdini's, or on their own: the air the liquid has mixed in finer than its
+voxels, which its surface can't show (each of those points is one particle's air). Houdini's is
 rendered as points as wide as they are apart (its solver's pscale makes each twice that, which renders as beads). The sun is on the
 camera's side: where Karma Physical Sky starts it, behind the scene, whitewater and everything else facing the camera is in shade, and reads as grey.
 """
@@ -52,11 +55,13 @@ def _specks(node, own):
     point as SPECKS white specks scattered within the spacing of the points by its id, so each frame puts them in the same place. Built beside
     node once: another Karma setup for the same node draws from the same nodes"""
     parent = node.parent()
+    merged = parent.node(node.name() + "_whitewater_own")
+    if merged is None:
+        merged = parent.createNode("object_merge", node.name() + "_whitewater_own")     #the loader is inside node: brought out beside it
+        merged.setPosition(node.position() + hou.Vector2(3.0, -1.0))
+    merged.parm("objpath1").set(own.path())     #again each time: an older setup's was the whitewater's loader alone, without the air's bubbles
     specks = parent.node(node.name() + "_whitewater_specks")
     if specks is None:
-        merged = parent.createNode("object_merge", node.name() + "_whitewater_own")     #the loader is inside node: brought out beside it
-        merged.parm("objpath1").set(own.path())
-        merged.setPosition(node.position() + hou.Vector2(3.0, -1.0))
         specks = parent.createNode("attribwrangle", node.name() + "_whitewater_specks")
         specks.setInput(0, merged)
         specks.parm("snippet").set(
@@ -102,18 +107,22 @@ def create_render(node):
     priority.parm("xn__primvarskarmaobjectdielectricpriority_e1bfg").set(1)
     made.append(priority)
     folder = os.path.join(node.evalParm("outputdir").rstrip("/"), "bake") if kind == "solver" else node.evalParm("bakedir").rstrip("/")
-    own = node.node(importer.WHITEWATER)
+    exported = os.path.join(folder, "export", "houdini")
+    own = node.node(importer.WHITEWATER_ALL) or node.node(importer.WHITEWATER)     #the bake's own whitewater and its air's bubbles (an older node: no bubbles)
     whitewater = node.parent().node(prefix + "_whitewater")
-    if own is not None and importer.has_whitewater(os.path.join(folder, "export", "houdini")):     #the bake's own: its spray, and its foam and bubbles as specks
+    if own is not None and importer.has_whitewater(exported):     #the bake's own: its spray, and its foam and bubbles, the air's too, as specks
         imported("whitewater", _specks(node, own), "whitewater")
-    elif whitewater is not None:    #Houdini's, sized to render: the solver's pscale is the points' whole separation
-        sized = node.parent().node(prefix + "_whitewater_render")
-        if sized is None:
-            sized = node.parent().createNode("attribwrangle", prefix + "_whitewater_render")
-            sized.setInput(0, whitewater)
-            sized.parm("snippet").set("@pscale *= %g;     // the fraction of the whitewater's separation each point is drawn as" % WHITEWATER_WIDTH)
-            sized.setPosition(whitewater.position() + hou.Vector2(0.0, -1.5))
-        imported("whitewater", sized, "whitewater")
+    else:
+        if whitewater is not None:    #Houdini's, sized to render: the solver's pscale is the points' whole separation
+            sized = node.parent().node(prefix + "_whitewater_render")
+            if sized is None:
+                sized = node.parent().createNode("attribwrangle", prefix + "_whitewater_render")
+                sized.setInput(0, whitewater)
+                sized.parm("snippet").set("@pscale *= %g;     // the fraction of the whitewater's separation each point is drawn as" % WHITEWATER_WIDTH)
+                sized.setPosition(whitewater.position() + hou.Vector2(0.0, -1.5))
+            imported("whitewater", sized, "whitewater")
+        if own is not None and importer.has_bubbles(exported):    #the air's own bubbles, as specks: beside Houdini's whitewater, or on their own
+            imported("bubbles", _specks(node, own), "whitewater")
     wired = node.inputs()
     collision = (node.node("COLLISION") if len(wired) > 1 and wired[1] is not None else None) if kind == "solver" else (wired[0] if wired else None)
     if collision is not None:
