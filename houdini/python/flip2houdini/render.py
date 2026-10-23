@@ -17,7 +17,9 @@ surface to the water. (With the Solver node's Water at Collisions at Cut, nothin
 The bake's own whitewater is rendered as its spray points, and each of its foam and bubble points as a cloud of fine specks: a point stands for a
 voxel's worth of bubbles, and drawn as one white ball as wide as the points are apart, a cloud of them reads as polystyrene beads. A bake with air
 has its air's own bubbles drawn the same way, with its whitewater or Houdini's, or on their own: the air the liquid has mixed in finer than its
-voxels, which its surface can't show (each of those points is one particle's air). Houdini's is
+voxels, which its surface can't show (each of those points is one particle's air). Bubbles aren't motion-blurred: their specks are much
+larger and sparser than real bubbles, and blurred by their velocity a cloud of them carried along at 2 m/s drew as long streaks, a furry smear
+sliding through the water. Houdini's is
 rendered as points as wide as they are apart (its solver's pscale makes each twice that, which renders as beads). The sun is on the
 camera's side: where Karma Physical Sky starts it, behind the scene, whitewater and everything else facing the camera is in shade, and reads as grey.
 """
@@ -64,19 +66,19 @@ def _specks(node, own):
     if specks is None:
         specks = parent.createNode("attribwrangle", node.name() + "_whitewater_specks")
         specks.setInput(0, merged)
-        specks.parm("snippet").set(
-            "if(i@kind != 0){\n"
-            "    for(int k = 0; k < %d; k++){\n"
-            "        vector u = rand(set(float(i@id), float(k), 17.0));\n"
-            "        int speck = addpoint(0, @P + 2.0*f@pscale*sample_sphere_uniform(u));     // pscale is half the points' spacing\n"
-            "        float u1 = rand(set(float(i@id), float(k), 41.0)), u2 = rand(set(float(i@id), float(k), 43.0));\n"
-            "        setpointattrib(0, \"pscale\", speck, %g*f@pscale*exp(0.45*sqrt(-2.0*log(max(u1, 1e-6)))*cos(2.0*PI*u2)));\n"
-            "        setpointattrib(0, \"v\", speck, v@v);\n"
-            "        setpointattrib(0, \"kind\", speck, i@kind);\n"
-            "    }\n"
-            "    removepoint(0, @ptnum);\n"
-            "}\n" % (SPECKS, SPECK_SIZE))
         specks.setPosition(merged.position() + hou.Vector2(0.0, -1.0))
+    specks.parm("snippet").set(     #again each time: an older setup's motion-blurred the bubbles too
+        "if(i@kind != 0){\n"
+        "    for(int k = 0; k < %d; k++){\n"
+        "        vector u = rand(set(float(i@id), float(k), 17.0));\n"
+        "        int speck = addpoint(0, @P + 2.0*f@pscale*sample_sphere_uniform(u));     // pscale is half the points' spacing\n"
+        "        float u1 = rand(set(float(i@id), float(k), 41.0)), u2 = rand(set(float(i@id), float(k), 43.0));\n"
+        "        setpointattrib(0, \"pscale\", speck, %g*f@pscale*exp(0.45*sqrt(-2.0*log(max(u1, 1e-6)))*cos(2.0*PI*u2)));\n"
+        "        setpointattrib(0, \"v\", speck, i@kind == 2 ? set(0.0, 0.0, 0.0) : v@v);     // bubbles aren't blurred (see the top)\n"
+        "        setpointattrib(0, \"kind\", speck, i@kind);\n"
+        "    }\n"
+        "    removepoint(0, @ptnum);\n"
+        "}\n" % (SPECKS, SPECK_SIZE))
     return specks
 
 
