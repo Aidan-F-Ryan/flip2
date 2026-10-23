@@ -427,9 +427,25 @@ bool writeFluidFields(const std::string& path, const FluidFields& fields, std::s
                 voxels.setValueOn(openvdb::Coord(at[0], at[1], at[2]), openvdb::Vec3s(v[0], v[1], v[2]));
             }
         }
+        openvdb::GridCPtrVec grids{surface, vel};
+        if(fields.bubbles){     //what the bubbles scatter, inside the liquid's surface: past it a bubble is air the grid resolves, which isn't a cloud of them
+            openvdb::FloatGrid::Ptr bubbles = openvdb::FloatGrid::create(0.0f);
+            bubbles->setTransform(transform->copy());
+            bubbles->setName("bubbles");
+            bubbles->setGridClass(openvdb::GRID_FOG_VOLUME);
+            openvdb::FloatGrid::ConstAccessor inside = surface->getConstAccessor();
+            openvdb::FloatGrid::Accessor voxels = bubbles->getAccessor();
+            for(size_t voxel = 0; voxel < fields.scattering.size(); ++voxel){
+                openvdb::Coord at(fields.bubbleVoxels[3*voxel], fields.bubbleVoxels[3*voxel + 1], fields.bubbleVoxels[3*voxel + 2]);
+                if(inside.getValue(at) < 0.0f){
+                    voxels.setValueOn(at, fields.scattering[voxel]);
+                }
+            }
+            grids.push_back(bubbles);
+        }
         std::string temporary = path + ".tmp";
         openvdb::io::File file(temporary);
-        file.write(openvdb::GridCPtrVec{surface, vel});     //Blosc-compressed, as OpenVDB writes by default
+        file.write(grids);      //Blosc-compressed, as OpenVDB writes by default
         file.close();
         std::error_code renamed;
         std::filesystem::rename(temporary, path, renamed);

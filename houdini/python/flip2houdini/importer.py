@@ -188,6 +188,11 @@ def has_whitewater(folder):
     return bool(glob.glob(os.path.join(hou.text.expandString(folder), WHITEWATER + ".[0-9]*.bgeo*")))
 
 
+def has_fields(folder):
+    """whether a bake's export/houdini directory holds any frames of its fluid fields (flip2 mesh --fields)"""
+    return bool(glob.glob(os.path.join(hou.text.expandString(folder), FIELDS + ".[0-9]*.vdb")))
+
+
 def has_bubbles(folder):
     """whether a bake's export/houdini directory holds any frames of its air's bubbles"""
     return bool(glob.glob(os.path.join(hou.text.expandString(folder), BUBBLES + ".[0-9]*.bgeo*")))

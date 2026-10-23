@@ -112,6 +112,9 @@ struct EscapedFlight{
 //last in a voxel holding no liquid. The churning that breaks entrained air up is where and while it's entrained, still a pocket the grid resolves
 //(measured only from then, nothing changed: the air escapes a moment later, in calmer water). The churning by Smagorinsky's model of what the
 //grid doesn't resolve: dissipating (Cs h)^2 |S|^3, with |S| the magnitude of the grid's strain rate, at each voxel (churnAt, G2P)
+//A bubble keeps the spread's Sauter mean radius beside its own (airSauter): three times the spread's volume over its surface's area. A draw is one
+//size, which sets how fast that air rises; how much light bubbles scatter goes by the whole spread: 0.75 times their share of the volume over the
+//Sauter mean, per metre (what renders the air as a medium)
 struct BubbleSizes{
     float fixed = 0.0f;     //the scene's bubble radius (TwoPhase::bubbleRadius), which every bubble takes; 0 to draw each one's
     float ball = 0.0f;      //the radius of a ball of one particle's air, metres
@@ -195,8 +198,8 @@ public:
     uint frameBubbleCount() const{
         return frameBubbles;
     }
-    //those bubbles for the cache, into pinned host memory (CacheWriter::bubbleBytes): float32 P x, y, z and v x, y, z, the id (64 bits) and the radius
-    //each flies as, each a plane of every bubble's value, recording copied once they're there
+    //those bubbles for the cache, into pinned host memory (CacheWriter::bubbleBytes): float32 P x, y, z and v x, y, z, the id (64 bits), the radius
+    //each flies as and its spread's Sauter mean, each a plane of every bubble's value, recording copied once they're there
     void copyFrameBubblesToHost(char* host, cudaEvent_t copied);
     //this partition's whole state for a checkpoint, into pinned host memory (CacheWriter::checkpointBytes), recording copied once it's there
     void copyCheckpointToHost(char* host, cudaEvent_t copied);
@@ -323,6 +326,8 @@ public:
         if(twoPhase.escaping()){    //no particle has escaped yet; a checkpoint's sizes come after this
             airBreakup.resizeAsync(size, stream);
             airBreakup.zeroDeviceAsync(stream);
+            airSauter.resizeAsync(size, stream);
+            airSauter.zeroDeviceAsync(stream);
         }
     }
     //at a bake's start, before initialize: the particles given from first on are air (a scene's air is seeded after its liquid), and the liquid's next id
@@ -479,6 +484,7 @@ private:
     //it escapes, the radius of the bubbles that broke it into, metres (G2P marks one escaping with its churning, as -(churning + 1e-30), and its
     //flight draws its size). The liquid's mean nothing. Empty without such air
     CudaVec<float> airBreakup;
+    CudaVec<float> airSauter;   //and the Sauter mean radius of the spread each escaped one's size was drawn from (BubbleSizes), metres, set as it escapes
     //Each particle's id, which it keeps for as long as it exists and no other ever has, and when it came to be, in seconds from the start. The fluid
     //the scene starts with is numbered in the order it's given in, born at 0; each particle made after that (emitParticles) takes the next id in the
     //order of the lattice point it came from, which every partition works out for every new particle, its own or not: so the ids are the same however

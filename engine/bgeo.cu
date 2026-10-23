@@ -496,12 +496,12 @@ void writeStrings(BinaryJson& json, const char* name, const std::vector<std::str
 }
 
 //a point cloud: the shards' P and v, id and age where every shard has them, and with whitewater its life, radius, kind and the pscale given; bubbles
-//(the air's) as the whitewater's are, from their radius: a kind of 2 and a life of 0
+//(the air's) as the whitewater's are, from their radius: a kind of 2 and a life of 0, and their spread's Sauter mean radius where the shards have it
 static bool writePointsBgeo(const std::string& path, const std::vector<const ShardData*>& shards, bool whitewater, bool bubbles, float pscale, const std::string& software,
                             std::string& why){
     uint64_t points = 0;
     float low[3] = {INFINITY, INFINITY, INFINITY}, high[3] = {-INFINITY, -INFINITY, -INFINITY};
-    bool ids = true, ages = true;   //written if every shard has them
+    bool ids = true, ages = true, sauters = bubbles;    //written if every shard has them
     for(const ShardData* shard : shards){
         if(shard->particles == 0){  //nothing to check, or to write: a frame before any whitewater is a cloud of no points
             continue;
@@ -513,6 +513,7 @@ static bool writePointsBgeo(const std::string& path, const std::vector<const Sha
         }
         ids = ids && planeOf(*shard, "id", 3) != nullptr;
         ages = ages && planeOf(*shard, "age", 1) != nullptr;
+        sauters = sauters && planeOf(*shard, "sauter", 1) != nullptr;
         if(whitewater && (planeOf(*shard, "kind", 1) == nullptr || planeOf(*shard, "life", 1) == nullptr || planeOf(*shard, "radius", 1) == nullptr)){
             why = "a whitewater shard without float32 kind, life and radius";
             return false;
@@ -599,6 +600,9 @@ static bool writePointsBgeo(const std::string& path, const std::vector<const Sha
                     }
                     endVector(json);
                     scalar("radius", false);
+                    if(sauters){
+                        scalar("sauter", false);
+                    }
                 }
             }
             beginVector(json, name, points);

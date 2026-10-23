@@ -42,13 +42,15 @@
 //with byte shuffle: blosc's own header says which, so any blosc reader takes either). A frame's attributes: "P" (position) and "v" (velocity), float32 x,
 //y, z each, and unless the scene leaves them out, "id", uint64, which a particle keeps for as long as it exists and no other ever has, and "age",
 //float32, the seconds since it came to be. A checkpoint's: "P" as float64, "v", with APIC "c", float32 velocity gradients (component c along axis a at
-//3c + a), with escaping air "breakup", float32, how far the churning has broken each air particle's air (Particles::airBreakup), "id", and
+//3c + a), with escaping air "breakup", float32, how far the churning has broken each air particle's air (Particles::airBreakup), and "sauter",
+//float32, each escaped one's spread's Sauter mean radius (Particles::airSauter), "id", and
 //"birth", float32, when each particle came to be. The particles' order changes from frame to frame: the ids say which is which. Floats
 //from a simulation are noisy: losslessly P and v come to about 17 bytes a particle (1.4x) with zstd and 18.5 with lz4, measured on the dam break.
 //A frame's whitewater: "P", "v", "id" and "age" as the particles', then float32 "life" (the seconds it has left as foam), "radius" (the droplet's or
 //the bubble's, metres) and "kind" (0 spray, 1 foam, 2 a bubble). A checkpoint's: "P" as float64, "id", "v", "birth", "life", "radius", "kind".
 //A frame's bubbles: "P" and "v" as the particles', "id" (its air particle's number, which the air the scene seeded has from the start and any other
-//takes when a frame first finds it a bubble, and keeps) and float32 "radius" (the bubble's it flies as, metres).
+//takes when a frame first finds it a bubble, and keeps), float32 "radius" (the bubble's it flies as, metres) and "sauter" (the Sauter mean radius of
+//the spread of sizes that was drawn from, metres: what the light the air scatters goes by).
 //A frame's bodies, in the scene's order, all float64: "P" (its centre of mass), "orient" (its turn from where it rests, a quaternion w x y z), "v" and
 //"w" (its angular velocity). A checkpoint's: every field of each body's state and each contact's, as the engine has them (Bodies::checkpoint)
 struct CacheDescription{
@@ -108,7 +110,8 @@ struct CheckpointState{
     double time = 0.0;                  //seconds simulated
     unsigned long long substep = 0;     //substeps taken, which seeds the emitters' jitter
     bool apic = false;                  //whether the particles carry velocity gradients ("c")
-    bool breakup = false;               //whether they carry the air's breakup ("breakup", Particles::airBreakup): with escaping air
+    bool breakup = false;               //whether they carry the air's breakup and Sauter radii ("breakup", "sauter": Particles::airBreakup, airSauter):
+                                        //with escaping air
     unsigned long long nextId = 0;      //the id the next new particle gets
     double acceleration = 0.0;          //the most its last substep accelerated a face at, m/s^2, which limits the next substep (Particles::getCourantDt)
     unsigned long long whitewaterNextId = 0;    //with whitewater, the id the next of its particles gets
@@ -161,10 +164,10 @@ public:
         return (checkpoint ? 3*sizeof(double) + sizeof(uint64_t) + 7*sizeof(float) : 6*sizeof(float) + sizeof(uint64_t) + 4*sizeof(float))*particles;
     }
     static size_t bubbleBytes(size_t particles){    //a rank's bubbles in a frame
-        return (6*sizeof(float) + sizeof(uint64_t) + sizeof(float))*particles;
+        return (6*sizeof(float) + sizeof(uint64_t) + 2*sizeof(float))*particles;
     }
     static size_t checkpointBytes(size_t particles, bool apic, bool breakup){
-        return (3*sizeof(double) + 3*sizeof(float) + (apic ? 9*sizeof(float) : 0) + (breakup ? sizeof(float) : 0) + sizeof(uint64_t) + sizeof(float))*particles;
+        return (3*sizeof(double) + 3*sizeof(float) + (apic ? 9*sizeof(float) : 0) + (breakup ? 2*sizeof(float) : 0) + sizeof(uint64_t) + sizeof(float))*particles;
     }
     static size_t bodyBytes(int bodies){     //a frame's dynamic bodies (CacheBodies)
         return BODY_PLACEMENT*sizeof(double)*(size_t)bodies;

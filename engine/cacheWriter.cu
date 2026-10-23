@@ -421,6 +421,7 @@ void CacheWriter::process(const Job& job){
     }
     if(job.checkpoint && job.state.breakup){
         layout.push_back({"breakup", 1, 4, false});
+        layout.push_back({"sauter", 1, 4, false});
     }
     if(job.checkpoint || description.ids){
         layout.push_back({"id", 1, 8, true});
@@ -478,7 +479,7 @@ void CacheWriter::process(const Job& job){
         : std::vector<Layout>{{"P", 3, 4, false}, {"v", 3, 4, false}, {"id", 1, 8, true}, {"age", 1, 4, false}, {"life", 1, 4, false}, {"radius", 1, 4, false}, {"kind", 1, 4, false}};
     std::vector<ShardRecord> whitewaterRecords, bubbleRecords;
     writeMore("whitewater", job.whitewater, whitewaterLayout, whitewaterRecords);
-    writeMore("bubbles", job.bubbles, {{"P", 3, 4, false}, {"v", 3, 4, false}, {"id", 1, 8, true}, {"radius", 1, 4, false}}, bubbleRecords);    //bubbleBytes' order
+    writeMore("bubbles", job.bubbles, {{"P", 3, 4, false}, {"v", 3, 4, false}, {"id", 1, 8, true}, {"radius", 1, 4, false}, {"sauter", 1, 4, false}}, bubbleRecords);    //bubbleBytes' order
     //the dynamic bodies, which only rank 0's process has (every partition moves them alike): a frame's placements, from its buffer, each one's values
     //turned into planes; a checkpoint's states and contacts, as the bodies gave them
     std::vector<ShardRecord> bodyRecords, contactRecords;

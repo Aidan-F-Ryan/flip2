@@ -169,6 +169,7 @@ std::vector<CudaVec<float>*> Particles::particleFloats(){
     }
     if(twoPhase.escaping()){
         arrays.push_back(&airBreakup);
+        arrays.push_back(&airSauter);
     }
     return arrays;
 }
@@ -1560,10 +1561,12 @@ __device__ inline float churnAt(const float* block, int voxels1D, int voxels3D, 
 //The size of the bubbles an air particle that has just escaped at pos stands for (BubbleSizes): the scene's, or drawn, by the most violent churning
 //it went through since the liquid pulled it in (churn, m^2/s^3: churnAt) and the voxels' liquid shares around it, at shares, a tile width voxels on
 //a side that pos is in (signed: shareAround); x, y, z, where it is. The largest it can be, the air around it the grid doesn't resolve as one ball:
-//1 less the liquid's share there, of a voxel. The draw, by the inverse of the spread's distribution, from a hash of where it is
+//1 less the liquid's share there, of a voxel. The draw, by the inverse of the spread's distribution, from a hash of where it is; and sauter, the
+//spread's Sauter mean radius
 __device__ inline float bubbleRadius(const float* shares, int width, float3 pos, int3 origin, int3 domainVoxels, float voxelSize, float churn,
-                                     double x, double y, double z, const BubbleSizes& sizes){
+                                     double x, double y, double z, const BubbleSizes& sizes, float& sauter){
     if(sizes.fixed > 0.0f){
+        sauter = sizes.fixed;
         return sizes.fixed;
     }
     float liquid = shareAround<true>(shares, width, pos, origin, domainVoxels, false);
@@ -1575,6 +1578,10 @@ __device__ inline float bubbleRadius(const float* shares, int width, float3 pos,
     //the spread by volume, r^(3/2) up to the Hinze scale and hinze^(11/6) r^(-1/3) past it: what of it lies under each, and the draw's share of all of it
     float below = 0.4f*(powf(hinze, 2.5f) - powf(smallest, 2.5f));
     float above = 1.5f*powf(hinze, 11.0f/6.0f)*(powf(largest, 2.0f/3.0f) - powf(hinze, 2.0f/3.0f));
+    //the Sauter mean: all of it over the sum of each size's share over that size, the same two pieces' r^(1/2) and hinze^(11/6) r^(-4/3)
+    float under = (2.0f/3.0f)*(powf(hinze, 1.5f) - powf(smallest, 1.5f));
+    float over = 3.0f*powf(hinze, 11.0f/6.0f)*(powf(hinze, -1.0f/3.0f) - powf(largest, -1.0f/3.0f));
+    sauter = under + over > 0.0f ? (below + above) / (under + over) : largest;
     unsigned long long hash = mixBits64(mixBits64(mixBits64((unsigned long long)__double_as_longlong(x) ^ 0xb5ad4eceda1ce2a9ull) ^ (unsigned long long)__double_as_longlong(y)) ^
                                         (unsigned long long)__double_as_longlong(z));
     float drawn = (float)(hash >> 40)*(1.0f / 16777216.0f)*(below + above);    //24 bits: [0, 1) of all of it
@@ -2101,7 +2108,8 @@ __global__ void __launch_bounds__(NODE_THREADS, 2) flyEscaped(uint numParticleNo
                            const float* ux, const float* uy, const float* uz, const float* oldUx, const float* oldUy, const float* oldUz,
                            const float* weightsX, const float* weightsY, const float* weightsZ,
                            float dt, bool rungeKutta3, WallStick stick, WallStick airStick, Grid grid, uint refinementLevel, EscapedFlight droplet, EscapedFlight bubble,
-                           float* airBreakup, BubbleSizes bubbleSizes, float eotvosPerArea,  //each bubble's size, a new one's drawn here (bubbleRadius);
+                           float* airBreakup, float* airSauter, BubbleSizes bubbleSizes, float eotvosPerArea,  //each bubble's size and its spread's Sauter
+                                                                                                                //mean, a new one's drawn here (bubbleRadius);
                                                                                                 //its Eotvos number over its radius squared
                            unsigned int* largestChange){    //the most any particle's velocity changes by, per second (G2P's measure, carried on)
     extern __shared__ float tile[];
@@ -2156,9 +2164,11 @@ __global__ void __launch_bounds__(NODE_THREADS, 2) flyEscaped(uint numParticleNo
             if(flight.radius < 0.0f){   //escaped in this substep's G2P, where it still is, marked with the churning it went through: its size by that
                 float3 at = make_float3((px[index] - grid.negX)/voxelSize - tileOrigin.x, (py[index] - grid.negY)/voxelSize - tileOrigin.y,
                                         (pz[index] - grid.negZ)/voxelSize - tileOrigin.z);
+                float sauter;
                 flight.radius = bubbleRadius(tile + 3*tileVoxels, tileWidth, at, tileOrigin, domainVoxels, voxelSize, fmaxf(-flight.radius - 1.0e-30f, 0.0f),
-                                             px[index], py[index], pz[index], bubbleSizes);
+                                             px[index], py[index], pz[index], bubbleSizes, sauter);
                 airBreakup[index] = flight.radius;
+                airSauter[index] = sauter;
             }
             float eotvos = eotvosPerArea*flight.radius*flight.radius;
             flight.bluff = 8.0f/3.0f*eotvos / (eotvos + 4.0f);
@@ -2240,7 +2250,8 @@ void Particles::voxelVelsToParticles(){
             numUsedGridNodes, nodeCells.devPtr(), cellToNode.devPtr(), nodeInteriorVoxels.devPtr(),
             voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr(), voxelsUxOld.devPtr(), voxelsUyOld.devPtr(), voxelsUzOld.devPtr(),
             voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), dt, rungeKutta3, stick, airStick, grid, refinementLevel, droplet, bubble,
-            airBreakup.devPtr(), BubbleSizes{twoPhase.bubbleRadius, (float)particleBall(), twoPhase.surfaceTension}, (float)eotvosPerArea, accelerationBits.devPtr());
+            airBreakup.devPtr(), airSauter.devPtr(), BubbleSizes{twoPhase.bubbleRadius, (float)particleBall(), twoPhase.surfaceTension}, (float)eotvosPerArea,
+            accelerationBits.devPtr());
         gpuErrchk(cudaPeekAtLastError());
     }
 }
@@ -2477,9 +2488,10 @@ double Particles::particleBall() const{
 }
 
 //the bubbles countFrameParticles counted, closed up in the order they're in (ends: how many there are up to each particle; count: in all), as
-//CacheWriter::bubbleBytes has them: P and v as float32s, the id (the number alone, as a frame's particles have theirs) and the radius each flies as
+//CacheWriter::bubbleBytes has them: P and v as float32s, the id (the number alone, as a frame's particles have theirs), the radius each flies as and
+//its spread's Sauter mean
 __global__ void packBubbles(uint numParticles, const double* px, const double* py, const double* pz, const float* vx, const float* vy, const float* vz,
-                            const uint* ids, const uint* ends, uint count, const float* radii, char* planes){
+                            const uint* ids, const uint* ends, uint count, const float* radii, const float* sauters, char* planes){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
     if(index < numParticles && ends[index] != (index == 0 ? 0 : ends[index - 1])){
         size_t n = count;
@@ -2493,16 +2505,17 @@ __global__ void packBubbles(uint numParticles, const double* px, const double* p
         floats[5*n + at] = vz[index];
         ((unsigned long long*)planes)[3*n + at] = ids[index] & PARTICLE_NUMBER;     //6n floats in, so on an 8-byte boundary
         floats[8*n + at] = radii[index];
+        floats[9*n + at] = sauters[index];
     }
 }
 
 void Particles::copyFrameBubblesToHost(char* host, cudaEvent_t copied){
     if(frameBubbles > 0){
-        size_t bytes = (size_t)frameBubbles*36;
+        size_t bytes = (size_t)frameBubbles*40;     //CacheWriter::bubbleBytes
         char* planes;
         gpuErrchk(cudaMallocAsync((void**)&planes, bytes, stream));
         packBubbles<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(),
-            particleIds.devPtr(), bubbleEnds.devPtr(), frameBubbles, airBreakup.devPtr(), planes);
+            particleIds.devPtr(), bubbleEnds.devPtr(), frameBubbles, airBreakup.devPtr(), airSauter.devPtr(), planes);
         gpuErrchk(cudaPeekAtLastError());
         gpuErrchk(cudaMemcpyAsync(host, planes, bytes, cudaMemcpyDeviceToHost, stream));
         gpuErrchk(cudaFreeAsync(planes, stream));

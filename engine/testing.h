@@ -249,6 +249,15 @@ public:
         });
     }
 
+    //and each one's spread's Sauter mean radius (Particles::airSauter)
+    void setAirSauter(const std::vector<float>& sauter){
+        simulation.forEachPartition([&](Particles& partition){
+            if(partition.size > 0){
+                gpuErrchk(cudaMemcpyAsync(partition.airSauter.devPtr(), sauter.data(), sizeof(float)*partition.size, cudaMemcpyHostToDevice, partition.stream));
+            }
+        });
+    }
+
     //a checkpoint's ids and birth times for setParticles' particles, and the next id to hand out (Particles::setIdentities)
     void setIdentities(const std::vector<uint>& ids, const std::vector<float>& births, unsigned long long nextId){
         simulation.forEachPartition([&](Particles& partition){

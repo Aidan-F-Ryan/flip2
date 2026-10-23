@@ -41,6 +41,7 @@ void Particles::resizeParticleArrays(uint newSize, uint keep){
     }
     if(twoPhase.escaping() && newSize > keep){  //and none has escaped yet
         gpuErrchk(cudaMemsetAsync(airBreakup.devPtr() + keep, 0, sizeof(float)*(newSize - keep), stream));
+        gpuErrchk(cudaMemsetAsync(airSauter.devPtr() + keep, 0, sizeof(float)*(newSize - keep), stream));
     }
     if(reorderedGridIndices.size() < newSize){
         reorderedGridIndices.resizeAsync(newSize, stream);
