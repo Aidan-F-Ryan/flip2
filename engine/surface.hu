@@ -83,7 +83,7 @@ public:
     //the walls and the obstacles (which have to stay where they are until fields() has been called too)
     void mesh(const float* positions, const float* velocities, unsigned long long count, const float low[3], const float high[3], const SurfaceSettings& settings,
               SurfaceMesh& out, const MeshWalls& walls = MeshWalls(), const MeshSolids& solids = MeshSolids());
-    //the fields of the particles the last mesh() meshed
+    //the fields of the particles the last mesh() meshed, against the same walls and obstacles, but always stopped at the obstacles' surfaces
     void fields(const FieldSettings& settings, FluidFields& out);
     double seconds = 0.0;           //the last mesh's time on the GPU, copies included
     double fieldSeconds = 0.0;      //and the last fields'

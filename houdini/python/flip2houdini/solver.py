@@ -38,8 +38,8 @@ outwards, their points carrying v for motion blur, flat against the domain's wal
 touches them (or cut at their surfaces: Water at Collisions). Mesh Bake meshes a bake's frames again, with other settings or after a bake made without
 them.
 
-Its outputs: 1, the bake's surface, particles or both (Show); 2, its fluid fields, with Output Fluid Fields (surface, a level set, and vel, as Houdini's
-FLIP outputs them); 3, the domain, and 4, the collisions, both as Houdini's own FLIP nodes make them from the domain, the Collisions input and the RBD
+Its outputs: 1, the bake's surface, particles or both (Show); 2, its fluid fields, with Output Fluid Fields or a bake whose air's bubbles fly
+(surface, a level set, and vel, as Houdini's FLIP outputs them, and with air bubbles, the light they scatter, which they render from); 3, the domain, and 4, the collisions, both as Houdini's own FLIP nodes make them from the domain, the Collisions input and the RBD
 pieces where they've been moved. Outputs 2 to 4 are what Whitewater Source takes as its Liquid Simulation, Container and Collisions: flip2 Whitewater
 (whitewater.py) sets Houdini's up on them. 5, the bake's own whitewater, and with air the air's own bubbles as whitewater bubbles (kind 2): the air
 mixed into the liquid finer than its voxels. 6 and 7 are as RBD Bullet Solver's Geometry and Simulation Points outputs: the
@@ -382,9 +382,10 @@ def _interface(node):
                                                       "water flat, as a cutaway shows it"))
     surface.addParmTemplate(hou.ToggleParmTemplate("outputfields", "Output Fluid Fields", default_value=False,
                                                    help="Write the liquid's surface level set and velocity field each frame too (surface and vel, as Houdini's FLIP "
-                                                        "outputs them): the node's second output, for Whitewater Source"))
+                                                        "outputs them): the node's second output, for Whitewater Source. Always written with Liquid and Air "
+                                                        "when Droplets and Bubbles Fly, with the air's bubbles: flip2 Karma Setup renders them from it"))
     surface.addParmTemplate(hou.FloatParmTemplate("fieldvoxelscale", "Field Voxel Scale", 1, default_value=(2.0,), min=0.5, max=8.0,
-                                                  disable_when="{ outputfields == 0 }",
+                                                  disable_when="{ outputfields == 0 phases == 0 } { outputfields == 0 airescaped == 0 }",
                                                   help="The fields' voxel size, in particle separations: 2 is the simulation's own, as Houdini's FLIP has them"))
     surface.addParmTemplate(hou.ButtonParmTemplate("meshbake", "Mesh Bake", help="Mesh the bake's frames again with these settings, replacing their "
                                                    "surfaces: after a bake made without them, or to try others", **_callback("mesh_bake")))
@@ -1315,8 +1316,10 @@ def _launch_remote(job, host, directory, program, arguments, upload, local, logs
 
 
 def _mesh_options(node):
-    """flip2 mesh's options, from the Surface tab, checked as flip2 mesh would check them"""
-    fields = node.evalParm("outputfields")
+    """flip2 mesh's options, from the Surface tab, checked as flip2 mesh would check them. A bake whose air's bubbles fly always has its fields:
+    they hold the light the bubbles scatter, which is how they render (flip2 Karma Setup)"""
+    bubbles = node.parm("phases") is not None and node.evalParm("phases") == 1 and node.evalParm("airescaped")
+    fields = node.evalParm("outputfields") or bubbles
     voxel, influence, radius = node.evalParm("voxelscale"), node.evalParm("influencescale"), node.evalParm("radiusscale")
     smoothing = node.evalParm("smoothing")
     if min(voxel, influence, radius) <= 0 or smoothing < 0:

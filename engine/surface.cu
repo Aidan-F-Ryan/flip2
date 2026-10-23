@@ -1113,7 +1113,8 @@ void SurfaceMesher::fields(const FieldSettings& settings, FluidFields& out){
         lattice.wallHigh[axis] = walls.high[axis];
     }
     lattice.solids = solids.obstacles != nullptr ? *solids.obstacles : Obstacles();
-    lattice.overlap = solids.overlap;
+    lattice.overlap = false;    //cut at the obstacles, whatever the mesh does: carried into a body, the level set has what reads it (Houdini's whitewater,
+                                //the bubbles' grid) take the body's inside for liquid
     int passes = (int)std::ceil(settings.halfWidth);
     int rings = (int)std::ceil((lattice.reach + passes*lattice.h) / lattice.cellSize);   //cells past the occupied ones: room for the velocity carried on
     int first[3], extent[3];
