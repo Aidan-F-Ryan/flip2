@@ -144,6 +144,7 @@ A shard is little-endian and is laid out in this order:
 | `P` | float64 | 3 | position in metres, x y z |
 | `v` | float32 | 3 | velocity in metres per second |
 | `c` | float32 | 9 | with APIC only: velocity gradient, component c along axis a at 3c + a, per second |
+| `breakup` | float32 | 1 | with air whose particles escape only: for an air particle the grid carries, the most violent churning it has been through since it was last in a voxel holding no liquid (turbulent dissipation, m²/s³); for one that has escaped, its bubbles' radius in metres; nothing for the liquid |
 | `id` | uint64 | 1 | the particle's id |
 | `birth` | float32 | 1 | when the particle came to be, in simulated seconds |
 
@@ -190,9 +191,11 @@ A scene with an `air` block simulates the air as particles too. Air the grid can
 | `P` | float32 | 3 | position in metres |
 | `v` | float32 | 3 | velocity in metres per second |
 | `id` | uint64 | 1 | the bubble's id (below) |
-| `radius` | float32 | 1 | the radius of the bubble it flies as, in metres: the scene's `air.bubbleRadius`, or a ball of one particle's air |
+| `radius` | float32 | 1 | the radius of the bubbles its air is in, which it flies as, in metres: the scene's `air.bubbleRadius`, or its own, drawn as it escaped (below) |
 
 **What a bubble is.** Each one is the air of one particle: a voxel's volume divided by `cache.json`'s `bubbles.perVoxel`. That sets how large to draw it, as for whitewater: `flip2 export` writes half of `voxelSize / cbrt(perVoxel)` as `pscale`. A bubble is drawn best as a cloud of much finer ones, as whitewater's bubbles are.
+
+**Sizes.** `radius` is the size of the bubbles that air is in, which sets how fast they rise; how much air there is doesn't change with it. Unless the scene sets `air.bubbleRadius`, each bubble's is drawn as it escapes, from the spread of sizes turbulence breaks entrained air into (Deane & Stokes 2002, under breaking waves). The spread runs from 0.05 mm up to the largest the air it escaped from makes: the air around it the grid doesn't resolve, as one ball, and never less than one particle's air. Most of the air sits near the Hinze scale, the largest bubble turbulence leaves whole, taken at the most violent churning the air went through since the liquid took hold of it (since it was last in a voxel holding no liquid): the churning that breaks air up is where and while it's entrained, before it spreads too thin for the grid and escapes. So a cloud of bubbles has a spread of sizes: the large ones rise in a second or two, and the finest linger for tens of seconds. A bubble keeps its size until it rejoins the grid.
 
 **Ids.** A bubble's id is its air particle's number. The air a scene starts with is numbered after the liquid, in the order the scene gives it. Air the bake makes later takes a number when a frame first finds it a bubble: a hash of where it is, the same however the domain is split. A particle keeps its number from then on, through any number of times it leaves and rejoins the grid. Air ids are separate from the liquid's and the whitewater's, and two bubbles can share one, rarely. `flip2 export` writes them to Houdini as int32 `id`.
 

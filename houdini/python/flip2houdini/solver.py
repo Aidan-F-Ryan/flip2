@@ -267,7 +267,7 @@ def _interface(node):
     air_advanced.addParmTemplate(hou.FloatParmTemplate("airdropletradius", "Droplet Radius", 1, default_value=(0.0,), min=0.0, max=0.1, disable_when=no_air,
                                                        help="Metres, for the air's drag on a flying droplet: 0 for a particle's worth of liquid"))
     air_advanced.addParmTemplate(hou.FloatParmTemplate("airbubbleradius", "Bubble Radius", 1, default_value=(0.0,), min=0.0, max=0.1, disable_when=no_air,
-                                                       help="Metres, for the liquid's drag on a rising bubble: 0 for a particle's worth of air"))
+                                                       help="Metres: every bubble's radius, for the liquid's drag on it as it rises. 0 sizes each bubble as it escapes, from the air it escaped from and how hard the water churns there"))
     air_advanced.addParmTemplate(hou.FloatParmTemplate("airviscosity", "Air Viscosity", 1, default_value=(1.5e-5,), min=1.0e-7, max=1.0e-2, disable_when=no_air,
                                                        help="The air's kinematic viscosity, m^2/s, for its drag on droplets: 1.5e-5 is air's"))
     air.addParmTemplate(air_advanced)

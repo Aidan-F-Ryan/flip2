@@ -102,6 +102,26 @@ struct EscapedFlight{
     float air;          //of liquid (EscapedPath): 1 and 1 over the density ratio for a bubble, the density ratio and 1 for a droplet
 };
 
+//A bubble's size, which it takes as it escapes (bubbleRadius, particles.cu) and flies at until it's the grid's again. The air it stands for is
+//one particle's whatever its size: the size is that of the bubbles that air is in, which sets how fast they rise. Air the turbulence of the flow
+//entrains breaks into bubbles of a spread of sizes (Deane & Stokes 2002, under breaking waves): by number, r^(-3/2) under the Hinze scale, the
+//largest a bubble the turbulence there leaves whole is, and r^(-10/3) over it; so by volume, which is what a particle's draw goes by, r^(3/2)
+//and r^(-1/3). Each bubble's is drawn from that, from BUBBLE_SMALLEST up to the largest the air it escaped from makes: the air the grid doesn't
+//resolve around it, as one ball, and never less than a ball of the particle's own air. The Hinze scale is Hinze's (1955) largest whole bubble,
+//0.725 (sigma/rho)^(3/5) eps^(-2/5) across, at the most violent churning the air has been through since the liquid took hold of it: since it was
+//last in a voxel holding no liquid. The churning that breaks entrained air up is where and while it's entrained, still a pocket the grid resolves
+//(measured only from then, nothing changed: the air escapes a moment later, in calmer water). The churning by Smagorinsky's model of what the
+//grid doesn't resolve: dissipating (Cs h)^2 |S|^3, with |S| the magnitude of the grid's strain rate, at each voxel (churnAt, G2P)
+struct BubbleSizes{
+    float fixed = 0.0f;     //the scene's bubble radius (TwoPhase::bubbleRadius), which every bubble takes; 0 to draw each one's
+    float ball = 0.0f;      //the radius of a ball of one particle's air, metres
+    float tension = 0.0f;   //the liquid's surface tension over its density, m^3/s^2
+};
+static constexpr float BUBBLE_SMALLEST = 5.0e-5f;   //metres: finer bubbles dissolve before they'd matter
+static constexpr float SMAGORINSKY = 0.17f;         //Lilly's constant for Smagorinsky's model: the eddies a voxel can't hold mix what's in it at (0.17 dx)^2 |S|
+static constexpr float HINZE = 0.725f;              //Hinze's (1955) constant: the largest whole bubble's diameter, in (sigma/rho)^(3/5) eps^(-2/5)
+                                                    //(the whitewater's bubbles take both too)
+
 //the air band (TwoPhase::band, twophase.cu): a node cell's ring is how many nodes it is from one holding liquid, and this is one no ring reached
 static constexpr char BEYOND_BAND = 127;
 
@@ -297,9 +317,13 @@ public:
         freeSurfaceMode = mode;
     }
 
-    //air as well as liquid (see TwoPhase): before initialize. Not with the sharp free surface yet
+    //air as well as liquid (see TwoPhase): before initialize, after setParticles. Not with the sharp free surface yet
     void setTwoPhase(const TwoPhase& settings){
         twoPhase = settings;
+        if(twoPhase.escaping()){    //no particle has escaped yet; a checkpoint's sizes come after this
+            airBreakup.resizeAsync(size, stream);
+            airBreakup.zeroDeviceAsync(stream);
+        }
     }
     //at a bake's start, before initialize: the particles given from first on are air (a scene's air is seeded after its liquid), and the liquid's next id
     //is first. A checkpoint's ids say which is which themselves
@@ -341,7 +365,7 @@ private:
     void exchangeParticles();
     ForceVoxels forceVoxels();
     void resizeParticleArrays(uint newSize, uint keep);
-    std::vector<CudaVec<float>*> particleFloats();      //the per-particle float arrays: velocities, and with APIC their gradients
+    std::vector<CudaVec<float>*> particleFloats();      //the per-particle float arrays: velocities, with APIC their gradients, and with escaping air the bubbles' sizes
     void markRemovedParticles();
     void killRemovedParticles();
     void dropRemovedParticles();
@@ -450,6 +474,11 @@ private:
     CudaVec<double> px, py, pz;    //positions stay double: in a large domain, float would round a slow particle's step away
     CudaVec<float> vx, vy, vz;
     CudaVec<float> affine[9];   //APIC: per particle, velocity component c's gradient along axis a, in 1/s, at [3*c + a]; empty without APIC
+    //With air whose particles escape, how far the churning has broken each air particle's air (BubbleSizes), in two stages: while the grid carries it,
+    //the most violent churning it has been through since it was last in a voxel holding no liquid (turbulent dissipation, m^2/s^3; 0 there); once
+    //it escapes, the radius of the bubbles that broke it into, metres (G2P marks one escaping with its churning, as -(churning + 1e-30), and its
+    //flight draws its size). The liquid's mean nothing. Empty without such air
+    CudaVec<float> airBreakup;
     //Each particle's id, which it keeps for as long as it exists and no other ever has, and when it came to be, in seconds from the start. The fluid
     //the scene starts with is numbered in the order it's given in, born at 0; each particle made after that (emitParticles) takes the next id in the
     //order of the lattice point it came from, which every partition works out for every new particle, its own or not: so the ids are the same however

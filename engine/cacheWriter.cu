@@ -419,6 +419,9 @@ void CacheWriter::process(const Job& job){
     if(job.checkpoint && job.state.apic){
         layout.push_back({"c", 9, 4, false});
     }
+    if(job.checkpoint && job.state.breakup){
+        layout.push_back({"breakup", 1, 4, false});
+    }
     if(job.checkpoint || description.ids){
         layout.push_back({"id", 1, 8, true});
     }

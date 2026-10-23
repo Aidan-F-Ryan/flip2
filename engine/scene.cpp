@@ -448,7 +448,7 @@ Scene loadScene(const std::string& path){
         scene.airLiquidViscosity = read.number(*air, "liquidViscosity", "air", scene.viscosity > 0.0 ? scene.viscosity : scene.airLiquidViscosity);
         scene.airSurfaceTension = read.number(*air, "surfaceTension", "air", scene.surfaceTension > 0.0 ? scene.surfaceTension : scene.airSurfaceTension);
         if(scene.airDropletRadius < 0.0 || scene.airBubbleRadius < 0.0 || scene.airViscosity <= 0.0 || scene.airLiquidViscosity <= 0.0 || scene.airSurfaceTension <= 0.0){
-            read.fail("air", "dropletRadius and bubbleRadius have to be at least 0 (0 for a particle's worth of the fluid), and viscosity, liquidViscosity and surfaceTension positive");
+            read.fail("air", "dropletRadius and bubbleRadius have to be at least 0 (0: a droplet a particle's worth of liquid, each bubble sized as it escapes), and viscosity, liquidViscosity and surfaceTension positive");
         }
         if((scene.viscosity > 0.0 && scene.airLiquidViscosity != scene.viscosity) || (scene.surfaceTension > 0.0 && scene.airSurfaceTension != scene.surfaceTension)){
             read.fail("air", "liquidViscosity and surfaceTension are the liquid's own where \"liquid\" gives it a viscosity or a surfaceTension: leave them out");

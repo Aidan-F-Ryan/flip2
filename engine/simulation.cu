@@ -465,8 +465,9 @@ void Simulation::writeCacheFrame(int frame){
 
 void Simulation::writeCheckpoint(int frame){
     bool apic = partitions[0]->apic;
+    bool breakup = partitions[0]->twoPhase.escaping();   //the air's breakup, with escaping air
     std::vector<uint> whitewaterCounts = countWhitewater();
-    size_t fluidBytes = (CacheWriter::checkpointBytes(particlesHere(), apic) + 7) / 8*8;
+    size_t fluidBytes = (CacheWriter::checkpointBytes(particlesHere(), apic, breakup) + 7) / 8*8;
     size_t whitewaterTotal = 0;
     for(uint count : whitewaterCounts){
         whitewaterTotal += count;
@@ -483,7 +484,7 @@ void Simulation::writeCheckpoint(int frame){
         partition.copyCheckpointToHost(host + offset, cacheCopies[index][buffer]);
         shards.push_back({ranks[index], partition.numParticles(), offset});
         copies.push_back(cacheCopies[index][buffer]);
-        offset += CacheWriter::checkpointBytes(partition.numParticles(), apic);
+        offset += CacheWriter::checkpointBytes(partition.numParticles(), apic, breakup);
         state.acceleration = std::max(state.acceleration, partition.acceleration());    //this rank's partitions' largest; the record takes every rank's
     }
     offset = fluidBytes;
@@ -502,6 +503,7 @@ void Simulation::writeCheckpoint(int frame){
     state.time = partitions[0]->elapsedTime;
     state.substep = partitions[0]->substepIndex;
     state.apic = apic;
+    state.breakup = breakup;
     state.nextId = partitions[0]->nextId();
     state.whitewaterNextId = partitions[0]->nextWhitewaterId();
     cacheWriter->submitCheckpoint(buffer, frame, state, shards, copies, whitewater);

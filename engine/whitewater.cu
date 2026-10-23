@@ -74,9 +74,9 @@ static constexpr float FACE_LIQUID = 0.1f;      //a face holding less of its res
 static constexpr float BREAKUP_WEBER = 12.0f;   //rho w^2 d / sigma for a ball of diameter d whose kinetic energy at w is its surface's
 static constexpr float AIR_FOLDED = 1.0f;       //the volume of bubbles a breaking surface makes, per unit area and time, over how far past breaking its speed is
 static constexpr float SPRAY_THROWN = 8.0f;     //and of spray
-static constexpr float HINZE = 0.725f;          //Hinze's constant, for the largest bubble turbulence leaves whole
 static constexpr float SIZE_SPREAD = 0.4f;      //the log-normal's width: a standard deviation of 0.4 in the logarithm, a factor of 1.5
-static constexpr float SMAGORINSKY = 0.17f;     //Smagorinsky's constant: the eddies a voxel can't hold mix what's in it at (0.17 dx)^2 times the strain rate
+//HINZE, for the largest bubble turbulence leaves whole, and SMAGORINSKY, how the eddies a voxel can't hold mix what's in it ((0.17 dx)^2 times the
+//strain rate), are the escaping air's too (particles.hu)
 static constexpr uint MOST_PER_VOXEL = 4096;    //bubbles a voxel makes in a substep at most, and droplets: only so that no rate, however wrong, overflows a count
 static constexpr uint WHITEWATER_THREADS = 256; //per node block in flyWhitewater, a particle each
 

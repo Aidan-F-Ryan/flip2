@@ -1186,12 +1186,13 @@ static bool newestCheckpoint(const std::string& directory, Checkpoint& out, std:
 }
 
 //the checkpoint's particles in the ranks whose planes overlap node planes [low, high), in rank order: the order one partition would hold them in. Each
-//state shard is checked against its record's XXH64 as it's read. ids and births come back empty from a checkpoint made before particles had them
+//state shard is checked against its record's XXH64 as it's read. ids and births come back empty from a checkpoint made before particles had them, and
+//breakup (how far the churning has broken each air particle's air: escaping air) from one without it
 static bool loadCheckpoint(const std::string& directory, const Checkpoint& checkpoint, uint low, uint high, std::vector<double>& x, std::vector<double>& y,
                            std::vector<double>& z, std::vector<float>& u, std::vector<float>& v, std::vector<float>& w,
-                           std::vector<std::vector<float>>& gradients, std::vector<uint>& ids, std::vector<float>& births, std::string& why){
+                           std::vector<std::vector<float>>& gradients, std::vector<uint>& ids, std::vector<float>& births, std::vector<float>& breakup, std::string& why){
     gradients.assign(9, {});
-    bool identified = true;
+    bool identified = true, sized = true;
     for(const Checkpoint::State& state : checkpoint.states){
         if(checkpoint.planes[state.rank] >= high || checkpoint.planes[state.rank + 1] <= low){
             continue;
@@ -1222,6 +1223,14 @@ static bool loadCheckpoint(const std::string& directory, const Checkpoint& check
                 gradients[k].insert(gradients[k].end(), c + k*count, c + (k + 1)*count);
             }
         }
+        const ShardData::Attribute* broken = shard.find("breakup");
+        if(broken != nullptr && broken->type == 1 && broken->components == 1){
+            const float* b = (const float*)broken->planes.data();
+            breakup.insert(breakup.end(), b, b + count);
+        }
+        else{
+            sized = false;
+        }
         const ShardData::Attribute* id = shard.find("id");
         const ShardData::Attribute* birth = shard.find("birth");
         if(id != nullptr && birth != nullptr && id->type == 3 && birth->type == 1 && id->components == 1 && birth->components == 1){
@@ -1239,6 +1248,9 @@ static bool loadCheckpoint(const std::string& directory, const Checkpoint& check
     if(!identified){
         ids.clear();
         births.clear();
+    }
+    if(!sized){
+        breakup.clear();
     }
     return true;
 }
@@ -1581,6 +1593,7 @@ int main(int argc, char** argv){
     std::vector<std::vector<float>> gradients;
     std::vector<uint> ids;
     std::vector<float> births;
+    std::vector<float> breakup; //how far the churning has broken each air particle's air, with escaping air
     uint low = 0, high = scene.nodes[2];    //the node planes this process holds: all of them, or across processes, its rank's
     if(resuming){   //every rank's particles here, or across processes, those of the checkpoint's ranks whose planes overlap this rank's
         if(!alone){
@@ -1592,7 +1605,7 @@ int main(int argc, char** argv){
             high = planes[myRank + 1];
         }
         std::string why;
-        if(!loadCheckpoint(scene.outputDirectory, checkpoint, low, high, x, y, z, u, v, w, gradients, ids, births, why)){
+        if(!loadCheckpoint(scene.outputDirectory, checkpoint, low, high, x, y, z, u, v, w, gradients, ids, births, breakup, why)){
             return failure(why);
         }
         if((ids.empty() && !x.empty()) || !checkpoint.hasNextId){   //made before particles had ids: they're numbered as they come, from here on
@@ -1682,6 +1695,19 @@ int main(int argc, char** argv){
             simulation->markAirParticles(liquidSeeds);
         }
         simulation->setTwoPhase(twoPhase);
+        if(resuming && twoPhase.escaping()){    //the air's breakup as the checkpoint has it: one made before has its flying bubbles at the size every
+            if(breakup.size() != x.size()){     //bubble flew at then, and the rest unbroken
+                float then = twoPhase.bubbleRadius > 0.0f ? twoPhase.bubbleRadius
+                                                          : (float)(scene.voxelSize()*std::cbrt(3.0 / (4.0*3.14159265358979323846*scene.particlesPerVoxel)));
+                breakup.assign(x.size(), 0.0f);
+                for(size_t particle = 0; particle < ids.size() && particle < breakup.size(); ++particle){
+                    if((ids[particle] & (AIR_PARTICLE | ESCAPED_PARTICLE)) == (AIR_PARTICLE | ESCAPED_PARTICLE)){
+                        breakup[particle] = then;
+                    }
+                }
+            }
+            simulation->setAirBreakup(breakup);
+        }
         if(printsEvents){
             std::cerr<<"Two phases: density ratio "<<twoPhase.densityRatio<<"\n";
         }
