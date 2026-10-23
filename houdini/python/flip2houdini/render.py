@@ -21,9 +21,13 @@ as long streaks, a furry smear sliding through the water.
 
 A bake with air has its air's own bubbles rendered as what they are to light: the air the liquid has mixed in finer than its voxels, which its surface
 can't show. Bubbles too fine to see one by one are a medium in the water, which scatters what the fluid fields' bubbles grid says, per metre (flip2
-mesh --fields: 0.75 times their share of the volume over their Sauter mean radius), white, since bubbles absorb next to nothing, and leaning forward
-as bubbles in water do (BUBBLE_ANISOTROPY), with light scattered in it as often as it takes to get out (VOLUME_BOUNCES: Karma's own 0 scatters it
-once, which leaves a cloud of bubbles grey as soot). Those BUBBLE_DRAWN or larger are drawn one by one as balls of air in the water. Without the
+mesh --fields: 0.75 times their share of the volume over their Sauter mean radius), white, since bubbles absorb next to nothing. They scatter it
+forward (BUBBLE_ANISOTROPY), so in a cloud dense enough to whiten water light turns back out only after many bounces: it's rendered as the
+similarity relation has it, evenly in every direction at the reduced coefficient, 1 - g of that, which is exact where the cloud is many scatterings
+deep and gets the light out in about a third of the bounces; with VOLUME_BOUNCES (Karma's own 0 scatters it once, which leaves a cloud of bubbles
+grey as soot, and 16 still greyed it). The light it scatters goes through water as it does, and the water absorbs as pure water does: in a cloud
+that's a long way, and water tinted as a stronger dye turned it grey-teal. Those BUBBLE_DRAWN or larger are drawn one by one as balls of air in the
+water. Without the
 fields (the Solver node's Output Fluid Fields) the air's bubbles aren't rendered: drawn from their points instead (as specks, soft balls, a haze
 spread from them), a cloud of them shows the spacing of the points, and read as polystyrene, cotton balls or smoke. Houdini's is
 rendered as points as wide as they are apart (its solver's pscale makes each twice that, which renders as beads). The sun is on the
@@ -37,8 +41,8 @@ import hou
 from . import importer
 
 LOOKS = {     #MaterialX standard surfaces
-    "water": dict(base=0.0, specular=1.0, specular_roughness=0.02, specular_IOR=1.33, transmission=1.0, transmission_depth=0.6,
-                  transmission_colorr=0.55, transmission_colorg=0.8, transmission_colorb=0.9),
+    "water": dict(base=0.0, specular=1.0, specular_roughness=0.02, specular_IOR=1.33, transmission=1.0, transmission_depth=1.0,     #pure water's own
+                  transmission_colorr=0.71, transmission_colorg=0.946, transmission_colorb=0.991),     #absorption, a metre of it (Pope and Fry 1997)
     "whitewater": dict(base=1.0, base_colorr=0.95, base_colorg=0.97, base_colorb=1.0, specular=0.2, specular_roughness=0.6),
     "solid": dict(base=1.0, base_colorr=0.35, base_colorg=0.33, base_colorb=0.3, specular_roughness=0.5),
     "body": dict(base=1.0, base_colorr=0.75, base_colorg=0.42, base_colorb=0.16, specular=0.4, specular_roughness=0.45),    #painted wood: what floats stands out
@@ -48,10 +52,10 @@ LOOKS = {     #MaterialX standard surfaces
 WHITEWATER_WIDTH = 0.5      #a whitewater point's radius, as a fraction of the whitewater's separation: so each is as wide as they are apart
 BUBBLE_DRAWN = 0.0015       #the air's bubbles this radius or larger, metres, are drawn one by one: across a frame a few metres wide, a pixel or more
 BUBBLE_ANISOTROPY = 0.68    #how far forward bubbles in water scatter what they reflect and refract (Henyey-Greenstein's g; 0.84 with the diffracted half)
-VOLUME_BOUNCES = 16         #volume bounces, with the air's bubbles: a cloud of them is white by scattering light many times
+VOLUME_BOUNCES = 64         #volume bounces, with the air's bubbles: a cloud of them is white by scattering light many times
 REFRACTION_BOUNCES = 12     #and refraction bounces: through the water's surface and the balls of air in it
-VOLUME_LOOKS = {     #Karma Pyro Shaders (_volume_material): the air's fine bubbles, a medium that scatters what its density says per metre, absorbing nothing
-    "bubblemedium": dict(densityscale=1.0, smokecolorr=1.0, smokecolorg=1.0, smokecolorb=1.0, anisotropy=BUBBLE_ANISOTROPY),
+VOLUME_LOOKS = {     #Karma Pyro Shaders (_volume_material): the air's fine bubbles, a medium that scatters, evenly, the reduced part of what its density says
+    "bubblemedium": dict(densityscale=1.0 - BUBBLE_ANISOTROPY, smokecolorr=1.0, smokecolorg=1.0, smokecolorb=1.0, anisotropy=0.0),     #per metre
 }
 SPECKS = 24                 #each of the bake's own foam and bubble points drawn as this many white specks,
 SPECK_SIZE = 0.25           #each this fraction of the point's size (spread log-normally), scattered over the spacing of the points
