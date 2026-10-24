@@ -14,6 +14,7 @@ import argparse
 import json
 import math
 import operator
+import os
 import shutil
 import subprocess
 import sys
@@ -493,6 +494,236 @@ def wall_settings(bake):
             Result("speed kept on a floor with friction, over one without", rough.velocity(rough.frames[-1])[0] / slips.velocity(slips.frames[-1])[0], 0.0, 0.99, "", "most")]
 
 
+# ---- dynamic bodies (two-way coupled: bodies.cu, contacts.cu) ----
+
+TANK, DEEP, RADIUS = 0.5, 0.25, 0.08    #bodies.py's tank, 0.5 m across with water a quarter of a metre deep, and its ball
+LIQUID = 1000.0                         #the scenes' liquid density, kg/m^3 (scene.hpp's default)
+
+
+def tank(frames, voxel=1.0 / 128, top=TANK, depth=DEEP, fps=24, **more):
+    """the tank, top high, with water depth deep (0: dry, but for a voxel of it in a corner, as bodies.py's pool=0)"""
+    water = box([0.0, 0.0, 0.0], [TANK, depth, TANK]) if depth > 0.0 else box([0.0, 0.0, 0.0], [voxel, voxel, voxel])
+    return scene([0.0, 0.0, 0.0], [TANK, top, TANK], voxel, frames, [water], fps=fps, **more)
+
+
+def body(shape, place, density, turn=0.0, **dynamic):
+    """a dynamic body: an obstacle's shape, in its own space, put at place and turned turn degrees about y"""
+    c, s = math.cos(math.radians(turn)), math.sin(math.radians(turn))
+    return dict(shape, transform=[c, 0, s, place[0], 0, 1, 0, place[1], -s, 0, c, place[2], 0, 0, 0, 1], dynamic=dict(dynamic, density=density))
+
+
+def ball(height, density, **dynamic):
+    """the ball, in the middle of the tank with its centre height high"""
+    return body({"shape": "sphere", "centre": [0, 0, 0], "radius": RADIUS}, [0.5 * TANK, height, 0.5 * TANK], density, **dynamic)
+
+
+def stack(size, voxel):
+    """three boxes of side size over the middle of the tank, a voxel apart, the lowest's centre 0.125 m up, each turned 7 degrees more than the one under it"""
+    return [body(box([-0.5 * size] * 3, [0.5 * size] * 3), [0.5 * TANK, 0.125 + i * (size + voxel), 0.5 * TANK], 2000.0, turn=7.0 * i) for i in range(3)]
+
+
+def track(run, what="position", axis=1, which=0, start=0):
+    """one number of a body by frame, from frame start: (time, value); axis None for its length"""
+    def value(f):
+        v = run.rows[f]["bodies"][which][what]
+        return math.sqrt(sum(x * x for x in v)) if axis is None else v[axis]
+    return [(run.time(f), value(f)) for f in run.frames if f >= start]
+
+
+def parabola(points):
+    """least squares y = a + b t + c t^2 through (t, y) points: the fit, and its slope, as functions of t"""
+    t0 = points[0][0]
+    rows = [[0.0] * 4 for _ in range(3)]    #the normal equations, with their right hand side
+    for t, y in points:
+        powers = [1.0, t - t0, (t - t0) ** 2]
+        for i in range(3):
+            for j in range(3):
+                rows[i][j] += powers[i] * powers[j]
+            rows[i][3] += powers[i] * y
+    for i in range(3):      #Gauss-Jordan
+        rows[i] = [value / rows[i][i] for value in rows[i]]
+        for k in range(3):
+            if k != i:
+                rows[k] = [value - rows[k][i] * mine for value, mine in zip(rows[k], rows[i])]
+    a, b, c = (rows[i][3] for i in range(3))
+    return (lambda t: a + b * (t - t0) + c * (t - t0) ** 2), (lambda t: b + 2.0 * c * (t - t0))
+
+
+def first_bounce(run, rest, step):
+    """A body dropped from rest onto a floor, its first hit, which the frames miss: parabolas through its free flight before and after it meet where
+    it turned round. The bodies move by semi-implicit Euler, each collision step (step long) adding its gravity and then moving, so a parabola
+    through the positions has the steps' mean velocities, half a step's gravity off what each step moves at: the contact solve saw the body closing
+    at the fit's speed in plus that, and left it at the fit's speed out less it. Those two speeds, and how high over rest its centre turned round"""
+    heights, speeds = track(run), track(run, "velocity")
+    ups = [i for i in range(1, len(speeds)) if speeds[i][1] > 0.0 > speeds[i - 1][1]]     #the frames it's going up again after coming down
+    hit, again = ups[0], ups[1] if len(ups) > 1 else len(heights)
+    before, falling = parabola(heights[:hit])
+    after, rising = parabola(heights[hit:again])
+    turn = heights[hit][0]
+    for _ in range(50):     #where the two meet
+        turn -= (before(turn) - after(turn)) / (falling(turn) - rising(turn))
+    half = 0.5 * G * step
+    return -falling(turn) + half, rising(turn) - half, before(turn) - rest
+
+
+def cap(fraction):
+    """how deep the ball sits holding fraction of its volume under the water: the cap height h with pi h^2 (3 r - h) / 3 = fraction 4/3 pi r^3"""
+    low, high = 0.0, 2.0 * RADIUS
+    for _ in range(60):
+        middle = 0.5 * (low + high)
+        if math.pi * middle * middle * (3.0 * RADIUS - middle) / 3.0 < fraction * 4.0 / 3.0 * math.pi * RADIUS ** 3:
+            low = middle
+        else:
+            high = middle
+    return 0.5 * (low + high)
+
+
+def most_work(start, level, density):
+    """the most the water's push, less its weight, can give a ball of density rising from start: as if the water's level stayed at level, which
+    it only falls from as the ball leaves it, so more than it really gives; the most where push and weight balance"""
+    volume = 4.0 / 3.0 * math.pi * RADIUS ** 3
+    def under(y):
+        h = min(max(level - (y - RADIUS), 0.0), 2.0 * RADIUS)
+        return math.pi * h * h * (3.0 * RADIUS - h) / 3.0
+    work, most, y, dy = 0.0, 0.0, start, 1.0e-4
+    while y < level + RADIUS:
+        work += (LIQUID * under(y + 0.5 * dy) - density * volume) * G * dy
+        most = max(most, work)
+        y += dy
+    return most
+
+
+def bodies_differing(one, other):
+    """how many of two bakes' frames differ in their bodies' records"""
+    return sum(1 for frame in one.frames if frame not in other.rows or one.rows[frame].get("bodies") != other.rows[frame].get("bodies"))
+
+
+@check("body-float",
+       "A ball of half the liquid's density, let go with its centre on the waterline, floats there (Archimedes) and stays still.",
+       "The plan's test for the coupling: its centre within half a voxel of the waterline. Measured 24 October: 0.0002 of a voxel off, and 0.38 of a"
+       " voxel between its highest and its lowest over its last 2 s, the particles' settling rocking it (0.09 on 18 October: why it has grown isn't "
+       "known). Half a voxel allowed for both.")
+def body_float(bake):
+    voxel = 1.0 / 128
+    run = bake("body-float", tank(96, obstacles=[ball(DEEP, 0.5 * LIQUID)]))
+    late = [y for t, y in track(run, start=48)]
+    return [Result("its centre over the last 2 s, as a height", sum(late) / len(late), DEEP, 0.5 * voxel, "m", "absolute"),
+            Result("its highest less its lowest in them", max(late) - min(late), 0.0, 0.5 * voxel, "m", "most")]
+
+
+@check("body-heave",
+       "A ball of half the liquid's density dropped onto the water bobs at its heave period, T = 2 pi sqrt((m + a) / (rho g pi r^2)): its mass "
+       "and the water's that moves with it (added mass, a, half of what it displaces) on the stiffness of its waterline.",
+       "The plan's test: within 10%. The added mass changes with the frequency (Hulme 1982: 0.83 of what a floating hemisphere displaces bobbing "
+       "slowly, 0.5 bobbing fast, which is 0.63 s and 0.57 s here), and the 0.5 m tank's second sloshing mode, at 0.57 s, keeps it bobbing. Measured"
+       " 24 October: 0.606 s over 9 half swings, 6.8% long (0.58 to 0.60 s on 18 October).")
+def body_heave(bake):
+    run = bake("body-heave", tank(96, obstacles=[ball(DEEP + 2.5 * RADIUS, 0.5 * LIQUID)]))
+    late = [y for t, y in track(run, start=48)]
+    middle = sum(late) / len(late)
+    measured, found = period([(t, y - middle) for t, y in track(run, start=24)])
+    mass = 0.5 * LIQUID * 4.0 / 3.0 * math.pi * RADIUS ** 3
+    expected = 2.0 * math.pi * math.sqrt(1.5 * mass / (LIQUID * G * math.pi * RADIUS ** 2))
+    return [Result("period, over %d half swings" % max(len(found) - 1, 0), measured, expected, 0.10, "s")]
+
+
+@check("body-light",
+       "A ball a twentieth of the liquid's density let go under water rises, leaves it, falls back and floats, and nothing blows up: it's never "
+       "faster than all the work the water's push could do on it would make it, it hardly turns (pressure pushes through a ball's centre, so it "
+       "can't turn it), and it ends floating where Archimedes has it, the water lower by the volume it no longer displaces.",
+       "Its speed's bound is energy's: all the work the water's push less its weight could do on it rising from where it starts, the water's level "
+       "held where it starts and none of the water moving with it, 6.7 m/s; measured 24 October, 2.0 m/s as it leaves the water. Its turning is "
+       "what's left of the coupling's torque leak, 0.022 rad/s at most measured 24 October (0.014 to 0.038 on 19 October); 0.1 allowed. A ceiling at"
+       " 0.5 m, which it would hit, rolls it (0.2 to 0.8 rad/s), so the tank's a metre high. Over its last second, after falling back in and bobbing"
+       " for 3 s, its centre was 0.06 of a voxel under Archimedes' height (24 October); two voxels allowed.")
+def body_light(bake):
+    voxel, density, start = 1.0 / 128, 0.05 * LIQUID, 0.5 * DEEP
+    run = bake("body-light", tank(96, top=1.0, obstacles=[ball(start, density)]))  #a metre high: it leaves the water at 2 m/s, and a ceiling at 0.5 m rolls it
+    volume = 4.0 / 3.0 * math.pi * RADIUS ** 3
+    level = DEEP - volume * (1.0 - density / LIQUID) / TANK ** 2    #the water seeded round the ball, which then displaces only part of its volume
+    floats = level + RADIUS - cap(density / LIQUID)
+    fastest = math.sqrt(2.0 * most_work(start, DEEP, density) / (density * volume))
+    last = [y for t, y in track(run, start=72)]
+    return [Result("fastest it goes", max(v for t, v in track(run, "velocity", None)), 0.0, fastest, "m/s", "most"),
+            Result("fastest it turns", max(w for t, w in track(run, "angularVelocity", None)), 0.0, 0.1, "rad/s", "most"),
+            Result("its centre over the last second, as a height", sum(last) / len(last), floats, 2.0 * voxel, "m", "absolute")]
+
+
+@check("body-bounce",
+       "A body dropped on a floor leaves it at the bounce Bullet gives, the body's times the floor's, which are RBD Bullet Solver's unless given: "
+       "a piece's 0.25 times a floor's 0.5, on the domain's floor and on a collider's top alike. It turns round on the floor or over it, not in it.",
+       "The contact solve gives the product in floats: 0.125 to 5 digits on both floors, measured 24 October; 0.2% allowed. It bounces at the start "
+       "of the collision step in which it would reach the floor, so it turns round up to a step's move over it (1.5 mm, 0.94 of a step's move, from "
+       "this drop; 0.06 to 1.6 mm over a frame's worth of drops, 24 October), and it may sink 0.05 of a voxel, the push out's slop, before it's "
+       "pushed out: those are the limits. (Read from the frames' speeds instead, gravity has taken a different amount since the hit on each floor, "
+       "and the two once looked 4% apart.)")
+def body_bounce(bake):
+    voxel, fps, substeps, drop = 1.0 / 128, 240, 5, 0.2
+    step = 1.0 / (fps * substeps)       #fast enough that the half voxel floor on a step's move adds none
+    results = []
+    for name, where, top, floors in (("wall", "the domain's floor", 0.0, []), ("collider", "a collider", 0.02, [box([0.1, 0.0, 0.1], [0.4, 0.02, 0.4])])):
+        run = bake("body-bounce-" + name, tank(90, depth=0.0, fps=fps, obstacles=[ball(top + RADIUS + drop, 2.0 * LIQUID, bounce=0.25)] + floors,
+                                                solver={"collisionSubsteps": substeps}))
+        closing, leaving, turned = first_bounce(run, top + RADIUS, step)
+        results += [Result("%s: the bounce its contact gave" % where, leaving / closing, 0.125, 0.002),
+                    Result("%s: how far it had sunk in at the turn" % where, max(-turned, 0.0), 0.0, 0.05 * voxel, "m", "most"),
+                    Result("%s: how far over it it turned, in steps' moves" % where, turned / (closing * step), 0.0, 1.0, "", "most")]
+    return results
+
+
+@check("body-stack",
+       "Boxes dropped one over another onto a dry floor come to rest in a stack and stay there.",
+       "Measured 24 October, from 2 s on: its top box moves 0.53 mm, and the boxes are still (0.04 mm/s at most) but for one jolt at 3.2 s, 7.8 mm/s"
+       " at most for three frames, the contacts' doing and not looked into. On 18 October's engine they were still settling at 1.5 s (15.6 mm/s). 1 "
+       "mm and 1 cm/s allowed.")
+def body_stack(bake):
+    run = bake("body-stack", tank(96, depth=0.0, obstacles=stack(0.12, 1.0 / 128)))
+    top = lambda frame: run.rows[frame]["bodies"][2]["position"]
+    last = run.frames[-1]
+    moved = math.sqrt(sum((a - b) ** 2 for a, b in zip(top(48), top(last))))
+    fastest = max(v for which in range(3) for t, v in track(run, "velocity", None, which, 48))
+    return [Result("how far its top box moves in its last 2 s", moved, 0.0, 0.001, "m", "most"),
+            Result("fastest any box goes in them", fastest, 0.0, 0.01, "m/s", "most")]
+
+
+@check("body-resume",
+       "A bake carried on from a checkpoint is the bake that never stopped, to the bit, with bodies resting on each other and on the floor under "
+       "water, whose contacts the checkpoint carries over: in as many partitions as it stopped in, or in more.",
+       "Exact. (Until 24 October a resumed bake's first contact steps were dealt from keys the islands' sort never sorted: restoring the "
+       "contacts made room for them but not the sort's scratch, so where they filled every slot the first substep needed, it never got any.)")
+def body_resume(bake):
+    made = tank(48, voxel=1.0 / 64, obstacles=stack(0.12, 1.0 / 64))
+    straight = bake("body-resume", made, cache=True)
+    results = []
+    for partitions in (1, 3):
+        name = "body-resume-%d" % partitions
+        bake(name, made, cache=True, until=24)
+        resumed = bake(name, None, until=48, partitions=partitions)
+        into = "in %d partition%s" % (partitions, "s" if partitions > 1 else "")
+        results += [Result("resumed at frame 24 %s: frames that differ" % into, differing(straight, resumed), 0, 0, "", "most"),
+                    Result("and frames whose bodies differ", bodies_differing(straight, resumed), 0, 0, "", "most")]
+    return results
+
+
+@check("body-spin",
+       "With no gravity, a ball spun in still water keeps its spin and leaves the water still: pressure pushes square to the surface, through a "
+       "ball's centre, so it can't turn it, and the water slips past it freely.",
+       "Against the same bake with the ball still, whose water settles as this one's does: the spun ball's water gains 4.5e-4 of the ball's angular "
+       "momentum in 2 s and the ball keeps all but 0.013% of its spin, measured 24 October (4.2e-4 and 0.014% on 18 October's engine, when free slip"
+       " was built): the coupling's torque leak, which hasn't been traced. A thousandth and 0.1% allowed.")
+def body_spin(bake):
+    voxel, depth, spin = 1.0 / 128, 0.4, 5.0
+    def spun(name, rate):
+        return bake(name, tank(48, depth=depth, gravity=[0.0, 0.0, 0.0], obstacles=[ball(0.5 * depth, LIQUID, angularVelocity=[0.0, 0.0, rate])]))
+    run, still = spun("body-spin", spin), spun("body-spin-still", 0.0)
+    last = run.frames[-1]
+    own = 0.4 * LIQUID * 4.0 / 3.0 * math.pi * RADIUS ** 5 * spin     #2/5 m r^2 w
+    particle = LIQUID * voxel ** 3 / 8.0    #the diagnostics' angular momentum is the particles' r x v, 8 of them a voxel
+    water = max(abs(run.rows[f]["angularMomentum"][2] - still.rows[f]["angularMomentum"][2]) * particle for f in run.frames)
+    return [Result("its spin after %.0f s" % run.time(last), run.rows[last]["bodies"][0]["angularVelocity"][2], spin, 0.001, "rad/s"),
+            Result("angular momentum it gives the water, over its own", water / own, 0.0, 0.001, "", "most")]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--bin", default=str(REPO / "build" / "engine" / "flip2"), help="the flip2 to run (default build/engine/flip2)")
@@ -514,20 +745,28 @@ def main():
     binary, out = Path(args.bin).resolve(), Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
 
-    def bake(name, made, cache=False):
+    def bake(name, made, cache=False, until=None, partitions=None):
+        """bakes a scene into out/name, stopping after frame until if given; with made None, carries name's bake on from its last checkpoint (a
+        cache's, which it writes at its end) to frame until instead (flip2 resume); partitions splits the domain between that many"""
         directory = out / name
-        if directory.exists():
-            shutil.rmtree(directory)
-        made = dict(made)
-        made["output"] = {"dir": str(directory), "cache": cache, "compression": "none", "checkpoints": {"every": 0}, "positions": False, "diagnostics": "diagnostics.jsonl"}
         path = out / (name + ".json")
-        with open(path, "w") as file:
-            json.dump(made, file)
+        if made is None:
+            made = json.loads(path.read_text())
+            command = [str(binary), "resume", str(directory), "--frames", str(until)]
+        else:
+            if directory.exists():
+                shutil.rmtree(directory)
+            made = dict(made)
+            made["output"] = {"dir": str(directory), "cache": cache, "compression": "none", "checkpoints": {"every": 0}, "positions": False, "diagnostics": "diagnostics.jsonl"}
+            with open(path, "w") as file:
+                json.dump(made, file)
+            command = [str(binary), "bake", str(path), "--overwrite"] + (["--frames", str(until)] if until else [])
         start = time.time()
-        with open(out / (name + ".log"), "w") as log:
-            result = subprocess.run([str(binary), "bake", str(path), "--overwrite"], stdout=log, stderr=subprocess.STDOUT, timeout=args.timeout)
+        with open(out / (name + ".log"), "a" if command[1] == "resume" else "w") as log:
+            result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, timeout=args.timeout,
+                                    env=dict(os.environ, FLIP2_PARTITIONS=str(partitions)) if partitions else None)
         if result.returncode != 0:
-            raise RuntimeError("%s bake %s exited with %d: see %s" % (binary, path, result.returncode, out / (name + ".log")))
+            raise RuntimeError("%s %s %s exited with %d: see %s" % (binary, command[1], command[2], result.returncode, out / (name + ".log")))
         return Run(directory, made, time.time() - start)
 
     failed, known, mended = [], [], []
