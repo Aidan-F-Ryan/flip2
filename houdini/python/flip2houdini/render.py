@@ -26,7 +26,7 @@ forward (BUBBLE_ANISOTROPY), so in a cloud dense enough to whiten water light tu
 similarity relation has it, evenly in every direction at the reduced coefficient, 1 - g of that, which is exact where the cloud is many scatterings
 deep and gets the light out in about a third of the bounces; with VOLUME_BOUNCES (Karma's own 0 scatters it once, which leaves a cloud of bubbles
 grey as soot, and 16 still greyed it). The light it scatters goes through water as it does, and the water absorbs as pure water does: in a cloud
-that's a long way, and water tinted as a stronger dye turned it grey-teal. Those BUBBLE_DRAWN or larger are drawn one by one as balls of air in the
+that's a long way, and water tinted as a stronger dye turned it grey-teal. Those of the bubble balls node's Smallest Bubble Drawn or larger (BUBBLE_DRAWN to start) are drawn one by one as balls of air in the
 water. Without the
 fields (the Solver node's Output Fluid Fields) the air's bubbles aren't rendered: drawn from their points instead (as specks, soft balls, a haze
 spread from them), a cloud of them shows the spacing of the points, and read as polystyrene, cotton balls or smoke. Houdini's is
@@ -50,10 +50,11 @@ LOOKS = {     #MaterialX standard surfaces
     "ground": dict(base=1.0, base_colorr=0.45, base_colorg=0.45, base_colorb=0.45, specular_roughness=0.7),
 }
 WHITEWATER_WIDTH = 0.5      #a whitewater point's radius, as a fraction of the whitewater's separation: so each is as wide as they are apart
-BUBBLE_DRAWN = 0.0015       #the air's bubbles this radius or larger, metres, are drawn one by one: across a frame a few metres wide, a pixel or more
+BUBBLE_DRAWN = 0.0015       #the air's bubbles this radius or larger, metres, are drawn one by one (to start: a slider on the bubble balls node). Across a
+                            #frame a few metres wide that's a pixel or more; at 3 mm, 22% faster, they lose a little of the churn's fine grain
 BUBBLE_ANISOTROPY = 0.68    #how far forward bubbles in water scatter what they reflect and refract (Henyey-Greenstein's g; 0.84 with the diffracted half)
 VOLUME_BOUNCES = 64         #volume bounces, with the air's bubbles: a cloud of them is white by scattering light many times
-REFRACTION_BOUNCES = 12     #and refraction bounces: through the water's surface and the balls of air in it
+REFRACTION_BOUNCES = 6      #and refraction bounces: through the water's surface and the balls of air in it (12 looked the same, and took 4% longer)
 VOLUME_LOOKS = {     #Karma Pyro Shaders (_volume_material): the air's fine bubbles, a medium that scatters, evenly, the reduced part of what its density says
     "bubblemedium": dict(densityscale=1.0 - BUBBLE_ANISOTROPY, smokecolorr=1.0, smokecolorg=1.0, smokecolorb=1.0, anisotropy=0.0),     #per metre
 }
@@ -125,7 +126,7 @@ def _bubble_medium(node, fields):
 
 
 def _bubble_balls(node, air):
-    """the air's bubbles BUBBLE_DRAWN or larger, one by one. Each of the bake's bubble points is one particle's air, (2 pscale)^3 (pscale is half the
+    """the air's bubbles of its Smallest Bubble Drawn or larger, one by one. Each of the bake's bubble points is one particle's air, (2 pscale)^3 (pscale is half the
     points' spacing), in bubbles of its radius: as many balls of that radius as that air makes (a fraction of one taken at random, by its id), spread
     over its spacing by its id, so they move with it, each a ball of air in the water. Not motion-blurred, as the specks aren't"""
     merged = _beside(node, air, "_bubbles", 1)
@@ -134,8 +135,14 @@ def _bubble_balls(node, air):
         balls = node.parent().createNode("attribwrangle", node.name() + "_bubble_balls")
         balls.setInput(0, merged)
         balls.setPosition(merged.position() + hou.Vector2(0.0, -1.0))
+    if balls.parm("smallest") is None:
+        balls.addSpareParmTuple(hou.FloatParmTemplate("smallest", "Smallest Bubble Drawn (mm)", 1, default_value=(BUBBLE_DRAWN*1000.0,), min=0.5, max=10.0,
+                                                      help="The air's bubbles this radius or larger are drawn one by one, as balls of air; finer ones only "
+                                                           "whiten the water, as the bubbles' medium. Larger renders faster (3 mm: about 22% at 1080p) with a "
+                                                           "little less fine grain in the churn"))
+        balls.parm("smallest").set(BUBBLE_DRAWN*1000.0)
     balls.parm("snippet").set(
-        "if(f@radius >= %g){\n"
+        "if(f@radius >= 0.001*chf(\"smallest\")){\n"
         "    float n = pow(2.0*f@pscale, 3.0) / (4.0/3.0*PI*pow(f@radius, 3.0));\n"
         "    int count = int(floor(n + rand(set(float(i@id), 7.0, 3.0))));\n"
         "    for(int k = 0; k < count; k++){\n"
@@ -144,7 +151,7 @@ def _bubble_balls(node, air):
         "        setpointattrib(0, \"v\", ball, set(0.0, 0.0, 0.0));\n"
         "    }\n"
         "}\n"
-        "removepoint(0, @ptnum);\n" % BUBBLE_DRAWN)
+        "removepoint(0, @ptnum);\n")
     return balls
 
 
