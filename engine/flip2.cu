@@ -1766,6 +1766,7 @@ int main(int argc, char** argv){
     for(int face = 0; face < 6; ++face){
         simulation->setWallContactAngle(face, scene.wallContactAngle[face]);
         simulation->setWallFriction(face, scene.wallFriction[face]);
+        simulation->setWallContact(face, scene.wallBounce[face], scene.wallContactFriction[face]);
     }
     simulation->setViscousCfl(scene.viscousCfl);
     simulation->setFreeSurface(scene.freeSurface == "levelSet" ? FreeSurface::sharp : FreeSurface::footprint);

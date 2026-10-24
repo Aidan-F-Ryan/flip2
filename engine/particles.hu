@@ -272,6 +272,9 @@ public:
     //what the fluid flows around (see obstacles.hu), and among them, what it moves too (dynamic ones, bodies.hu): weighed against the liquid's density,
     //kg/m^3. After setDomain
     void setObstacles(const std::vector<SceneObstacle>& descriptions, double liquidDensity = 1000.0);
+    void setWallContact(int wall, double bounce, double contactFriction){   //what a dynamic body meets at a wall (Bodies::setWallContact)
+        bodies.setWallContact(wall, bounce, contactFriction);
+    }
     void setCollisionSubsteps(int perFrame){    //the dynamic bodies' contact steps a frame, at least (Bodies::setCollisionSubsteps)
         bodies.setCollisionSubsteps(perFrame);
     }

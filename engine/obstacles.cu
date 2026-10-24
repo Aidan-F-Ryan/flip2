@@ -1118,6 +1118,8 @@ void ObstacleSet::update(double time){
         state.radius = obstacle.radius;
         state.friction = obstacle.friction;
         state.letsGo = obstacle.letsGo;
+        state.bounce = obstacle.bounce;
+        state.contactFriction = obstacle.contactFriction;
         state.frame = obstacle.frame;
         state.body = obstacle.body;
         changed.push_back((int)index);
@@ -1364,6 +1366,8 @@ void ObstacleSet::build(const std::vector<SceneObstacle>& obstacles, double voxe
         made.kind = obstacle.kind == SceneObstacle::MESH || obstacle.kind == SceneObstacle::FIELD ? OBSTACLE_MESH : obstacle.kind == SceneObstacle::BOX ? OBSTACLE_BOX : OBSTACLE_SPHERE;
         made.friction = (float)obstacle.friction;
         made.letsGo = !obstacle.hold;
+        made.bounce = (float)obstacle.bounce;
+        made.contactFriction = (float)obstacle.contactFriction;
         made.keyTimes = obstacle.keyTimes;
         //each key's rigid motion; the first key's scale is baked into the shape
         double scale[3] = {1.0, 1.0, 1.0};

@@ -8,7 +8,8 @@ Its inputs are geometry, as Houdini's own FLIP Solver takes it:
     4 Sinks        closed surfaces that remove the fluid inside them
 
 Each input is one object, or with a "name" primitive attribute, one per name. A collision object's geometry can carry its own settings, as primitive
-attributes with one value per object: flip2_friction, flip2_hold (0 or 1) and flip2_thickness; without them it gets the Collisions tab's. Packed
+attributes with one value per object: flip2_friction, flip2_hold (0 or 1) and flip2_thickness, and what RBD pieces meet in it, flip2_bounce and
+flip2_contactfriction; without them it gets the Collisions tab's and the RBD tab's. Packed
 geometry is unpacked, every primitive turned into polygons and the polygons into triangles. An object is sampled every frame of the range, and goes to flip2 as what it does: still, its vertices once; moving rigidly (no
 vertex further than a hundredth of a voxel from where a turn and a shift put it), its vertices once and a transform per frame, which flip2 turns it
 through exactly; or deforming, its vertices every frame, which flip2 re-voxelizes between, so its points and triangles mustn't change. flip2 takes
@@ -90,7 +91,8 @@ FORCE_FILE = "force_volumes.vdb"
 MESH_VERTICES = "meshes_vertices.npy"       #every object's vertices where it starts, one after another (_Packer)
 MESH_TRIANGLES = "meshes_triangles.npy"     #and their triangles, each numbering its own vertices from 0
 DEFORMING_FILE = "deforming_f%d.npy"        #every deforming object's vertices at a frame
-SETTINGS = (("friction", "flip2_friction", float), ("hold", "flip2_hold", int), ("thickness", "flip2_thickness", float))  #a collision object's own, as primitive attributes
+SETTINGS = (("friction", "flip2_friction", float), ("hold", "flip2_hold", int), ("thickness", "flip2_thickness", float),    #a collision object's own,
+            ("bounce", "flip2_bounce", float), ("contactFriction", "flip2_contactfriction", float))                                 #as primitive attributes
 FORCE_LIMIT = 16    #and the forces
 FIELD_TYPES = ("point", "vortex", "turbulence", "wind")     #the Forces tab's force fields, as the scene names them
 FIELD_SETTINGS = {  #each one's scene keys, and the parameters of a Force Fields instance they come from
@@ -106,6 +108,7 @@ _jobs = {}      #per node path, its bake's processes, while this session runs th
 GEO_FILE = re.compile(r"^((%s)\d+_(triangles|vertices|f-?\d+)\.npy|meshes_(vertices|triangles)\.npy|deforming_f-?\d+\.npy|(collision|force)_volumes\.vdb)$"
                       % "|".join(ROLES + ("rbd",)))
 RBD_DEFAULTS = {"density": 1000.0, "friction": 1.0, "bounce": 0.25}     #RBD Bullet Solver's, for a piece without the attribute
+CONTACT_DEFAULTS = {"bounce": 0.5, "contactFriction": 1.0}  #and for its collisions and ground plane, which the engine takes when a scene gives none
 PIECE_TAG = '''//a packed piece's name, as a point attribute or its primitive's, which unpacking hands its geometry
 string piece = point(0, "name", @ptnum);
 if(!haspointattrib(0, "name")){
@@ -300,7 +303,8 @@ def _interface(node):
     collisions.addParmTemplate(hou.LabelParmTemplate("collisionnote", "Per Object",
                                                      column_labels=("These are every collision object's, unless its geometry carries its own: primitive "
                                                                     "attributes flip2_friction, flip2_hold (0 or 1) and flip2_thickness, one value per object "
-                                                                    "(objects are told apart by their name attribute)",)))
+                                                                    "(objects are told apart by their name attribute); and flip2_bounce and "
+                                                                    "flip2_contactfriction in place of the RBD tab's Collision Bounce and Friction",)))
     collisions.addParmTemplate(hou.FloatParmTemplate("friction", "Friction", 1, default_value=(0.0,), min=0.0, max=1.0,
                                                      help="0: the fluid slips along collisions freely; 1: the fluid touching them moves with them. An object's "
                                                           "own flip2_friction primitive attribute overrides this"))
@@ -329,6 +333,20 @@ def _interface(node):
                                                  "are solved, as RBD Bullet Solver's Substeps: 5 at 24 frames a second is 120 a second, enough for a "
                                                  "stack to stand; a tall one needs more. More steps are taken when a piece moves fast, so none moves "
                                                  "more than half a voxel in one"))
+    rbd.addParmTemplate(hou.FloatParmTemplate("rbdcollisionbounce", "Collision Bounce", 1, default_value=(CONTACT_DEFAULTS["bounce"],), min=0.0, max=1.0,
+                                              join_with_next=True,
+                                              help="What a piece meets in the Collisions input's objects, as RBD Bullet Solver's Collision tab: a piece "
+                                                   "bounces off one at its own bounce times this, and grips it at its own friction times Collision "
+                                                   "Friction, as Bullet multiplies them. An object's own flip2_bounce and flip2_contactfriction primitive "
+                                                   "attributes override these (once any object has one, every object has a value of it, 0 unless the "
+                                                   "attribute was made with another default). Pieces that aren't active collide with their own bounce "
+                                                   "and friction"))
+    rbd.addParmTemplate(hou.FloatParmTemplate("rbdcollisionfriction", "Friction", 1, default_value=(CONTACT_DEFAULTS["contactFriction"],), min=0.0, max=10.0))
+    rbd.addParmTemplate(hou.FloatParmTemplate("rbdwallbounce", "Wall Bounce", 1, default_value=(CONTACT_DEFAULTS["bounce"],), min=0.0, max=1.0,
+                                              join_with_next=True,
+                                              help="What a piece meets in the domain's walls, as RBD Bullet Solver's ground plane: a piece of Bullet's "
+                                                   "defaults (bounce 0.25) bounces off the floor at 0.25 times 0.5, as it does there"))
+    rbd.addParmTemplate(hou.FloatParmTemplate("rbdwallfriction", "Friction", 1, default_value=(CONTACT_DEFAULTS["contactFriction"],), min=0.0, max=10.0))
     group.append(rbd)
     sources = hou.FolderParmTemplate("sources", "Sources", folder_type=hou.folderType.Tabs)
     sources.addParmTemplate(hou.ToggleParmTemplate("usev", "Use v Attribute", default_value=True,
@@ -606,6 +624,17 @@ def _frames(node):
     if end < start:
         raise hou.NodeError("the end frame is before the start frame")
     return start, end
+
+
+def _contact_settings(node, samples):
+    """what the RBD tab's pieces meet in a collision object, where it isn't the engine's default: a piece that isn't active, its own bounce and friction, as
+    RBD Bullet Solver collides them; any other object, its flip2_bounce and flip2_contactfriction, or the RBD tab's Collision Bounce and Friction"""
+    own = samples.get("rbd")
+    tab = {"bounce": node.evalParm("rbdcollisionbounce") if node.parm("rbdcollisionbounce") is not None else CONTACT_DEFAULTS["bounce"],
+           "contactFriction": node.evalParm("rbdcollisionfriction") if node.parm("rbdcollisionfriction") is not None else CONTACT_DEFAULTS["contactFriction"]}
+    found = {"bounce": own["bounce"], "contactFriction": own["friction"]} if own is not None else \
+            {key: samples.get("settings", {}).get(key, tab[key]) for key in tab}
+    return {key: value for key, value in found.items() if value != CONTACT_DEFAULTS[key]}
 
 
 def _settings(geometry, chosen, label):
@@ -994,6 +1023,9 @@ def write_scene(node):
             wall["contactAngle"] = node.evalParm("wallangle%d" % index)
         if wall:
             walls[face] = wall
+    for key, parm in (("bounce", "rbdwallbounce"), ("contactFriction", "rbdwallfriction")):   #and what the RBD tab's pieces meet at all of them
+        if node.parm(parm) is not None and node.evalParm(parm) != CONTACT_DEFAULTS[key]:
+            walls[key] = node.evalParm(parm)
     if walls:
         scene["domain"]["walls"] = walls
     holds = node.parm("collisionhold") is None or bool(node.evalParm("collisionhold"))     #whether collisions hold the liquid on them, as walls do
@@ -1038,6 +1070,7 @@ def write_scene(node):
                 entry["thickness"] = samples["settings"].get("thickness", node.evalParm("thickness"))
                 if not samples["settings"].get("hold", holds):
                     entry["hold"] = False
+                entry.update(_contact_settings(node, samples))
                 scene["obstacles"].append(entry)
             elif role == "source":
                 entry["velocity"] = _emission_velocity(node, samples)
@@ -1050,6 +1083,7 @@ def write_scene(node):
         entry = {"vdb": "geo/" + VOLUME_FILE, "grid": volume["name"], "friction": volume["settings"].get("friction", node.evalParm("friction"))}
         if not volume["settings"].get("hold", holds):
             entry["hold"] = False
+        entry.update(_contact_settings(node, volume))
         if volume["velocity"]:
             entry["velocityGrid"] = volume["velocity"]
         if volume["transforms"]:

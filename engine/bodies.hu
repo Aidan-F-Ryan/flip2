@@ -247,6 +247,12 @@ public:
     void setCollisionSubsteps(int perFrame){
         collisionSubsteps = perFrame;
     }
+    //what a body that hits a wall meets there (the wall's bounce and contactFriction, Scene's), each times the body's own: 0.5 and 1 unless set, as
+    //RBD Bullet Solver's ground plane has them
+    void setWallContact(int wall, double bounce, double contactFriction){
+        wallBounce[wall] = (float)bounce;
+        wallContactFriction[wall] = (float)contactFriction;
+    }
 
     //SolveTerm
     void addTimes(const float* x, float* y, float sign, const uint* onlyIf, cudaStream_t stream) override;
@@ -352,6 +358,8 @@ private:
     cudaStream_t stream = nullptr;
     double voxel = 0.0;
     int collisionSubsteps = 5;
+    float wallBounce[6] = {0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f};             //setWallContact's
+    float wallContactFriction[6] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
 };
 
 #endif

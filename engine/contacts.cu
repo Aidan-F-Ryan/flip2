@@ -23,7 +23,9 @@
 //under water is held up from the substep's start, so the water sees it at rest, rather than seeing it fall and the floor stop it after. Its contact,
 //found again after the solve by its surface point, starts from that impulse and corrects it; one not found again is taken back
 //
-//Friction and bounce combine as Bullet combines them, as products: a wall's and an obstacle's are 1 here, so a body's own hold against them
+//Friction and bounce combine as Bullet combines them, as products of the body's own and its partner's: another body's own, or a wall's or a still or
+//moved obstacle's from the scene, which are RBD Bullet Solver's for its ground plane and collisions unless given (bounce 0.5, friction 1), so a piece
+//of Houdini's defaults (bounce 0.25) bounces off a floor as it does there, at 0.125
 
 #include "bodies.hu"
 #include "algorithms/parallelPrefixSumKernels.hu"
@@ -159,6 +161,7 @@ struct ContactWorld{
     Obstacles obstacles;                    //each one's body, if it's dynamic, in its state
     const int* obstacleOf;                  //per body, its obstacle, on the GPU
     float3 low, high;   //the domain's walls
+    float wallBounce[6], wallContactFriction[6];    //what a body meets at each (Bodies::setWallContact)
     float voxel;
     float dt;
     float stillSpeed;   //the speed apart under which a contact doesn't bounce
@@ -423,8 +426,11 @@ __global__ void buildContacts(ContactWorld world, const float3* points, const in
         }
         contact.mass[direction] = k > 0.0f ? 1.0f / k : 0.0f;
     }
-    contact.friction = masses[body].contactFriction*(other >= 0 ? masses[other].contactFriction : 1.0f);
-    float bounce = masses[body].bounce*(other >= 0 ? masses[other].bounce : 1.0f);
+    //each times its partner's: another body's own, a wall's or a still or moved obstacle's (the scene's, RBD Bullet Solver's ground plane's and
+    //collisions' unless given)
+    const ObstacleState* still = partner >= 6 ? &world.obstacles.items[partner - 6] : nullptr;
+    contact.friction = masses[body].contactFriction*(other >= 0 ? masses[other].contactFriction : still != nullptr ? still->contactFriction : world.wallContactFriction[partner]);
+    float bounce = masses[body].bounce*(other >= 0 ? masses[other].bounce : still != nullptr ? still->bounce : world.wallBounce[partner]);
     //the speed apart it has to reach: one closing the gap within this substep, fast enough, bounces; otherwise it may close the gap, and no more
     float apart = dot(speed, normal);
     bool hits = apart < -fmaxf(distance, 0.0f) / world.dt;
@@ -976,12 +982,17 @@ __global__ void finishSolve(int numBodies, BodyState* states, const BodyMass* ma
     writeVelocity(state, frames[body]);
 }
 
-static ContactWorld contactWorld(const Obstacles& obstacleState, const int* obstacleOf, float3 low, float3 high, double voxel, double dt, float stillSpeed){
+static ContactWorld contactWorld(const Obstacles& obstacleState, const int* obstacleOf, float3 low, float3 high, const float wallBounce[6], const float wallContactFriction[6],
+                                 double voxel, double dt, float stillSpeed){
     ContactWorld world;
     world.obstacles = obstacleState;
     world.obstacleOf = obstacleOf;
     world.low = low;
     world.high = high;
+    for(int wall = 0; wall < 6; ++wall){
+        world.wallBounce[wall] = wallBounce[wall];
+        world.wallContactFriction[wall] = wallContactFriction[wall];
+    }
     world.voxel = (float)voxel;
     world.dt = (float)dt;
     world.stillSpeed = stillSpeed;
@@ -1068,7 +1079,7 @@ void Bodies::makePairs(const Obstacles& obstacleState, float3 low, float3 high){
             sortScratchBytes = bytes;
         }
     }
-    ContactWorld world = contactWorld(obstacleState, deviceObstacles, low, high, voxel, 0.0, 0.0f);
+    ContactWorld world = contactWorld(obstacleState, deviceObstacles, low, high, wallBounce, wallContactFriction, voxel, 0.0, 0.0f);
     if(numPairs > 0){
         fillPairs<<<bodyBlocks(), 32, 0, stream>>>(numBodies, world, queryBoxes, pairEnds, pairBodies, pairPartners);
         emptySlots<<<(uint)(numSlots / 256 + 1), 256, 0, stream>>>((int)numSlots, remapped);
@@ -1109,7 +1120,7 @@ void Bodies::warmStart(double dt, const Obstacles& obstacleState, float3 gravity
         return;
     }
     float g = sqrtf(gravity.x*gravity.x + gravity.y*gravity.y + gravity.z*gravity.z);
-    ContactWorld world = contactWorld(obstacleState, deviceObstacles, low, high, voxel, dt, 2.0f*g*(float)dt);
+    ContactWorld world = contactWorld(obstacleState, deviceObstacles, low, high, wallBounce, wallContactFriction, voxel, dt, 2.0f*g*(float)dt);
     startWarm<<<bodyBlocks(), 32, 0, stream>>>(numBodies, states);
     if(numLast > 0){
         warmStartContacts<<<numLast / 256 + 1, 256, 0, stream>>>(numLast, world, states, lastContacts, pushSums);
@@ -1132,7 +1143,7 @@ void Bodies::touch(double dt, const Obstacles& obstacleState, float3 low, float3
         return;
     }
     float g = sqrtf(gravity.x*gravity.x + gravity.y*gravity.y + gravity.z*gravity.z);
-    ContactWorld world = contactWorld(obstacleState, deviceObstacles, low, high, voxel, dt, 2.0f*g*(float)dt);
+    ContactWorld world = contactWorld(obstacleState, deviceObstacles, low, high, wallBounce, wallContactFriction, voxel, dt, 2.0f*g*(float)dt);
     int slots = numPairs*CONTACT_SLOTS;
     uint slotBlocks = (uint)(slots / 256 + 1);
     if(slots > 0){

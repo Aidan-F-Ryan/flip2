@@ -361,23 +361,30 @@ Scene loadScene(const std::string& path){
         }
         if(const Json* walls = read.object(*domain, "walls", "domain")){    //what the walls do to the liquid on them: all of them, then any that differ
             const char* faces[6] = {"-x", "+x", "-y", "+y", "-z", "+z"};
-            read.checkKeys(*walls, "domain.walls", {"hold", "friction", "contactAngle", "-x", "+x", "-y", "+y", "-z", "+z"});
+            read.checkKeys(*walls, "domain.walls", {"hold", "friction", "contactAngle", "bounce", "contactFriction", "-x", "+x", "-y", "+y", "-z", "+z"});
             bool hold = read.flag(*walls, "hold", "domain.walls", true);
             double friction = read.number(*walls, "friction", "domain.walls", 0.0);
             double contactAngle = read.number(*walls, "contactAngle", "domain.walls", -1.0);    //none: the liquid's
+            double bounce = read.number(*walls, "bounce", "domain.walls", scene.wallBounce[0]);
+            double contactFriction = read.number(*walls, "contactFriction", "domain.walls", scene.wallContactFriction[0]);
             for(int face = 0; face < 6; ++face){
                 scene.wallHold[face] = hold;
                 scene.wallFriction[face] = friction;
                 wallAngles[face] = contactAngle;
+                scene.wallBounce[face] = bounce;
+                scene.wallContactFriction[face] = contactFriction;
                 std::string where = std::string("domain.walls[\"") + faces[face] + "\"]";
                 if(const Json* wall = read.object(*walls, faces[face], "domain.walls")){
-                    read.checkKeys(*wall, where, {"hold", "friction", "contactAngle"});
+                    read.checkKeys(*wall, where, {"hold", "friction", "contactAngle", "bounce", "contactFriction"});
                     scene.wallHold[face] = read.flag(*wall, "hold", where, hold);
                     scene.wallFriction[face] = read.number(*wall, "friction", where, friction);
                     wallAngles[face] = read.number(*wall, "contactAngle", where, contactAngle);
+                    scene.wallBounce[face] = read.number(*wall, "bounce", where, bounce);
+                    scene.wallContactFriction[face] = read.number(*wall, "contactFriction", where, contactFriction);
                 }
-                if(scene.wallFriction[face] < 0.0 || scene.wallFriction[face] > 1.0 || wallAngles[face] > 180.0 || (wallAngles[face] < 0.0 && wallAngles[face] != -1.0)){
-                    read.fail(where, "friction is between 0 and 1, and contactAngle from 0 to 180 degrees");
+                if(scene.wallFriction[face] < 0.0 || scene.wallFriction[face] > 1.0 || wallAngles[face] > 180.0 || (wallAngles[face] < 0.0 && wallAngles[face] != -1.0)
+                   || scene.wallBounce[face] < 0.0 || scene.wallBounce[face] > 1.0 || scene.wallContactFriction[face] < 0.0){
+                    read.fail(where, "friction and bounce are between 0 and 1, contactFriction at least 0, and contactAngle from 0 to 180 degrees");
                 }
             }
         }
@@ -759,7 +766,7 @@ Scene loadScene(const std::string& path){
                 read.fail(where, "should be an object, {...}");
             }
             read.checkKeys(item, where, {"mesh", "vertices", "triangles", "vdb", "grid", "velocityGrid", "shape", "min", "max", "center", "centre", "radius", "transform", "keyframes",
-                                         "deforming", "friction", "thickness", "hold", "dynamic", "name"});
+                                         "deforming", "friction", "thickness", "hold", "dynamic", "name", "bounce", "contactFriction"});
             SceneObstacle obstacle;
             obstacle.name = read.text(item, "name", where, "");
             bool deforms = item.find("deforming") != nullptr;
@@ -794,14 +801,19 @@ Scene loadScene(const std::string& path){
             obstacle.friction = read.number(item, "friction", where, obstacle.friction);
             obstacle.thickness = read.number(item, "thickness", where, obstacle.thickness);
             obstacle.hold = read.flag(item, "hold", where, obstacle.hold);
-            if(obstacle.friction < 0.0 || obstacle.friction > 1.0 || obstacle.thickness < 0.0){
-                read.fail(where, "friction is between 0 and 1, and thickness can't be negative");
+            obstacle.bounce = read.number(item, "bounce", where, obstacle.bounce);
+            obstacle.contactFriction = read.number(item, "contactFriction", where, obstacle.contactFriction);
+            if(obstacle.friction < 0.0 || obstacle.friction > 1.0 || obstacle.thickness < 0.0 || obstacle.bounce < 0.0 || obstacle.bounce > 1.0 || obstacle.contactFriction < 0.0){
+                read.fail(where, "friction and bounce are between 0 and 1, contactFriction at least 0, and thickness can't be negative");
             }
             if(const Json* dynamic = read.object(item, "dynamic", where)){
                 std::string at = where + ".dynamic";
                 read.checkKeys(*dynamic, at, {"density", "mass", "velocity", "angularVelocity", "bounce", "contactFriction"});
                 if(item.find("keyframes") || item.find("deforming")){
                     read.fail(where, "a dynamic obstacle moves itself, from where its \"transform\" puts it: it can't have \"keyframes\" or be \"deforming\"");
+                }
+                if(item.find("bounce") || item.find("contactFriction")){
+                    read.fail(where, "a dynamic obstacle's own \"bounce\" and \"contactFriction\" go in its \"dynamic\"");
                 }
                 if(obstacle.kind == SceneObstacle::FIELD && !obstacle.field->velocities.empty()){
                     read.fail(where, "a dynamic obstacle moves itself: its level set can't come with a \"velocityGrid\"");

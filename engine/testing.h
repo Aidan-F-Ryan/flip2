@@ -78,6 +78,10 @@ public:
         simulation.forEachPartition([&](Particles& partition){ partition.setWallFriction(wall, friction); });
     }
 
+    void setWallContact(int wall, double bounce, double contactFriction){
+        simulation.forEachPartition([&](Particles& partition){ partition.setWallContact(wall, bounce, contactFriction); });
+    }
+
     void setViscousCfl(double voxels){
         simulation.forEachPartition([&](Particles& partition){ partition.setViscousCfl(voxels); });
     }

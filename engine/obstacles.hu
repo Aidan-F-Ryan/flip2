@@ -52,6 +52,8 @@ struct ObstacleState{
     float velocity[12];         //row-major 3x4: the solid's velocity at world point x is velocity times (x, 1)
     float friction;
     bool letsGo;                //whether it only pushes on the liquid, and never pulls (boundaries.cu)
+    float bounce;               //not dynamic: what a dynamic body that hits it meets, each times the body's own (SceneObstacle's, contacts.cu)
+    float contactFriction;
     float3 reachLow, reachHigh; //the box in the world past which nothing asks its distance: around its surface, 3 voxels wider every way
     const BodyFrame* frame;     //a dynamic body's place, motion and reach, on the GPU, which hold in place of the three above; nullptr for the others
     int body;                   //a dynamic one's place among the bodies (bodies.hu), or -1
@@ -511,6 +513,8 @@ private:
         std::vector<double> rotations;      //per key: a unit quaternion, w x y z
         float friction;
         bool letsGo;
+        float bounce;
+        float contactFriction;
         const BodyFrame* frame = nullptr;   //a dynamic body's (setFrame)
         int body = -1;
     };
