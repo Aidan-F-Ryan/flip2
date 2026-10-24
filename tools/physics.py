@@ -133,32 +133,54 @@ def free_fall(bake):
 
 
 @check("momentum",
-       "With no gravity and nothing to push it, a ball of liquid keeps the velocity it has, all of it together, and its shape.",
-       "Nothing acts on it, so there is nothing to allow for: the limits are a thousandth of its speed, and a voxel on its width.",
+       "With no gravity and nothing to push it, a ball of liquid keeps the velocity it has and its shape, and moving changes nothing of what it does: "
+       "each of its particles' velocities strays from their mean as the same particle's does in the same ball at rest.",
+       "Nothing acts on it but the density correction, which evens out the seeding's jitter in the ball at rest alike (0.0010 m/s of spread by "
+       "a quarter of a second, settling as the rest check's tank does), so there is nothing to allow for: the limits are a thousandth of its "
+       "speed, and a voxel on its width.",
        known="Traced and mended 8 October, but for the density correction. P2G gave the faces at the edge of its reach wrong velocities (its sums "
              "rounded each particle's share of the weight and of the momentum on their own, and divided by the weight plus 1e-7), and the "
              "extrapolation after it left a handful of unreached faces at rest each substep; the pressure solve took both for divergence, and the "
              "ball lost a thousandth of its speed a substep. The sums are exact now and the extrapolation reaches every face: with the density "
-             "correction off the ball keeps its velocity to 2e-8 of its speed over 12 substeps, whatever its size. What's left here is the "
-             "correction itself. Until 24 October it measured each voxel's count of particles, which rose and fell by a particle as the ball's "
-             "particles crossed the voxels in step: 0.4% of the ball's speed in spread after a quarter of a second. It measures their B-spline "
-             "density now, which slides smoothly with them: 0.17%. Most of that is the correction evening out the seeding's jitter, which a count "
-             "can't see: the same ball at rest spreads 0.0010 m/s by then, settling as the rest check's tank does, against 0.00105 moving. The "
-             "rest comes and goes with where the ball sits on the grid, every 6 frames here, when it has moved a whole number of voxels along "
-             "each axis.")
+             "correction off the ball keeps its velocity to 2e-8 of its speed over 12 substeps, whatever its size, and moving changes nothing. "
+             "What's left is the correction. Until 24 October it measured each voxel's count of particles, which rose and fell by a particle as "
+             "the ball's particles crossed the voxels in step: 0.4% of the ball's speed in spread. It measures their B-spline density now, which "
+             "slides smoothly with them, and the check holds the moving ball to the still one: moving changes its particles' velocities by "
+             "0.0005 to 0.0010 m/s (0.09 to 0.16% of its speed). The B-spline density of jittered particles changes as they slide across the "
+             "voxel centres, so the moving ball's correction isn't the still one's: most at frame 3, half way through the 6 frames in which the "
+             "ball moves a whole number of voxels along each axis and comes back to its starting place on the grid. Next for it: a correction "
+             "that restores each particle's seeded volume rather than one density everywhere.")
 def momentum(bake):
     start = [0.5, 0.3, 0.2]
     speed = math.sqrt(sum(v * v for v in start))
-    run = bake("momentum", scene([-0.5, -0.5, -0.5], [0.5, 0.5, 0.5], 0.025, 6, [{"shape": "sphere", "center": [-0.1, -0.05, -0.05], "radius": 0.1, "velocity": start}],
-                              gravity=[0.0, 0.0, 0.0]))
+
+    def ball(name, velocity):
+        return bake(name, scene([-0.5, -0.5, -0.5], [0.5, 0.5, 0.5], 0.025, 6, [{"shape": "sphere", "center": [-0.1, -0.05, -0.05], "radius": 0.1, "velocity": velocity}],
+                                gravity=[0.0, 0.0, 0.0]), cache=True)
+
+    def strays(run, frame):
+        """each particle's velocity less the ball's mean, by its id"""
+        values, _ = flip2cache.read_frame(str(run.directory), frame, ("v", "id"))
+        v, ids = values["v"], values["id"]
+        vx, vy, vz, numbers = (v[:, 0], v[:, 1], v[:, 2], ids[:, 0]) if hasattr(v, "shape") else (v[0], v[1], v[2], ids[0])
+        n = len(vx)
+        mean = (sum(vx) / n, sum(vy) / n, sum(vz) / n)
+        return {int(numbers[i]): (vx[i] - mean[0], vy[i] - mean[1], vz[i] - mean[2]) for i in range(n)}
+
+    run, still = ball("momentum", start), ball("momentum-still", [0.0, 0.0, 0.0])
     last = run.frames[-1]
     velocity = run.velocity(last)
     off = math.sqrt(sum((v - s) ** 2 for v, s in zip(velocity, start)))
+    changed, worst = 0.0, last     #the most, over the frames, that moving changes the particles' velocities: rms over them, each against itself at rest
+    for frame in run.frames[1:]:
+        moving, resting = strays(run, frame), strays(still, frame)
+        rms = math.sqrt(sum(sum((a - b) ** 2 for a, b in zip(moving[k], resting[k])) for k in moving) / len(moving))
+        if rms > changed:
+            changed, worst = rms, frame
     row = run.rows[last]
-    spread = math.sqrt(max(2.0 * row["kineticEnergy"] / row["particles"] - sum(v * v for v in velocity), 0.0))    #how far the particles' velocities are from their mean, rms
     widths = [row["highest"][axis] - row["lowest"][axis] for axis in range(3)]
     return [Result("change in its velocity after %.2f s" % run.time(last), off, 0.0, 1.0e-3 * speed, "m/s", "most"),
-            Result("spread of its particles' velocities", spread, 0.0, 1.0e-3 * speed, "m/s", "most"),
+            Result("most moving changes its particles' velocities (frame %d)" % worst, changed, 0.0, 1.0e-3 * speed, "m/s", "most"),
             Result("widest it gets", max(widths), 0.2, 0.025, "m", "absolute")]
 
 
