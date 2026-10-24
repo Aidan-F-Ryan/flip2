@@ -1,4 +1,4 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 
 #ifndef PARTITIONCONTEXT_HU
 #define PARTITIONCONTEXT_HU
@@ -13,6 +13,14 @@
 class PartitionContext{
 public:
     virtual ~PartitionContext() = default;
+
+    //which partition this is, of how many, in the order the sums take them
+    virtual int rank() const{
+        return 0;
+    }
+    virtual int numRanks() const{
+        return 1;
+    }
 
     //ghost voxels take their owners' values
     virtual void fillGhosts(float* values, cudaStream_t stream){}

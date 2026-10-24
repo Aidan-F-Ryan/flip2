@@ -1,4 +1,4 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 
 //Viscosity, implicit, with the free surface it needs (Batty and Bridson, Accurate viscous free surfaces for buckling, coiling and rotating liquids,
 //2008), between two pressure solves, which it leaves alone: it has its own equations and its own conjugate gradient, here.
@@ -23,8 +23,9 @@
 //What's solid holds: a face on one of the domain's walls stays at rest, and the faces in and against obstacles move with them. Viscous liquid sticks
 //to both (no slip), whatever an obstacle's friction is: past a wall, the faces along it mirror the liquid's with their sign reversed, so the velocity
 //on the wall itself is zero, and the faces inside obstacles take the obstacle's velocity for the solve (stickToObstacles). Obstacles are whole voxels
-//to it: the faces their surfaces cut are solved as liquid, and an obstacle holds the liquid half a voxel inside its face. The particles follow the
-//faces: how they read the faces past a wall, and how they move beside one, hold to it as far as the viscosity carries (Particles::wallStick).
+//to it but for the liquid each face holds: the faces their surfaces cut are solved as liquid, each with as much of a face's inertia as it's open
+//(weighCutFaces), and an obstacle holds the liquid half a voxel inside its face. The particles follow the faces: how they read the faces past a wall,
+//and how they move beside one, hold to it as far as the viscosity carries (Particles::wallStick).
 //
 //It isn't solved together with the pressure (Larionov et al. 2017 do that), so each substep's last word is the pressure's: what the second solve adds
 //isn't resisted until the next substep. Where gravity drives the flow that's small, as the first solve has already turned gravity into the pressure
@@ -294,6 +295,20 @@ __device__ inline void weighFacesAsHeld(const float* lightX, const float* lightY
     mass[2] = 1.0f / lightZ[voxel];
 }
 
+//A face an obstacle cuts holds liquid over its open part alone, so its inertia is as much of a face's as is open: a sliver between touching bodies, whose
+//open part the pressure's jump across it drives at hundreds of metres a second, counts for next to nothing, and takes its neighbours' velocity
+//rather than giving them its own. On top of a face's density with two phases
+__device__ inline void weighCutFaces(const char* near, const uint* opens, uint voxel, float mass[3]){
+    if(near == nullptr || !(near[voxel] & NEAR_SURFACE)){
+        return;
+    }
+    CutFaces cut = cachedCut(opens, voxel);
+    #pragma unroll
+    for(int dim = 0; dim < 3; ++dim){
+        mass[dim] *= cut.open[2*dim];
+    }
+}
+
 // ---- the solve ----
 
 //the start, a block per node of this partition's own: which of its faces the solve moves, each one's own coefficient, and the residual of the starting
@@ -301,8 +316,8 @@ __device__ inline void weighFacesAsHeld(const float* lightX, const float* lightY
 //A template on two PHASES (weighFacesAsHeld), so that without them the kernel is the one it always was
 template<bool PHASES>
 __global__ void startViscosity(uint numUsedGridNodes, const uint* nodeCells, const uint* cellToNode, const uint* interiorVoxels, Grid grid, const float* levels, const char* live,
-                               const char* solid, const char* near, uint numVoxels, const float* ux, const float* uy, const float* uz, float c, float* r, float* diagonal, float* d,
-                               const float* lightX, const float* lightY, const float* lightZ){
+                               const char* solid, const char* near, const uint* opens, uint numVoxels, const float* ux, const float* uy, const float* uz, float c, float* r,
+                               float* diagonal, float* d, const float* lightX, const float* lightY, const float* lightZ){
     const float* const faces[3] = {ux, uy, uz};
     VISCOUS_TILE(faces)
     if(voxel == NO_VOXEL){
@@ -313,6 +328,7 @@ __global__ void startViscosity(uint numUsedGridNodes, const uint* nodeCells, con
     if constexpr(PHASES){
         weighFacesAsHeld(lightX, lightY, lightZ, voxel, mass);
     }
+    weighCutFaces(near, opens, voxel, mass);
     #pragma unroll
     for(int dim = 0; dim < 3; ++dim){
         float coefficient = mass[dim] + c*own[dim];
@@ -329,8 +345,8 @@ __global__ void startViscosity(uint numUsedGridNodes, const uint* nodeCells, con
 //q = A*d over the faces the solve moves, a block per node of this partition's own. d is 0 on every other face, so the walls and obstacles hold
 template<bool PHASES>
 __global__ void multiplyViscosity(uint numUsedGridNodes, const uint* nodeCells, const uint* cellToNode, const uint* interiorVoxels, Grid grid, const float* levels, const char* live,
-                                  const char* solid, const char* near, uint numVoxels, const float* diagonal, const float* d, float c, const ViscousSolve* solve, float* q,
-                                  const float* lightX, const float* lightY, const float* lightZ){
+                                  const char* solid, const char* near, const uint* opens, uint numVoxels, const float* diagonal, const float* d, float c, const ViscousSolve* solve,
+                                  float* q, const float* lightX, const float* lightY, const float* lightZ){
     if(solve->done){
         return;
     }
@@ -344,6 +360,7 @@ __global__ void multiplyViscosity(uint numUsedGridNodes, const uint* nodeCells, 
     if constexpr(PHASES){
         weighFacesAsHeld(lightX, lightY, lightZ, voxel, mass);
     }
+    weighCutFaces(near, opens, voxel, mass);
     #pragma unroll
     for(int dim = 0; dim < 3; ++dim){
         size_t at = (size_t)dim*numVoxels + voxel;
@@ -606,6 +623,7 @@ void Particles::applyViscosity(){
     gpuErrchk(cudaMemsetAsync(solve, 0, sizeof(ViscousSolve), stream));
     const char* solid = hasObstacles ? obstacleSolids.devPtr() : nullptr;
     const char* near = hasObstacles ? obstacleNear.devPtr() : nullptr;
+    const uint* opens = hasObstacles ? obstacleOpen.devPtr() : nullptr;
     bool mine = numOwnNodes > 0 && numVoxels > 0;   //whether this partition has anything to solve: it makes every exchange either way
     uint entryBlocks = (uint)(count / BLOCKSIZE + 1);
     //total = a*b, or with a diagonal a*(a/diagonal), over every partition's faces
@@ -629,7 +647,7 @@ void Particles::applyViscosity(){
     auto multiply = phases ? multiplyViscosity<true> : multiplyViscosity<false>;
     if(mine){
         start<<<numOwnNodes, VISCOUS_THREADS, 0, stream>>>(numUsedGridNodes, nodeCells.devPtr(), cellToNode.devPtr(), nodeInteriorVoxels.devPtr(), grid, liquidLevel.devPtr(), live,
-            solid, near, numVoxels, voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr(), c, r, diagonal, d, light[0], light[1], light[2]);
+            solid, near, opens, numVoxels, voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr(), c, r, diagonal, d, light[0], light[1], light[2]);
     }
     dotProduct(r, nullptr, diagonal, &solve->rzNext);
     beginViscosity<<<1, 1, 0, stream>>>(solve);
@@ -641,7 +659,7 @@ void Particles::applyViscosity(){
         for(uint iteration = 0; iteration < batch; ++iteration){
             if(mine){
                 multiply<<<numOwnNodes, VISCOUS_THREADS, 0, stream>>>(numUsedGridNodes, nodeCells.devPtr(), cellToNode.devPtr(), nodeInteriorVoxels.devPtr(), grid,
-                    liquidLevel.devPtr(), live, solid, near, numVoxels, diagonal, d, c, solve, q, light[0], light[1], light[2]);
+                    liquidLevel.devPtr(), live, solid, near, opens, numVoxels, diagonal, d, c, solve, q, light[0], light[1], light[2]);
             }
             dotProduct(d, q, nullptr, &solve->dq);
             if(numVoxels > 0){

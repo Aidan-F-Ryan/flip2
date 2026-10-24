@@ -1,4 +1,4 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 
 #include "scene.hpp"
 #include "json.hpp"
@@ -230,20 +230,26 @@ static std::vector<double> loadNpy(const std::string& path){
     return values;
 }
 
-void loadNpyMesh(const std::string& verticesPath, const std::string& trianglesPath, std::vector<float>& vertices, std::vector<int>& triangles){
-    for(double value : loadNpy(verticesPath)){
+//a mesh from its vertices' and its triangles' rows, as .npy files (or slices of them) hold them, named for what's wrong
+static void npyMesh(const std::vector<double>& vertexRows, const std::vector<double>& triangleRows, const std::string& verticesName, const std::string& trianglesName,
+                    std::vector<float>& vertices, std::vector<int>& triangles){
+    for(double value : vertexRows){
         vertices.push_back((float)value);
     }
     int numVertices = (int)vertices.size() / 3;
-    for(double value : loadNpy(trianglesPath)){
+    for(double value : triangleRows){
         if(value < 0 || value >= numVertices){
-            throw std::runtime_error(trianglesPath + ": names vertex " + std::to_string((long long)value) + ", but " + verticesPath + " has " + std::to_string(numVertices));
+            throw std::runtime_error(trianglesName + ": names vertex " + std::to_string((long long)value) + ", but " + verticesName + " has " + std::to_string(numVertices));
         }
         triangles.push_back((int)value);
     }
     if(triangles.empty()){
-        throw std::runtime_error(trianglesPath + ": no triangles");
+        throw std::runtime_error(trianglesName + ": no triangles");
     }
+}
+
+void loadNpyMesh(const std::string& verticesPath, const std::string& trianglesPath, std::vector<float>& vertices, std::vector<int>& triangles){
+    npyMesh(loadNpy(verticesPath), loadNpy(trianglesPath), verticesPath, trianglesPath, vertices, triangles);
 }
 
 bool SceneShape::contains(const double point[3]) const{
@@ -355,30 +361,38 @@ Scene loadScene(const std::string& path){
         }
         if(const Json* walls = read.object(*domain, "walls", "domain")){    //what the walls do to the liquid on them: all of them, then any that differ
             const char* faces[6] = {"-x", "+x", "-y", "+y", "-z", "+z"};
-            read.checkKeys(*walls, "domain.walls", {"hold", "friction", "contactAngle", "-x", "+x", "-y", "+y", "-z", "+z"});
+            read.checkKeys(*walls, "domain.walls", {"hold", "friction", "contactAngle", "bounce", "contactFriction", "-x", "+x", "-y", "+y", "-z", "+z"});
             bool hold = read.flag(*walls, "hold", "domain.walls", true);
             double friction = read.number(*walls, "friction", "domain.walls", 0.0);
             double contactAngle = read.number(*walls, "contactAngle", "domain.walls", -1.0);    //none: the liquid's
+            double bounce = read.number(*walls, "bounce", "domain.walls", scene.wallBounce[0]);
+            double contactFriction = read.number(*walls, "contactFriction", "domain.walls", scene.wallContactFriction[0]);
             for(int face = 0; face < 6; ++face){
                 scene.wallHold[face] = hold;
                 scene.wallFriction[face] = friction;
                 wallAngles[face] = contactAngle;
+                scene.wallBounce[face] = bounce;
+                scene.wallContactFriction[face] = contactFriction;
                 std::string where = std::string("domain.walls[\"") + faces[face] + "\"]";
                 if(const Json* wall = read.object(*walls, faces[face], "domain.walls")){
-                    read.checkKeys(*wall, where, {"hold", "friction", "contactAngle"});
+                    read.checkKeys(*wall, where, {"hold", "friction", "contactAngle", "bounce", "contactFriction"});
                     scene.wallHold[face] = read.flag(*wall, "hold", where, hold);
                     scene.wallFriction[face] = read.number(*wall, "friction", where, friction);
                     wallAngles[face] = read.number(*wall, "contactAngle", where, contactAngle);
+                    scene.wallBounce[face] = read.number(*wall, "bounce", where, bounce);
+                    scene.wallContactFriction[face] = read.number(*wall, "contactFriction", where, contactFriction);
                 }
-                if(scene.wallFriction[face] < 0.0 || scene.wallFriction[face] > 1.0 || wallAngles[face] > 180.0 || (wallAngles[face] < 0.0 && wallAngles[face] != -1.0)){
-                    read.fail(where, "friction is between 0 and 1, and contactAngle from 0 to 180 degrees");
+                if(scene.wallFriction[face] < 0.0 || scene.wallFriction[face] > 1.0 || wallAngles[face] > 180.0 || (wallAngles[face] < 0.0 && wallAngles[face] != -1.0)
+                   || scene.wallBounce[face] < 0.0 || scene.wallBounce[face] > 1.0 || scene.wallContactFriction[face] < 0.0){
+                    read.fail(where, "friction and bounce are between 0 and 1, contactFriction at least 0, and contactAngle from 0 to 180 degrees");
                 }
             }
         }
     }
 
     if(const Json* solver = read.object(root, "solver", "the scene")){
-        read.checkKeys(*solver, "solver", {"flipRatio", "cfl", "densityCorrectionTime", "pressureSolver", "advection", "dotProducts", "transfer", "viscousCfl", "freeSurface"});
+        read.checkKeys(*solver, "solver", {"flipRatio", "cfl", "densityCorrectionTime", "pressureSolver", "advection", "dotProducts", "transfer", "viscousCfl", "freeSurface",
+                                           "collisionSubsteps"});
         scene.flipRatio = read.number(*solver, "flipRatio", "solver", scene.flipRatio);
         scene.cfl = read.number(*solver, "cfl", "solver", scene.cfl);
         scene.densityCorrectionTime = read.number(*solver, "densityCorrectionTime", "solver", scene.densityCorrectionTime);
@@ -388,6 +402,10 @@ Scene loadScene(const std::string& path){
         scene.transfer = read.text(*solver, "transfer", "solver", scene.transfer);
         scene.viscousCfl = read.number(*solver, "viscousCfl", "solver", scene.viscousCfl);
         scene.freeSurface = read.text(*solver, "freeSurface", "solver", scene.freeSurface);
+        scene.collisionSubsteps = (int)read.number(*solver, "collisionSubsteps", "solver", scene.collisionSubsteps);
+        if(scene.collisionSubsteps < 1){
+            read.fail("solver.collisionSubsteps", "is at least 1");
+        }
         if(scene.pressureSolver != "multigrid" && scene.pressureSolver != "cg" && scene.pressureSolver != "jacobi" && scene.pressureSolver != "sor"){
             read.fail("solver.pressureSolver", "is multigrid, cg, jacobi or sor");
         }
@@ -400,8 +418,8 @@ Scene loadScene(const std::string& path){
         if(scene.dotProducts != "exact" && scene.dotProducts != "blocks"){
             read.fail("solver.dotProducts", "is exact or blocks");
         }
-        if(scene.freeSurface != "footprint" && scene.freeSurface != "sharp"){
-            read.fail("solver.freeSurface", "is footprint or sharp");
+        if(!scene.freeSurface.empty() && scene.freeSurface != "levelSet" && scene.freeSurface != "voxel"){
+            read.fail("solver.freeSurface", "is levelSet or voxel");
         }
         if(scene.cfl <= 0.0 || scene.flipRatio < 0.0 || scene.flipRatio > 1.0 || scene.densityCorrectionTime < 0.0 || !(scene.viscousCfl >= 0.0)){
             read.fail("solver", "cfl has to be positive, flipRatio between 0 and 1, and densityCorrectionTime and viscousCfl at least 0");
@@ -437,7 +455,7 @@ Scene loadScene(const std::string& path){
         scene.airLiquidViscosity = read.number(*air, "liquidViscosity", "air", scene.viscosity > 0.0 ? scene.viscosity : scene.airLiquidViscosity);
         scene.airSurfaceTension = read.number(*air, "surfaceTension", "air", scene.surfaceTension > 0.0 ? scene.surfaceTension : scene.airSurfaceTension);
         if(scene.airDropletRadius < 0.0 || scene.airBubbleRadius < 0.0 || scene.airViscosity <= 0.0 || scene.airLiquidViscosity <= 0.0 || scene.airSurfaceTension <= 0.0){
-            read.fail("air", "dropletRadius and bubbleRadius have to be at least 0 (0 for a particle's worth of the fluid), and viscosity, liquidViscosity and surfaceTension positive");
+            read.fail("air", "dropletRadius and bubbleRadius have to be at least 0 (0: a droplet a particle's worth of liquid, each bubble sized as it escapes), and viscosity, liquidViscosity and surfaceTension positive");
         }
         if((scene.viscosity > 0.0 && scene.airLiquidViscosity != scene.viscosity) || (scene.surfaceTension > 0.0 && scene.airSurfaceTension != scene.surfaceTension)){
             read.fail("air", "liquidViscosity and surfaceTension are the liquid's own where \"liquid\" gives it a viscosity or a surfaceTension: leave them out");
@@ -473,6 +491,31 @@ Scene loadScene(const std::string& path){
     auto resolve = [&](const std::string& file){
         return file.empty() || file[0] == '/' ? file : directory + file;
     };
+    //An .npy's rows for "vertices" or "triangles": the whole file, its path, or rows [first, first + count) of a file many objects share,
+    //{"file": "geo/meshes_vertices.npy", "first": 1200, "count": 342} (the Houdini node packs every object's into one). Each file is read once,
+    //however many name it; what's named comes back as the file's name, with the rows if a slice
+    std::map<std::string, std::vector<double>> npyFiles;
+    auto npyRows = [&](const Json& item, const char* key, const std::string& where, std::string& named){
+        const Json* value = item.find(key);
+        if(value == nullptr || value->kind != Json::OBJECT){
+            named = resolve(read.text(item, key, where, ""));
+            return loadNpy(named);
+        }
+        std::string at = where + "." + key;
+        read.checkKeys(*value, at, {"file", "first", "count"});
+        std::string file = resolve(read.text(*value, "file", at, ""));
+        double first = read.number(*value, "first", at, -1.0), count = read.number(*value, "count", at, -1.0);
+        auto loaded = npyFiles.find(file);
+        if(loaded == npyFiles.end()){
+            loaded = npyFiles.emplace(file, loadNpy(file)).first;
+        }
+        size_t rows = loaded->second.size() / 3;
+        if(!(first >= 0.0) || !(count >= 0.0) || first != std::floor(first) || count != std::floor(count) || first + count > (double)rows){
+            read.fail(at, "should name rows of " + file + ", which has " + std::to_string(rows) + ": a whole \"first\" and \"count\" within them");
+        }
+        named = file + " rows " + std::to_string((size_t)first) + " to " + std::to_string((size_t)(first + count));
+        return std::vector<double>(loaded->second.begin() + 3*(size_t)first, loaded->second.begin() + 3*(size_t)(first + count));
+    };
     //runs load, saying where in the scene a file it reads was named if reading it fails
     auto naming = [&](const std::string& where, auto load){
         try{
@@ -505,7 +548,10 @@ Scene loadScene(const std::string& path){
                 loadObj(resolve(read.text(item, "mesh", where, "")), placed.vertices, placed.triangles);
             }
             else if(named){
-                loadNpyMesh(resolve(read.text(item, "vertices", where, "")), resolve(read.text(item, "triangles", where, "")), placed.vertices, placed.triangles);
+                std::string verticesName, trianglesName;
+                std::vector<double> vertexRows = npyRows(item, "vertices", where, verticesName);
+                std::vector<double> triangleRows = npyRows(item, "triangles", where, trianglesName);
+                npyMesh(vertexRows, triangleRows, verticesName, trianglesName, placed.vertices, placed.triangles);
             }
         });
         if(named){
@@ -589,7 +635,8 @@ Scene loadScene(const std::string& path){
                         loadObj(resolve(read.text(sample, "mesh", at, "")), vertices, triangles);
                     }
                     else{
-                        for(double value : loadNpy(resolve(read.text(sample, "vertices", at, "")))){
+                        std::string named;
+                        for(double value : npyRows(sample, "vertices", at, named)){
                             vertices.push_back((float)value);
                         }
                     }
@@ -704,21 +751,11 @@ Scene loadScene(const std::string& path){
     if(airFluids && !scene.air){
         read.fail("fluids", "\"phase\": \"air\" needs an \"air\" block");
     }
-    if(scene.air && scene.freeSurface == "sharp"){     //its pressure is 0 on the liquid's surface, and with air that's solved for
-        read.fail("air", "doesn't go with the sharp free surface yet");
+    if(scene.freeSurface.empty()){
+        scene.freeSurface = scene.air ? "voxel" : "levelSet";
     }
-    if(scene.emitters.size() > 16 || scene.sinks.size() > 16){
-        read.fail("the scene", "can have up to 16 emitters and 16 sinks");
-    }
-    size_t meshes = 0, meshFluids = 0;
-    for(const std::vector<SceneShape>* shapes : {&scene.fluids, &scene.emitters, &scene.sinks}){
-        for(const SceneShape& shape : *shapes){
-            meshes += shape.kind == SceneShape::MESH;
-            meshFluids += shape.kind == SceneShape::MESH && shapes == &scene.fluids;
-        }
-    }
-    if(meshes > 16 || (meshFluids > 0 && scene.fluids.size() > 16)){
-        read.fail("the scene", "can have up to 16 meshes among its fluids, emitters and sinks, and up to 16 fluids if any is a mesh");
+    if(scene.air && scene.freeSurface == "levelSet"){       //its pressure is 0 on the liquid's surface, and with air that's solved for
+        read.fail("air", "doesn't go with the levelSet free surface yet: with air, the surface is where the two fluids meet, and voxel is used");
     }
 
     if(const Json* obstacles = read.array(root, "obstacles", "the scene")){
@@ -729,8 +766,9 @@ Scene loadScene(const std::string& path){
                 read.fail(where, "should be an object, {...}");
             }
             read.checkKeys(item, where, {"mesh", "vertices", "triangles", "vdb", "grid", "velocityGrid", "shape", "min", "max", "center", "centre", "radius", "transform", "keyframes",
-                                         "deforming", "friction", "thickness", "hold"});
+                                         "deforming", "friction", "thickness", "hold", "dynamic", "name", "bounce", "contactFriction"});
             SceneObstacle obstacle;
+            obstacle.name = read.text(item, "name", where, "");
             bool deforms = item.find("deforming") != nullptr;
             if(deforms && item.find("shape")){
                 read.fail(where, "a deforming obstacle is a mesh: it can't have a \"shape\" too");
@@ -763,13 +801,50 @@ Scene loadScene(const std::string& path){
             obstacle.friction = read.number(item, "friction", where, obstacle.friction);
             obstacle.thickness = read.number(item, "thickness", where, obstacle.thickness);
             obstacle.hold = read.flag(item, "hold", where, obstacle.hold);
-            if(obstacle.friction < 0.0 || obstacle.friction > 1.0 || obstacle.thickness < 0.0){
-                read.fail(where, "friction is between 0 and 1, and thickness can't be negative");
+            obstacle.bounce = read.number(item, "bounce", where, obstacle.bounce);
+            obstacle.contactFriction = read.number(item, "contactFriction", where, obstacle.contactFriction);
+            if(obstacle.friction < 0.0 || obstacle.friction > 1.0 || obstacle.thickness < 0.0 || obstacle.bounce < 0.0 || obstacle.bounce > 1.0 || obstacle.contactFriction < 0.0){
+                read.fail(where, "friction and bounce are between 0 and 1, contactFriction at least 0, and thickness can't be negative");
+            }
+            if(const Json* dynamic = read.object(item, "dynamic", where)){
+                std::string at = where + ".dynamic";
+                read.checkKeys(*dynamic, at, {"density", "mass", "velocity", "angularVelocity", "bounce", "contactFriction"});
+                if(item.find("keyframes") || item.find("deforming")){
+                    read.fail(where, "a dynamic obstacle moves itself, from where its \"transform\" puts it: it can't have \"keyframes\" or be \"deforming\"");
+                }
+                if(item.find("bounce") || item.find("contactFriction")){
+                    read.fail(where, "a dynamic obstacle's own \"bounce\" and \"contactFriction\" go in its \"dynamic\"");
+                }
+                if(obstacle.kind == SceneObstacle::FIELD && !obstacle.field->velocities.empty()){
+                    read.fail(where, "a dynamic obstacle moves itself: its level set can't come with a \"velocityGrid\"");
+                }
+                SceneBody& body = obstacle.body;
+                body.density = read.number(*dynamic, "density", at, body.density);
+                body.mass = read.number(*dynamic, "mass", at, body.mass);
+                read.vector3(*dynamic, "velocity", at, body.velocity);
+                read.vector3(*dynamic, "angularVelocity", at, body.angularVelocity);
+                body.bounce = read.number(*dynamic, "bounce", at, body.bounce);
+                body.contactFriction = read.number(*dynamic, "contactFriction", at, body.contactFriction);
+                if(!(body.density > 0.0) || body.mass < 0.0 || body.bounce < 0.0 || body.bounce > 1.0 || body.contactFriction < 0.0){
+                    read.fail(at, "density has to be positive, mass at least 0 (0: from the density), bounce between 0 and 1, and contactFriction at least 0");
+                }
+                obstacle.dynamic = true;
             }
             scene.obstacles.push_back(obstacle);
         }
-        if(scene.obstacles.size() > 16){
-            read.fail("obstacles", "can have up to 16 of them");
+        bool dynamic = false;
+        for(const SceneObstacle& obstacle : scene.obstacles){
+            if(obstacle.dynamic && scene.pressureSolver == "sor"){  //a body's motion ties every unknown its surface cuts together, which SOR can't solve
+                read.fail("solver.pressureSolver", "dynamic obstacles need \"multigrid\", \"cg\" or \"jacobi\", not \"sor\"");
+            }
+            dynamic = dynamic || obstacle.dynamic;
+        }
+        //A floating body is held up by the pressure on it, so it floats where the solve puts the liquid's surface: the voxel surface puts the pressure's 0
+        //at the centres of the first air voxels past the particles' stencils, 2 to 2.5 voxels over the particles, and a half-density ball rode that much
+        //high; the level set surface puts it on the level set through the particles (freesurface.cu), and with air there's no free surface to put
+        if(dynamic && !scene.air && scene.freeSurface != "levelSet"){
+            read.fail("solver.freeSurface", "dynamic obstacles float at the liquid's surface only with levelSet, or with air simulated: voxel's "
+                      "surface is 2 to 2.5 voxels over the particles");
         }
     }
 

@@ -1,14 +1,36 @@
 """flip2 Karma Setup: a flip2 bake, ready to render in Karma.
 
-Builds in /stage what a first render needs: the liquid's surface with a water material, the collision geometry, the bake's whitewater if it was baked
-with any (or else Houdini's, if flip2 Whitewater set it up), a ground under the domain, a sky, a camera that takes the domain in, Karma's render settings and a USD Render node to render with.
+Builds in /stage what a first render needs: the liquid's surface with a water material, the collision geometry, the RBD tab's pieces where the bake
+moved them (a body's own material), the bake's whitewater if it was baked with any (or else Houdini's, if flip2 Whitewater set it up) and its air's
+bubbles if it was baked with air, a ground under the
+domain, a sky, a camera that takes the domain in, Karma's render settings and a USD Render node to render with.
 
 One of those settings is the reason to have this at all. flip2's surface carries the liquid's velocity as v, which Solaris imports as USD's velocities,
 and Karma blurs a moving mesh by them, but only when its Velocity Blur says to, and it starts at No Velocity Blur: a flip2 surface renders with no
 motion blur at all until that's changed. Here it's on.
 
-Whitewater is rendered as points as wide as they are apart (the bake's own come sized so; Houdini's solver's pscale makes each twice that, which
-renders as beads), and the sun is on the
+The liquid gives way to what it overlaps. flip2 mesh carries the water's surface a voxel or so into the collision objects and RBD pieces it touches,
+so that where it meets them there's no water surface of its own to see, and Karma takes, where refractive objects overlap, the one with the highest
+dielectric priority (0 is the highest, and every object's own): the liquid is set to 1, so glass, ice or anything else see-through shows its own
+surface to the water. (With the Solver node's Water at Collisions at Cut, nothing overlaps and the setting does nothing.)
+
+The bake's own whitewater is rendered as its spray points, and each of its foam and bubble points as a cloud of fine specks: a point stands for a
+voxel's worth of bubbles, and drawn as one white ball as wide as the points are apart, a cloud of them reads as polystyrene beads. Its bubbles aren't
+motion-blurred: their specks are much larger and sparser than real bubbles, and blurred by their velocity a cloud of them carried along at 2 m/s drew
+as long streaks, a furry smear sliding through the water.
+
+A bake with air has its air's own bubbles rendered as what they are to light: the air the liquid has mixed in finer than its voxels, which its surface
+can't show. Bubbles too fine to see one by one are a medium in the water, which scatters what the fluid fields' bubbles grid says, per metre (flip2
+mesh --fields: 0.75 times their share of the volume over their Sauter mean radius), white, since bubbles absorb next to nothing. They scatter it
+forward (BUBBLE_ANISOTROPY), so in a cloud dense enough to whiten water light turns back out only after many bounces: it's rendered as the
+similarity relation has it, evenly in every direction at the reduced coefficient, 1 - g of that, which is exact where the cloud is many scatterings
+deep and gets the light out in about a third of the bounces; with VOLUME_BOUNCES (Karma's own 0 scatters it once, which leaves a cloud of bubbles
+grey as soot, and 16 still greyed it). The light it scatters goes through water as it does, and the water absorbs as pure water does: in a cloud
+that's a long way, and water tinted as a stronger dye turned it grey-teal. Those of the bubble balls node's Smallest Bubble Drawn or larger (BUBBLE_DRAWN to start) are drawn one by one as balls of air in the
+water. Without the
+fields (the Solver node's Output Fluid Fields) the air's bubbles aren't rendered: drawn from their points instead (as specks, soft balls, a haze
+spread from them), a cloud of them shows the spacing of the points, and read as polystyrene, cotton balls or smoke. Houdini's is
+rendered as points as wide as they are apart (its solver's pscale makes each twice that, which renders as beads). The sun is on the
 camera's side: where Karma Physical Sky starts it, behind the scene, whitewater and everything else facing the camera is in shade, and reads as grey.
 """
 import math
@@ -19,13 +41,25 @@ import hou
 from . import importer
 
 LOOKS = {     #MaterialX standard surfaces
-    "water": dict(base=0.0, specular=1.0, specular_roughness=0.02, specular_IOR=1.33, transmission=1.0, transmission_depth=0.6,
-                  transmission_colorr=0.55, transmission_colorg=0.8, transmission_colorb=0.9),
+    "water": dict(base=0.0, specular=1.0, specular_roughness=0.02, specular_IOR=1.33, transmission=1.0, transmission_depth=1.0,     #pure water's own
+                  transmission_colorr=0.71, transmission_colorg=0.946, transmission_colorb=0.991),     #absorption, a metre of it (Pope and Fry 1997)
     "whitewater": dict(base=1.0, base_colorr=0.95, base_colorg=0.97, base_colorb=1.0, specular=0.2, specular_roughness=0.6),
     "solid": dict(base=1.0, base_colorr=0.35, base_colorg=0.33, base_colorb=0.3, specular_roughness=0.5),
+    "body": dict(base=1.0, base_colorr=0.75, base_colorg=0.42, base_colorb=0.16, specular=0.4, specular_roughness=0.45),    #painted wood: what floats stands out
+    "airbubble": dict(base=0.0, specular=1.0, specular_roughness=0.0, specular_IOR=1.0, transmission=1.0),     #air, in the water: over its priority
     "ground": dict(base=1.0, base_colorr=0.45, base_colorg=0.45, base_colorb=0.45, specular_roughness=0.7),
 }
 WHITEWATER_WIDTH = 0.5      #a whitewater point's radius, as a fraction of the whitewater's separation: so each is as wide as they are apart
+BUBBLE_DRAWN = 0.0015       #the air's bubbles this radius or larger, metres, are drawn one by one (to start: a slider on the bubble balls node). Across a
+                            #frame a few metres wide that's a pixel or more; at 3 mm, 22% faster, they lose a little of the churn's fine grain
+BUBBLE_ANISOTROPY = 0.68    #how far forward bubbles in water scatter what they reflect and refract (Henyey-Greenstein's g; 0.84 with the diffracted half)
+VOLUME_BOUNCES = 64         #volume bounces, with the air's bubbles: a cloud of them is white by scattering light many times
+REFRACTION_BOUNCES = 6      #and refraction bounces: through the water's surface and the balls of air in it (12 looked the same, and took 4% longer)
+VOLUME_LOOKS = {     #Karma Pyro Shaders (_volume_material): the air's fine bubbles, a medium that scatters, evenly, the reduced part of what its density says
+    "bubblemedium": dict(densityscale=1.0 - BUBBLE_ANISOTROPY, smokecolorr=1.0, smokecolorg=1.0, smokecolorb=1.0, anisotropy=0.0),     #per metre
+}
+SPECKS = 24                 #each of the bake's own foam and bubble points drawn as this many white specks,
+SPECK_SIZE = 0.25           #each this fraction of the point's size (spread log-normally), scattered over the spacing of the points
 FOCAL_LENGTH, APERTURE, ASPECT = 30.0, 20.955, 16.0/9.0
 
 
@@ -35,6 +69,108 @@ def _domain(node):
         return node.evalParmTuple("domaincenter"), node.evalParmTuple("domainsize")
     box = node.node("container")
     return box.evalParmTuple("t"), box.evalParmTuple("size")
+
+
+def _specks(node, own):
+    """the bake's own whitewater as it's drawn, own being node's loader of it: spray (kind 0) as its points are, and each foam (1) and bubble (2)
+    point as SPECKS white specks scattered within the spacing of the points by its id, so each frame puts them in the same place. Built beside
+    node once: another Karma setup for the same node draws from the same nodes"""
+    parent = node.parent()
+    merged = parent.node(node.name() + "_whitewater_own")
+    if merged is None:
+        merged = parent.createNode("object_merge", node.name() + "_whitewater_own")     #the loader is inside node: brought out beside it
+        merged.setPosition(node.position() + hou.Vector2(3.0, -1.0))
+    merged.parm("objpath1").set(own.path())     #again each time: an older setup's took the air's bubbles in too, which are rendered as they are now
+    specks = parent.node(node.name() + "_whitewater_specks")
+    if specks is None:
+        specks = parent.createNode("attribwrangle", node.name() + "_whitewater_specks")
+        specks.setInput(0, merged)
+        specks.setPosition(merged.position() + hou.Vector2(0.0, -1.0))
+    specks.parm("snippet").set(     #again each time: an older setup's motion-blurred the bubbles too
+        "if(i@kind != 0){\n"
+        "    for(int k = 0; k < %d; k++){\n"
+        "        vector u = rand(set(float(i@id), float(k), 17.0));\n"
+        "        int speck = addpoint(0, @P + 2.0*f@pscale*sample_sphere_uniform(u));     // pscale is half the points' spacing\n"
+        "        float u1 = rand(set(float(i@id), float(k), 41.0)), u2 = rand(set(float(i@id), float(k), 43.0));\n"
+        "        setpointattrib(0, \"pscale\", speck, %g*f@pscale*exp(0.45*sqrt(-2.0*log(max(u1, 1e-6)))*cos(2.0*PI*u2)));\n"
+        "        setpointattrib(0, \"v\", speck, i@kind == 2 ? set(0.0, 0.0, 0.0) : v@v);     // bubbles aren't blurred (see the top)\n"
+        "        setpointattrib(0, \"kind\", speck, i@kind);\n"
+        "    }\n"
+        "    removepoint(0, @ptnum);\n"
+        "}\n" % (SPECKS, SPECK_SIZE))
+    return specks
+
+
+def _beside(node, loader, suffix, row):
+    """node's inner loader brought out beside it (in a row of them), as the stage imports from there"""
+    merged = node.parent().node(node.name() + suffix)
+    if merged is None:
+        merged = node.parent().createNode("object_merge", node.name() + suffix)
+        merged.setPosition(node.position() + hou.Vector2(6.0, -1.0 - 2.0*row))
+    merged.parm("objpath1").set(loader.path())
+    return merged
+
+
+def _bubble_medium(node, fields):
+    """the air's bubbles too fine to see one by one, as the medium they make in the water: the fluid fields' bubbles grid, what they scatter per metre,
+    as the density Karma's volume shader takes"""
+    merged = _beside(node, fields, "_fields", 0)
+    medium = node.parent().node(node.name() + "_bubble_medium")
+    if medium is None:
+        medium = node.parent().createNode("attribwrangle", node.name() + "_bubble_medium")
+        medium.setInput(0, merged)
+        medium.parm("class").set(1)     #primitives: the fields' grids
+        medium.setPosition(merged.position() + hou.Vector2(0.0, -1.0))
+    medium.parm("snippet").set('if(s@name != "bubbles") removeprim(0, @primnum, 1); else s@name = "density";')
+    return medium
+
+
+def _bubble_balls(node, air):
+    """the air's bubbles of its Smallest Bubble Drawn or larger, one by one. Each of the bake's bubble points is one particle's air, (2 pscale)^3 (pscale is half the
+    points' spacing), in bubbles of its radius: as many balls of that radius as that air makes (a fraction of one taken at random, by its id), spread
+    over its spacing by its id, so they move with it, each a ball of air in the water. Not motion-blurred, as the specks aren't"""
+    merged = _beside(node, air, "_bubbles", 1)
+    balls = node.parent().node(node.name() + "_bubble_balls")
+    if balls is None:
+        balls = node.parent().createNode("attribwrangle", node.name() + "_bubble_balls")
+        balls.setInput(0, merged)
+        balls.setPosition(merged.position() + hou.Vector2(0.0, -1.0))
+    if balls.parm("smallest") is None:
+        balls.addSpareParmTuple(hou.FloatParmTemplate("smallest", "Smallest Bubble Drawn (mm)", 1, default_value=(BUBBLE_DRAWN*1000.0,), min=0.5, max=10.0,
+                                                      help="The air's bubbles this radius or larger are drawn one by one, as balls of air; finer ones only "
+                                                           "whiten the water, as the bubbles' medium. Larger renders faster (3 mm: about 22% at 1080p) with a "
+                                                           "little less fine grain in the churn"))
+        balls.parm("smallest").set(BUBBLE_DRAWN*1000.0)
+    balls.parm("snippet").set(
+        "if(f@radius >= 0.001*chf(\"smallest\")){\n"
+        "    float n = pow(2.0*f@pscale, 3.0) / (4.0/3.0*PI*pow(f@radius, 3.0));\n"
+        "    int count = int(floor(n + rand(set(float(i@id), 7.0, 3.0))));\n"
+        "    for(int k = 0; k < count; k++){\n"
+        "        int ball = addpoint(0, @P + 2.0*f@pscale*sample_sphere_uniform(rand(set(float(i@id), float(k), 17.0))));\n"
+        "        setpointattrib(0, \"pscale\", ball, f@radius);\n"
+        "        setpointattrib(0, \"v\", ball, set(0.0, 0.0, 0.0));\n"
+        "    }\n"
+        "}\n"
+        "removepoint(0, @ptnum);\n")
+    return balls
+
+
+def _volume_material(library, name, settings):
+    """a Karma Material Builder in library, made as Houdini's own tool makes one, with a Karma Pyro Shader (settings) on its volume output. On its
+    own in the library the shader makes no material, without a word, and Karma renders the volume with its default shading instead"""
+    import voptoolutils
+    builder = voptoolutils._setupMtlXBuilderSubnet(destination_node=library, name=name, mask=voptoolutils.KARMAMTLX_TAB_MASK,
+                                                   folder_label="Karma Material Builder", render_context="kma")
+    for unused in ("mtlxstandard_surface", "mtlxdisplacement"):
+        if builder.node(unused) is not None:
+            builder.node(unused).destroy()
+    shader = builder.createNode("kma_pyroshader", "pyro")
+    for parm, value in settings.items():
+        shader.parm(parm).set(value)
+    outputs = builder.node("Material_Outputs_and_AOVs")
+    outputs.setInput(outputs.inputNames().index("next"), shader, 0)     #which gives the output node a volume input, wired to it
+    builder.layoutChildren()
+    return builder
 
 
 def create_render(node):
@@ -57,11 +193,18 @@ def create_render(node):
         looks["/" + lop.name()] = look
 
     imported("liquid", node.node("surface"), "water")     #the surface itself, whatever the node's Show says
+    priority = stage.createNode("rendergeometrysettings", prefix + "_liquid_priority")     #under every other object's where they overlap
+    priority.setInput(0, made[-1])
+    priority.parm("primpattern").set("/" + made[-1].name())
+    priority.parm("xn__primvarskarmaobjectdielectricpriority_control_ffcfg").set("set")
+    priority.parm("xn__primvarskarmaobjectdielectricpriority_e1bfg").set(1)
+    made.append(priority)
     folder = os.path.join(node.evalParm("outputdir").rstrip("/"), "bake") if kind == "solver" else node.evalParm("bakedir").rstrip("/")
-    own = node.node(importer.WHITEWATER)
+    exported = os.path.join(folder, "export", "houdini")
+    own = node.node(importer.WHITEWATER)     #the bake's own whitewater
     whitewater = node.parent().node(prefix + "_whitewater")
-    if own is not None and importer.has_whitewater(os.path.join(folder, "export", "houdini")):     #the bake's own, its pscale already the size to draw
-        imported("whitewater", own, "whitewater")
+    if own is not None and importer.has_whitewater(exported):     #the bake's own: its spray, and its foam and bubbles as specks
+        imported("whitewater", _specks(node, own), "whitewater")
     elif whitewater is not None:    #Houdini's, sized to render: the solver's pscale is the points' whole separation
         sized = node.parent().node(prefix + "_whitewater_render")
         if sized is None:
@@ -70,16 +213,27 @@ def create_render(node):
             sized.parm("snippet").set("@pscale *= %g;     // the fraction of the whitewater's separation each point is drawn as" % WHITEWATER_WIDTH)
             sized.setPosition(whitewater.position() + hou.Vector2(0.0, -1.5))
         imported("whitewater", sized, "whitewater")
+    air, fields = node.node(importer.BUBBLES), node.node(importer.FIELDS)
+    medium = air is not None and fields is not None and importer.has_bubbles(exported) and importer.has_fields(exported)
+    if medium:      #the air's own bubbles, as they are to light: the fine ones a medium in the water, the ones large enough to see drawn one by one
+        imported("bubble_medium", _bubble_medium(node, fields), "bubblemedium")
+        imported("bubble_balls", _bubble_balls(node, air), "airbubble")
     wired = node.inputs()
     collision = (node.node("COLLISION") if len(wired) > 1 and wired[1] is not None else None) if kind == "solver" else (wired[0] if wired else None)
     if collision is not None:
         imported("collisions", collision, "solid")
+    pieces = node.node("rbd_pieces")    #the RBD tab's pieces, the simulated ones where the bake moved them (importer.build_bodies)
+    if pieces is not None and (kind == "import" or (node.parm("rbdsop") is not None and node.evalParm("rbdsop").strip())):
+        imported("bodies", pieces, "body")
     centre, size = _domain(node)
-    ground = stage.createNode("cube", prefix + "_ground")       #a slab under the domain, three times as wide
+    #a slab under the domain, three times as wide, its top a thousandth of the domain's height over the floor: the liquid's surface lies flat on the
+    #floor (flip2 mesh cuts it there), so it's inside the slab and hidden. With the slab's top under the floor instead, the liquid's flat bottom is water
+    #over a hair's gap of air, which mirrors the water above it at a grazing look (total internal reflection), as a bright band across its lower part
+    ground = stage.createNode("cube", prefix + "_ground")
     ground.setInput(0, made[-1])
     ground.parm("size").set(1.0)
     ground.parmTuple("s").set((3.0*size[0], 0.01*size[1], 3.0*max(size[2], size[0])))
-    ground.parmTuple("t").set((centre[0], centre[1] - 0.5*size[1] - 0.006*size[1], centre[2]))
+    ground.parmTuple("t").set((centre[0], centre[1] - 0.5*size[1] - 0.004*size[1], centre[2]))
     made.append(ground)
     looks[ground.evalParm("primpath")] = "ground"
     library = stage.createNode("materiallibrary", prefix + "_materials")
@@ -87,6 +241,8 @@ def create_render(node):
     library.parm("materials").set(len(looks))
     shaders = {}
     for index, (prim, look) in enumerate(looks.items(), 1):
+        if look in VOLUME_LOOKS and look not in shaders:
+            shaders[look] = _volume_material(library, look, VOLUME_LOOKS[look])
         if look not in shaders:
             shaders[look] = library.createNode("mtlxstandard_surface", look)
             for parm, value in LOOKS[look].items():
@@ -113,6 +269,9 @@ def create_render(node):
     settings.setInput(0, sky)
     settings.parm("camera").set(camera.evalParm("primpath"))
     settings.parm("vblur").set("Velocity Blur")     #or the surface's v blurs nothing
+    if medium:
+        settings.parm("volumelimit").set(VOLUME_BOUNCES)
+        settings.parm("refractionlimit").set(REFRACTION_BOUNCES)
     render = stage.createNode("usdrender_rop", prefix + "_render")
     render.setInput(0, settings)
     stage.layoutChildren()
@@ -125,8 +284,9 @@ def create_render(node):
     bare = []
     for prim in (built.Traverse() if built is not None else ()):
         if prim.GetTypeName() == "Material":
-            surface = UsdShade.Material(prim).GetSurfaceOutput("mtlx")    #what the translation makes: the material's surface output, wired to its shader
-            if not surface or not surface.HasConnectedSource():
+            material = UsdShade.Material(prim)    #what the translation makes: the material's surface output (a volume's: Karma's volume output), wired to its shader
+            outputs = (material.GetSurfaceOutput("mtlx"), material.GetVolumeOutput("kma"))
+            if not any(output and output.HasConnectedSource() for output in outputs):
                 bare.append(prim.GetPath().pathString)
     if bare:
         raise hou.Error("The materials %s came out without their shaders, so everything would render grey. Houdini's MaterialX translation failed silently: "
@@ -141,8 +301,14 @@ def shelf_tool(kwargs):
     if not selected:
         raise hou.Error("Select a flip2 Solver or flip2 Import node first: flip2 Karma Setup builds a stage to render its bake")
     render = create_render(selected[0])
+    node = selected[0]
+    folder = os.path.join(node.evalParm("outputdir").rstrip("/"), "bake") if node.userData("flip2") == "solver" else node.evalParm("bakedir").rstrip("/")
+    exported = os.path.join(folder, "export", "houdini")
+    unseen = importer.has_bubbles(exported) and not importer.has_fields(exported)
     if hou.isUIAvailable():
-        hou.ui.displayMessage("Built a Karma setup in /stage for %s." % selected[0].name(),
+        hou.ui.displayMessage("Built a Karma setup in /stage for %s." % node.name(),
                               details="Open /stage to see it. %s renders the frame range; its picture is set on %s. Velocity Blur is on, so the "
-                                      "surface's motion blurs." % (render.name(), render.inputs()[0].name()))
+                                      "surface's motion blurs.%s" % (render.name(), render.inputs()[0].name(),
+                                      " The bake's air has bubbles, which render from its fluid fields: turn on Output Fluid Fields and mesh it again, "
+                                      "then run flip2 Karma Setup again to see them." if unseen else ""))
     return render

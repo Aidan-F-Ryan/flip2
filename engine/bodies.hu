@@ -1,0 +1,365 @@
+//Copyright 2026 Taimen LLC
+
+#ifndef BODIES_HU
+#define BODIES_HU
+
+#include "typedefs.h"
+#include "grid.hpp"
+#include "obstacles.hu"
+#include "scene.hpp"
+#include "partitionContext.hu"
+#include "cudaVec.hu"
+#include "algorithms/conjugateGradientFunctions.hu"
+#include "algorithms/condensationFunctions.hu"
+#include "algorithms/exactSum.hu"
+#include "json.hpp"
+#include "cacheWriter.hu"       //ShardColumns, ShardData
+#include <initializer_list>
+#include <string>
+#include <utility>
+#include <vector>
+
+//Two-way coupled rigid bodies: dynamic obstacles (SceneBody), which the liquid moves as they move it. Batty, Bertails and Bridson's variational
+//coupling (A fast variational framework for accurate solid-fluid coupling, 2007), on the cut cells the obstacles already have: the pressure solve
+//finds the fluid's pressure and the bodies' velocities together, as the one kinetic energy they share at its lowest.
+//
+//A body's generalized velocity xi = (V, w), its centre of mass's and its turning, moves the solid part of each face its surface cuts at
+//e.(V + w x (x_face - c)): that's the flow obstacleFaceFlux puts in the divergence, row B_i xi for each unknown i, B_i the sum over its faces the body cuts
+//of sign (1 - open)(e, (x_face - c) x e). The pressure pushes back on it through the same faces, so the impulse a substep's pressure gives it is the
+//transpose: B^T p, in the solve's units. With the solve's scale s (dt over its density and the voxel's area, as cudaGetA has it) and the body's mass in
+//voxels of liquid (M~ = M / (rho dx^3)), its velocity after the solve is xi* + s M~^-1 B^T p, and the unknowns' equations become
+//    (A + s B M~^-1 B^T) p = -divU(u*, xi*)
+//symmetric and positive definite still: CG solves it as it does A alone (the term's part of each product is Bodies::addTimes), and the multigrid
+//preconditions A, but for the unknowns between touching bodies, where the term outweighs A: those it solves for with the term exactly
+//(condensationFunctions.cu, from the term's diagonal and its factor, addDiagonal and factorRows). A light body is as stable as a heavy one, which a
+//body pushed by the pressure from a solve that didn't know its mass isn't: there, it overshoots by its added mass every substep.
+//
+//Each body is one obstacle (obstacles.hu), its shape built once in its own space as a rigid obstacle's is; only where it is and how it moves, its
+//BodyFrame, is the GPU's, which moves it. Its state is in double, its mass, centre of mass and inertia come from integrating its density over the
+//inside of its shape (uniform for now; a density that varies through it is the same integral), and its turning carries over as angular momentum, so
+//a body tumbling through the air keeps its momentum while its axes turn. Nothing the bodies do waits on the host: the host reads their state a substep
+//late, after the waits the substep already has, for the timestep and the frames.
+
+static constexpr int BODY_LANES = 6;    //a body's generalized velocity: V, then w
+
+//one body's state, on the GPU, in double: a body resting on the bottom has to stay put to well under a voxel for thousands of substeps
+struct BodyState{
+    double position[3];         //its centre of mass, in the world
+    double orientation[4];      //a unit quaternion, w x y z: its own axes in the world's
+    double velocity[3];         //its centre of mass's
+    double angularVelocity[3];  //about its centre of mass, in the world
+    double angularMomentum[3];  //the same as momentum, which the substeps carry over (without torque, it's what stays the same while it tumbles)
+    double before[BODY_LANES];  //its velocities at the start of the substep, for how fast they changed
+    double acceleration;        //the most its surface's velocity changed by over the last substep, per second, for the timestep
+    double pseudo[BODY_LANES];  //how fast its contacts push it out of what it's sunk into this substep: moves it, but isn't its velocity (contacts.cu)
+    double held[BODY_LANES];    //its velocity and angular momentum once the warm start held it up (contacts.cu), which gravity and the liquid add to
+    double perSecond[BODY_LANES];   //what they add a second over the substep, to the velocity and the angular momentum (torque), a piece each step
+};
+
+//what stays the same: its mass and how it's spread
+struct BodyMass{
+    double mass;                //kg
+    double volume;              //m^3: the inside of its shape
+    double centre[3];           //its centre of mass in its own space (the obstacle's, which its transform's scale is baked into)
+    double inertia[9];          //about its centre of mass, along its own axes, kg m^2
+    double inverseInertia[9];
+    double reach;               //how far its bounds' farthest corner is from its centre of mass: the most any point of it moves for a turn
+    float3 objectLow, objectHigh;   //its bounds in its own space
+    double liquidVoxelMass;     //rho dx^3: the liquid's mass in a voxel, the unit the coupling weighs the body in
+    float bounce;               //SceneBody's
+    float contactFriction;
+};
+
+//Contacts (contacts.cu): a body touches the domain's six walls, then any obstacle, another body among them, each a partner: 6 and the obstacles' count
+//in all (Bodies::partners). Against each it keeps a manifold of up to CONTACT_SLOTS of its surface points: the deepest, the farthest from it, the one
+//making the largest triangle with those, and the one farthest from all three, enough for a box to rest flat
+static constexpr int CONTACT_SLOTS = 4;
+
+//one contact: a point of a body's surface against a partner. Its slot is (body, partner, k), its identity the surface point
+struct BodyContact{
+    int point;              //the body's surface point, or -1: the slot's empty
+    int other;              //the partner's body, or -1 for a wall or an obstacle that's not a body
+    int body;               //the body, its partner (the walls 0 to 5, then 6 and an obstacle's number), and its place among the partner's CONTACT_SLOTS:
+    int partner;            //what it is wherever the substep's pairs put its slot (contacts.cu)
+    int k;
+    float3 at;              //where, in the world
+    float3 normal;          //out of the partner, towards the body
+    float depth;            //how far apart they are along it: negative, how far the body's sunk in
+    float3 tangents[2];
+    float3 partnerVelocity; //a wall's or an obstacle's velocity there
+    float3 lever[2];        //from the body's centre of mass to the point, and from the other body's
+    float mass[3];          //what an impulse along the normal, and along each tangent, takes to change their speed apart there by 1
+    float friction;         //Coulomb's coefficient between them
+    float target;           //the speed apart along the normal it has to reach: its bounce, or how close it may come this substep
+    float bias;             //and how fast it's pushed out of what it's sunk into (split impulse)
+    float impulse[3];       //normal, tangents: what it's given this substep so far, which the next starts from (warm starting)
+    float applied;          //1 if its impulse was given again at the substep's start, before the pressure solve (warmStartBodies), to be taken back
+    float pseudo;           //the push out's
+    float3 local;           //the point in the body's own space
+    float dt;               //the substep its impulse was given over
+    int color;              //its batch in the solve: no two contacts in one share a body
+};
+
+//one body as the contact solve takes it (contacts.cu): its velocity and turning, the push out's, and its inverse mass and inertia, as floats
+struct SolveBody{
+    float3 v, w, pv, pw;
+    float inverseMass;
+    float inverseInertia[9];
+};
+
+//one body as the coupling's kernels take it this substep: its centre of mass, and its inverse mass and inertia in voxels of liquid, in the world's axes
+struct BodyCoupling{
+    float3 centre;
+    double inverseMass;
+    double inverseInertia[9];
+};
+
+//where the unknowns are, as the coupling's kernels read them this substep: the nodes near obstacles (findSolidVoxels), the partition's own coming first,
+//their interior voxels, which of those are unknowns, how open each face is and which body is across it
+struct CouplingGrid{
+    const uint* nodes;          //how many, then the stored nodes near obstacles
+    uint numOwnNodes;
+    const uint* nodeCells;
+    const uint* interiorVoxels; //per node, its 4^3 interior's voxels, x fastest, or NO_VOXEL
+    const char* solveCodes;
+    const char* near;           //obstacleNear's bits
+    const uint* opens;          //obstacleOpen's fractions
+    const uint* centroids;      //obstacleCentroids: where on each face its solid part is
+    const uint* faceBodies;     //per stored voxel, six faces: the body across each that's near an unknown's, plus 1, or 0
+    Grid grid;
+    int interiorWidth;
+};
+
+//a face's friction into its body's sums, if a dynamic body is across it (body, or -1: bodyOf): the momentum the particles take from the face's change,
+//along the face's axis at the face's centre, and its moment about the body's centre of mass, which the body gives up (Bodies::takeFriction)
+__device__ inline void addFriction(const BodyFriction& friction, int body, int axis, float3 point, uint voxel, float change){
+    if(friction.sums == nullptr || body < 0 || change == 0.0f){
+        return;
+    }
+    float momentum = friction.scale*friction.weights[axis][voxel]*change;
+    float3 centre = friction.couplings[body].centre;
+    float lever[3] = {point.x - centre.x, point.y - centre.y, point.z - centre.z};
+    float lanes[BODY_LANES] = {axis == 0 ? momentum : 0.0f, axis == 1 ? momentum : 0.0f, axis == 2 ? momentum : 0.0f,     //lever x e, times it
+                               axis == 0 ? 0.0f : axis == 1 ? -lever[2]*momentum : lever[1]*momentum,
+                               axis == 0 ? lever[2]*momentum : axis == 1 ? 0.0f : -lever[0]*momentum,
+                               axis == 0 ? -lever[1]*momentum : axis == 1 ? lever[0]*momentum : 0.0f};
+    for(int lane = 0; lane < BODY_LANES; ++lane){
+        addExactly(lanes[lane], friction.sums[BODY_LANES*body + lane]);
+    }
+}
+
+// ---- small double helpers, for the bodies' own state ----
+
+__host__ __device__ inline void rotationOf(const double q[4], double r[9]){     //a unit quaternion, w x y z, as a row-major rotation
+    double w = q[0], x = q[1], y = q[2], z = q[3];
+    r[0] = 1 - 2*(y*y + z*z);
+    r[1] = 2*(x*y - w*z);
+    r[2] = 2*(x*z + w*y);
+    r[3] = 2*(x*y + w*z);
+    r[4] = 1 - 2*(x*x + z*z);
+    r[5] = 2*(y*z - w*x);
+    r[6] = 2*(x*z - w*y);
+    r[7] = 2*(y*z + w*x);
+    r[8] = 1 - 2*(x*x + y*y);
+}
+
+//R M R^T: a tensor along a body's own axes, along the world's
+__host__ __device__ inline void turned(const double r[9], const double m[9], double out[9]){
+    double rm[9];
+    for(int row = 0; row < 3; ++row){
+        for(int column = 0; column < 3; ++column){
+            rm[3*row + column] = r[3*row]*m[column] + r[3*row + 1]*m[3 + column] + r[3*row + 2]*m[6 + column];
+        }
+    }
+    for(int row = 0; row < 3; ++row){
+        for(int column = 0; column < 3; ++column){
+            out[3*row + column] = rm[3*row]*r[3*column] + rm[3*row + 1]*r[3*column + 1] + rm[3*row + 2]*r[3*column + 2];
+        }
+    }
+}
+
+__host__ __device__ inline void times(const double m[9], const double v[3], double out[3]){
+    for(int row = 0; row < 3; ++row){
+        out[row] = m[3*row]*v[0] + m[3*row + 1]*v[1] + m[3*row + 2]*v[2];
+    }
+}
+
+//a body's velocity as the obstacle passes read it: the velocity at world point x is velocity times (x, 1), V + w x (x - c) = W x + (V - W c)
+__device__ inline void writeVelocity(const BodyState& state, BodyFrame& frame){
+    const double* w = state.angularVelocity;
+    const double* c = state.position;
+    double W[9] = {0.0, -w[2], w[1], w[2], 0.0, -w[0], -w[1], w[0], 0.0};
+    for(int row = 0; row < 3; ++row){
+        for(int column = 0; column < 3; ++column){
+            frame.velocity[4*row + column] = (float)W[3*row + column];
+        }
+        frame.velocity[4*row + 3] = (float)(state.velocity[row] - (W[3*row]*c[0] + W[3*row + 1]*c[1] + W[3*row + 2]*c[2]));
+    }
+}
+
+class Bodies : public SolveTerm{
+public:
+    Bodies() = default;
+    Bodies(const Bodies&) = delete;
+    Bodies& operator=(const Bodies&) = delete;
+    ~Bodies();
+
+    //the dynamic obstacles among descriptions, which obstacles has built: their mass, from their density over the inside of their shapes, and where
+    //they start. Their frames are then the obstacle set's to hand to the kernels (ObstacleSet::setFrames). On stream, in this partition's context
+    void setUp(const std::vector<SceneObstacle>& descriptions, ObstacleSet& obstacles, double liquidDensity, double voxelSize, PartitionContext* context,
+               cudaStream_t stream);
+
+    int count() const{
+        return numBodies;
+    }
+
+    //each body's frame from its state: where it is, its reach, how it moves, and what the coupling weighs it at there. After it moves, and on resuming
+    void writeFrames();
+    //the start of a substep: gravity's dt on each body, which the divergence's flow at its surface (obstacleFaceFlux) and the solve start from
+    void predict(double dt, float3 gravity);
+    //which body is across each face of the near unknowns (findFaceBodies), after obstacleFaceFlux's lookups: once a substep, once the obstacles' solids are
+    //marked, for numVoxels stored voxels
+    void findFaceBodies(const Obstacles& obstacles, const VoxelPlaces& places, uint3 domainVoxels, const uint* nodes, uint numOwnNodes, const char* solveCodes,
+                        const char* near, const uint* opens, const uint* const neighbors[6], uint numVoxels);
+    //before a solve: the solve's scale, and where the unknowns are this substep; with bounded, the term's norm bound too, which normBound() returns once
+    //the host has waited on the stream after this (the bounded solve does, before it needs it)
+    void prepare(double scale, const uint* nodes, uint numOwnNodes, const uint* nodeCells, const uint* interiorVoxels, const char* solveCodes, const char* near,
+                 const uint* opens, const uint* centroids, const Grid& grid, int interiorWidth, bool bounded);
+    //after a solve (once the boundaries have settled it): the impulse the pressure p gives each body, s M~^-1 B^T p, onto its velocity
+    void takePressure(const float* p);
+    //Friction (obstacles.cu, slipVelocity): the obstacle passes add up what their faces' friction gives the particles (BodyFriction) over a substep, from
+    //P2G's, which beginFriction clears, to the velocity update's, after which takeFriction gives each body the opposite. frictionFor: the sums and what
+    //they need, for a pass whose change the particles take share of (scale, with the particle's mass), or none for share 0
+    void beginFriction();
+    BodyFriction frictionFor(float share, double particleMass, const float* weightsX, const float* weightsY, const float* weightsZ);
+    void takeFriction();
+    //contacts (contacts.cu): the last substep's contacts' impulses again, for this one's dt, before predict, so what rests on something is held up
+    //through the pressure solve; and the substep's pairs counted, for step to make: what each body can touch in it, the walls (low to high) among them,
+    //as fast as it and the rest move (the obstacles' fastest at obstacleSpeed)
+    void warmStart(double dt, const Obstacles& obstacles, float3 gravity, float obstacleSpeed, float3 low, float3 high);
+    //After the friction, the bodies' own steps through the substep (contacts.cu): what gravity, the pressure and the friction gave each body since the
+    //warm start taken back and given again a piece a step, as a steady push over the substep, and at each step, each body against the domain's walls
+    //(low to high) and the obstacles where they are then, its contacts solved for, and it moves; then its state goes to the host. As many steps as the collision substeps ask (setCollisionSubsteps, frameDt the frame's length), and enough that no body's
+    //surface moves more than half a voxel in one
+    void step(double dt, double frameDt, const Obstacles& obstacles, float3 low, float3 high, float3 gravity);
+    //contact steps a frame, at least: the rate a pile's contacts are solved at, which a stack needs a few of to stand (5, at 24 frames a second 120 a
+    //second, Houdini's RBD Bullet Solver's Substeps)
+    void setCollisionSubsteps(int perFrame){
+        collisionSubsteps = perFrame;
+    }
+    //what a body that hits a wall meets there (the wall's bounce and contactFriction, Scene's), each times the body's own: 0.5 and 1 unless set, as
+    //RBD Bullet Solver's ground plane has them
+    void setWallContact(int wall, double bounce, double contactFriction){
+        wallBounce[wall] = (float)bounce;
+        wallContactFriction[wall] = (float)contactFriction;
+    }
+
+    //SolveTerm
+    void addTimes(const float* x, float* y, float sign, const uint* onlyIf, cudaStream_t stream) override;
+    void addLastEnergy(double* total, cudaStream_t stream) override;
+    float normBound() const override;
+    void addDiagonal(float* diagonal, cudaStream_t stream) override;
+    void factorRows(uint count, const uint* voxels, const int3* places, uint* columns, double* values, cudaStream_t stream) override;
+    Condensation& condensation() override{
+        return condensed;
+    }
+
+    //from the state the host last read back: the fastest any body's surface moves, in m/s, and the most its velocity changed by per second
+    float fastest() const;
+    float acceleration() const;
+    const BodyState* hostStates() const{   //each body's state as the host last read it back
+        return seen;
+    }
+    const BodyMass& mass(int body) const{
+        return masses[body];
+    }
+    int obstacleOf(int body) const{
+        return obstacles[body];
+    }
+    uint bodyBlocks() const{    //for a kernel taking a body a thread, in warps
+        return (uint)(numBodies + 31) / 32;
+    }
+    const std::string& name(int body) const{    //its obstacle's name in the scene
+        return names[body];
+    }
+    //each body's placement for a cache frame, into pinned host memory: the BODY_PLACEMENT doubles its state starts with (cacheWriter.hu), on the
+    //stream, so an event recorded on it after this has them there
+    void copyPlacements(double* host);
+    //Checkpoints (flip2 resume): every body's state and the contacts the next substep starts from, as they are now, as columns for the checkpoint's
+    //bodies and contacts shards, which restore carries on from exactly. It waits for the GPU: once a checkpoint, with the stream's work done
+    //(Simulation::writeCheckpoint has just waited on it)
+    void checkpoint(ShardColumns& bodyColumns, ShardColumns& contactColumns);
+    //a checkpoint's bodies and contacts shards in place of where setUp started the bodies, before resume places the obstacles (updateObstacles writes
+    //their frames from them): what's wrong with them for this scene's bodies, if anything
+    std::string restore(const ShardData& bodyShard, const ShardData& contactShard);
+
+private:
+    void release();
+    void setUpContacts(const ObstacleSet& obstacles, double voxelSize);     //each body's surface points (contacts.cu)
+    void touch(double dt, const Obstacles& obstacles, float3 low, float3 high, float3 gravity);    //one contact step's contacts
+    void moveOnce(double dt, double measureOver);   //and the move after it: how fast the bodies' velocities changed is measured over the whole substep
+    void sumShares(const float* x, const uint* onlyIf);    //B^T x into the sums, every partition's, then s M~^-1 of it into responses
+    void makePairs(const Obstacles& obstacles, float3 low, float3 high);   //the substep's pairs, from the count warmStart made, and the last contacts in them
+    void reserve(size_t& capacity, size_t needed, std::initializer_list<std::pair<void**, size_t>> arrays);  //room for needed of each, kept if there is
+
+    int numBodies = 0;
+    int partners = 6;                   //what a body can touch: the walls, and every obstacle (setUpContacts)
+    std::vector<int> obstacles;         //per body, its obstacle's place in the obstacle set
+    int* deviceObstacles = nullptr;     //and on the GPU
+    std::vector<std::string> names;     //and its name in the scene
+    std::vector<BodyMass> masses;
+    BodyState* states = nullptr;        //on the GPU
+    BodyMass* deviceMasses = nullptr;
+    BodyFrame* frames = nullptr;
+    BodyCoupling* couplings = nullptr;
+    ExactSum* sums = nullptr;           //B^T x, BODY_LANES per body
+    double* responses = nullptr;        //s M~^-1 B^T x, BODY_LANES per body, then (B^T x).(s M~^-1 B^T x) in all
+    ExactSum* frictionSums = nullptr;   //the friction the substep's faces gave the particles, BODY_LANES per body
+    ExactSum* boundSums = nullptr;      //per body, the sum over its unknowns of B_i M~^-1 B_i^T
+    double* bound = nullptr;            //s times their total, on the GPU
+    double* seenBound = nullptr;        //and pinned, for normBound
+    BodyState* seen = nullptr;          //pinned: the states as the host last read them
+    float3* surfacePoints = nullptr;    //every body's surface points, in its own space, body after body (contacts.cu)
+    int* surfaceBodies = nullptr;       //and whose each is
+    int numSurfacePoints = 0;
+    //Contacts (contacts.cu): each substep, the pairs of a body and a partner that can touch in it, a body's after another's, its partners in order,
+    //and CONTACT_SLOTS slots a pair; the last step's contacts, which the next starts from, numLast of them
+    float3* queryBoxes = nullptr;       //per body, warmStart's: where it and what it can touch can be in the substep, low then high
+    uint* pairEnds = nullptr;           //per body, the pairs counted up to it
+    uint* pairTotal = nullptr;          //pinned: their total, as warmStart counted them
+    cudaEvent_t pairsCounted = nullptr;
+    int* pairBodies = nullptr;          //per pair
+    int* pairPartners = nullptr;
+    size_t pairCapacity = 0;
+    int numPairs = 0;
+    unsigned long long* picks = nullptr;    //per slot, the point it picked this step: how good, then which
+    BodyContact* contacts = nullptr;    //per slot: this step's
+    BodyContact* lastContacts = nullptr;    //the last step's, which this one starts from
+    BodyContact* remapped = nullptr;    //the last substep's, in this one's slots
+    int numLast = 0;
+    size_t slotCapacity = 0;
+    ExactSum* pushSums = nullptr;       //per body, BODY_LANES: the impulses the warm start and the carry give it, and their moments, added up exactly
+    int* islands = nullptr;             //per body, the lowest body numbered among those its contacts join it to (union-find)
+    unsigned long long* islandKeys = nullptr;   //per slot: its island, then the slot, for sorting them by; and sorted
+    unsigned long long* sortedKeys = nullptr;
+    int* slotsIn = nullptr;             //the slots, and in that order
+    int* slotsSorted = nullptr;
+    int* contactOrder = nullptr;        //per island, its contacts batch after batch, from where its first is in sortedKeys
+    int* islandBatches = nullptr;       //per body that's an island's lowest: where in its range each batch starts, and its end
+    unsigned long long* bodyBatches = nullptr;  //per body, the batches its contacts are in so far, a bit each, while the islands are dealt into them
+    void* sortScratch = nullptr;
+    size_t sortScratchBytes = 0;
+    SolveBody* solveBodies = nullptr;   //per body, while the islands are solved
+    double scale = 0.0;                 //the solve's, s
+    Condensation condensed;             //the multigrid's, for the unknowns the coupling outweighs the stencil at
+    CudaVec<uint> faceBodyCodes;        //per stored voxel, six of findFaceBodies'
+    CouplingGrid where = {};
+    PartitionContext* context = nullptr;
+    cudaStream_t stream = nullptr;
+    double voxel = 0.0;
+    int collisionSubsteps = 5;
+    float wallBounce[6] = {0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f};             //setWallContact's
+    float wallContactFriction[6] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+};
+
+#endif

@@ -1,4 +1,4 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 
 #ifndef SCENE_HPP
 #define SCENE_HPP
@@ -13,19 +13,24 @@
 //    "domain": {"min": [-0.5, -0.5, -0.5], "max": [0.5, 0.5, 0.5], "voxelSize": 0.0078125,     //rounded up to whole nodes of 4^3 voxels
 //               "open": [],                                                //faces that delete the fluid reaching them: "-x", "+x", "-y", "+y", "-z", "+z"
 //               "walls": {"hold": true, "friction": 0, "contactAngle": 60,  //what the walls do to the liquid on them, all of them, and then any that
-//                         "+y": {"hold": false, "friction": 0.5}}},        //differ, by face. hold: a wall that holds pulls on the liquid as well as
-//                                                                           //pushing it, as a sealed tank's do, so a splash hangs from the ceiling;
+//                         "bounce": 0.5, "contactFriction": 1,             //differ, by face. hold: a wall that holds pulls on the liquid as well as
+//                         "+y": {"hold": false, "friction": 0.5}}},        //pushing it, as a sealed tank's do, so a splash hangs from the ceiling;
 //                                                                           //one that doesn't lets it go wherever air can get in behind it, as
 //                                                                           //anything in open air does (boundaries.cu). With "air" simulated the air
 //                                                                           //gets behind the liquid itself, and every wall holds. friction: as an
 //                                                                           //obstacle's, 0 for the liquid sliding freely along the wall to 1.
 //                                                                           //contactAngle: the angle the liquid's surface meets this wall at,
-//                                                                           //where it isn't the liquid's own (below)
+//                                                                           //where it isn't the liquid's own (below). bounce and contactFriction:
+//                                                                           //what a dynamic obstacle that hits the wall meets, each times its own,
+//                                                                           //as RBD Bullet Solver's ground plane has them
 //    "solver": {"flipRatio": 0.95, "cfl": 4, "densityCorrectionTime": 0.1, "pressureSolver": "multigrid", "advection": "rk3", "dotProducts": "exact",
 //               "transfer": "flip",                                        //or "apic": particles carry their velocity's gradient; flipRatio 0 for pure APIC
 //               "viscousCfl": 6,                                           //with viscosity: voxels it may spread across in a substep; 0 for no limit
-//               "freeSurface": "footprint"},                               //or "sharp": the pressure is 0 at the level set's surface (ghost fluid),
-//                                                                           //which costs more a substep and, with surface tension, 0.7 the timestep
+//               "freeSurface": "levelSet",                                 //the pressure is 0 at the level set's surface (freesurface.cu); or
+//                                                                           //"voxel": at the centres of the voxels past the particles' footprint,
+//                                                                           //which costs about half as much a frame and damps the surface. With air,
+//                                                                           //voxel, the only one that goes with it yet
+//               "collisionSubsteps": 5},                                   //dynamic obstacles: their contacts' steps a frame, at least
 //    "gravity": [0, -9.8, 0],
 //    "liquid": {"density": 1000, "viscosity": 0, "surfaceTension": 0,       //kg/m^3; Pa s, dynamic (water 0.001, honey 2 to 10); N/m (water 0.073). With
 //               "contactAngle": 60},                                        //viscosity, it sticks to walls and obstacles; with surface tension, the
@@ -39,11 +44,18 @@
 //    "emitters": [{"shape": "box", "min": [...], "max": [...], "velocity": [0, 0, 2]}],   //inflow: keeps its shape full of fluid moving at velocity
 //    "sinks": [{"shape": "sphere", "center": [...], "radius": 0.1}],                       //outflow: deletes the fluid inside it
 //    "obstacles": [{"mesh": "rock.obj", "friction": 0, "thickness": 0, "hold": true,     //or "vertices": "v.npy", "triangles": "t.npy"; or a box or sphere;
-//                                                                                         //hold: as a wall's
+//                   "bounce": 0.5, "contactFriction": 1,                                  //a still or moved one's, to the dynamic ones that hit it: as RBD
+//                                                                                         //Bullet Solver's collisions', each times the body's own
+//                                                                                         //hold: as a wall's. Each .npy can be rows of one many share:
+//                                                                                         //{"file": "all.npy", "first": 1200, "count": 342}
 //                                                                                         //or "vdb": "rock.vdb", "grid": "surface", "velocityGrid": "vel"
 //                   "transform": [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1],                    //its own space to the world: row-major, acting on column vectors
 //                   "keyframes": [{"time": 0, "transform": [...]}, ...],                 //instead of a transform, it moves: linearly, rotations by slerp
-//                   "deforming": [{"time": 0, "mesh": "f1.obj"}, {"time": 0.04, "vertices": "f2.npy"}, ...]}],   //or it deforms: see SceneObstacle
+//                   "deforming": [{"time": 0, "mesh": "f1.obj"}, {"time": 0.04, "vertices": "f2.npy"}, ...],     //or it deforms: see SceneObstacle
+//                   "dynamic": {"density": 1000, "mass": 0, "velocity": [0, 0, 0], "angularVelocity": [0, 0, 0],      //or the liquid moves it, from where its
+//                               "bounce": 0, "contactFriction": 0.5},                                                 //transform puts it: see SceneBody. Without
+//                                                                                                                     //air, the free surface is then sharp
+//                   "name": "piece0"}],                                                   //what a DCC calls it: a dynamic one's frames in the cache carry it
 //    "forces": [{"type": "point", "position": [...], "strength": 9.8, "radius": 0, "falloff": 1},       //strength in m/s^2, towards it (negative: away)
 //               {"type": "vortex", "position": [...], "axis": [0, 1, 0], "strength": 5, "radius": 0, "falloff": 1},
 //               {"type": "turbulence", "strength": 2, "scale": 0.1, "speed": 0.5, "seed": 0},
@@ -85,6 +97,18 @@ struct SceneField{
     double high[3] = {0.0, 0.0, 0.0};
 };
 
+//A dynamic obstacle's own (bodies.cu): a rigid body the liquid moves as it moves the liquid, falling under gravity, pushed by the pressure on it and
+//kept out of the walls and the other obstacles. Its mass is its density over the volume inside it, or the mass given; its centre of mass and inertia
+//follow from where that mass is
+struct SceneBody{
+    double density = 1000.0;    //kg/m^3
+    double mass = 0.0;          //kg: over 0, this in place of the density's
+    double velocity[3] = {0.0, 0.0, 0.0};           //its centre of mass's at the start, m/s
+    double angularVelocity[3] = {0.0, 0.0, 0.0};    //at the start, rad/s, about its centre of mass
+    double bounce = 0.0;            //how much of its speed into a contact it leaves with: 0 none, 1 all
+    double contactFriction = 0.5;   //Coulomb's, in its contacts: how hard it can be pushed along a contact for how hard it's pressed into it
+};
+
 //Something solid the fluid flows around: a triangle mesh, a box or a sphere, in its own space, placed in the world by a transform or moved by keyframed
 //transforms. Each transform's scale is baked into the shape at the first key, so it moves rigidly from there on, and the fluid sees its true distances.
 //Or a deforming mesh: samples of its vertices in the world over time, with the same triangles throughout, each an OBJ (whose triangles have to be the
@@ -106,6 +130,11 @@ struct SceneObstacle{
     std::vector<double> sampleTimes;                    //deforming: when each sample is; empty: it doesn't deform
     std::shared_ptr<const std::vector<float>> samples;  //deforming: each sample's vertices in turn, x, y, z each, in the world (shared by the scene's copies)
     std::shared_ptr<const SceneField> field;            //FIELD: its distances, and velocities if it came with a velocity grid (then it isn't placed)
+    bool dynamic = false;       //whether the liquid moves it (body): it starts where its transform puts it, and moves itself from there
+    SceneBody body;
+    std::string name;           //what a DCC calls it (a Houdini RBD piece's name), which a body's frames in the cache carry; may be empty
+    double bounce = 0.5;            //not dynamic: what a dynamic obstacle meets in it, as a body's own (SceneBody), the two multiplied (contacts.cu):
+    double contactFriction = 1.0;   //RBD Bullet Solver's for its collisions
 };
 
 //a fluid, emitter or sink: a box or sphere in the world, or a closed mesh placed and moved as an obstacle is ("mesh" or "vertices" and "triangles", with
@@ -160,7 +189,9 @@ struct Scene{
     std::string dotProducts = "exact";
     std::string transfer = "flip";
     double viscousCfl = 6.0;        //with viscosity: voxels it may spread across in a substep; 0 for no limit
-    std::string freeSurface = "footprint";  //or "sharp": where the pressure solve puts the liquid's surface (FreeSurface, particles.hu)
+    std::string freeSurface;                //"levelSet" or "voxel": where the pressure solve puts the liquid's surface (FreeSurface, particles.hu); unset,
+                                            //levelSet without air and voxel with it
+    int collisionSubsteps = 5;              //the dynamic bodies' contact steps a frame, at least (Bodies::setCollisionSubsteps)
     double gravity[3] = {0.0, -9.8, 0.0};
     double density = 1000.0;        //the liquid's, kg/m^3: what turns its viscosity and surface tension into accelerations
     double viscosity = 0.0;         //dynamic, Pa s
@@ -176,7 +207,7 @@ struct Scene{
                                     //and bubbles smaller than a voxel rise through the liquid's (particles.hu, ESCAPED_PARTICLE)
     double airDropletRadius = 0.0;  //a droplet's radius for that drag, in metres; 0 for a ball of the liquid one particle stands for
     double airViscosity = 1.5e-5;   //the air's kinematic viscosity, m^2/s, for the same
-    double airBubbleRadius = 0.0;   //a bubble's radius for the liquid's drag on it, in metres; 0 for a ball of the air one particle stands for
+    double airBubbleRadius = 0.0;   //every bubble's radius, for the liquid's drag on it, in metres; 0 to size each as it escapes (BubbleSizes, particles.hu)
     double airLiquidViscosity = 0.001;  //the liquid's viscosity for that drag, Pa s: "liquid"'s where that gives one, water's (0.001) where it gives none
     double airSurfaceTension = 0.072;   //between the two fluids, N/m: how far a bubble flattens as it rises, and so how fast a large one does. "liquid"'s
                                         //where that gives one, water's and air's (0.072) where it gives none
@@ -203,6 +234,8 @@ struct Scene{
     bool wallHold[6] = {true, true, true, true, true, true};    //whether it can pull on the liquid as well as push it; false, the liquid leaves it freely
     double wallFriction[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};    //0: the fluid slides along it freely; 1: the fluid touching it is at rest, as on an obstacle
     double wallContactAngle[6] = {60.0, 60.0, 60.0, 60.0, 60.0, 60.0};  //degrees: its own, or the liquid's contactAngle where it has none
+    double wallBounce[6] = {0.5, 0.5, 0.5, 0.5, 0.5, 0.5};              //what a dynamic obstacle meets in it, as a static obstacle's bounce and
+    double wallContactFriction[6] = {1.0, 1.0, 1.0, 1.0, 1.0, 1.0};     //contactFriction: RBD Bullet Solver's for its ground plane
     std::vector<SceneObstacle> obstacles;
     std::vector<SceneForce> forces;
     int partitions = 1;

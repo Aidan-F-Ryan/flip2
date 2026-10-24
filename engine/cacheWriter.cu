@@ -1,4 +1,4 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 
 #include "cacheWriter.hu"
 #include "json.hpp"
@@ -349,8 +349,9 @@ int CacheWriter::acquire(size_t bytes){
     return buffer;
 }
 
-void CacheWriter::submit(int buffer, int frame, double time, const std::vector<CacheShard>& shards, const std::vector<cudaEvent_t>& copies, const std::vector<CacheShard>& whitewater){
-    Job job{false, buffer, frame, CheckpointState(), shards, copies, whitewater};
+void CacheWriter::submit(int buffer, int frame, double time, const std::vector<CacheShard>& shards, const std::vector<cudaEvent_t>& copies, const std::vector<CacheShard>& whitewater,
+                         const CacheBodies& bodies, const std::vector<CacheShard>& bubbles){
+    Job job{false, buffer, frame, CheckpointState(), shards, copies, whitewater, bodies, bubbles};
     job.state.time = time;
     {
         std::lock_guard<std::mutex> lock(mutex);
@@ -418,6 +419,10 @@ void CacheWriter::process(const Job& job){
     if(job.checkpoint && job.state.apic){
         layout.push_back({"c", 9, 4, false});
     }
+    if(job.checkpoint && job.state.breakup){
+        layout.push_back({"breakup", 1, 4, false});
+        layout.push_back({"sauter", 1, 4, false});
+    }
     if(job.checkpoint || description.ids){
         layout.push_back({"id", 1, 8, true});
     }
@@ -452,24 +457,57 @@ void CacheWriter::process(const Job& job){
         }
         records.push_back(record);
     }
-    //the whitewater's shards, beside the particles', and their records for rank 0 the same way
+    //the whitewater's shards, beside the particles', and their records for rank 0 the same way; and a frame's bubbles likewise
+    auto writeMore = [&](const char* kind, const std::vector<CacheShard>& shards, const std::vector<Layout>& moreLayout, std::vector<ShardRecord>& moreRecords){
+        for(const CacheShard& shard : shards){
+            ShardRecord record;
+            fine = fine && writeShard(place + "/" + shardName(kind, shard.rank, "f2p"), job.frame, shard, hostBuffers[job.buffer] + shard.offset, moreLayout, record);
+            if(fine && !commits){
+                std::string why;
+                std::string text = "{\"rank\":" + std::to_string(record.rank) + ",\"particles\":" + std::to_string(record.particles) + ",\"bytes\":" +
+                                   std::to_string(record.bytes) + ",\"xxh64\":\"" + hex(record.hash) + "\",\"low\":" + triple(record.low) + ",\"high\":" + triple(record.high) + "}\n";
+                if(!replaceFile(place + "/" + shardName(kind, record.rank, "json"), text, why, false)){
+                    fail(why);
+                    fine = false;
+                }
+            }
+            moreRecords.push_back(record);
+        }
+    };
     std::vector<Layout> whitewaterLayout = job.checkpoint
         ? std::vector<Layout>{{"P", 3, 8, false}, {"id", 1, 8, true}, {"v", 3, 4, false}, {"birth", 1, 4, false}, {"life", 1, 4, false}, {"radius", 1, 4, false}, {"kind", 1, 4, false}}
         : std::vector<Layout>{{"P", 3, 4, false}, {"v", 3, 4, false}, {"id", 1, 8, true}, {"age", 1, 4, false}, {"life", 1, 4, false}, {"radius", 1, 4, false}, {"kind", 1, 4, false}};
-    std::vector<ShardRecord> whitewaterRecords;
-    for(const CacheShard& shard : job.whitewater){
-        ShardRecord record;
-        fine = fine && writeShard(place + "/" + shardName("whitewater", shard.rank, "f2p"), job.frame, shard, hostBuffers[job.buffer] + shard.offset, whitewaterLayout, record);
-        if(fine && !commits){
-            std::string why;
-            std::string text = "{\"rank\":" + std::to_string(record.rank) + ",\"particles\":" + std::to_string(record.particles) + ",\"bytes\":" +
-                               std::to_string(record.bytes) + ",\"xxh64\":\"" + hex(record.hash) + "\",\"low\":" + triple(record.low) + ",\"high\":" + triple(record.high) + "}\n";
-            if(!replaceFile(place + "/" + shardName("whitewater", record.rank, "json"), text, why, false)){
-                fail(why);
-                fine = false;
+    std::vector<ShardRecord> whitewaterRecords, bubbleRecords;
+    writeMore("whitewater", job.whitewater, whitewaterLayout, whitewaterRecords);
+    writeMore("bubbles", job.bubbles, {{"P", 3, 4, false}, {"v", 3, 4, false}, {"id", 1, 8, true}, {"radius", 1, 4, false}, {"sauter", 1, 4, false}}, bubbleRecords);    //bubbleBytes' order
+    //the dynamic bodies, which only rank 0's process has (every partition moves them alike): a frame's placements, from its buffer, each one's values
+    //turned into planes; a checkpoint's states and contacts, as the bodies gave them
+    std::vector<ShardRecord> bodyRecords, contactRecords;
+    if(fine && !job.checkpoint && job.bodies.count > 0){
+        size_t count = (size_t)job.bodies.count;
+        const double* placements = (const double*)(hostBuffers[job.buffer] + job.bodies.offset);
+        std::vector<double> planes(BODY_PLACEMENT*count);
+        for(size_t body = 0; body < count; ++body){
+            for(int value = 0; value < BODY_PLACEMENT; ++value){
+                planes[value*count + body] = placements[BODY_PLACEMENT*body + value];
             }
         }
-        whitewaterRecords.push_back(record);
+        std::vector<Layout> bodyLayout = {{"P", 3, 8, false}, {"orient", 4, 8, false}, {"v", 3, 8, false}, {"w", 3, 8, false}};    //BODY_PLACEMENT's order
+        ShardRecord record;
+        fine = writeShard(place + "/" + shardName("bodies", 0, "f2p"), job.frame, {0, count, 0}, (const char*)planes.data(), bodyLayout, record);
+        bodyRecords.push_back(record);
+    }
+    if(fine && job.checkpoint && job.state.bodies.count > 0){
+        for(const ShardColumns* columns : {&job.state.bodies, &job.state.contacts}){
+            std::vector<Layout> columnLayout;
+            for(const ShardColumns::Column& column : columns->columns){
+                columnLayout.push_back({column.name, column.components, column.bytes, column.integer});
+            }
+            ShardRecord record;
+            const char* kind = columns == &job.state.bodies ? "bodies" : "contacts";
+            fine = fine && writeShard(place + "/" + shardName(kind, 0, "f2p"), job.frame, {0, columns->count, 0}, columns->planes.data(), columnLayout, record);
+            (columns == &job.state.bodies ? bodyRecords : contactRecords).push_back(record);
+        }
     }
     {
         std::lock_guard<std::mutex> lock(mutex);
@@ -479,14 +517,23 @@ void CacheWriter::process(const Job& job){
     if(!fine || !commits){
         return;
     }
-    for(int rank = 0; rank < description.worldSize; ++rank){    //the ranks in other processes, as their records turn up: the particles', and with whitewater its own
+    //the ranks in other processes, as their records turn up: the particles', with whitewater its own, and with escaping air a frame's bubbles
+    struct Kind{
+        const char* name;
+        std::vector<ShardRecord>* records;
+        bool there;
+    };
+    const Kind kinds[] = {{base, &records, true}, {"whitewater", &whitewaterRecords, description.whitewaterPerVoxel > 0},
+                          {"bubbles", &bubbleRecords, !job.checkpoint && description.bubblesPerVoxel > 0}};
+    for(int rank = 0; rank < description.worldSize; ++rank){
         if(std::find(localRanks.begin(), localRanks.end(), rank) != localRanks.end()){
             continue;
         }
-        for(const char* kind : {base, "whitewater"}){
-            if(kind != base && description.whitewaterPerVoxel <= 0){
+        for(const Kind& each : kinds){
+            if(!each.there){
                 continue;
             }
+            const char* kind = each.name;
             std::string path = place + "/" + shardName(kind, rank, "json");
             ShardRecord record;
             auto start = std::chrono::steady_clock::now();
@@ -503,14 +550,15 @@ void CacheWriter::process(const Job& job){
                     return;
                 }
             }
-            (kind == base ? records : whitewaterRecords).push_back(record);
+            each.records->push_back(record);
         }
     }
-    for(std::vector<ShardRecord>* list : {&records, &whitewaterRecords}){
+    for(std::vector<ShardRecord>* list : {&records, &whitewaterRecords, &bubbleRecords}){
         std::sort(list->begin(), list->end(), [](const ShardRecord& a, const ShardRecord& b){ return a.rank < b.rank; });
     }
     auto start = std::chrono::steady_clock::now();
-    bool down = job.checkpoint ? commitCheckpoint(place, job, records, whitewaterRecords) : commit(place, job.frame, job.state.time, records, whitewaterRecords);
+    bool down = job.checkpoint ? commitCheckpoint(place, job, records, whitewaterRecords, bodyRecords, contactRecords)
+                               : commit(place, job.frame, job.state.time, records, whitewaterRecords, bodyRecords, bubbleRecords);
     timing.commit += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     ++(job.checkpoint ? timing.checkpoints : timing.frames);
     if(down && done){
@@ -753,13 +801,38 @@ std::string CacheWriter::whitewaterJson(const std::vector<ShardRecord>& whitewat
     return ",\n \"whitewater\":{\"particles\":" + std::to_string(total) + more + ",\"shards\":[" + shardsJson(whitewater, "whitewater") + "]}";
 }
 
-bool CacheWriter::commit(const std::string& frameDirectory, int frame, double time, const std::vector<ShardRecord>& records, const std::vector<ShardRecord>& whitewater){
+//the dynamic bodies' or their contacts' part of a record: how many there are, and their shard. Nothing without any
+std::string CacheWriter::countedJson(const char* key, const std::vector<ShardRecord>& shards, const char* base) const{
+    if(shards.empty()){
+        return "";
+    }
+    uint64_t total = 0;
+    for(const ShardRecord& record : shards){
+        total += record.particles;
+    }
+    return std::string(",\n \"") + key + "\":{\"count\":" + std::to_string(total) + ",\"shards\":[" + shardsJson(shards, base) + "]}";
+}
+
+//a frame's bubbles' part of its commit record: how many there are, and their shards. Nothing without escaping air
+std::string CacheWriter::bubblesJson(const std::vector<ShardRecord>& bubbles) const{
+    if(description.bubblesPerVoxel <= 0){
+        return "";
+    }
+    uint64_t total = 0;
+    for(const ShardRecord& record : bubbles){
+        total += record.particles;
+    }
+    return ",\n \"bubbles\":{\"particles\":" + std::to_string(total) + ",\"shards\":[" + shardsJson(bubbles, "bubbles") + "]}";
+}
+
+bool CacheWriter::commit(const std::string& frameDirectory, int frame, double time, const std::vector<ShardRecord>& records, const std::vector<ShardRecord>& whitewater,
+                         const std::vector<ShardRecord>& bodies, const std::vector<ShardRecord>& bubbles){
     uint64_t total = 0;
     for(const ShardRecord& record : records){
         total += record.particles;
     }
     std::string text = "{\"flip2\":\"commit\",\"version\":1,\"frame\":" + std::to_string(frame) + ",\"time\":" + number(time) + ",\"particles\":" + std::to_string(total) +
-                       ",\"shards\":[" + shardsJson(records, "particles") + "]" + whitewaterJson(whitewater) + "}\n";
+                       ",\"shards\":[" + shardsJson(records, "particles") + "]" + whitewaterJson(whitewater) + countedJson("bodies", bodies, "bodies") + bubblesJson(bubbles) + "}\n";
     //the shards were flushed as they were written, and flushing the frame's directory after the rename makes their names last along with the record's;
     //then the frame's own name in frames/
     std::string why;
@@ -776,7 +849,8 @@ bool CacheWriter::commit(const std::string& frameDirectory, int frame, double ti
 }
 
 //a checkpoint's record, written last as a frame's is: what flip2 resume needs besides the particles, which are in the state shards
-bool CacheWriter::commitCheckpoint(const std::string& checkpointDirectory, const Job& job, const std::vector<ShardRecord>& records, const std::vector<ShardRecord>& whitewater){
+bool CacheWriter::commitCheckpoint(const std::string& checkpointDirectory, const Job& job, const std::vector<ShardRecord>& records, const std::vector<ShardRecord>& whitewater,
+                                  const std::vector<ShardRecord>& bodies, const std::vector<ShardRecord>& contacts){
     uint64_t total = 0;
     for(const ShardRecord& record : records){
         total += record.particles;
@@ -793,7 +867,8 @@ bool CacheWriter::commitCheckpoint(const std::string& checkpointDirectory, const
                        std::to_string(job.state.substep) + ",\"apic\":" + (job.state.apic ? "true" : "false") + ",\"nextId\":" + std::to_string(job.state.nextId) + ",\"acceleration\":" + number(acceleration) +
                        ",\"particles\":" + std::to_string(total) +
                        ",\n \"worldSize\":" + std::to_string(description.worldSize) + ",\"partitionPlanes\":[" + planes + "],\"sceneXxh64\":\"" + description.sceneHash +
-                       "\",\"build\":" + quoted(FLIP2_BUILD_ID) + ",\n \"states\":[" + shardsJson(records, "state") + "]" + whitewaterJson(whitewater, ",\"nextId\":" + std::to_string(job.state.whitewaterNextId)) + "}\n";
+                       "\",\"build\":" + quoted(FLIP2_BUILD_ID) + ",\n \"states\":[" + shardsJson(records, "state") + "]" + whitewaterJson(whitewater, ",\"nextId\":" + std::to_string(job.state.whitewaterNextId)) +
+                       countedJson("bodies", bodies, "bodies") + countedJson("contacts", contacts, "contacts") + "}\n";
     std::string why;
     if(!replaceFile(checkpointDirectory + "/ckpt.json", text, why)){
         fail(why);
@@ -835,16 +910,31 @@ std::string CacheWriter::cacheJson() const{
     for(size_t i = 0; i < d.partitionPlanes.size(); ++i){
         planes += (i ? "," : "") + std::to_string(d.partitionPlanes[i]);
     }
+    std::string open;       //the domain's faces the fluid can leave by, as the scene names them
+    const char* faces[6] = {"-x", "+x", "-y", "+y", "-z", "+z"};
+    for(int face = 0; face < 6; ++face){
+        if(d.openFaces >> face & 1){
+            open += std::string(open.empty() ? "" : ",") + "\"" + faces[face] + "\"";
+        }
+    }
+    std::string bodies;     //with dynamic bodies, each one's name and pivot, in the order the frames' bodies shards have them
+    for(size_t body = 0; body < d.bodies.size(); ++body){
+        const double* pivot = d.bodies[body].pivot;
+        bodies += std::string(body ? "," : ",\n \"bodies\":[") + "{\"name\":" + quoted(d.bodies[body].name) + ",\"pivot\":[" + number(pivot[0]) + "," + number(pivot[1]) + "," +
+                  number(pivot[2]) + "]}" + (body + 1 == d.bodies.size() ? "]" : "");
+    }
     return "{\"flip2\":\"cache\",\"version\":1,\n"
            " \"scene\":{\"path\":" + quoted(d.scenePath) + ",\"xxh64\":\"" + d.sceneHash + "\"},\n"
            " \"fps\":" + number(d.fps) + ",\"frames\":" + std::to_string(d.frames) + ",\"committed\":" + std::to_string(lastCommitted) + ",\"checkpoint\":" +
            std::to_string(lastCheckpoint) + ",\n"
            " \"worldSize\":" + std::to_string(d.worldSize) + ",\"partitionPlanes\":[" + planes + "],\n"
            " \"nodes\":[" + std::to_string(d.nodes[0]) + "," + std::to_string(d.nodes[1]) + "," + std::to_string(d.nodes[2]) + "],\"nodeSize\":" + number(d.nodeSize) +
-           ",\"voxelSize\":" + number(d.voxelSize) + ",\"domainMin\":[" + number(d.domainMin[0]) + "," + number(d.domainMin[1]) + "," + number(d.domainMin[2]) + "],\n"
+           ",\"voxelSize\":" + number(d.voxelSize) + ",\"domainMin\":[" + number(d.domainMin[0]) + "," + number(d.domainMin[1]) + "," + number(d.domainMin[2]) + "],\"open\":[" +
+           open + "],\n"
            " \"gpu\":" + quoted(d.gpu) + ",\"sm\":" + std::to_string(d.sm) + ",\"cudaRuntime\":" + std::to_string(d.cudaRuntime) + ",\"build\":" + quoted(FLIP2_BUILD_ID) + ",\n"
            " \"shards\":{\"format\":\"f2p\",\"version\":1,\"compression\":\"" + (d.compression == "none" ? std::string("none") : "blosc-" + d.compression) + "\","
            "\"attributes\":[{\"name\":\"P\",\"type\":\"float32\",\"components\":3},{\"name\":\"v\",\"type\":\"float32\",\"components\":3}" +
            (d.ids ? ",{\"name\":\"id\",\"type\":\"uint64\",\"components\":1}" : "") + (d.ages ? ",{\"name\":\"age\",\"type\":\"float32\",\"components\":1}" : "") + "]}" +
-           (d.whitewaterPerVoxel > 0 ? ",\n \"whitewater\":{\"perVoxel\":" + std::to_string(d.whitewaterPerVoxel) + "}" : std::string()) + "}\n";
+           (d.whitewaterPerVoxel > 0 ? ",\n \"whitewater\":{\"perVoxel\":" + std::to_string(d.whitewaterPerVoxel) + "}" : std::string()) +
+           (d.bubblesPerVoxel > 0 ? ",\n \"bubbles\":{\"perVoxel\":" + std::to_string(d.bubblesPerVoxel) + "}" : std::string()) + bodies + "}\n";
 }

@@ -3,7 +3,11 @@
 wrote them (fields.NNNN.vdb: surface and vel), its third the domain the bake filled, and its fourth the collision geometry wired to its input, the last
 two as Houdini's own FLIP nodes make them: what Whitewater Source takes as its Liquid Simulation, Container and Collisions (whitewater.py sets it up).
 Its fifth has the bake's own whitewater, if it was baked with any (whitewater.NNNN.bgeo.sc): points with v, id, age, life, radius, kind (0 spray, 1
-foam, 2 a bubble) and the pscale to draw them at.
+foam, 2 a bubble) and the pscale to draw them at; and with air, the air's own bubbles (bubbles.NNNN.bgeo.sc), the air the liquid has mixed in finer than
+its voxels, as points like the whitewater's bubbles (kind 2). A bake with RBD pieces (the flip2 Solver's RBD tab) has their Simulation Points on its seventh
+(bodies.NNNN.bgeo.sc), as RBD Bullet Solver's: a point per piece with name, P, orient, pivot, scale, v and w. With the pieces wired to its second input,
+as they were at the bake's start frame, its sixth has them moved by those points, as RBD Bullet Solver's Geometry output: the simulated ones (active,
+or without active) moved there, the others as wired. The collisions on its fourth output include them, where they were moved.
 
 A flip2 frame is a time: frame N is N/fps seconds after the bake's start. Houdini's frame 1 is time 0, so loading by time puts the bake's frame 0 on
 Houdini's frame 1, and keeps it there whatever frame rate either uses. A frame the bake hasn't made (yet) loads as no geometry.
@@ -18,6 +22,11 @@ PARTICLES = "particles"
 SURFACE = "surface"
 FIELDS = "fields"
 WHITEWATER = "whitewater"
+BUBBLES = "bubbles"
+WHITEWATER_ALL = "whitewater_all"   #the whitewater and the air's bubbles together, on the fifth output
+BODIES = "bodies"
+SIMULATED = 'int point = primpoint(0, @primnum, 0); if(haspointattrib(0, "active") && point(0, "active", point) == 0) removeprim(0, @primnum, 1);'
+NOT_SIMULATED = 'int point = primpoint(0, @primnum, 0); if(!haspointattrib(0, "active") || point(0, "active", point) != 0) removeprim(0, @primnum, 1);'
 SHOW = (("surface", "Surface"), ("particles", "Particles"), ("both", "Surface and Particles"))
 FORMATS = (("bgeo.sc", "Compressed (.bgeo.sc)"), ("bgeo", "Uncompressed (.bgeo)"))
 
@@ -95,15 +104,83 @@ def build_fields(node, folder, frame):
 
 
 def build_whitewater(node, folder, frame):
-    """inside node, a File node loading a frame's whitewater from folder at frame (as build_loaders), on the node's fifth output. Makes only what's
-    missing"""
-    loader = node.node(WHITEWATER)
+    """inside node, File nodes loading a frame's whitewater and its air's bubbles from folder at frame (as build_loaders), merged on the node's fifth
+    output; either is no geometry in a bake without it. Returns the merge. Makes only what's missing, so an older node gains the bubbles"""
+    merged = node.node(WHITEWATER_ALL)
+    if merged is None:
+        merged = node.createNode("merge", WHITEWATER_ALL)
+        node.layoutChildren()
+    for index, name in enumerate((WHITEWATER, BUBBLES)):
+        loader = node.node(name)
+        if loader is None:
+            loader = node.createNode("file", name)
+            loader.parm("missingframe").set("empty")
+        loader.parm("file").set('%s/%s.`padzero(4, %s)`.`chs("../exportformat")`' % (folder, name, frame))
+        merged.setInput(index, loader)
+    _output(node, 4, merged)
+    return merged
+
+
+def build_bodies(node, folder, frame, rest, now):
+    """inside node, a File node loading a frame's RBD Simulation Points from folder at frame (as build_loaders), on the node's seventh output; and the
+    pieces they move, on its sixth: of rest (the pieces as the bake started them) the simulated ones (active, or without active), moved by Transform
+    Pieces, and of now (the pieces as they are now) the others, as they are. Returns the pieces. Makes only what's missing"""
+    loader = node.node(BODIES)
     if loader is None:
-        loader = node.createNode("file", WHITEWATER)
+        loader = node.createNode("file", BODIES)
         loader.parm("missingframe").set("empty")
-    loader.parm("file").set('%s/whitewater.`padzero(4, %s)`.`chs("../exportformat")`' % (folder, frame))
-    _output(node, 4, loader)
-    return loader
+    loader.parm("file").set('%s/bodies.`padzero(4, %s)`.`chs("../exportformat")`' % (folder, frame))
+    pieces = node.node("rbd_pieces")
+    if pieces is None:
+        simulated = node.createNode("attribwrangle", "rbd_simulated")
+        simulated.parm("class").set(1)
+        simulated.parm("snippet").set(SIMULATED)
+        others = node.createNode("attribwrangle", "rbd_others")
+        others.parm("class").set(1)
+        others.parm("snippet").set(NOT_SIMULATED)
+        moved = node.createNode("xformpieces", "rbd_moved")
+        moved.setInput(0, simulated)
+        moved.setInput(1, loader)
+        pieces = node.createNode("merge", "rbd_pieces")
+        pieces.setInput(0, moved)
+        pieces.setInput(1, others)
+        node.layoutChildren()
+    node.node("rbd_simulated").setInput(0, rest)
+    node.node("rbd_others").setInput(0, now)
+    _output(node, 5, pieces)
+    _output(node, 6, loader)
+    return pieces
+
+
+def or_nothing(node, name, source, condition):
+    """a switch inside node named name: source while condition (an expression) holds, and otherwise no geometry, so what's fed from an input nothing's
+    wired to has nothing to fail on. Makes only what's missing"""
+    switch = node.node(name)
+    if switch is None:
+        nothing = node.node("nothing")
+        if nothing is None:
+            nothing = node.createNode("add", "nothing")
+        switch = node.createNode("switch", name)
+        switch.setInput(0, nothing)
+        node.layoutChildren()
+    switch.setInput(1, source)
+    switch.parm("input").setExpression(condition)
+    return switch
+
+
+def collisions_with(node, collision, wired, pieces):
+    """what the collisions output (FLIP Collide) is made from: collision, while something's wired to the node's input number wired, and the RBD
+    pieces where they were moved, unpacked. Makes only what's missing"""
+    merged = node.node("collision_all")
+    if merged is None:
+        unpack = node.createNode("unpack", "rbd_collision_unpack")
+        unpack.parm("limit_iterations").set(False)
+        merged = node.createNode("merge", "collision_all")
+        merged.setInput(1, unpack)
+        node.layoutChildren()
+    node.node("rbd_collision_unpack").setInput(0, pieces)
+    merged.setInput(0, or_nothing(node, "collision_wired", collision, 'strlen(opinputpath("..", %d)) > 0' % wired))
+    return merged
 
 
 def has_whitewater(folder):
@@ -111,12 +188,22 @@ def has_whitewater(folder):
     return bool(glob.glob(os.path.join(hou.text.expandString(folder), WHITEWATER + ".[0-9]*.bgeo*")))
 
 
-def build_container(node, collision, wired):
+def has_fields(folder):
+    """whether a bake's export/houdini directory holds any frames of its fluid fields (flip2 mesh --fields)"""
+    return bool(glob.glob(os.path.join(hou.text.expandString(folder), FIELDS + ".[0-9]*.vdb")))
+
+
+def has_bubbles(folder):
+    """whether a bake's export/houdini directory holds any frames of its air's bubbles"""
+    return bool(glob.glob(os.path.join(hou.text.expandString(folder), BUBBLES + ".[0-9]*.bgeo*")))
+
+
+def build_container(node, collision, wired, also=None):
     """inside node, the domain and the collisions as Houdini's FLIP has them, for its whitewater: a box for the domain the bake filled, which the caller
     sizes, through FLIP Container (the Container stream, on the node's third output), and the node's collision geometry (collision: an inner node, or
     one of its inputs) through FLIP Collide (the Collisions stream, on its fourth: a level set of the colliders and their velocity); or while nothing's
-    wired to the node's input number wired, the container's own empty collisions. Both are at the node's particle separation. Returns the box. Makes
-    only what's missing, so an older node gains the rest"""
+    wired to the node's input number wired, and also (an expression) doesn't hold, the container's own empty collisions. Both are at the node's particle
+    separation. Returns the box. Makes only what's missing, so an older node gains the rest"""
     box = node.node("container")
     if box is None:
         box = node.createNode("box", "container")
@@ -136,7 +223,7 @@ def build_container(node, collision, wired):
         collisions = node.createNode("switch", "collisions")
         collisions.setInput(0, container, 2)
         collisions.setInput(1, collide, 2)
-        collisions.parm("input").setExpression('strlen(opinputpath("..", %d)) > 0' % wired)
+    collisions.parm("input").setExpression('strlen(opinputpath("..", %d)) > 0' % wired + (" || " + also if also else ""))
     _output(node, 2, container, 1)
     _output(node, 3, collisions)
     return box
@@ -189,10 +276,13 @@ def _network(node):
     folder, frame = '`chs("../bakedir")`/export/houdini', 'round(($T - ch("../timeoffset"))*ch("../fps"))'
     shown = build_loaders(node, folder, frame)
     build_fields(node, folder, frame)
-    build_container(node, node.indirectInputs()[0], 0)
+    wired = or_nothing(node, "rbd_wired", node.indirectInputs()[1], 'strlen(opinputpath("..", 1)) > 0')
+    pieces = build_bodies(node, folder, frame, wired, wired)
+    build_container(node, collisions_with(node, node.indirectInputs()[0], 0, pieces), 0, 'strlen(opinputpath("..", 1)) > 0')
     build_whitewater(node, folder, frame)
-    if node.parm("label1") is not None:
-        node.parm("label1").set("Collisions (for Whitewater)")
+    for index, label in enumerate(("Collisions (for Whitewater)", "RBD Pieces (at the Start)")):
+        if node.parm("label%d" % (index + 1)) is not None:
+            node.parm("label%d" % (index + 1)).set(label)
     return shown
 
 
@@ -243,7 +333,7 @@ def reload(node):
         committed, frames = bake.get("committed", -1), bake.get("frames", -1)
         node.parm("status").set("%d of frames 0-%d committed, at %g fps" % (committed + 1, frames, bake.get("fps", 24.0)) if committed < frames
                                 else "frames 0-%d, at %g fps" % (frames, bake.get("fps", 24.0)))
-    for name in (SURFACE, PARTICLES, FIELDS, WHITEWATER):
+    for name in (SURFACE, PARTICLES, FIELDS, WHITEWATER, BUBBLES, BODIES):
         loader = node.node(name)
         if loader is not None:
             loader.parm("reload").pressButton()

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright 2023 Aberrant Behavior LLC
+# Copyright 2026 Taimen LLC
 """Writes the deforming-obstacle test scenes: a coarse icosphere (320 triangles) and samples of its vertices over time, as (n, 3) float32 .npy files,
 one per frame at 24 fps, in a quarter-metre tank half full of water (scenes/tank-*.json). Only Python's standard library, so it runs on coeus.
 

@@ -1,4 +1,4 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 
 #ifndef TESTING_H
 #define TESTING_H
@@ -78,6 +78,10 @@ public:
         simulation.forEachPartition([&](Particles& partition){ partition.setWallFriction(wall, friction); });
     }
 
+    void setWallContact(int wall, double bounce, double contactFriction){
+        simulation.forEachPartition([&](Particles& partition){ partition.setWallContact(wall, bounce, contactFriction); });
+    }
+
     void setViscousCfl(double voxels){
         simulation.forEachPartition([&](Particles& partition){ partition.setViscousCfl(voxels); });
     }
@@ -107,11 +111,15 @@ public:
         simulation.forEachPartition([&](Particles& partition){ partition.setWallsLetGo(walls); });
     }
 
-    void setObstacles(const std::vector<SceneObstacle>& obstacles){
-        simulation.forEachPartition([&](Particles& partition){ partition.setObstacles(obstacles); });
+    void setObstacles(const std::vector<SceneObstacle>& obstacles, double liquidDensity = 1000.0){
+        simulation.forEachPartition([&](Particles& partition){ partition.setObstacles(obstacles, liquidDensity); });
     }
 
-    void setSources(const Sources& sources){
+    void setCollisionSubsteps(int perFrame){
+        simulation.forEachPartition([&](Particles& partition){ partition.setCollisionSubsteps(perFrame); });
+    }
+
+    void setSources(const SourceSettings& sources){
         simulation.forEachPartition([&](Particles& partition){ partition.setSources(sources); });
     }
 
@@ -235,6 +243,25 @@ public:
         });
     }
 
+    //with escaping air, after setTwoPhase: how far the churning has broken each of setParticles' particles' air, as a checkpoint has it
+    //(Particles::airBreakup)
+    void setAirBreakup(const std::vector<float>& breakup){
+        simulation.forEachPartition([&](Particles& partition){
+            if(partition.size > 0){     //from pageable memory, so it's copied before this returns
+                gpuErrchk(cudaMemcpyAsync(partition.airBreakup.devPtr(), breakup.data(), sizeof(float)*partition.size, cudaMemcpyHostToDevice, partition.stream));
+            }
+        });
+    }
+
+    //and each one's spread's Sauter mean radius (Particles::airSauter)
+    void setAirSauter(const std::vector<float>& sauter){
+        simulation.forEachPartition([&](Particles& partition){
+            if(partition.size > 0){
+                gpuErrchk(cudaMemcpyAsync(partition.airSauter.devPtr(), sauter.data(), sizeof(float)*partition.size, cudaMemcpyHostToDevice, partition.stream));
+            }
+        });
+    }
+
     //a checkpoint's ids and birth times for setParticles' particles, and the next id to hand out (Particles::setIdentities)
     void setIdentities(const std::vector<uint>& ids, const std::vector<float>& births, unsigned long long nextId){
         simulation.forEachPartition([&](Particles& partition){
@@ -325,6 +352,19 @@ public:
 
     void writeCheckpoint(int frame){
         simulation.writeCheckpoint(frame);
+    }
+
+    //a checkpoint's dynamic bodies and their contacts (its bodies and contacts shards) in place of where setObstacles started them, before resume
+    //(Bodies::restore): what's wrong with them, if anything
+    std::string restoreBodies(const ShardData& bodies, const ShardData& contacts){
+        std::string why;
+        simulation.forEachPartition([&](Particles& partition){
+            std::string wrong = partition.bodies.restore(bodies, contacts);
+            if(why.empty()){
+                why = wrong;
+            }
+        });
+        return why;
     }
 
     void resume(double time, unsigned long long substep, double acceleration){

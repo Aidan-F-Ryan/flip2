@@ -1,9 +1,11 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 
-//The sharp free surface (FreeSurface::sharp, particles.hu): the pressure solve's liquid is what the level set finds (levelset.cu), and its pressure is 0
-//at the surface itself, or sigma kappa with surface tension, rather than at the centres of the air voxels past the particles' footprint.
+//The sharp free surface (FreeSurface::sharp, particles.hu; levelSet in scene files, Level Set in Houdini, and the default without air): the pressure
+//solve's liquid is what the level set finds (levelset.cu), and its pressure is 0 at the surface itself, or sigma kappa with surface tension, rather than
+//at the centres of the air voxels past the particles' footprint.
 //
-//With the footprint, the default, every voxel the particles' stencils reach is an unknown, and the pressure is 0 at the centre of each air voxel past
+//With the footprint (voxel in scene files, Voxel in Houdini: the opt-in, and what air goes with), every voxel the particles' stencils reach is an
+//unknown, and the pressure is 0 at the centre of each air voxel past
 //them: the solve's surface sits a voxel or two outside the liquid's. Liquid near the surface then moves as if it were that much deeper: a drop 16 voxels
 //in radius oscillates 9% slow (2% sharp), and a pool's sloshing dies away in a few seconds where sharp it carries on.
 //
@@ -14,7 +16,8 @@
 //pressure under the liquid's weight, and collapse at metres a second.
 //1. The unknowns whose centres are outside the liquid stop being unknowns (retireDryUnknowns): the solve's liquid is the voxels whose centres are in it.
 //   Nothing's added, as the level set's liquid lies inside the footprint. Particles outside it move with the velocities step 5 gives them, with no
-//   pressure to hold them apart, so an unknown packed with particles stays one whatever the level set says (dryUnknown).
+//   pressure to hold them apart, so an unknown packed with particles stays one whatever the level set says (dryUnknown). A voxel an obstacle cuts
+//   whose centre is inside the obstacle has the level across its open faces as its own (smoothLevelSet), where its liquid is.
 //2. Each liquid unknown's face to air weighs 1/theta in its pressure equation (weighSurfaceFaces), theta being how far from its centre towards the air
 //   voxel's the level set crosses 0: the pressure past the face is the one a line through the unknown's pressure and the surface's reaches there, the
 //   ghost fluid method (Gibou, Fedkiw, Cheng and Kang 2002; Enright, Nguyen, Gibou and Fedkiw 2003). Only the diagonal changes, and it only grows, so
@@ -26,7 +29,10 @@
 //4. The velocity update takes the same pressures past those faces (correctSurfaceFaces, after cudaVelocityUpdate), so the velocities are the ones the
 //   equations solved for.
 //5. The faces that particles read but no pressure reaches, around the liquid, take the liquid's velocity carried out from its faces, EXTEND_LAYERS voxels
-//   deep (extendLiquidVelocities), after the solve. FLIP's old velocities stay as P2G left them there, the particles' own, so the particles just outside
+//   deep (extendLiquidVelocities), after the solve, each face it's carried from counting for as much of a face as is open, as in the obstacle pass's
+//   mean (mixCutFaces): with less than a whole face open among those it takes from, a face keeps its own velocity for the rest, so a sliver between
+//   touching bodies, whose open part the pressure's jump drives at hundreds of metres a second, carries out only what crosses it. FLIP's old
+//   velocities stay as P2G left them there, the particles' own, so the particles just outside
 //   the liquid end up with the liquid's velocity plus what each differed by from the ones around it: they move with the surface. (With the old
 //   velocities carried out too, they kept their own and took only the liquid's change, and a film crept out along the floor from a drop's edge with
 //   nothing to bring it back.) Further out, spray's faces keep what P2G gave them and the forces, so it flies on its own.
@@ -172,10 +178,13 @@ __global__ void weighSurfaceFacesKernel(uint numVoxels, const char* solveCodes, 
 //- The density correction, where cudaCalcDivU leaves it out (within CORRECTION_DEPTH of the footprint's edge), for voxels packed denser than rest only:
 //  particles falling through the air above the liquid, which nothing holds apart there, land in its top voxels, and with nothing to spread them those
 //  pack ever tighter (the footprint holds them as they come). Spreading only, measured as cudaCalcDivU measures it, so the partly filled voxels at the
-//  surface aren't taken for sparse and filled. Not in the voxels obstacles cut, whose correction obstacleFaceFlux scales
+//  surface aren't taken for sparse and filled. Its B-spline weights reach into the air there, so the last voxel under a flat surface reads 5/6 of its
+//  packing, and could pack a fifth denser than rest unseen. None does: a dam break's pool 16 s on is at rest to 0.2% under its surface with no layer
+//  denser, as with the particle counts this measured before (each voxel's own particles alone), which shook it with every particle that crossed a face.
+//  Not in the voxels obstacles cut, whose correction obstacleFaceFlux scales
 __global__ void surfaceDivergenceKernel(uint numVoxels, const char* solveCodes, const uint* neighborNx, const uint* neighborPx, const uint* neighborNy, const uint* neighborPy,
                                         const uint* neighborNz, const uint* neighborPz, const float* surface, const float* level, const float* curvature, const char* near,
-                                        const uint* opens, float tension, const float* particleCounts, const char* footprintDepth, float restParticlesPerVoxel,
+                                        const uint* opens, float tension, const float* particleDensity, const char* footprintDepth, float restParticlesPerVoxel,
                                         float correctionRate, float* divU){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
     if(index >= numVoxels || !solveCodes[index]){
@@ -202,13 +211,13 @@ __global__ void surfaceDivergenceKernel(uint numVoxels, const char* solveCodes, 
         change -= tension*sum;
     }
     if(correctionRate > 0.0f && footprintDepth[index] < CORRECTION_DEPTH && !cut){
-        float count = 6.0f*particleCounts[index];
+        float count = 6.0f*particleDensity[index];
         float weight = 6.0f;
         #pragma unroll
         for(int face = 0; face < 6; ++face){
             uint neighbor = neighbors[face][index];
             if(neighbor < WALL_VOXEL){
-                count += particleCounts[neighbor];
+                count += particleDensity[neighbor];
                 weight += 1.0f;
             }
         }
@@ -265,13 +274,15 @@ __global__ void correctSurfaceFacesKernel(uint numVoxels, const char* solveCodes
 //The faces around the liquid, a block per node of this partition's own on a tile of its voxels and EXTEND_LAYERS more on every side (liquidTile.hu), from
 //before, the face velocities as they were (other blocks write their own nodes' meanwhile). The faces the solve gives a velocity are the liquid's: a liquid
 //unknown's that aren't a wall's, and an air voxel's above a liquid unknown. Each layer, a face that isn't takes the mean of those of its six neighbours of
-//the same component that are, or that took one in an earlier layer, and EXTEND_LAYERS layers leave the node's own faces as passes over the whole grid
-//would. An air voxel's face on one of the domain's walls is set at rest, as cudaVelocityUpdate leaves the unknowns', and the obstacles' faces (closed, or
-//with a solid voxel either side) are left for the obstacle passes, which set them after this
+//the same component that are, or that took one in an earlier layer, each weighed by how much of a face it counts for (a solved one as much as it's open,
+//one that took a value as much as it took, at most a face), with its own velocity for what's short of a whole face among them; EXTEND_LAYERS layers
+//leave the node's own faces as passes over the whole grid would. An air voxel's face on one of the domain's walls is set at rest, as cudaVelocityUpdate
+//leaves the unknowns', and the obstacles' faces (closed, or with a solid voxel either side) are left for the obstacle passes, which set them after this
 __global__ void extendVelocities(uint numUsedGridNodes, const uint* nodeCells, const uint* cellToNode, const uint* interiorVoxels, Grid grid, const char* solveCodes,
-                                 const uint* neighborNx, const uint* neighborNy, const uint* neighborNz, const char* solid, const char* near, const float* before, uint numVoxels,
-                                 float* ux, float* uy, float* uz){
+                                 const uint* neighborNx, const uint* neighborNy, const uint* neighborNz, const char* solid, const char* near, const uint* opens, const float* before,
+                                 uint numVoxels, float* ux, float* uy, float* uz){
     __shared__ float values[3][EXTEND_SLOTS];
+    extern __shared__ float weights[];      //with obstacles, how much of a face each counts for, 3*EXTEND_SLOTS: without, every face counts for one
     __shared__ unsigned char states[3][EXTEND_SLOTS];
     __shared__ char solidSlots[EXTEND_SLOTS];
     __shared__ uint nodes[27];
@@ -287,22 +298,32 @@ __global__ void extendVelocities(uint numUsedGridNodes, const uint* nodeCells, c
         int coordinates[3] = {g.x, g.y, g.z};
         bool inSolid = voxel != NO_VOXEL && solid != nullptr && solid[voxel];
         solidSlots[slot] = inSolid;
+        bool cut = voxel != NO_VOXEL && near != nullptr && (near[voxel] & NEAR_SURFACE);
+        CutFaces faces;
+        if(cut){
+            faces = cachedCut(opens, voxel);
+        }
         #pragma unroll
         for(int dim = 0; dim < 3; ++dim){
             unsigned char state = FACE_KEPT;
             float value = 0.0f;
+            float weight = 1.0f;
             if(voxel != NO_VOXEL){
                 value = before[dim*(size_t)numVoxels + voxel];
                 uint below = lower[dim][voxel];
                 bool liquid = solveCodes[voxel];
                 if(liquid ? below != WALL_VOXEL : below < WALL_VOXEL){
                     state = FACE_SOLVED;
+                    weight = !cut ? 1.0f : near[voxel] & CLOSED_FACE << 2*dim ? 0.0f : faces.open[2*dim];
                 }
                 else if(!liquid && coordinates[dim] > 0 && !inSolid && !(near != nullptr && (near[voxel] & CLOSED_FACE << 2*dim))){
                     state = FACE_OPEN;
                 }
             }
             values[dim][slot] = value;
+            if(near != nullptr){
+                weights[dim*EXTEND_SLOTS + slot] = weight;
+            }
             states[dim][slot] = state;
         }
     }
@@ -335,7 +356,7 @@ __global__ void extendVelocities(uint numUsedGridNodes, const uint* nodeCells, c
                     if(states[dim][slot] != FACE_OPEN){
                         continue;
                     }
-                    float sum = 0.0f;
+                    float sum = 0.0f, weight = 0.0f;
                     int count = 0;
                     #pragma unroll
                     for(int axis = 0; axis < 3; ++axis){
@@ -347,13 +368,18 @@ __global__ void extendVelocities(uint numUsedGridNodes, const uint* nodeCells, c
                             }
                             int neighbor = slot + step*strides[axis];
                             if(states[dim][neighbor] < layer){
-                                sum += values[dim][neighbor];
+                                float counts = near != nullptr ? weights[dim*EXTEND_SLOTS + neighbor] : 1.0f;
+                                sum += counts*values[dim][neighbor];
+                                weight += counts;
                                 ++count;
                             }
                         }
                     }
-                    if(count > 0){
-                        values[dim][slot] = sum / count;
+                    if(count > 0){  //less than a whole face's worth beside it, its own velocity for the rest
+                        values[dim][slot] = weight >= 1.0f ? sum / weight : sum + (1.0f - weight)*values[dim][slot];
+                        if(near != nullptr){
+                            weights[dim*EXTEND_SLOTS + slot] = fminf(weight, 1.0f);
+                        }
                         states[dim][slot] = (unsigned char)layer;
                     }
                 }
@@ -425,7 +451,7 @@ void Particles::addSurfaceDivergence(float correctionRate){
     bool cut = obstacles.count() > 0;
     surfaceDivergenceKernel<<<numVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numVoxels, solveCodes.devPtr(), neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(),
         neighborPy.devPtr(), neighborNz.devPtr(), neighborPz.devPtr(), surfaceLevel.devPtr(), liquidLevel.devPtr(), tension ? liquidCurvature.devPtr() : nullptr,
-        cut ? obstacleNear.devPtr() : nullptr, cut ? obstacleOpen.devPtr() : nullptr, (float)(dt*surfaceTension / (voxelSize*voxelSize)), particleCounts.devPtr(),
+        cut ? obstacleNear.devPtr() : nullptr, cut ? obstacleOpen.devPtr() : nullptr, (float)(dt*surfaceTension / (voxelSize*voxelSize)), particleDensity.devPtr(),
         footprintDepth.devPtr(), (float)restParticlesPerVoxel, correctionRate, divU.devPtr());
     gpuErrchk(cudaPeekAtLastError());
 }
@@ -467,9 +493,10 @@ void Particles::extendLiquidVelocities(){
             gpuErrchk(cudaMemcpyAsync(before + dim*(size_t)numVoxels, velocities[dim]->devPtr(), sizeof(float)*numVoxels, cudaMemcpyDeviceToDevice, stream));
         }
         bool near = obstacles.count() > 0;
-        extendVelocities<<<numOwnNodes, EXTEND_THREADS, 0, stream>>>(numUsedGridNodes, nodeCells.devPtr(), cellToNode.devPtr(), nodeInteriorVoxels.devPtr(), grid, solveCodes.devPtr(),
-            neighborNx.devPtr(), neighborNy.devPtr(), neighborNz.devPtr(), near ? obstacleSolids.devPtr() : nullptr, near ? obstacleNear.devPtr() : nullptr, before, numVoxels,
-            ux.devPtr(), uy.devPtr(), uz.devPtr());
+        size_t weighing = near ? 3*EXTEND_SLOTS*sizeof(float) : 0;     //with no obstacles every face counts for one, and the tile keeps its old size
+        extendVelocities<<<numOwnNodes, EXTEND_THREADS, weighing, stream>>>(numUsedGridNodes, nodeCells.devPtr(), cellToNode.devPtr(), nodeInteriorVoxels.devPtr(), grid, solveCodes.devPtr(),
+            neighborNx.devPtr(), neighborNy.devPtr(), neighborNz.devPtr(), near ? obstacleSolids.devPtr() : nullptr, near ? obstacleNear.devPtr() : nullptr,
+            near ? obstacleOpen.devPtr() : nullptr, before, numVoxels, ux.devPtr(), uy.devPtr(), uz.devPtr());
         gpuErrchk(cudaPeekAtLastError());
         gpuErrchk(cudaFreeAsync(before, stream));
     }

@@ -1,12 +1,23 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 
 #ifndef SOURCES_HU
 #define SOURCES_HU
 
 #include "typedefs.h"
 #include "obstacles.hu"     //a mesh's field, and reading it
+#include <vector>
 
-#define MAX_SOURCE_SHAPES 16
+//What sets the emitters' and the mesh fluids' jitter apart: emitter e's seed is the scene's plus e, mesh fluid f's plus SOURCE_SEEDS plus f, the air
+//band's plus 2 SOURCE_SEEDS on, as when there could be no more than 16 of each; past the first SOURCE_SEEDS, each kind has a range of its own
+static constexpr unsigned long long SOURCE_SEEDS = 16;
+
+__host__ __device__ inline unsigned long long emitterSeed(unsigned long long seed, int emitter){
+    return seed + ((unsigned long long)emitter < SOURCE_SEEDS ? (unsigned long long)emitter : (1ull << 40) + emitter);
+}
+
+__host__ __device__ inline unsigned long long fillSeed(unsigned long long seed, int fluid){
+    return seed + SOURCE_SEEDS + ((unsigned long long)fluid < SOURCE_SEEDS ? (unsigned long long)fluid : (2ull << 40) + fluid);
+}
 
 //a region of space for emitting or removing fluid: a box, a sphere, or a closed triangle mesh, which is only ever tested on the GPU, through its
 //distance field. Positions are double, as the particles' are
@@ -87,10 +98,10 @@ struct FluidShape{
     }
 };
 
-//up to MAX_SOURCE_SHAPES of them, as one kernel argument
+//any number of them, for the kernels: in a table in the GPU's memory (Particles::uploadSources)
 struct FluidShapes{
     int count = 0;
-    FluidShape shapes[MAX_SOURCE_SHAPES];
+    const FluidShape* shapes = nullptr;
 };
 
 //What adds fluid to the domain and what takes it away, checked every substep:
@@ -101,12 +112,12 @@ struct FluidShapes{
 //- open faces of the domain delete the particles within a voxel of them. The pressure solve still sees a wall there, so fluid can't leave through the
 //  face faster than it reaches it; it just stops piling up
 //Each partition emits into its own node planes only, after the particles that crossed into them have arrived, so it sees every particle that could fill
-//a cell, and the same particles come out however the domain is split
+//a cell, and the same particles come out however the domain is split. For the kernels: the shapes are in a table in the GPU's memory
 struct Sources{
     int numEmitters = 0;
-    FluidShape emitters[MAX_SOURCE_SHAPES];
+    const FluidShape* emitters = nullptr;
     int numSinks = 0;
-    FluidShape sinks[MAX_SOURCE_SHAPES];
+    const FluidShape* sinks = nullptr;
     uint openFaces = 0;                 //bits: -x, +x, -y, +y, -z, +z
     int latticePerSide = 2;             //the seeding lattice's cells per voxel along each axis: 1, 2 or 3 (particlesPerVoxel 1, 8 or 27)
     unsigned long long seed = 1;
@@ -114,6 +125,15 @@ struct Sources{
     bool removes() const{
         return numSinks > 0 || openFaces != 0;
     }
+};
+
+//what Particles::setSources takes: the emitters and the sinks, any number of each, and the rest of Sources
+struct SourceSettings{
+    std::vector<FluidShape> emitters;
+    std::vector<FluidShape> sinks;
+    uint openFaces = 0;
+    int latticePerSide = 2;
+    unsigned long long seed = 1;
 };
 
 #endif

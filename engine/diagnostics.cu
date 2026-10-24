@@ -1,4 +1,4 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 
 //The numbers a regression test compares frame by frame (see diagnostics.hu), in two passes: one over the particles for their sums, the box around them,
 //the fastest and the hash, and one over the nodes holding particles for how full their voxels are. Each partition runs both over its own particles and

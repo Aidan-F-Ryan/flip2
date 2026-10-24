@@ -1,4 +1,4 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 
 //The liquid's level set on the simulation's own voxels, and surface tension from it.
 //
@@ -14,7 +14,8 @@
 //   doesn't depend on how the nodes are stored or split. The reach is 1.5 voxels, which every voxel a particle's own stencil reaches covers, and no
 //   more. Where a wall or an obstacle cuts into a voxel's reach, the mean would lean away from it and read as a surface along every wetted wall: so
 //   the particles beside a wall also count as their mirror images in it (splatParticles), and where there's liquid about, the part of the reach
-//   inside an obstacle counts as full of liquid at rest (finishLevelSet).
+//   inside an obstacle counts as full of liquid at rest (finishLevelSet). A voxel whose centre is inside an obstacle, which no particle can reach
+//   into, takes the level of the liquid or air beside it (fillSolidSlots).
 //2. That's only a distance within a voxel or so of the surface: further in, the particles' own unevenness swamps the lean, and further out there's too
 //   little in reach. So the voxels either side of its zero take their distance from where it crosses between them, and three passes carry distances on
 //   from those, each solving |grad d| = 1 upwind, as the mesher does for its render level set (surface.cu). A block per node, on a tile of the node's
@@ -25,9 +26,8 @@
 //   unsmoothed, the noise's curvature is several times a drop's. Smoothing takes it down to a few percent of one 16 voxels across.
 //
 //Past the domain's walls the level set mirrors what's inside, so a wall isn't a surface, tilted to meet the wall at the contact angle the liquid is
-//given (pastWall): 60 degrees by default, which water on most things is near. Obstacles' first layer of voxels reads as liquid where liquid touches them, from step 1, but nothing is
-//stored deeper in, which reads as outside: curvature within a couple of voxels of an obstacle is off by about what a drop 20 voxels across has, the
-//way a wall that doesn't wet would make it, and the contact angle doesn't reach them.
+//given (pastWall): 60 degrees by default, which water on most things is near. Inside obstacles the level set carries on what's beside them, so
+//the surface meets an obstacle square on, as a plain mirror image meets a wall: the contact angle doesn't reach obstacles.
 //
 //Surface tension is the pressure jump sigma*kappa across the surface, as a force on the faces it crosses (Brackbill, Kothe and Zemach's continuum
 //surface force, in its sharp form): each face between a liquid voxel and one that isn't gets dt*(sigma/rho)*kappa/dx towards the liquid, kappa where
@@ -49,12 +49,13 @@ static constexpr float SPLAT_REACH = 1.5f;          //voxels: how far from a par
 static constexpr float SPLAT_SCALE = 262144.0f;     //fixed point: units per unit weight. A voxel deep in liquid sums about 2 per particle in a voxel, so
                                                     //there's room for hundreds of times the rest density before 32 bits overflow
 static constexpr int SPLAT_LEAST = 64;              //a weight sum under this many units is too coarse to take a mean from: the voxel reads as outside
-static constexpr float SOLID_GATE = 0.25f;          //solids count as liquid in full once the particles' weight is this share of a voxel's deep in liquid
 static constexpr int LEVEL_HALO = 4;
 static constexpr int LEVEL_WIDTH = 12;              //a tile's side: a node's 4 voxels and LEVEL_HALO either side
 static constexpr int LEVEL_SLOTS = LEVEL_WIDTH*LEVEL_WIDTH*LEVEL_WIDTH;
 static constexpr uint LEVEL_THREADS = 256;
 static constexpr float UNKNOWN_DISTANCE = 1e20f;    //a distance not yet known
+static constexpr float IN_SOLID = 1e30f;            //a tile's mark for a voxel whose centre is inside an obstacle, to take the level beside it (fillSolidSlots)
+static constexpr float NOT_STORED = 2e30f;          //and for a slot whose level isn't known: nothing's stored there, or it's past the domain's walls
 static constexpr float KEPT_WITHIN = 1.0f;          //and within which smoothing takes the level set as it is: every voxel that near is stored (the nearest
                                                     //unstored one has no particle in the voxels around it, so it's 1.25 or more outside)
 
@@ -91,12 +92,17 @@ __device__ inline void splatPoint(const float p[3], int* sums, int voxels1D, int
 //each particle's weight and weighted offset, on the voxel centres within reach of it; then the block's sums into the voxels' owners. A particle within
 //a voxel of one of the domain's walls is also there as its mirror image in the wall (and in two or three walls at once, by an edge or a corner): beside
 //a wall a centre's reach is half inside it, and with the liquid on one side only the mean would lean away from the wall, as it does at a surface. With
-//the images it reads as the liquid carrying on through the wall as it is on this side
+//the images it reads as the liquid carrying on through the wall as it is on this side. So it is with the obstacles: a particle within a reach of the
+//nearest one's surface is also there as its image across the surface's tangent plane, as deep inside as it is outside (a centre outside an obstacle
+//can be as near its surface as you like, so the image weighs nothing anywhere outside only once it's a reach deep). The image of a gap is a gap:
+//water 1.3 voxels under an obstacle's flat underside keeps its surface, where counting the obstacle as liquid wherever there was liquid about (as
+//the field did) read the air between them as water, and the solve had no surface there. A centre outside the obstacle that an image reaches is
+//within the particle's own reach (across a flat surface exactly), so the images stay inside the node's block
 //With two PHASES (TwoPhase, particles.hu), only the liquid's particles on the grid make its surface: those whose ids aren't marked AIR_PARTICLE or ESCAPED_PARTICLE. A template, so that
 //without them the kernel is the one it always was, to the bit
 template<bool PHASES>
 __global__ void splatParticles(uint numParticleNodes, uint numParticles, const uint* firstParticles, const double* px, const double* py, const double* pz, VoxelPlaces places,
-                               int3 domainVoxels, const uint* voxelOwners, int* weights, int* offsetsX, int* offsetsY, int* offsetsZ,
+                               Obstacles obstacles, int3 domainVoxels, const uint* voxelOwners, int* weights, int* offsetsX, int* offsetsY, int* offsetsZ,
                                const uint* ids){
     extern __shared__ int sums[];   //per slot: the weights, then the weighted offsets along x, y and z, in voxels
     int voxels1D = places.interiorWidth + 2*places.apronCells;
@@ -132,6 +138,14 @@ __global__ void splatParticles(uint numParticleNodes, uint numParticles, const u
                 continue;
             }
             float at[3] = {mirrored & 1 ? image[0] : p[0], mirrored & 2 ? image[1] : p[1], mirrored & 4 ? image[2] : p[2]};
+            splatPoint(at, sums, voxels1D, origin, domainVoxels);
+        }
+        float distance;
+        float3 normal;      //out of the obstacle
+        if(obstacles.count > 0 && nearestObstacle(obstacles, make_float3((float)px[index], (float)py[index], (float)pz[index]), distance, normal) >= 0
+           && distance > 0.0f && distance < SPLAT_REACH*places.voxelSize()){
+            float across = 2.0f*distance*(float)perVoxel;
+            float at[3] = {p[0] - across*normal.x, p[1] - across*normal.y, p[2] - across*normal.z};
             splatPoint(at, sums, voxels1D, origin, domainVoxels);
         }
     }
@@ -185,54 +199,124 @@ __device__ inline float surfaceDistance(float toMean){
 }
 
 //the sums as the field, at every stored voxel, a block per node storing voxels: the distance from the voxel's centre to the weighted mean of what's
-//within reach of it, as the distance from the surface that would put the mean there (surfaceDistance). The walls' share of a reach is in the sums
-//already, as the particles' images. An obstacle's isn't: where the particles weigh enough for there to be liquid about (gate), the part of the reach
-//inside the nearest obstacle counts as liquid at rest, a half space as far off as its surface, facing the way its normal does
+//within reach of it, as the distance from the surface that would put the mean there (surfaceDistance). The walls' and the obstacles' shares of a
+//reach are in the sums already, as the particles' images. A voxel whose centre is inside an obstacle is marked IN_SOLID instead, for the tiles to
+//carry the level into (fillSolidSlots)
 __global__ void finishLevelSet(VoxelPlaces places, Obstacles obstacles, const char* walls, const int* weights, const int* offsetsX, const int* offsetsY, const int* offsetsZ,
-                               float bulk, float outside, float* raw){
+                               float outside, float* raw, char* inSolid){
     uint node = blockIdx.x;
     uint first = node == 0 ? 0 : places.nodeVoxelEnds[node - 1];
     uint last = places.nodeVoxelEnds[node];
     uint cell = places.nodeCells[node];
     for(uint index = first + threadIdx.x; index < last; index += blockDim.x){
         float value = outside;
-        if(!walls[index] && weights[index] >= SPLAT_LEAST){
-            float weight = weights[index] / SPLAT_SCALE;
-            float offset[3] = {offsetsX[index] / SPLAT_SCALE, offsetsY[index] / SPLAT_SCALE, offsetsZ[index] / SPLAT_SCALE};
-            if(obstacles.count > 0){
-                float gate = fminf(weight / (SOLID_GATE*bulk), 1.0f)*bulk;
-                int3 voxel = places.voxelOf(cell, places.voxelSlots[index]);
-                float distance;
-                float3 normal;
-                if(nearestObstacle(obstacles, places.point(voxel, 0.5f, 0.5f, 0.5f), distance, normal) >= 0){
-                    float t = fmaxf(distance / (SPLAT_REACH*places.voxelSize()), -1.0f);
-                    if(t < 1.0f){
-                        float moment = gate*SPLAT_REACH*capMoment(t);
-                        weight += gate*capShare(t);
-                        offset[0] -= moment*normal.x;   //the normal points out of the obstacle
-                        offset[1] -= moment*normal.y;
-                        offset[2] -= moment*normal.z;
-                    }
-                }
+        if(!walls[index]){
+            float distance = 0.0f;
+            float3 normal;
+            if(obstacles.count > 0 && nearestObstacle(obstacles, places.point(places.voxelOf(cell, places.voxelSlots[index]), 0.5f, 0.5f, 0.5f), distance, normal) >= 0
+               && distance < 0.0f){
+                value = IN_SOLID;
             }
-            value = surfaceDistance(sqrtf(offset[0]*offset[0] + offset[1]*offset[1] + offset[2]*offset[2]) / weight);
+            else if(weights[index] >= SPLAT_LEAST){
+                float weight = weights[index] / SPLAT_SCALE;
+                float offset[3] = {offsetsX[index] / SPLAT_SCALE, offsetsY[index] / SPLAT_SCALE, offsetsZ[index] / SPLAT_SCALE};
+                value = surfaceDistance(sqrtf(offset[0]*offset[0] + offset[1]*offset[1] + offset[2]*offset[2]) / weight);
+            }
         }
         raw[index] = value;
+        if(inSolid != nullptr){     //for the smoothing, which reads the redistanced level set (loadSmoothingTile)
+            inSolid[index] = value == IN_SOLID;
+        }
+    }
+}
+
+//Inside an obstacle the particles can't say whether a voxel is liquid or air: none fit there, and most of its reach is the obstacle's, so the field
+//reads it as outside, and puts a surface along every wetted obstacle, a voxel or so in. Where an obstacle leaves a gap too thin for particles to
+//fill, as round where a ball rests on the floor, that surface comes out through the gap: the blur reads the voxels there as air, and the sharp free
+//surface takes them for bubbles at 0 pressure under the liquid's weight, which the liquid round them pours into at metres a second. So each voxel
+//whose centre is inside an obstacle takes the level of what's beside it instead, liquid or air: the liquid's level set carried into the solid (Batty,
+//Bertails and Bridson 2007), layer by layer as Bridson's book does it, each pass every such voxel beside one that's known taking the mean of those,
+//until a pass fills none. The surface then meets an obstacle square on, and no wetted one reads as one. The tiles the level set is read through
+//(loadLevelTile, loadSmoothingTile) do it for every slot whose centre is inside an obstacle, stored or not: a voxel stores its lower faces, so the
+//voxels stored round the liquid reach a layer further into an obstacle on its low side than on its high one, and with only the stored ones carried
+//into, each side's surface would sit a different distance into it
+
+//whether the centre of a slot nothing's stored at is inside an obstacle
+__device__ inline bool slotInSolid(const Tile& tile, const Grid& grid, const Obstacles& obstacles, int3 t){
+    if(obstacles.count == 0){
+        return false;
+    }
+    int3 g = tile.global(t);
+    float h = grid.cellSize / tile.interiorWidth;
+    float distance;
+    float3 normal;
+    return nearestObstacle(obstacles, make_float3(grid.negX + (g.x + 0.5f)*h, grid.negY + (g.y + 0.5f)*h, grid.negZ + (g.z + 0.5f)*h), distance, normal) >= 0
+           && distance < 0.0f;
+}
+
+//Each slot marked IN_SOLID takes the mean of the neighbours beside it whose level is known (below IN_SOLID), layer by layer until a pass fills none;
+//any left keep the mark. A slot within LEVEL_HALO of what's known comes out as it would from passes over the whole grid, and deeper ones in obstacles
+//take what the tile reaches. from holds the tile and to is its other buffer; every thread of the block calls it
+__device__ inline void fillSolidSlots(float*& from, float*& to){
+    const int strides[3] = {1, LEVEL_WIDTH, LEVEL_WIDTH*LEVEL_WIDTH};
+    bool filled = true;
+    while(__syncthreads_or(filled)){
+        filled = false;
+        for(int slot = threadIdx.x; slot < LEVEL_SLOTS; slot += blockDim.x){
+            float own = from[slot];
+            if(own == IN_SOLID){
+                int coordinates[3] = {slot % LEVEL_WIDTH, slot / LEVEL_WIDTH % LEVEL_WIDTH, slot / (LEVEL_WIDTH*LEVEL_WIDTH)};
+                float sum = 0.0f;
+                int known = 0;
+                #pragma unroll
+                for(int axis = 0; axis < 3; ++axis){
+                    for(int step = -1; step <= 1; step += 2){
+                        int moved = coordinates[axis] + step;
+                        float there = moved >= 0 && moved < LEVEL_WIDTH ? from[slot + step*strides[axis]] : NOT_STORED;
+                        if(there < IN_SOLID){
+                            sum += there;
+                            ++known;
+                        }
+                    }
+                }
+                if(known > 0){
+                    own = sum / known;
+                    filled = true;
+                }
+            }
+            to[slot] = own;
+        }
+        float* swap = from;
+        from = to;
+        to = swap;
     }
 }
 
 // ---- 2: distances ----
 
-//a field into a tile: every slot inside the domain takes its stored voxel's value, or missing where nothing's stored, and the slots past the walls
-//mirror those, tilted to meet each wall at its contact angle (Tile::pastWall), unless there's nothing there to mirror. Every thread of the block
-//calls it, after loadTileNodes
-__device__ inline void loadLevelTile(const Tile& tile, const uint* nodes, uint numUsedGridNodes, const uint* interiorVoxels, const float* values, float missing,
-                                     const WallWetting& wetting, float* field){
+//a field into a tile: every slot inside the domain takes its stored voxel's value, or missing where nothing's stored; the slots in obstacles (IN_SOLID,
+//or with nothing stored and their centres inside one) the level of what's beside them (fillSolidSlots), or missing if there's none; and the slots past
+//the walls mirror those, tilted to meet each wall at its contact angle (Tile::pastWall), unless there's nothing there to mirror. field ends up in from,
+//with to as its other buffer. Every thread of the block calls it, after loadTileNodes
+__device__ inline void loadLevelTile(const Tile& tile, const Grid& grid, const Obstacles& obstacles, const uint* nodes, uint numUsedGridNodes, const uint* interiorVoxels,
+                                     const float* values, float missing, const WallWetting& wetting, float*& field, float*& other){
+    bool solid = false;
     for(int slot = threadIdx.x; slot < LEVEL_SLOTS; slot += blockDim.x){
         int3 t = tile.at(slot);
+        float value = NOT_STORED;   //past the walls, mirrored below
         if(tile.inDomain(t)){
             uint voxel = tile.voxel(t, nodes, numUsedGridNodes, interiorVoxels);
-            field[slot] = voxel != NO_VOXEL ? values[voxel] : missing;
+            value = voxel != NO_VOXEL ? values[voxel] : slotInSolid(tile, grid, obstacles, t) ? IN_SOLID : missing;
+        }
+        field[slot] = value;
+        solid = solid || value == IN_SOLID;
+    }
+    if(__syncthreads_or(solid)){
+        fillSolidSlots(field, other);
+        for(int slot = threadIdx.x; slot < LEVEL_SLOTS; slot += blockDim.x){
+            if(field[slot] == IN_SOLID){
+                field[slot] = missing;
+            }
         }
     }
     __syncthreads();
@@ -249,8 +333,8 @@ __device__ inline void loadLevelTile(const Tile& tile, const uint* nodes, uint n
 //the level set at a node's own voxels from the particles' field around them: startDistances and three passes of relaxDistances (surface.cu), over a
 //tile in shared memory. A pass is only right a slot further in from the tile's edge than the one before, where every neighbour it read was right;
 //4 passes leave the node's own voxels right. A tile all on one side of the surface is as far from it as the level set goes
-__global__ void redistanceLevelSet(uint numUsedGridNodes, const uint* nodeCells, const uint* cellToNode, const uint* interiorVoxels, Grid grid, float outside, WallWetting wetting,
-                                   const float* raw, float* level){
+__global__ void redistanceLevelSet(uint numUsedGridNodes, const uint* nodeCells, const uint* cellToNode, const uint* interiorVoxels, Grid grid, Obstacles obstacles, float outside,
+                                   WallWetting wetting, const float* raw, float* level){
     __shared__ float fields[2][LEVEL_SLOTS];
     __shared__ char beside[LEVEL_SLOTS];    //whether the surface passes between the slot and one next to it
     __shared__ uint nodes[27];
@@ -260,7 +344,7 @@ __global__ void redistanceLevelSet(uint numUsedGridNodes, const uint* nodeCells,
     Tile tile(cell, grid, LEVEL_WIDTH - 2*LEVEL_HALO, LEVEL_HALO);
     float* from = fields[0];
     float* to = fields[1];
-    loadLevelTile(tile, nodes, numUsedGridNodes, interiorVoxels, raw, outside, wetting, from);
+    loadLevelTile(tile, grid, obstacles, nodes, numUsedGridNodes, interiorVoxels, raw, outside, wetting, from, to);
     bool inside = from[0] < 0.0f;
     bool crossed = false;
     for(int slot = threadIdx.x; slot < LEVEL_SLOTS; slot += blockDim.x){
@@ -363,23 +447,37 @@ __global__ void redistanceLevelSet(uint numUsedGridNodes, const uint* nodeCells,
 //above the liquid than below it (the ones holding its upper faces), so taking what's stored and making up the rest would curve a drop's lower side
 //more than its upper, which pushes it along: a 2% difference had one drifting. So only the values within KEPT_WITHIN of the surface are taken, which
 //are stored on every side of it, and every other slot, stored or not, carries the distances on from those: three passes of the upwind solve, as
-//redistanceLevelSet's, and past those the level set's limit. The slots past the walls mirror what's inside (Tile::pastWall). Every thread of the block
-//calls it, after loadTileNodes; the tile ends up in from, with to as its other buffer, and stored says where a voxel is
-__device__ inline void loadSmoothingTile(const Tile& tile, const uint* nodes, uint numUsedGridNodes, const uint* interiorVoxels, const float* values, const WallWetting& wetting,
-                                         float*& from, float*& to, char* missing, char* stored){
+//redistanceLevelSet's, and past those the level set's limit. The slots in obstacles (inSolid where stored, finishLevelSet) are carried into last, from
+//those distances, stored or not: the layer beside what's outside them carries its level on in a straight line (smoothTile says why), and the rest take
+//the level beside them (fillSolidSlots). More of an obstacle's voxels are stored on its low side, and the level stored in them came from carrying the
+//particles' field in before redistancing, while the rest came from the redistanced level beside them, which isn't the same (under a ball resting on
+//the floor the surface sat up to half a voxel apart either side, and the ball rolled toward +x and +z). The slots past the
+//walls mirror what's inside (Tile::pastWall). Every thread of the block calls it, after loadTileNodes; the tile ends up in from, with to as its other
+//buffer, stored says where a voxel is, and inObstacle which slots are in obstacles (for smoothTile)
+__device__ inline void loadSmoothingTile(const Tile& tile, const Grid& grid, const Obstacles& obstacles, const uint* nodes, uint numUsedGridNodes, const uint* interiorVoxels,
+                                         const float* values, const char* inSolid, const WallWetting& wetting, float*& from, float*& to, char* missing, char* stored,
+                                         char* inObstacle){
+    bool solid = false;
     for(int slot = threadIdx.x; slot < LEVEL_SLOTS; slot += blockDim.x){
         int3 t = tile.at(slot);
+        float value = UNKNOWN_DISTANCE;
+        bool kept = false;
+        stored[slot] = 0;
         if(tile.inDomain(t)){
             uint voxel = tile.voxel(t, nodes, numUsedGridNodes, interiorVoxels);
-            float value = voxel != NO_VOXEL ? values[voxel] : UNKNOWN_DISTANCE;
-            bool kept = fabsf(value) < KEPT_WITHIN;
-            from[slot] = kept ? value : value < 0.0f ? -UNKNOWN_DISTANCE : UNKNOWN_DISTANCE;
-            missing[slot] = !kept;
             stored[slot] = voxel != NO_VOXEL;
+            if(voxel != NO_VOXEL ? inSolid != nullptr && inSolid[voxel] : slotInSolid(tile, grid, obstacles, t)){
+                value = IN_SOLID;
+            }
+            else if(voxel != NO_VOXEL){
+                kept = fabsf(values[voxel]) < KEPT_WITHIN;
+                value = kept ? values[voxel] : values[voxel] < 0.0f ? -UNKNOWN_DISTANCE : UNKNOWN_DISTANCE;
+            }
         }
-        else{
-            stored[slot] = 0;
-        }
+        from[slot] = value;
+        missing[slot] = !kept && value != IN_SOLID;
+        inObstacle[slot] = value == IN_SOLID;
+        solid = solid || value == IN_SOLID;
     }
     __syncthreads();
     for(int slot = threadIdx.x; slot < LEVEL_SLOTS; slot += blockDim.x){
@@ -388,6 +486,7 @@ __device__ inline void loadSmoothingTile(const Tile& tile, const uint* nodes, ui
             int image = tile.slot(tile.mirrored(t));
             from[slot] = from[image];
             missing[slot] = missing[image];
+            inObstacle[slot] = inObstacle[image];
         }
     }
     __syncthreads();
@@ -438,6 +537,44 @@ __device__ inline void loadSmoothingTile(const Tile& tile, const uint* nodes, ui
         from = to;
         to = swap;
     }
+    if(__syncthreads_or(solid)){    //the obstacles' slots beside what's outside them carry its level on in a straight line (smoothTile), the rest take theirs
+        for(int slot = threadIdx.x; slot < LEVEL_SLOTS; slot += blockDim.x){
+            float value = from[slot];
+            if(inObstacle[slot]){
+                int coordinates[3] = {slot % LEVEL_WIDTH, slot / LEVEL_WIDTH % LEVEL_WIDTH, slot / (LEVEL_WIDTH*LEVEL_WIDTH)};
+                float sum = 0.0f;
+                int count = 0;
+                #pragma unroll
+                for(int axis = 0; axis < 3; ++axis){
+                    for(int step = -1; step <= 1; step += 2){
+                        int moved = coordinates[axis] + step;
+                        int beside = slot + step*strides[axis];
+                        if(moved < 0 || moved >= LEVEL_WIDTH || inObstacle[beside]){
+                            continue;
+                        }
+                        bool inLine = moved + step >= 0 && moved + step < LEVEL_WIDTH && !inObstacle[beside + step*strides[axis]];
+                        sum += inLine ? 2.0f*from[beside] - from[beside + step*strides[axis]] : from[beside];
+                        ++count;
+                    }
+                }
+                if(count > 0){
+                    value = fminf(fmaxf(sum / count, -LIQUID_BAND), LIQUID_BAND);
+                }
+            }
+            to[slot] = value;
+        }
+        __syncthreads();
+        float* swap = from;
+        from = to;
+        to = swap;
+        fillSolidSlots(from, to);
+        for(int slot = threadIdx.x; slot < LEVEL_SLOTS; slot += blockDim.x){
+            if(from[slot] == IN_SOLID){
+                from[slot] = LIQUID_BAND;   //walled in by obstacle on every side the tile reaches: none of it is liquid
+            }
+        }
+        __syncthreads();
+    }
     if(wetting.any){    //the slots past the walls, once what they mirror is a distance at every depth: tilted to meet each wall at its contact angle
         for(int slot = threadIdx.x; slot < LEVEL_SLOTS; slot += blockDim.x){
             int3 t = tile.at(slot);
@@ -450,10 +587,18 @@ __device__ inline void loadSmoothingTile(const Tile& tile, const uint* nodes, ui
 }
 
 //passes of an even blur over each slot and the 26 around it, in a tile's two buffers; the result ends up in from. Even weights take out twice the
-//noise a 1 2 1 blur does for the same reach, which is what a tile is short of
-__device__ inline void smoothTile(int passes, float*& from, float*& to){
+//noise a 1 2 1 blur does for the same reach, which is what a tile is short of. The slots in obstacles keep what loadSmoothingTile carried in, so the
+//slots outside read only the layer of them beside them, carried on from their own side: blurred along with the rest, what's carried in from both
+//sides of a wall thinner than twice the blur's reach came through it (water in a sealed box, through its floor, made the air between the floor and
+//the pool under it read as water, and the solve kept no surface there). And that layer carries the level on in a straight line, so a surface along an
+//obstacle stays where it is, as one square on to it does: carried on unchanged, the air a voxel thick under an obstacle's underside read wetter than it was
+__device__ inline void smoothTile(int passes, float*& from, float*& to, const char* inObstacle){
     for(int pass = 0; pass < passes; ++pass){
         for(int slot = threadIdx.x; slot < LEVEL_SLOTS; slot += blockDim.x){
+            if(inObstacle[slot]){
+                to[slot] = from[slot];
+                continue;
+            }
             int x = slot % LEVEL_WIDTH, y = slot / LEVEL_WIDTH % LEVEL_WIDTH, z = slot / (LEVEL_WIDTH*LEVEL_WIDTH);
             float sum = 0.0f;
             #pragma unroll
@@ -479,10 +624,16 @@ __device__ inline void smoothTile(int passes, float*& from, float*& to){
 //passes take a particle-sized bump's curvature down to about 4% of a drop's 16 voxels across (3 leave 12%), and cost a drop that size about 1% of its
 //frequency. Only tiles holding a voxel near enough the surface for its curvature to be asked do anything: no other is read. The sharp free surface
 //takes fewer passes of its own (freesurface.cu)
-__global__ void smoothLevelSet(uint numUsedGridNodes, const uint* nodeCells, const uint* cellToNode, const uint* interiorVoxels, Grid grid, WallWetting wetting, int passes,
-                               const float* level, float* smoothed){
+//With obstacleNear and obstacleOpen, for the pressure solve's surface (surfaceLevel): a voxel an obstacle cuts whose centre is inside the obstacle has no
+//level of its own there, only what fillSolidSlots carried in from both sides of the obstacle, so against a wall thinner than the blur's reach it reads
+//as the air past the wall: the sliver of water against the inside of a sealed box, its walls 2.6 voxels thick, went dry (retireDryUnknowns), the water
+//in the box poured into it at 1.4 m/s, and out through the walls. Its liquid is on its open side, so its level is the mean of its neighbours' across its
+//faces, each weighed by how open it is (with none open, or only the domain's walls, its own). Read from the tile, as stored or carried in, so it's the
+//same however the voxels round it are stored
+__global__ void smoothLevelSet(uint numUsedGridNodes, const uint* nodeCells, const uint* cellToNode, const uint* interiorVoxels, Grid grid, Obstacles obstacles, WallWetting wetting,
+                               int passes, const char* obstacleNear, const uint* obstacleOpen, const float* level, const char* inSolid, float* smoothed){
     __shared__ float fields[2][LEVEL_SLOTS];
-    __shared__ char flags[2][LEVEL_SLOTS];
+    __shared__ char flags[3][LEVEL_SLOTS];
     __shared__ uint nodes[27];
     uint cell = nodeCells[blockIdx.x];
     loadTileNodes(nodes, cell, numUsedGridNodes, nodeCells, cellToNode, grid);
@@ -490,28 +641,48 @@ __global__ void smoothLevelSet(uint numUsedGridNodes, const uint* nodeCells, con
     Tile tile(cell, grid, LEVEL_WIDTH - 2*LEVEL_HALO, LEVEL_HALO);
     float* from = fields[0];
     float* to = fields[1];
-    loadSmoothingTile(tile, nodes, numUsedGridNodes, interiorVoxels, level, wetting, from, to, flags[0], flags[1]);
+    loadSmoothingTile(tile, grid, obstacles, nodes, numUsedGridNodes, interiorVoxels, level, inSolid, wetting, from, to, flags[0], flags[1], flags[2]);
     bool near = false;
     for(int slot = threadIdx.x; slot < LEVEL_SLOTS; slot += blockDim.x){
         near = near || fabsf(from[slot]) < CURVED_WITHIN;
     }
     if(__syncthreads_or(near)){
-        smoothTile(passes, from, to);
+        smoothTile(passes, from, to, flags[2]);
     }
+    const int strides[3] = {1, LEVEL_WIDTH, LEVEL_WIDTH*LEVEL_WIDTH};
     for(int slot = threadIdx.x; slot < LEVEL_SLOTS; slot += blockDim.x){
         int3 t = tile.at(slot);
-        if(tile.interior(t) && flags[1][slot]){
-            smoothed[tile.voxel(t, nodes, numUsedGridNodes, interiorVoxels)] = from[slot];
+        if(!tile.interior(t) || !flags[1][slot]){
+            continue;
         }
+        uint voxel = tile.voxel(t, nodes, numUsedGridNodes, interiorVoxels);
+        float value = from[slot];
+        if(obstacleNear != nullptr && (obstacleNear[voxel] & NEAR_SURFACE) && slotInSolid(tile, grid, obstacles, t)){
+            CutFaces cut = cachedCut(obstacleOpen, voxel);
+            float sum = 0.0f, weight = 0.0f;
+            for(int face = 0; face < 6; ++face){
+                int axis = face/2, step = face % 2 ? 1 : -1;
+                int3 there = make_int3(t.x + (axis == 0)*step, t.y + (axis == 1)*step, t.z + (axis == 2)*step);
+                if((obstacleNear[voxel] & CLOSED_FACE << face) || !tile.inDomain(there)){
+                    continue;
+                }
+                sum += cut.open[face]*from[slot + step*strides[axis]];
+                weight += cut.open[face];
+            }
+            if(weight > 0.0f){
+                value = sum / weight;
+            }
+        }
+        smoothed[voxel] = value;
     }
 }
 
 //the surface's curvature at a node's own voxels within CURVED_WITHIN of it, in 1/voxels, positive where the liquid bulges; 0 at the rest. The last 3
 //passes of blur, then div(grad d / |grad d|) by central differences. Features a voxel across can't have more curvature than 1 a voxel
-__global__ void curveLevelSet(uint numUsedGridNodes, const uint* nodeCells, const uint* cellToNode, const uint* interiorVoxels, Grid grid, WallWetting wetting, const float* level,
-                              const float* smoothed, float* curvature){
+__global__ void curveLevelSet(uint numUsedGridNodes, const uint* nodeCells, const uint* cellToNode, const uint* interiorVoxels, Grid grid, Obstacles obstacles, WallWetting wetting,
+                              const float* level, const float* smoothed, const char* inSolid, float* curvature){
     __shared__ float fields[2][LEVEL_SLOTS];
-    __shared__ char flags[2][LEVEL_SLOTS];
+    __shared__ char flags[3][LEVEL_SLOTS];
     __shared__ uint nodes[27];
     uint cell = nodeCells[blockIdx.x];
     loadTileNodes(nodes, cell, numUsedGridNodes, nodeCells, cellToNode, grid);
@@ -530,8 +701,8 @@ __global__ void curveLevelSet(uint numUsedGridNodes, const uint* nodeCells, cons
     }
     float* from = fields[0];
     float* to = fields[1];
-    loadSmoothingTile(tile, nodes, numUsedGridNodes, interiorVoxels, smoothed, wetting, from, to, flags[0], flags[1]);
-    smoothTile(3, from, to);
+    loadSmoothingTile(tile, grid, obstacles, nodes, numUsedGridNodes, interiorVoxels, smoothed, inSolid, wetting, from, to, flags[0], flags[1], flags[2]);
+    smoothTile(3, from, to, flags[2]);
     for(int slot = threadIdx.x; slot < LEVEL_SLOTS; slot += blockDim.x){
         int3 t = tile.at(slot);
         if(!tile.interior(t) || !flags[1][slot]){
@@ -619,7 +790,6 @@ void Particles::buildLevelSet(){
     uint interiorWidth = numVoxels1D - 2*(uint)std::floor(radius);
     float outside = SPLAT_REACH;    //where no particle is within reach, the surface is at least that far
     WallWetting wetting = surfaceTension > 0.0 ? wallWettings() : WallWetting();    //only surface tension gives the angle the liquid meets the walls at any meaning
-    float bulk = (float)(restParticlesPerVoxel*M_PI*SPLAT_REACH*SPLAT_REACH*SPLAT_REACH*64.0/315.0);    //a voxel's weight sum deep in liquid at rest
     liquidLevel.resizeAsync(numVoxels, stream);
     int* sums[4];
     float* raw;
@@ -629,25 +799,30 @@ void Particles::buildLevelSet(){
         gpuErrchk(cudaMemsetAsync(sum, 0, bytes, stream));
     }
     gpuErrchk(cudaMallocAsync((void**)&raw, bytes, stream));
+    char* inSolid = nullptr;    //per stored voxel: whether its centre is inside an obstacle
+    if(obstacles.count() > 0){
+        gpuErrchk(cudaMallocAsync((void**)&inSolid, numVoxels > 0 ? numVoxels : 1, stream));
+    }
     int3 domainVoxels = make_int3(grid.sizeX*interiorWidth, grid.sizeY*interiorWidth, grid.sizeZ*interiorWidth);
     if(numParticleNodes > 0){
         auto splat = twoPhase.on ? splatParticles<true> : splatParticles<false>;
         splat<<<numParticleNodes, SPLAT_THREADS, 4*sizeof(int)*numVoxelsPerNode, stream>>>(numParticleNodes, size, gridNodeIndicesToFirstParticleIndex.devPtr(), px.devPtr(), py.devPtr(),
-            pz.devPtr(), voxelPlaces(), domainVoxels, voxelOwners.devPtr(), sums[0], sums[1], sums[2], sums[3], particleIds.devPtr());
+            pz.devPtr(), voxelPlaces(), obstacles.state(), domainVoxels, voxelOwners.devPtr(), sums[0], sums[1], sums[2], sums[3], particleIds.devPtr());
     }
     for(int* sum : sums){   //particles near this partition's edge reach into ghost voxels: their owners add those sums in
         context->reduceGhosts(sum, stream);
     }
     if(numStoredNodes > 0 && numVoxels > 0){
-        finishLevelSet<<<numStoredNodes, 128, 0, stream>>>(voxelPlaces(), obstacles.state(), solids.devPtr(), sums[0], sums[1], sums[2], sums[3], bulk, outside, raw);
+        finishLevelSet<<<numStoredNodes, 128, 0, stream>>>(voxelPlaces(), obstacles.state(), solids.devPtr(), sums[0], sums[1], sums[2], sums[3], outside, raw, inSolid);
     }
     context->fillGhosts(raw, stream);
+    Obstacles solids = obstacles.state();   //whose insides the tiles carry the level into
     if(numVoxels > 0){  //a voxel in a node's apron that no node's interior holds reads as outside: nothing but the pressure update's air faces is kept there
         fillLevels<<<numVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numVoxels, LIQUID_BAND, liquidLevel.devPtr());
     }
     if(numOwnNodes > 0 && numVoxels > 0){
-        redistanceLevelSet<<<numOwnNodes, LEVEL_THREADS, 0, stream>>>(numUsedGridNodes, nodeCells.devPtr(), cellToNode.devPtr(), nodeInteriorVoxels.devPtr(), grid, outside, wetting,
-            raw, liquidLevel.devPtr());
+        redistanceLevelSet<<<numOwnNodes, LEVEL_THREADS, 0, stream>>>(numUsedGridNodes, nodeCells.devPtr(), cellToNode.devPtr(), nodeInteriorVoxels.devPtr(), grid, solids, outside,
+            wetting, raw, liquidLevel.devPtr());
     }
     context->fillGhosts(liquidLevel.devPtr(), stream);
     if(needsSurfaceLevel()){    //the pressure solve's surface: smoothed a little, so particles' unevenness doesn't become pressure (freesurface.cu, twophase.cu)
@@ -657,8 +832,9 @@ void Particles::buildLevelSet(){
         }
         if(numOwnNodes > 0 && numVoxels > 0){   //mirrored square on at the walls: the contact angle is the curvature's to impose, and tilted into the blur it
                                                 //would wet the floor beside a drop, or dry the drop's underside
-            smoothLevelSet<<<numOwnNodes, LEVEL_THREADS, 0, stream>>>(numUsedGridNodes, nodeCells.devPtr(), cellToNode.devPtr(), nodeInteriorVoxels.devPtr(), grid, WallWetting(),
-                SURFACE_PASSES, liquidLevel.devPtr(), surfaceLevel.devPtr());
+            bool cut = obstacles.count() > 0 && obstacleNear.size() == numVoxels;
+            smoothLevelSet<<<numOwnNodes, LEVEL_THREADS, 0, stream>>>(numUsedGridNodes, nodeCells.devPtr(), cellToNode.devPtr(), nodeInteriorVoxels.devPtr(), grid, solids,
+                WallWetting(), SURFACE_PASSES, cut ? obstacleNear.devPtr() : nullptr, cut ? obstacleOpen.devPtr() : nullptr, liquidLevel.devPtr(), inSolid, surfaceLevel.devPtr());
         }
         context->fillGhosts(surfaceLevel.devPtr(), stream);
     }
@@ -666,13 +842,13 @@ void Particles::buildLevelSet(){
         liquidCurvature.resizeAsync(numVoxels, stream);
         liquidCurvature.zeroDeviceAsync(stream);    //0 wherever it isn't worked out
         if(numOwnNodes > 0 && numVoxels > 0){   //the smoothed level set goes where the particles' field was: every voxel a tile reads gets one
-            smoothLevelSet<<<numOwnNodes, LEVEL_THREADS, 0, stream>>>(numUsedGridNodes, nodeCells.devPtr(), cellToNode.devPtr(), nodeInteriorVoxels.devPtr(), grid, wetting, 4,
-                liquidLevel.devPtr(), raw);
+            smoothLevelSet<<<numOwnNodes, LEVEL_THREADS, 0, stream>>>(numUsedGridNodes, nodeCells.devPtr(), cellToNode.devPtr(), nodeInteriorVoxels.devPtr(), grid, solids,
+                wetting, 4, nullptr, nullptr, liquidLevel.devPtr(), inSolid, raw);
         }
         context->fillGhosts(raw, stream);
         if(numOwnNodes > 0 && numVoxels > 0){
-            curveLevelSet<<<numOwnNodes, LEVEL_THREADS, 0, stream>>>(numUsedGridNodes, nodeCells.devPtr(), cellToNode.devPtr(), nodeInteriorVoxels.devPtr(), grid, wetting,
-                liquidLevel.devPtr(), raw, liquidCurvature.devPtr());
+            curveLevelSet<<<numOwnNodes, LEVEL_THREADS, 0, stream>>>(numUsedGridNodes, nodeCells.devPtr(), cellToNode.devPtr(), nodeInteriorVoxels.devPtr(), grid, solids,
+                wetting, liquidLevel.devPtr(), raw, inSolid, liquidCurvature.devPtr());
         }
         context->fillGhosts(liquidCurvature.devPtr(), stream);
     }
@@ -680,6 +856,9 @@ void Particles::buildLevelSet(){
         gpuErrchk(cudaFreeAsync(sum, stream));
     }
     gpuErrchk(cudaFreeAsync(raw, stream));
+    if(inSolid != nullptr){
+        gpuErrchk(cudaFreeAsync(inSolid, stream));
+    }
     gpuErrchk(cudaPeekAtLastError());
 }
 

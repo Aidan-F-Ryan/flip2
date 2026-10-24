@@ -1,0 +1,62 @@
+//Copyright 2026 Taimen LLC
+
+#ifndef CONDENSATIONFUNCTIONS_HU
+#define CONDENSATIONFUNCTIONS_HU
+
+    #include "../typedefs.h"
+    #include "../partitionContext.hu"
+    #include "multigridFunctions.hu"
+    #include "conjugateGradientFunctions.hu"
+
+    //The unknowns a solve's term outweighs the stencil at, which the multigrid's preconditioner solves for exactly with the term, and the V-cycle the
+    //rest (condensationFunctions.cu). The term keeps one (SolveTerm::condensation): the host's copy of the counts lasts between solves, the rest is a
+    //solve's own
+    struct Condensation{
+        //found ahead of the solve's first wait (findTrapped)
+        char* trapped = nullptr;        //per stored voxel, whether it's one of them, the ghosts as their owners say
+        char* colors = nullptr;         //the V-cycle's unknowns: the solve's, or the bounded solve's free ones, less those
+        uint* own = nullptr;            //this partition's, as indices among the stored voxels, in no order
+        int3* places = nullptr;         //and where each is in the domain, in voxels
+        uint* ownCount = nullptr;       //how many
+        long long* counts = nullptr;    //every partition's count, a word each in rank order
+        long long* seen = nullptr;      //the host's copy of them: pinned, kept between solves
+        int seenRanks = 0;
+        uint ownCapacity = 4096;        //how many own can hold, kept between solves: once a solve has had more, as many as it had
+        //made once the host has the counts (condense)
+        bool ready = false;
+        uint numTrapped = 0;            //over every partition: the order of their block of the equations
+        uint numOwn = 0;
+        uint numPadded = 0;             //numTrapped in whole tiles
+        uint* slots = nullptr;          //per entry in own, its place in the order every partition has them in
+        long long* records = nullptr;   //every partition's, gathered: what the block is made from
+        uint* order = nullptr;          //which record is at each place
+        long long* freeWords = nullptr; //per place, whether the bounded solve has it free
+        double* block = nullptr;        //the block, numPadded square, then its inverse
+        double* work = nullptr;         //its Cholesky factor's inverse, on the way
+        long long* gathered = nullptr;  //a value per place, from its owner
+        double* solved = nullptr;       //the block's inverse times them
+        float* lifted = nullptr;        //per stored voxel: those at the trapped unknowns, 0 elsewhere
+        float* reduced = nullptr;       //per stored voxel: the residual less what lifted makes of it
+        float* product = nullptr;       //per stored voxel: the term times the V-cycle's correction
+    };
+
+    //Before the solve's first wait: which of this partition's unknowns the term outweighs the stencil at, the V-cycle's colours without them (the
+    //solve's codes'), and every partition's count, on its way to the host for condense
+    void findTrapped(Condensation& condensation, Stencil A, const char* solveCodes, const VoxelLayout& layout, uint numUsedVoxels, SolveTerm& term,
+                     PartitionContext& context, cudaStream_t stream);
+
+    //After it: their block of the equations, gathered from every partition alike, its inverse, and with free (the bounded solve's free unknowns, which
+    //colours then follow), the block for the free ones among them, the others held at 0
+    void condense(Condensation& condensation, Stencil A, const VoxelLayout& layout, uint numUsedVoxels, const char* free, SolveTerm& term,
+                  PartitionContext& context, cudaStream_t stream);
+
+    //z = M^-1 r: their equations solved with the term exactly, around a V-cycle for the rest (one built on colours); with free, over the free unknowns
+    //alone, 0 at the others
+    void condensedVCycle(Condensation& condensation, const Multigrid& multigrid, Stencil A, const char* solveCodes, const char* free, SolveTerm& term,
+                         const float* r, float* z, uint numUsedVoxels, PartitionContext& context, cudaStream_t stream);
+
+    //a solve's buffers, at its end
+    void releaseTrapped(Condensation& condensation, cudaStream_t stream);
+    //and what's kept between solves
+    void freeCondensation(Condensation& condensation);
+#endif

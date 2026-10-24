@@ -1,4 +1,4 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 
 //Emitters, sinks and open faces (see sources.hu), run as initialize re-bins the particles each substep:
 //  markRemovedParticles before rootCell reflects anything back off the walls; killRemovedParticles after it, giving them the cell past the last, so the
@@ -38,6 +38,10 @@ void Particles::resizeParticleArrays(uint newSize, uint keep){
         for(CudaVec<float>& gradient : affine){
             gpuErrchk(cudaMemsetAsync(gradient.devPtr() + keep, 0, sizeof(float)*(newSize - keep), stream));
         }
+    }
+    if(twoPhase.escaping() && newSize > keep){  //and none has escaped yet
+        gpuErrchk(cudaMemsetAsync(airBreakup.devPtr() + keep, 0, sizeof(float)*(newSize - keep), stream));
+        gpuErrchk(cudaMemsetAsync(airSauter.devPtr() + keep, 0, sizeof(float)*(newSize - keep), stream));
     }
     if(reorderedGridIndices.size() < newSize){
         reorderedGridIndices.resizeAsync(newSize, stream);
@@ -385,8 +389,8 @@ __global__ void fillBandFromLattice(EmitterLattice lattice, BandFill band, Obsta
 
 void Particles::emitParticles(){
     bool filling = false;   //the start, with fluid in meshes to seed
-    for(int fluid = 0; fluid < fluids.count && substepIndex == 0; ++fluid){
-        filling = filling || fluids.shapes[fluid].kind == FluidShape::MESH;
+    for(size_t fluid = 0; fluid < fluidShapes.size() && substepIndex == 0; ++fluid){
+        filling = filling || fluidShapes[fluid].kind == FluidShape::MESH;
     }
     if(sources.numEmitters == 0 && !filling && !airBand()){
         return;
@@ -482,11 +486,11 @@ void Particles::emitParticles(){
         cudaFreeAsync(scratch, stream);
     };
     for(int emitter = 0; emitter < sources.numEmitters; ++emitter){
-        const FluidShape& shape = sources.emitters[emitter];
+        const FluidShape& shape = emitterShapes[emitter];
         if(size > 0){
             constrainEmitterVelocities<<<std::min(size / BLOCKSIZE + 1, 4096u), BLOCKSIZE, 0, stream>>>(size, px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(), shape);
         }
-        unsigned long long seed = sources.seed + emitter;
+        unsigned long long seed = emitterSeed(sources.seed, emitter);
         emitFrom(shape, false, [&](unsigned long long count, uint* emitting, uint* own){
             findEmissions<<<(uint)(count / BLOCKSIZE + 1), BLOCKSIZE, 0, stream>>>(lattice, shape, seed, emitting, own);
         }, [&](unsigned long long count, const uint* emitting, const uint* ends, uint first){
@@ -495,11 +499,11 @@ void Particles::emitParticles(){
         });
     }
     for(int fluid = 0; fluid < fluids.count && filling; ++fluid){
-        if(fluids.shapes[fluid].kind != FluidShape::MESH){
+        if(fluidShapes[fluid].kind != FluidShape::MESH){
             continue;
         }
-        unsigned long long seed = sources.seed + MAX_SOURCE_SHAPES + fluid;  //not an emitter's
-        emitFrom(fluids.shapes[fluid], false, [&](unsigned long long count, uint* emitting, uint* own){
+        unsigned long long seed = fillSeed(sources.seed, fluid);    //not an emitter's
+        emitFrom(fluidShapes[fluid], false, [&](unsigned long long count, uint* emitting, uint* own){
             findFills<<<(uint)(count / BLOCKSIZE + 1), BLOCKSIZE, 0, stream>>>(lattice, fluids, fluid, obstacles.state(), seed, emitting, own);
         }, [&](unsigned long long count, const uint* emitting, const uint* ends, uint first){
             fillFromLattice<<<(uint)(count / BLOCKSIZE + 1), BLOCKSIZE, 0, stream>>>(lattice, fluids, fluid, obstacles.state(), seed, emitting, ends, first,
@@ -537,7 +541,7 @@ void Particles::emitParticles(){
         everywhere.low[2] = lattice.ownLow;
         everywhere.high[2] = lattice.ownHigh;
         //not an emitter's seed or a fluid's, and another every substep: a voxel emptied twice doesn't fill the same way twice
-        unsigned long long seed = sources.seed + 2*MAX_SOURCE_SHAPES + 0x9e3779b97f4a7c15ull*(substepIndex + 1);
+        unsigned long long seed = sources.seed + 2*SOURCE_SEEDS + 0x9e3779b97f4a7c15ull*(substepIndex + 1);
         emitFrom(everywhere, true, [&](unsigned long long count, uint* emitting, uint* own){
             findBandFills<<<(uint)(count / BLOCKSIZE + 1), BLOCKSIZE, 0, stream>>>(lattice, band, obstacles.state(), seed, emitting, own);
         }, [&](unsigned long long count, const uint* emitting, const uint* ends, uint first){
@@ -552,15 +556,66 @@ void Particles::emitParticles(){
     }
 }
 
-void Particles::setSourceMeshes(const std::vector<SceneObstacle>& meshes, const std::vector<FluidShape>& startingFluids){
-    sourceMeshes.build(meshes, grid.cellSize / (2<<refinementLevel), stream);
-    fluids.count = 0;
-    for(const FluidShape& fluid : startingFluids){
-        if(fluids.count < MAX_SOURCE_SHAPES){
-            fluids.shapes[fluids.count++] = fluid;
-        }
+//The shapes go into the table through a kernel that takes up to SHAPE_BATCH of them as its argument, as the obstacles' states do (ObstacleSet::upload):
+//the host can change its copies again at once, with nothing waited for
+static constexpr int SHAPE_BATCH = 16;
+struct ShapeBatch{
+    int count;
+    int first;
+    FluidShape shapes[SHAPE_BATCH];
+};
+
+__global__ void writeFluidShapes(ShapeBatch batch, FluidShape* table){
+    if((int)threadIdx.x < batch.count){
+        table[batch.first + threadIdx.x] = batch.shapes[threadIdx.x];
     }
+}
+
+void Particles::uploadSources(){
+    size_t needed = emitterShapes.size() + sinkShapes.size() + fluidShapes.size();
+    if(needed > sourceTableSize){
+        if(sourceTable != nullptr){
+            gpuErrchk(cudaFreeAsync(sourceTable, stream));
+        }
+        gpuErrchk(cudaMallocAsync((void**)&sourceTable, sizeof(FluidShape)*needed, stream));
+        sourceTableSize = needed;
+    }
+    size_t at = 0;
+    for(const std::vector<FluidShape>* shapes : {&emitterShapes, &sinkShapes, &fluidShapes}){
+        for(size_t first = 0; first < shapes->size(); first += SHAPE_BATCH){
+            ShapeBatch batch;
+            batch.count = (int)std::min(shapes->size() - first, (size_t)SHAPE_BATCH);
+            batch.first = (int)(at + first);
+            for(int i = 0; i < batch.count; ++i){
+                batch.shapes[i] = (*shapes)[first + i];
+            }
+            writeFluidShapes<<<1, SHAPE_BATCH, 0, stream>>>(batch, sourceTable);
+        }
+        at += shapes->size();
+    }
+    gpuErrchk(cudaPeekAtLastError());
+    sources.numEmitters = (int)emitterShapes.size();
+    sources.emitters = sourceTable;
+    sources.numSinks = (int)sinkShapes.size();
+    sources.sinks = sourceTable + emitterShapes.size();
+    fluids.count = (int)fluidShapes.size();
+    fluids.shapes = sourceTable + emitterShapes.size() + sinkShapes.size();
+}
+
+void Particles::setSources(const SourceSettings& emittersAndSinks){
+    emitterShapes = emittersAndSinks.emitters;
+    sinkShapes = emittersAndSinks.sinks;
+    sources.openFaces = emittersAndSinks.openFaces;
+    sources.latticePerSide = emittersAndSinks.latticePerSide;
+    sources.seed = emittersAndSinks.seed;
+    uploadSources();
+}
+
+void Particles::setSourceMeshes(const std::vector<SceneObstacle>& meshes, const std::vector<FluidShape>& startingFluids){
+    sourceMeshes.build(meshes, grid.cellSize / (2<<refinementLevel), grid, stream);
+    fluidShapes = startingFluids;
     placeSourceMeshes();
+    uploadSources();
 }
 
 //every mesh emitter, sink and fluid takes its field where it is now, and the box around it; one left out of the build holds nothing
@@ -569,6 +624,7 @@ void Particles::placeSourceMeshes(){
         return;
     }
     sourceMeshes.update(elapsedTime);
+    sourceMeshes.index();
     auto place = [&](FluidShape& shape){
         if(shape.kind != FluidShape::MESH){
             return;
@@ -582,18 +638,15 @@ void Particles::placeSourceMeshes(){
             }
             return;
         }
-        shape.mesh = sourceMeshes.state().items[index];
+        shape.mesh = sourceMeshes.hostState(index);
         sourceMeshes.bounds(index, shape.low, shape.high);
     };
-    for(int emitter = 0; emitter < sources.numEmitters; ++emitter){
-        place(sources.emitters[emitter]);
+    for(std::vector<FluidShape>* shapes : {&emitterShapes, &sinkShapes, &fluidShapes}){
+        for(FluidShape& shape : *shapes){
+            place(shape);
+        }
     }
-    for(int sink = 0; sink < sources.numSinks; ++sink){
-        place(sources.sinks[sink]);
-    }
-    for(int fluid = 0; fluid < fluids.count; ++fluid){
-        place(fluids.shapes[fluid]);
-    }
+    uploadSources();
 }
 
 //a block per node storing voxels: each face of its voxels inside an emitter, or within a voxel of it, takes the emitter's velocity, so the fluid there

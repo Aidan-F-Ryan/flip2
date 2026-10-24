@@ -1,4 +1,4 @@
-#Copyright 2023 Aberrant Behavior LLC
+#Copyright 2026 Taimen LLC
 
 set(cudaLibraries 
     parallelPrefixSumKernels
@@ -8,6 +8,7 @@ set(cudaLibraries
     perVoxelParticleListFunctions
     voxelSolveFunctions
     conjugateGradientFunctions
+    condensationFunctions
     multigridFunctions
 )
 

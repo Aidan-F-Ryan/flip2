@@ -1,4 +1,4 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 
 #ifndef VOXELSOLVEFUNCTIONS_HU
 #define VOXELSOLVEFUNCTIONS_HU
@@ -43,10 +43,11 @@
     void applyGravity(const CudaVec<char>& solids, CudaVec<float>& voxelsUz, float dt, cudaStream_t stream);
     void removeGravity(const CudaVec<char>& solids, CudaVec<float>& voxelsUz, float dt, cudaStream_t stream);
 
-    //P2G's fixed-point sums (velocityScale and weightScale per unit) to float weights, counts and face velocities. The momentum sums' high digits are
-    //where the velocities go, and their low digits in lowX, lowY and lowZ
+    //P2G's fixed-point sums (velocityScale and weightScale per unit) to float weights, counts, densities and face velocities. The momentum sums' high
+    //digits are where the velocities go, and their low digits in lowX, lowY and lowZ
     void cudaNormalizeVoxelVelocities(const CudaVec<char>& solids, CudaVec<float>& voxelWeightsX, CudaVec<float>& voxelWeightsY, CudaVec<float>& voxelWeightsZ, CudaVec<float>& voxelsUx, CudaVec<float>& voxelsUy, CudaVec<float>& voxelsUz,
-        const CudaVec<float>& lowX, const CudaVec<float>& lowY, const CudaVec<float>& lowZ, CudaVec<float>& particleCounts, float velocityScale, float weightScale, cudaStream_t stream);
+        const CudaVec<float>& lowX, const CudaVec<float>& lowY, const CudaVec<float>& lowZ, CudaVec<float>& particleCounts, CudaVec<float>& particleDensity, float velocityScale, float weightScale,
+        cudaStream_t stream);
 
     void cudaExtrapolateUnreachedFaces(const CudaVec<char>& solveCodes, const CudaVec<uint>& neighborNx, const CudaVec<uint>& neighborPx, const CudaVec<uint>& neighborNy, const CudaVec<uint>& neighborPy, const CudaVec<uint>& neighborNz, const CudaVec<uint>& neighborPz,
         const CudaVec<float>& voxelWeightsX, const CudaVec<float>& voxelWeightsY, const CudaVec<float>& voxelWeightsZ, CudaVec<float>& voxelsUx, CudaVec<float>& voxelsUy, CudaVec<float>& voxelsUz,
@@ -56,7 +57,7 @@
         CudaVec<char>& depth, CudaVec<uint>& freeSurface, PartitionContext& context, cudaStream_t stream);
 
     void cudaCalcDivU(const CudaVec<char>& solveCodes, const CudaVec<uint>& neighborNx, const CudaVec<uint>& neighborPx, const CudaVec<uint>& neighborNy, const CudaVec<uint>& neighborPy, const CudaVec<uint>& neighborNz, const CudaVec<uint>& neighborPz,
-        const CudaVec<float>& voxelsUx, const CudaVec<float>& voxelsUy, const CudaVec<float>& voxelsUz, const CudaVec<float>& particleCounts, const CudaVec<char>& footprintDepth, float restParticlesPerVoxel, float correctionRate,
+        const CudaVec<float>& voxelsUx, const CudaVec<float>& voxelsUy, const CudaVec<float>& voxelsUz, const CudaVec<float>& particleDensity, const CudaVec<char>& footprintDepth, float restParticlesPerVoxel, float correctionRate,
         CudaVec<float>& divU, cudaStream_t stream);
 
     void cudaGetA(const CudaVec<char>& solveCodes, const CudaVec<uint>& neighborNx, const CudaVec<uint>& neighborPx, const CudaVec<uint>& neighborNy, const CudaVec<uint>& neighborPy, const CudaVec<uint>& neighborNz, const CudaVec<uint>& neighborPz,

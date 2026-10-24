@@ -1,4 +1,4 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 
 //Houdini's .bgeo is its JSON geometry schema in its binary JSON encoding (Houdini 12 on). The reference for both is in every Houdini install:
 //$HFS/houdini/public/binary_json/binary_json.py (the encoding) and $HFS/houdini/public/hgeo/hgeo.py (the schema). The file starts with a magic number,
@@ -364,9 +364,10 @@ void writeHeader(BinaryJson& json, uint64_t points, uint64_t vertices, uint64_t 
 }
 
 //a point attribute of size values per point, float32s or with integers int32s, whose values, every point's in order, the caller then writes with raw()
-//before endVector(). kind is what Houdini should take it for, which tells it how transforms and blends treat it: "point" (P), "vector" (v),
-//"nonarithmetic_integer" (id), or nullptr for a plain number
-void beginAttribute(BinaryJson& json, const char* name, uint64_t points, int size, bool integers, const char* kind){
+//before endVector(). kind is what Houdini should take it for, which tells it how transforms and blends treat it: "point" (P), "vector" (v), "normal"
+//(an angular velocity, w), "quaternion" (orient), "nonarithmetic_integer" (id), or nullptr for a plain number. defaults: a new point's value, one for
+//every component or one for all of them
+void beginAttribute(BinaryJson& json, const char* name, uint64_t points, int size, bool integers, const char* kind, const std::vector<double>& defaults = {0.0}){
     json.beginArray();
     json.beginArray();      //the definition
     json.string("scope");
@@ -396,16 +397,18 @@ void beginAttribute(BinaryJson& json, const char* name, uint64_t points, int siz
     json.string("defaults");
     json.beginArray();
     json.string("size");
-    json.integer(1);
+    json.integer((long long)defaults.size());
     json.string("storage");
     json.string(integers ? "int64" : "fpreal64");
     json.string("values");
     json.beginArray();
-    if(integers){
-        json.integer(0);
-    }
-    else{
-        json.real(0.0);
+    for(double value : defaults){
+        if(integers){
+            json.integer((long long)value);
+        }
+        else{
+            json.real(value);
+        }
     }
     json.endArray();
     json.endArray();
@@ -437,13 +440,68 @@ void endVector(BinaryJson& json){
     json.endArray();
 }
 
+//a point attribute of strings, a value per point: each different one once, and every point's index among them, as Houdini lays one out
+void writeStrings(BinaryJson& json, const char* name, const std::vector<std::string>& values){
+    std::vector<std::string> strings;
+    std::vector<long long> indices;
+    for(const std::string& value : values){
+        auto found = std::find(strings.begin(), strings.end(), value);
+        indices.push_back(found - strings.begin());
+        if(found == strings.end()){
+            strings.push_back(value);
+        }
+    }
+    json.beginArray();
+    json.beginArray();      //the definition
+    json.string("scope");
+    json.string("public");
+    json.string("type");
+    json.string("string");
+    json.string("name");
+    json.string(name);
+    json.string("options");
+    json.beginMap();
+    json.endMap();
+    json.endArray();
+    json.beginArray();      //the values
+    json.string("size");
+    json.integer(1);
+    json.string("storage");
+    json.string("int32");
+    json.string("strings");
+    json.beginArray();
+    for(const std::string& text : strings){
+        json.string(text);
+    }
+    json.endArray();
+    json.string("indices");
+    json.beginArray();
+    json.string("size");
+    json.integer(1);
+    json.string("storage");
+    json.string("int32");
+    json.string("arrays");
+    json.beginArray();
+    json.beginArray();
+    for(long long index : indices){
+        json.integer(index);
+    }
+    json.endArray();
+    json.endArray();
+    json.endArray();
+    json.endArray();
+    json.endArray();
 }
 
-//a point cloud: the shards' P and v, id and age where every shard has them, and with whitewater its life, radius, kind and the pscale given
-static bool writePointsBgeo(const std::string& path, const std::vector<const ShardData*>& shards, bool whitewater, float pscale, const std::string& software, std::string& why){
+}
+
+//a point cloud: the shards' P and v, id and age where every shard has them, and with whitewater its life, radius, kind and the pscale given; bubbles
+//(the air's) as the whitewater's are, from their radius: a kind of 2 and a life of 0, and their spread's Sauter mean radius where the shards have it
+static bool writePointsBgeo(const std::string& path, const std::vector<const ShardData*>& shards, bool whitewater, bool bubbles, float pscale, const std::string& software,
+                            std::string& why){
     uint64_t points = 0;
     float low[3] = {INFINITY, INFINITY, INFINITY}, high[3] = {-INFINITY, -INFINITY, -INFINITY};
-    bool ids = true, ages = true;   //written if every shard has them
+    bool ids = true, ages = true, sauters = bubbles;    //written if every shard has them
     for(const ShardData* shard : shards){
         if(shard->particles == 0){  //nothing to check, or to write: a frame before any whitewater is a cloud of no points
             continue;
@@ -455,8 +513,13 @@ static bool writePointsBgeo(const std::string& path, const std::vector<const Sha
         }
         ids = ids && planeOf(*shard, "id", 3) != nullptr;
         ages = ages && planeOf(*shard, "age", 1) != nullptr;
+        sauters = sauters && planeOf(*shard, "sauter", 1) != nullptr;
         if(whitewater && (planeOf(*shard, "kind", 1) == nullptr || planeOf(*shard, "life", 1) == nullptr || planeOf(*shard, "radius", 1) == nullptr)){
             why = "a whitewater shard without float32 kind, life and radius";
+            return false;
+        }
+        if(bubbles && planeOf(*shard, "radius", 1) == nullptr){
+            why = "a bubbles shard without float32 radius";
             return false;
         }
         for(int axis = 0; axis < 3; ++axis){
@@ -509,23 +572,23 @@ static bool writePointsBgeo(const std::string& path, const std::vector<const Sha
                 if(ids){
                     scalar("id", true);
                 }
-                if(whitewater){
-                    beginAttribute(json, "kind", points, 1, true, "nonarithmetic_integer");     //the shards hold it as a float
+                if(whitewater || bubbles){
+                    beginAttribute(json, "kind", points, 1, true, "nonarithmetic_integer");     //the shards hold it as a float; every bubble's is 2
                     for(const ShardData* shard : shards){
-                        const float* plane = (const float*)planeOf(*shard, "kind", 1);
+                        const float* plane = whitewater ? (const float*)planeOf(*shard, "kind", 1) : nullptr;
                         narrow.resize(shard->particles);
                         for(uint64_t particle = 0; particle < shard->particles; ++particle){
-                            narrow[particle] = (int32_t)plane[particle];
+                            narrow[particle] = plane != nullptr ? (int32_t)plane[particle] : 2;
                         }
                         json.raw(narrow.data(), 4*shard->particles);
                     }
                     endVector(json);
                     beginAttribute(json, "life", points, 1, false, nullptr);    //what it has left at the surface: the shards hold that below 0 once it has been there
                     for(const ShardData* shard : shards){
-                        const float* plane = (const float*)planeOf(*shard, "life", 1);
+                        const float* plane = whitewater ? (const float*)planeOf(*shard, "life", 1) : nullptr;
                         tuples.resize(shard->particles);
                         for(uint64_t particle = 0; particle < shard->particles; ++particle){
-                            tuples[particle] = std::fabs(plane[particle]);
+                            tuples[particle] = plane != nullptr ? std::fabs(plane[particle]) : 0.0f;
                         }
                         json.raw(tuples.data(), 4*shard->particles);
                     }
@@ -537,6 +600,9 @@ static bool writePointsBgeo(const std::string& path, const std::vector<const Sha
                     }
                     endVector(json);
                     scalar("radius", false);
+                    if(sauters){
+                        scalar("sauter", false);
+                    }
                 }
             }
             beginVector(json, name, points);
@@ -566,11 +632,15 @@ static bool writePointsBgeo(const std::string& path, const std::vector<const Sha
 }
 
 bool writeParticlesBgeo(const std::string& path, const std::vector<const ShardData*>& shards, const std::string& software, std::string& why){
-    return writePointsBgeo(path, shards, false, 0.0f, software, why);
+    return writePointsBgeo(path, shards, false, false, 0.0f, software, why);
 }
 
 bool writeWhitewaterBgeo(const std::string& path, const std::vector<const ShardData*>& shards, float pscale, const std::string& software, std::string& why){
-    return writePointsBgeo(path, shards, true, pscale, software, why);
+    return writePointsBgeo(path, shards, true, false, pscale, software, why);
+}
+
+bool writeBubblesBgeo(const std::string& path, const std::vector<const ShardData*>& shards, float pscale, const std::string& software, std::string& why){
+    return writePointsBgeo(path, shards, false, true, pscale, software, why);
 }
 
 bool writeSurfaceBgeo(const std::string& path, const SurfaceMesh& mesh, const std::string& software, std::string& why){
@@ -643,6 +713,58 @@ bool writeSurfaceBgeo(const std::string& path, const SurfaceMesh& mesh, const st
             json.endArray();
             json.endArray();
         }
+        json.endArray();
+        json.endArray();
+    });
+}
+
+bool writeBodiesBgeo(const std::string& path, const std::vector<BgeoBody>& bodies, const std::string& software, std::string& why){
+    uint64_t points = bodies.size();
+    float low[3] = {INFINITY, INFINITY, INFINITY}, high[3] = {-INFINITY, -INFINITY, -INFINITY};
+    std::vector<std::string> names;
+    for(const BgeoBody& body : bodies){
+        names.push_back(body.name);
+        for(int axis = 0; axis < 3; ++axis){
+            low[axis] = std::min(low[axis], body.position[axis]);
+            high[axis] = std::max(high[axis], body.position[axis]);
+        }
+    }
+    return writeFile(path, why, [&](BinaryJson& json){
+        json.beginArray();
+        writeHeader(json, points, 0, 0, software, low, high);
+        json.string("topology");
+        json.beginArray();
+        json.string("pointref");
+        json.beginArray();
+        json.string("indices");
+        json.beginArray();
+        json.endArray();
+        json.endArray();
+        json.endArray();
+        json.string("attributes");
+        json.beginArray();
+        json.string("pointattributes");
+        json.beginArray();
+        //in the order RBD Bullet Solver's Simulation Points have them, each tagged as there: w is a normal, so a transform turns it as the axis it is
+        auto floats = [&](const char* name, int size, const char* kind, const std::vector<double>& defaults, auto value){
+            beginAttribute(json, name, points, size, false, kind, defaults);
+            for(const BgeoBody& body : bodies){
+                json.raw(value(body), sizeof(float)*size);
+            }
+            endVector(json);
+        };
+        static const float one[3] = {1.0f, 1.0f, 1.0f};
+        floats("P", 3, "point", {0.0}, [](const BgeoBody& body){ return body.position; });
+        writeStrings(json, "name", names);
+        floats("orient", 4, "quaternion", {0.0, 0.0, 0.0, 1.0}, [](const BgeoBody& body){ return body.orientation; });
+        floats("pivot", 3, nullptr, {0.0}, [](const BgeoBody& body){ return body.pivot; });
+        floats("scale", 3, nullptr, {1.0}, [](const BgeoBody&){ return one; });
+        floats("v", 3, "vector", {0.0}, [](const BgeoBody& body){ return body.velocity; });
+        floats("w", 3, "normal", {0.0}, [](const BgeoBody& body){ return body.angularVelocity; });
+        json.endArray();
+        json.endArray();
+        json.string("primitives");
+        json.beginArray();
         json.endArray();
         json.endArray();
     });

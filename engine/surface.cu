@@ -1,4 +1,4 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 
 //A liquid's surface from its particles, on the GPU (surface.hu), in five passes over compact lists:
 //
@@ -25,7 +25,9 @@
 //so a frame always meshes to the same mesh
 
 #include "surface.hu"
+#include "obstacles.hu"
 #include <algorithm>
+#include <cfloat>
 #include <chrono>
 #include <climits>
 #include <cmath>
@@ -50,9 +52,86 @@ struct Lattice{
     float radius;       //r: each particle's radius
     float outside;      //the field where no particle reaches: R - r, the most it is where one does
     float deep;         //the field deep in the liquid: -r, what it is amid evenly spread particles
+    float wallLow[3], wallHigh[3];  //the domain's walls (MeshWalls)
+    unsigned int walls; //which of its faces are: bits -x, +x, -y, +y, -z, +z
+    Obstacles solids;   //the scene's obstacles where they are (MeshSolids), none with count 0
+    bool overlap;       //whether the surface goes on into them, or stops at theirs
 
     __host__ __device__ Key key(int x, int y, int z) const{
         return (Key)x + (Key)cells.x*((Key)y + (Key)cells.y*(Key)z);
+    }
+    //how far past the walls a point is: the most it's past any of them, negative where it's inside them all (and as far as can be with none)
+    __device__ float pastWalls(float3 p) const{
+        float q[3] = {p.x, p.y, p.z};
+        float past = -FLT_MAX;
+        for(int axis = 0; axis < 3; ++axis){
+            if(walls >> 2*axis & 1){
+                past = fmaxf(past, wallLow[axis] - q[axis]);
+            }
+            if(walls >> (2*axis + 1) & 1){
+                past = fmaxf(past, q[axis] - wallHigh[axis]);
+            }
+        }
+        return past;
+    }
+    //the wall along each axis a point is within reach of: -1 the low one, 1 the high one, 0 neither (the nearer, with both)
+    __device__ void wallsNear(const float q[3], int near[3]) const{
+        for(int axis = 0; axis < 3; ++axis){
+            float below = walls >> 2*axis & 1 ? q[axis] - wallLow[axis] : FLT_MAX;
+            float above = walls >> (2*axis + 1) & 1 ? wallHigh[axis] - q[axis] : FLT_MAX;
+            near[axis] = below < reach && below <= above ? -1 : above < reach ? 1 : 0;
+        }
+    }
+    //the obstacle a particle is outside of and within reach of, and its mirror image across that one's surface (along the normal, as far again inside
+    //as the particle is outside): when the image is inside it at least half as deep as the particle is out, which by a wall thinner than a reach it
+    //isn't, and the image would put liquid by the wall's far side, dry or not
+    __device__ bool solidImage(float3 q, float3& image, float3& normal, float& distance, int& which) const{
+        if(solids.count == 0){
+            return false;
+        }
+        which = nearestObstacle(solids, q, distance, normal);
+        if(which < 0 || !(distance > 0.0f) || !(distance < reach)){
+            return false;
+        }
+        image = make_float3(q.x - 2.0f*distance*normal.x, q.y - 2.0f*distance*normal.y, q.z - 2.0f*distance*normal.z);
+        float3 inward;
+        return obstacleDistance(solids.items[which], image, inward) <= -0.5f*distance;
+    }
+    //whether an obstacle's surface passes through the cell or the cells beside it, by the distance at its centre
+    __device__ bool besideSolid(int3 c) const{
+        if(solids.count == 0){
+            return false;
+        }
+        float3 centre = make_float3(origin.x + (c.x + 0.5f)*cellSize, origin.y + (c.y + 0.5f)*cellSize, origin.z + (c.z + 0.5f)*cellSize);
+        float distance;
+        float3 normal;
+        return nearestObstacle(solids, centre, distance, normal) >= 0 && fabsf(distance) < 1.9f*cellSize;   //sqrt(3)/2 of a cell, and one more
+    }
+    //how far a sample is outside the liquid by the walls and the obstacles: past a wall, or inside an obstacle deeper than a reach with overlap, or at
+    //all without; as far as can be where neither says
+    __device__ float pastSolids(float3 p) const{
+        float past = pastWalls(p);
+        if(solids.count > 0){
+            float distance;
+            float3 normal;
+            if(nearestObstacle(solids, p, distance, normal) >= 0){
+                past = fmaxf(past, overlap ? -distance - reach : -distance);
+            }
+        }
+        return past;
+    }
+    //whether a wall's plane passes through the cell or the cells beside it: the particles' mirror images are within reach of the wall, so no cell further
+    //off it, either way, has any
+    __device__ bool besideWall(int3 c) const{
+        int at[3] = {c.x, c.y, c.z};
+        float first[3] = {origin.x, origin.y, origin.z};
+        for(int axis = 0; axis < 3; ++axis){
+            float low = first[axis] + (at[axis] - 1)*cellSize, high = first[axis] + (at[axis] + 2)*cellSize;
+            if(((walls >> 2*axis & 1) && wallLow[axis] >= low && wallLow[axis] <= high) || ((walls >> (2*axis + 1) & 1) && wallHigh[axis] >= low && wallHigh[axis] <= high)){
+                return true;
+            }
+        }
+        return false;
     }
     __device__ int3 cell(Key key) const{
         return make_int3((int)(key % (Key)cells.x), (int)(key / (Key)cells.x % (Key)cells.y), (int)(key / ((Key)cells.x*(Key)cells.y)));
@@ -78,6 +157,73 @@ __device__ inline int findKey(const Key* keys, int count, Key key){
         }
     }
     return low < count && keys[low] == key ? low : -1;
+}
+
+// ---- 0: the particles' mirror images across the walls and the obstacles ----
+
+//how many mirror images each particle has: one across each wall within its reach, and across each two of them and all three, by an edge or a corner;
+//and one across the obstacle it's nearest, within its reach (Lattice::solidImage)
+__global__ void countMirrors(int count, const float* x, const float* y, const float* z, Lattice lattice, unsigned int* counts){
+    int i = threadIdx.x + blockIdx.x*blockDim.x;
+    if(i < count){
+        float q[3] = {x[i], y[i], z[i]};
+        int near[3];
+        lattice.wallsNear(q, near);
+        int walls = (near[0] != 0) + (near[1] != 0) + (near[2] != 0);
+        float3 image, normal;
+        float distance;
+        int which;
+        counts[i] = (1u << walls) - 1u + (lattice.solidImage(make_float3(q[0], q[1], q[2]), image, normal, distance, which) ? 1u : 0u);
+    }
+}
+
+//the particles' positions and velocities as planes of total each, the particles first and then their mirror images, each one's after those of the
+//particles before it (first: its counts summed before it). An image's velocity is its particle's with the part into each wall it's across reversed,
+//and across an obstacle, the part into the obstacle of its velocity against the obstacle's there
+__global__ void writeMirrors(int count, const float* planes, Lattice lattice, const unsigned int* first, size_t total, float* mirrored){
+    int i = threadIdx.x + blockIdx.x*blockDim.x;
+    if(i >= count){
+        return;
+    }
+    float q[3], u[3];
+    for(int axis = 0; axis < 3; ++axis){
+        q[axis] = planes[axis*(size_t)count + i];
+        u[axis] = planes[(3 + axis)*(size_t)count + i];
+        mirrored[axis*total + i] = q[axis];
+        mirrored[(3 + axis)*total + i] = u[axis];
+    }
+    int near[3];
+    lattice.wallsNear(q, near);
+    size_t at = count + (size_t)first[i];
+    for(int across = 1; across < 8; ++across){     //bit a: across the wall along axis a
+        bool any = true;
+        for(int axis = 0; axis < 3; ++axis){
+            any = any && (!(across >> axis & 1) || near[axis] != 0);
+        }
+        if(!any){
+            continue;
+        }
+        for(int axis = 0; axis < 3; ++axis){
+            bool flip = across >> axis & 1;
+            float wall = near[axis] < 0 ? lattice.wallLow[axis] : lattice.wallHigh[axis];
+            mirrored[axis*total + at] = flip ? 2.0f*wall - q[axis] : q[axis];
+            mirrored[(3 + axis)*total + at] = flip ? -u[axis] : u[axis];
+        }
+        ++at;
+    }
+    float3 image, normal;
+    float distance;
+    int which;
+    if(lattice.solidImage(make_float3(q[0], q[1], q[2]), image, normal, distance, which)){
+        float3 surface = make_float3(q[0] - distance*normal.x, q[1] - distance*normal.y, q[2] - distance*normal.z);
+        float3 solid = obstacleVelocity(lattice.solids.items[which], surface);
+        float into = (u[0] - solid.x)*normal.x + (u[1] - solid.y)*normal.y + (u[2] - solid.z)*normal.z;
+        const float position[3] = {image.x, image.y, image.z}, direction[3] = {normal.x, normal.y, normal.z};
+        for(int axis = 0; axis < 3; ++axis){
+            mirrored[axis*total + at] = position[axis];
+            mirrored[(3 + axis)*total + at] = u[axis] - 2.0f*into*direction[axis];
+        }
+    }
 }
 
 // ---- 1: cells ----
@@ -106,14 +252,16 @@ __global__ void gatherParticles(int count, const unsigned int* order, const floa
 
 // ---- 2: the band ----
 
-//each occupied cell with an empty neighbour puts itself and its 26 neighbours forward for the band; the rest put forward nothing
+//each occupied cell with an empty neighbour puts itself and its 26 neighbours forward for the band; the rest put forward nothing. So does every
+//occupied cell beside a wall or an obstacle's surface, which is cut through the band's field there: taken as deep instead, its samples past the wall
+//or inside the obstacle would be liquid
 __global__ void markBand(int occupiedCount, const Key* occupied, Lattice lattice, Key* candidates){
     int i = threadIdx.x + blockIdx.x*blockDim.x;
     if(i >= occupiedCount){
         return;
     }
     int3 c = lattice.cell(occupied[i]);
-    bool edge = false;
+    bool edge = lattice.besideWall(c) || lattice.besideSolid(c);
     for(int n = 0; n < 27 && !edge; ++n){
         int x = c.x + n % 3 - 1, y = c.y + n / 3 % 3 - 1, z = c.z + n / 9 - 1;
         edge = !lattice.contains(x, y, z) || findKey(occupied, occupiedCount, lattice.key(x, y, z)) < 0;
@@ -273,6 +421,17 @@ __global__ void dilateCells(int occupiedCount, const Key* occupied, Lattice latt
             }
         }
     }
+}
+
+//the field past the walls is outside the liquid, and so is the field inside an obstacle, deeper than a reach with overlap: at each sample, the most of
+//the field and how far past those it is (Lattice::pastSolids), so that where liquid reaches a wall the surface is the wall's plane
+__global__ void cutAtSolids(const Key* cells, Lattice lattice, float* field){
+    int3 c = lattice.cell(cells[blockIdx.x]);
+    int3 local = localSample(lattice.side);
+    float3 p = make_float3(lattice.origin.x + lattice.h*(c.x*lattice.side + local.x), lattice.origin.y + lattice.h*(c.y*lattice.side + local.y),
+                           lattice.origin.z + lattice.h*(c.z*lattice.side + local.z));
+    size_t at = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
+    field[at] = fmaxf(field[at], lattice.pastSolids(p));
 }
 
 // ---- 4: smoothing ----
@@ -601,7 +760,9 @@ struct Buffer{
 }
 
 struct SurfaceMesher::Buffers{
-    Buffer<float> planes;               //positions then velocities, x, y and z planes
+    Buffer<float> given;                //the particles as given, with walls: positions then velocities, x, y and z planes
+    Buffer<unsigned int> mirrors;       //and how many mirror images each has, summed before each
+    Buffer<float> planes;               //positions then velocities, x, y and z planes: with walls, the particles' mirror images after them
     Buffer<Key> keys, sortedKeys;
     Buffer<unsigned int> order, sortedOrder;
     Buffer<float4> positions, particleVelocities;
@@ -702,8 +863,8 @@ std::string SurfaceSettings::problem() const{
     return "";
 }
 
-void SurfaceMesher::mesh(const float* positionPlanes, const float* velocityPlanes, unsigned long long count, const float low[3], const float high[3],
-                         const SurfaceSettings& settings, SurfaceMesh& out){
+void SurfaceMesher::mesh(const float* positionPlanes, const float* velocityPlanes, unsigned long long count, const float particlesLow[3], const float particlesHigh[3],
+                         const SurfaceSettings& settings, SurfaceMesh& out, const MeshWalls& walls, const MeshSolids& solids){
     auto began = std::chrono::steady_clock::now();
     out.points.clear();
     out.velocities.clear();
@@ -732,6 +893,24 @@ void SurfaceMesher::mesh(const float* positionPlanes, const float* velocityPlane
     lattice.reach = std::min(lattice.reach, lattice.cellSize);     //what reaches a cell's samples has to be in it or its neighbours
     lattice.outside = lattice.reach - lattice.radius;
     lattice.deep = -lattice.radius;
+    lattice.walls = walls.closed & 63u;
+    lattice.solids = solids.obstacles != nullptr ? *solids.obstacles : Obstacles();
+    lattice.overlap = solids.overlap;
+    bool mirrored = lattice.walls != 0 || lattice.solids.count > 0;
+    float low[3], high[3];  //the particles' bounds, and their mirror images' within reach past the walls (those inside obstacles are within the reach
+                            //of particles, which the lattice's two empty cells round them hold)
+    for(int axis = 0; axis < 3; ++axis){
+        lattice.wallLow[axis] = walls.low[axis];
+        lattice.wallHigh[axis] = walls.high[axis];
+        low[axis] = particlesLow[axis];
+        high[axis] = particlesHigh[axis];
+        if((lattice.walls >> 2*axis & 1) && low[axis] < walls.low[axis] + lattice.reach){
+            low[axis] = std::min(low[axis], walls.low[axis] - lattice.reach);
+        }
+        if((lattice.walls >> (2*axis + 1) & 1) && high[axis] > walls.high[axis] - lattice.reach){
+            high[axis] = std::max(high[axis], walls.high[axis] + lattice.reach);
+        }
+    }
     double cellCount = 1.0;
     int extent[3];
     float origin[3];
@@ -749,17 +928,43 @@ void SurfaceMesher::mesh(const float* positionPlanes, const float* velocityPlane
     const int threads = 256;
     int n = (int)count;
 
-    // 1: cells
-    float* planes = b.planes.hold(6*count);
-    check(cudaMemcpy(planes, positionPlanes, sizeof(float)*3*count, cudaMemcpyHostToDevice), "copying positions");
-    check(cudaMemcpy(planes + 3*count, velocityPlanes, sizeof(float)*3*count, cudaMemcpyHostToDevice), "copying velocities");
-    this->count = count;
+    // 0: the particles, and with walls their mirror images
+    size_t total = count;
+    if(!mirrored){
+        float* planes = b.planes.hold(6*count);
+        check(cudaMemcpy(planes, positionPlanes, sizeof(float)*3*count, cudaMemcpyHostToDevice), "copying positions");
+        check(cudaMemcpy(planes + 3*count, velocityPlanes, sizeof(float)*3*count, cudaMemcpyHostToDevice), "copying velocities");
+    }
+    else{
+        float* staged = b.given.hold(6*count);
+        check(cudaMemcpy(staged, positionPlanes, sizeof(float)*3*count, cudaMemcpyHostToDevice), "copying positions");
+        check(cudaMemcpy(staged + 3*count, velocityPlanes, sizeof(float)*3*count, cudaMemcpyHostToDevice), "copying velocities");
+        unsigned int* firsts = b.mirrors.hold(count + 1);
+        countMirrors<<<(n + threads - 1) / threads, threads>>>(n, staged, staged + count, staged + 2*count, lattice, firsts);
+        check(cudaMemset(firsts + count, 0, sizeof(unsigned int)), "the mirror images' counts");
+        int listed = n + 1;
+        b.run([&](void* scratch, size_t& bytes){
+            return cub::DeviceScan::ExclusiveSum(scratch, bytes, firsts, listed);
+        });
+        unsigned int images = 0;
+        check(cudaMemcpy(&images, firsts + count, sizeof(unsigned int), cudaMemcpyDeviceToHost), "counting mirror images");
+        total = count + images;
+        if(total > (size_t)INT_MAX){
+            throw std::runtime_error("too many particles to mesh in one piece, with their mirror images across the walls");
+        }
+        writeMirrors<<<(n + threads - 1) / threads, threads>>>(n, staged, lattice, firsts, total, b.planes.hold(6*total));
+    }
+    this->count = total;
     surface = settings;
+    this->walls = walls;
+    this->solids = solids;
     for(int axis = 0; axis < 3; ++axis){
         this->low[axis] = low[axis];
         this->high[axis] = high[axis];
     }
-    int occupiedCount = b.sortIntoCells(lattice, n, keyBits);
+
+    // 1: cells
+    int occupiedCount = b.sortIntoCells(lattice, (int)total, keyBits);
     Key* occupied = b.occupied.data;
     int* counts = b.counts.data;
     int* starts = b.starts.data;
@@ -810,6 +1015,9 @@ void SurfaceMesher::mesh(const float* positionPlanes, const float* velocityPlane
         for(int pass = 0; pass < settings.smoothing; ++pass){
             smoothField<<<bandCount, perCell>>>(neighbours, lattice, field, spare);
             std::swap(field, spare);
+        }
+        if(mirrored){
+            cutAtSolids<<<bandCount, perCell>>>(band, lattice, field);
         }
         if(rounds == MOST_ROUNDS){
             break;
@@ -899,6 +1107,14 @@ void SurfaceMesher::fields(const FieldSettings& settings, FluidFields& out){
     lattice.reach = std::min(lattice.reach, lattice.cellSize);
     lattice.outside = lattice.reach - lattice.radius;
     lattice.deep = -lattice.radius;
+    lattice.walls = walls.closed & 63u;
+    for(int axis = 0; axis < 3; ++axis){
+        lattice.wallLow[axis] = walls.low[axis];
+        lattice.wallHigh[axis] = walls.high[axis];
+    }
+    lattice.solids = solids.obstacles != nullptr ? *solids.obstacles : Obstacles();
+    lattice.overlap = false;    //cut at the obstacles, whatever the mesh does: carried into a body, the level set has what reads it (Houdini's whitewater,
+                                //the bubbles' grid) take the body's inside for liquid
     int passes = (int)std::ceil(settings.halfWidth);
     int rings = (int)std::ceil((lattice.reach + passes*lattice.h) / lattice.cellSize);   //cells past the occupied ones: room for the velocity carried on
     int first[3], extent[3];
@@ -952,6 +1168,9 @@ void SurfaceMesher::fields(const FieldSettings& settings, FluidFields& out){
     float4* spare = b.spareVelocities.hold(samples);
     evaluateField<<<cellsFound, perCell>>>(cells, occupiedCount, b.occupied.data, b.starts.data, b.counts.data, b.positions.data, b.particleVelocities.data,
                                            lattice, field, velocities);
+    if(lattice.walls != 0 || lattice.solids.count > 0){     //the surface against the walls and the obstacles, as the mesh has it
+        cutAtSolids<<<cellsFound, perCell>>>(cells, lattice, field);
+    }
     for(int pass = 0; pass < passes; ++pass){
         extendVelocity<<<cellsFound, perCell>>>(neighbours, lattice, velocities, spare);
         std::swap(velocities, spare);

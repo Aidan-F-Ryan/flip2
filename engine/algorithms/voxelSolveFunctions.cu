@@ -1,4 +1,4 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 
 #include "voxelSolveFunctions.hu"
 #include "multigridFunctions.hu"    //Stencil: an unknown's row, and its product
@@ -37,8 +37,8 @@ void removeGravity(const CudaVec<char>& solids, CudaVec<float>& voxelsUy, float 
 //integer's: 71 us for this kernel against 52, at 370k particles.) A face every particle reaches at one velocity gets that velocity, to the bit,
 //whatever its weight; one no share reaches has none (0, until it's extrapolated)
 __global__ void normalizeVoxelVelocities(uint numUsedVoxels, const char* solids, float* weightsX, float* weightsY, float* weightsZ, float* ux, float* uy, float* uz,
-                                         const unsigned int* lowX, const unsigned int* lowY, const unsigned int* lowZ, float* particleCounts, double unscaleVelocity,
-                                         float unscaleWeight){
+                                         const unsigned int* lowX, const unsigned int* lowY, const unsigned int* lowZ, float* particleCounts, float* particleDensity,
+                                         double unscaleVelocity, float unscaleWeight){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
     if(index < numUsedVoxels){
         float* weights[3] = {weightsX, weightsY, weightsZ};
@@ -57,13 +57,16 @@ __global__ void normalizeVoxelVelocities(uint numUsedVoxels, const char* solids,
             velocities[dim][index] = velocity;
         }
         particleCounts[index] = ((int*)particleCounts)[index];
+        particleDensity[index] = ((int*)particleDensity)[index]*unscaleWeight;
     }
 }
 
 void cudaNormalizeVoxelVelocities(const CudaVec<char>& solids, CudaVec<float>& voxelWeightsX, CudaVec<float>& voxelWeightsY, CudaVec<float>& voxelWeightsZ, CudaVec<float>& voxelsUx, CudaVec<float>& voxelsUy, CudaVec<float>& voxelsUz,
-    const CudaVec<float>& lowX, const CudaVec<float>& lowY, const CudaVec<float>& lowZ, CudaVec<float>& particleCounts, float velocityScale, float weightScale, cudaStream_t stream){
+    const CudaVec<float>& lowX, const CudaVec<float>& lowY, const CudaVec<float>& lowZ, CudaVec<float>& particleCounts, CudaVec<float>& particleDensity, float velocityScale, float weightScale,
+    cudaStream_t stream){
     normalizeVoxelVelocities<<<solids.size() / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(solids.size(), solids.devPtr(), voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr(),
-        (const unsigned int*)lowX.devPtr(), (const unsigned int*)lowY.devPtr(), (const unsigned int*)lowZ.devPtr(), particleCounts.devPtr(), 1.0/(double)velocityScale, 1.0f/weightScale);
+        (const unsigned int*)lowX.devPtr(), (const unsigned int*)lowY.devPtr(), (const unsigned int*)lowZ.devPtr(), particleCounts.devPtr(), particleDensity.devPtr(), 1.0/(double)velocityScale,
+        1.0f/weightScale);
 }
 
 //P2G leaves the faces no particle reaches at 0, and on the edge of the fluid the pressure solve would then drag on every surface moving outward, speeding
@@ -141,25 +144,29 @@ __global__ void extrapolateAirFaces(uint numUsedVoxels, const char* solveCodes, 
 void cudaExtrapolateUnreachedFaces(const CudaVec<char>& solveCodes, const CudaVec<uint>& neighborNx, const CudaVec<uint>& neighborPx, const CudaVec<uint>& neighborNy, const CudaVec<uint>& neighborPy, const CudaVec<uint>& neighborNz, const CudaVec<uint>& neighborPz,
     const CudaVec<float>& voxelWeightsX, const CudaVec<float>& voxelWeightsY, const CudaVec<float>& voxelWeightsZ, CudaVec<float>& voxelsUx, CudaVec<float>& voxelsUy, CudaVec<float>& voxelsUz,
     PartitionContext& context, cudaStream_t stream){
-    if(solveCodes.size() == 0){
-        return;
-    }
+    uint numVoxels = solveCodes.size();     //none in a partition the fluid hasn't reached, which still takes its turn in the ghosts' exchanges below
     unsigned char* marks;
-    gpuErrchk(cudaMallocAsync((void**)&marks, solveCodes.size(), stream));
+    gpuErrchk(cudaMallocAsync((void**)&marks, numVoxels > 0 ? numVoxels : 1, stream));
     for(int pass = 0; pass < EXTRAPOLATION_PASSES; ++pass){
-        extrapolateUnreachedFaces<<<solveCodes.size() / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(solveCodes.size(), solveCodes.devPtr(), neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(), neighborPy.devPtr(), neighborNz.devPtr(), neighborPz.devPtr(),
-            voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), pass == 0, marks, voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr());
+        if(numVoxels > 0){
+            extrapolateUnreachedFaces<<<numVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numVoxels, solveCodes.devPtr(), neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(), neighborPy.devPtr(), neighborNz.devPtr(), neighborPz.devPtr(),
+                voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), pass == 0, marks, voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr());
+        }
         for(CudaVec<float>* velocity : {&voxelsUx, &voxelsUy, &voxelsUz}){
             context.fillGhosts(velocity->devPtr(), stream);
         }
         if(pass + 1 < EXTRAPOLATION_PASSES){    //and the ghosts' marks, as their owners have them, for the next pass
-            settleFaceMarks<<<solveCodes.size() / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(solveCodes.size(), marks);
+            if(numVoxels > 0){
+                settleFaceMarks<<<numVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numVoxels, marks);
+            }
             context.fillGhosts((char*)marks, stream);
         }
     }
     gpuErrchk(cudaFreeAsync(marks, stream));
-    extrapolateAirFaces<<<solveCodes.size() / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(solveCodes.size(), solveCodes.devPtr(), neighborNx.devPtr(), neighborNy.devPtr(), neighborNz.devPtr(),
-        voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr());
+    if(numVoxels > 0){
+        extrapolateAirFaces<<<numVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numVoxels, solveCodes.devPtr(), neighborNx.devPtr(), neighborNy.devPtr(), neighborNz.devPtr(),
+            voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr());
+    }
     for(CudaVec<float>* velocity : {&voxelsUx, &voxelsUy, &voxelsUz}){
         context.fillGhosts(velocity->devPtr(), stream);
     }
@@ -209,7 +216,7 @@ void cudaFindFootprintDepth(const CudaVec<char>& solveCodes, const CudaVec<uint>
 //velocities sit on each voxel's negative faces, so an unknown's divergence reads its own three faces and its upper neighbours' (owning) copies;
 //wall faces carry no flow and faces nothing stores read as 0
 __global__ void calculateDivU(uint numUsedVoxels, const char* solveCodes, const uint* neighborNx, const uint* neighborPx, const uint* neighborNy, const uint* neighborPy, const uint* neighborNz, const uint* neighborPz,
-                                const float* ux, const float* uy, const float* uz, const float* particleCounts, const char* footprintDepth, float restParticlesPerVoxel, float correctionRate, float* divU){
+                                const float* ux, const float* uy, const float* uz, const float* particleDensity, const char* footprintDepth, float restParticlesPerVoxel, float correctionRate, float* divU){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
     if(index < numUsedVoxels){
         float divergence = 0.0f;
@@ -223,15 +230,16 @@ __global__ void calculateDivU(uint numUsedVoxels, const char* solveCodes, const 
         }
         if(footprintDepth[index] >= CORRECTION_DEPTH){  //the solve can't see particles bunching up or spreading out, so ask it for the divergence that restores the rest density
             const uint* neighbors[6] = {neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz};
-            //the voxel weighs half and its neighbours 1/12 each: an even average over the 7 reads a checkerboard of dense and sparse voxels with its sign
-            //flipped, so the correction would feed it and clump particles into every other voxel. These weights never flip a pattern's sign
-            float count = 6.0f*particleCounts[index];
+            //the density P2G measured at the centres (particleDensity), the voxel's weighing half and its neighbours' 1/12 each: an even average over
+            //the 7 reads a checkerboard of dense and sparse voxels with its sign flipped, so the correction would feed it and clump particles into every
+            //other voxel. These weights never flip a pattern's sign
+            float count = 6.0f*particleDensity[index];
             float weight = 6.0f;
             #pragma unroll
             for(int face = 0; face < 6; ++face){
                 uint neighbor = neighbors[face][index];
                 if(neighbor < WALL_VOXEL){
-                    count += particleCounts[neighbor];
+                    count += particleDensity[neighbor];
                     weight += 1.0f;
                 }
             }
@@ -242,10 +250,10 @@ __global__ void calculateDivU(uint numUsedVoxels, const char* solveCodes, const 
 }
 
 void cudaCalcDivU(const CudaVec<char>& solveCodes, const CudaVec<uint>& neighborNx, const CudaVec<uint>& neighborPx, const CudaVec<uint>& neighborNy, const CudaVec<uint>& neighborPy, const CudaVec<uint>& neighborNz, const CudaVec<uint>& neighborPz,
-    const CudaVec<float>& voxelsUx, const CudaVec<float>& voxelsUy, const CudaVec<float>& voxelsUz, const CudaVec<float>& particleCounts, const CudaVec<char>& footprintDepth, float restParticlesPerVoxel, float correctionRate,
+    const CudaVec<float>& voxelsUx, const CudaVec<float>& voxelsUy, const CudaVec<float>& voxelsUz, const CudaVec<float>& particleDensity, const CudaVec<char>& footprintDepth, float restParticlesPerVoxel, float correctionRate,
     CudaVec<float>& divU, cudaStream_t stream){
     calculateDivU<<<divU.size() / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(divU.size(), solveCodes.devPtr(), neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(), neighborPy.devPtr(), neighborNz.devPtr(), neighborPz.devPtr(),
-        voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr(), particleCounts.devPtr(), footprintDepth.devPtr(), restParticlesPerVoxel, correctionRate, divU.devPtr());
+        voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr(), particleDensity.devPtr(), footprintDepth.devPtr(), restParticlesPerVoxel, correctionRate, divU.devPtr());
 }
 
 //one face of an unknown's pressure equation: -scale towards a neighbouring unknown, and scale on the diagonal unless the face is a wall (anything else is air, pinned at p = 0)

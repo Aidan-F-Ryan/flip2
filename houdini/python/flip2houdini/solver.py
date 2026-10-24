@@ -8,14 +8,21 @@ Its inputs are geometry, as Houdini's own FLIP Solver takes it:
     4 Sinks        closed surfaces that remove the fluid inside them
 
 Each input is one object, or with a "name" primitive attribute, one per name. A collision object's geometry can carry its own settings, as primitive
-attributes with one value per object: flip2_friction, flip2_hold (0 or 1) and flip2_thickness; without them it gets the Collisions tab's. Packed
+attributes with one value per object: flip2_friction, flip2_hold (0 or 1) and flip2_thickness, and what RBD pieces meet in it, flip2_bounce and
+flip2_contactfriction; without them it gets the Collisions tab's and the RBD tab's. Packed
 geometry is unpacked, every primitive turned into polygons and the polygons into triangles. An object is sampled every frame of the range, and goes to flip2 as what it does: still, its vertices once; moving rigidly (no
 vertex further than a hundredth of a voxel from where a turn and a shift put it), its vertices once and a transform per frame, which flip2 turns it
-through exactly; or deforming, its vertices every frame, which flip2 re-voxelizes between, so its points and triangles mustn't change. flip2 takes 16
-collisions: with more names than that, the still ones go as one object, and if need be the moving ones as another.
+through exactly; or deforming, its vertices every frame, which flip2 re-voxelizes between, so its points and triangles mustn't change. flip2 takes
+any number of collisions, each named object on its own.
 
 VDBs in the Collisions input stay volumes: a level set that's still (with a velocity VDB beside it, if there is one: named after it with "vel" on the
 end, or "vel" or "v") or moved rigidly goes to flip2 as it is. One that changes shape over time flip2 can't take yet.
+
+RBD pieces come from a SOP named on the RBD tab (a subnet has only the four inputs), as RBD Bullet Solver's Geometry input takes them: packed
+pieces with a name each, and its point attributes meaning what they mean to it (active, density or mass, friction, bounce, v, w; its defaults without
+them). flip2 simulates the active ones with the liquid, two-way: each piece moves the liquid as the liquid moves it, and they collide with each other,
+the walls and the collisions, Collision Substeps times a frame at least. The others collide, as the Collisions input's objects do. flip2 simulates
+any number of pieces, as many as fit in the GPU's memory.
 
 Forces are set on the Forces tab, 16 in all. Force Fields are made there: a point that pulls the fluid in or pushes it out, a vortex that swirls it
 around an axis, turbulence that stirs it, or wind that drags its surface along. Force Volumes come from a SOP too, but one named on the tab, as a
@@ -28,11 +35,17 @@ running bake commits frames to, and export/houdini/ beside it) and logs/. The ba
 surface, its particles or both (Show).
 
 The surface is meshed on the GPU as each frame is committed (flip2 mesh, beside flip2 export), with the Surface tab's settings: closed quads facing
-outwards, their points carrying v for motion blur. Mesh Bake meshes a bake's frames again, with other settings or after a bake made without them.
+outwards, their points carrying v for motion blur, flat against the domain's walls, and carried on into the collisions and RBD pieces where the water
+touches them (or cut at their surfaces: Water at Collisions). Mesh Bake meshes a bake's frames again, with other settings or after a bake made without
+them.
 
-Its outputs: 1, the bake's surface, particles or both (Show); 2, its fluid fields, with Output Fluid Fields (surface, a level set, and vel, as Houdini's
-FLIP outputs them); 3, the domain, and 4, the collisions, both as Houdini's own FLIP nodes make them from the domain and the Collisions input. Outputs 2
-to 4 are what Whitewater Source takes as its Liquid Simulation, Container and Collisions: flip2 Whitewater (whitewater.py) sets Houdini's up on them.
+Its outputs: 1, the bake's surface, particles or both (Show); 2, its fluid fields, with Output Fluid Fields or a bake whose air's bubbles fly
+(surface, a level set, and vel, as Houdini's FLIP outputs them, and with air bubbles, the light they scatter, which they render from); 3, the domain, and 4, the collisions, both as Houdini's own FLIP nodes make them from the domain, the Collisions input and the RBD
+pieces where they've been moved. Outputs 2 to 4 are what Whitewater Source takes as its Liquid Simulation, Container and Collisions: flip2 Whitewater
+(whitewater.py) sets Houdini's up on them. 5, the bake's own whitewater, and with air the air's own bubbles as whitewater bubbles (kind 2): the air
+mixed into the liquid finer than its voxels. 6 and 7 are as RBD Bullet Solver's Geometry and Simulation Points outputs: the
+RBD pieces moved where flip2 moved them (the simulated ones by Transform Pieces from the start frame; the others as the geometry has them), and the
+points that moved them, one per piece with name, P, orient, pivot, scale, v and w.
 
 Bake On picks where flip2 runs: this machine, or another over ssh (a GPU box, for a Mac). A remote bake sends scene.json and geo/ to the remote
 directory, runs there detached (remote/job.sh), and is mirrored back every couple of seconds (remote/mirror.sh): its logs, its cache.json and its
@@ -75,8 +88,11 @@ VOLUMES = 'if(primintrinsic(0, "typename", @primnum) != "VDB") removeprim(0, @pr
 VECTORS = 'if(!match("vec3*", primintrinsic(0, "vdb_value_type", @primnum))) removeprim(0, @primnum, 1);'     #of VDBs, only those of vectors
 VOLUME_FILE = "collision_volumes.vdb"
 FORCE_FILE = "force_volumes.vdb"
-LIMIT = 16      #the obstacles flip2 takes, and the meshes among its fluids, emitters and sinks
-SETTINGS = (("friction", "flip2_friction", float), ("hold", "flip2_hold", int), ("thickness", "flip2_thickness", float))  #a collision object's own, as primitive attributes
+MESH_VERTICES = "meshes_vertices.npy"       #every object's vertices where it starts, one after another (_Packer)
+MESH_TRIANGLES = "meshes_triangles.npy"     #and their triangles, each numbering its own vertices from 0
+DEFORMING_FILE = "deforming_f%d.npy"        #every deforming object's vertices at a frame
+SETTINGS = (("friction", "flip2_friction", float), ("hold", "flip2_hold", int), ("thickness", "flip2_thickness", float),    #a collision object's own,
+            ("bounce", "flip2_bounce", float), ("contactFriction", "flip2_contactfriction", float))                                 #as primitive attributes
 FORCE_LIMIT = 16    #and the forces
 FIELD_TYPES = ("point", "vortex", "turbulence", "wind")     #the Forces tab's force fields, as the scene names them
 FIELD_SETTINGS = {  #each one's scene keys, and the parameters of a Force Fields instance they come from
@@ -88,7 +104,19 @@ FIELD_SETTINGS = {  #each one's scene keys, and the parameters of a Force Fields
 SURFACE_DEFAULTS = {"influencescale": (3.0,), "radiusscale": (0.8,), "smoothing": (4,)}     #flip2 mesh's own
 OLD_SURFACE_DEFAULTS = {"influencescale": 2.0, "radiusscale": 0.6, "smoothing": 2}         #what they were, which left the surface dimpled
 _jobs = {}      #per node path, its bake's processes, while this session runs them
-GEO_FILE = re.compile(r"^((%s)\d+_(triangles|vertices|f-?\d+)\.npy|(collision|force)_volumes\.vdb)$" % "|".join(ROLES))    #the files write_scene writes into geo/
+#the files write_scene writes into geo/, and the ones an object each it wrote before it packed them
+GEO_FILE = re.compile(r"^((%s)\d+_(triangles|vertices|f-?\d+)\.npy|meshes_(vertices|triangles)\.npy|deforming_f-?\d+\.npy|(collision|force)_volumes\.vdb)$"
+                      % "|".join(ROLES + ("rbd",)))
+RBD_DEFAULTS = {"density": 1000.0, "friction": 1.0, "bounce": 0.25}     #RBD Bullet Solver's, for a piece without the attribute
+CONTACT_DEFAULTS = {"bounce": 0.5, "contactFriction": 1.0}  #and for its collisions and ground plane, which the engine takes when a scene gives none
+PIECE_TAG = '''//a packed piece's name, as a point attribute or its primitive's, which unpacking hands its geometry
+string piece = point(0, "name", @ptnum);
+if(!haspointattrib(0, "name")){
+    int prims[] = pointprims(0, @ptnum);
+    piece = len(prims) > 0 ? prim(0, "name", prims[0]) : "";
+}
+s@flip2_piece = piece;
+'''
 
 
 def _callback(function):
@@ -175,14 +203,16 @@ def _interface(node):
     simulation.addParmTemplate(hou.IntParmTemplate("startframe", "Start Frame", 1, default_expression=("$FSTART",)))
     simulation.addParmTemplate(hou.IntParmTemplate("endframe", "End Frame", 1, default_expression=("$FEND",)))
     simulation.addParmTemplate(hou.MenuParmTemplate("transfer", "Velocity Transfer", ("flip", "apic"), ("FLIP (Splashy)", "APIC (Swirly)"), default_value=0))
-    simulation.addParmTemplate(hou.MenuParmTemplate("freesurface", "Free Surface", ("footprint", "sharp"), ("Footprint (Calm, Fast)", "Sharp (Accurate Surface)"),
-                                                    default_value=0, disable_when="{ phases == 1 }",
-                                                    help="Where the pressure solve puts the liquid's surface. Footprint: a voxel or so outside the particles, which "
-                                                         "settles quickly and damps small waves. Sharp: at the particles' own surface (ghost fluid), so drops "
-                                                         "oscillate and waves travel at the right speed and the liquid keeps its volume better, but calm "
-                                                         "water stays a little livelier, and a bake takes about twice as long: more per substep, and more "
-                                                         "substeps, as the liquid keeps moving for longer. Not with air yet: with Liquid and Air the surface "
-                                                         "is where the two fluids meet, and the footprint is used"))
+    simulation.addParmTemplate(hou.MenuParmTemplate("freesurface", "Free Surface", ("voxel", "levelset"), ("Voxel (Fast/Damped)", "Level Set (Accurate)"),
+                                                    default_value=1, disable_when="{ phases == 1 }",
+                                                    help="Where the pressure solve puts the liquid's surface. Level Set: at the particles' own surface, found as a "
+                                                         "level set each substep, with the pressure set exactly there (the ghost fluid method), so drops "
+                                                         "oscillate and waves travel at the right speed, the liquid keeps its volume, and floating objects sit "
+                                                         "at the right height; calm water stays a little lively. Voxel: every voxel the particles touch is "
+                                                         "liquid, and the surface is the edge of those voxels, a voxel or two outside the particles (marker "
+                                                         "cells), which settles quickly, damps small waves, and bakes in about half the time; not with dynamic "
+                                                         "objects, which would float high. Not with air yet: with Liquid and Air the surface is where the two "
+                                                         "fluids meet, and Voxel is used"))
     simulation.addParmTemplate(hou.FloatParmTemplate("flipratio", "FLIP Ratio", 1, default_value=(0.95,), min=0.0, max=1.0,
                                                      help="How much of each particle's own velocity it keeps: 0 is pure PIC (or pure APIC), 1 pure FLIP"))
     simulation.addParmTemplate(hou.FloatParmTemplate("cfl", "CFL Condition", 1, default_value=(4.0,), min=0.1, max=4.0,
@@ -240,7 +270,7 @@ def _interface(node):
     air_advanced.addParmTemplate(hou.FloatParmTemplate("airdropletradius", "Droplet Radius", 1, default_value=(0.0,), min=0.0, max=0.1, disable_when=no_air,
                                                        help="Metres, for the air's drag on a flying droplet: 0 for a particle's worth of liquid"))
     air_advanced.addParmTemplate(hou.FloatParmTemplate("airbubbleradius", "Bubble Radius", 1, default_value=(0.0,), min=0.0, max=0.1, disable_when=no_air,
-                                                       help="Metres, for the liquid's drag on a rising bubble: 0 for a particle's worth of air"))
+                                                       help="Metres: every bubble's radius, for the liquid's drag on it as it rises. 0 sizes each bubble as it escapes, from the air it escaped from and how hard the water churns there"))
     air_advanced.addParmTemplate(hou.FloatParmTemplate("airviscosity", "Air Viscosity", 1, default_value=(1.5e-5,), min=1.0e-7, max=1.0e-2, disable_when=no_air,
                                                        help="The air's kinematic viscosity, m^2/s, for its drag on droplets: 1.5e-5 is air's"))
     air.addParmTemplate(air_advanced)
@@ -273,7 +303,8 @@ def _interface(node):
     collisions.addParmTemplate(hou.LabelParmTemplate("collisionnote", "Per Object",
                                                      column_labels=("These are every collision object's, unless its geometry carries its own: primitive "
                                                                     "attributes flip2_friction, flip2_hold (0 or 1) and flip2_thickness, one value per object "
-                                                                    "(objects are told apart by their name attribute)",)))
+                                                                    "(objects are told apart by their name attribute); and flip2_bounce and "
+                                                                    "flip2_contactfriction in place of the RBD tab's Collision Bounce and Friction",)))
     collisions.addParmTemplate(hou.FloatParmTemplate("friction", "Friction", 1, default_value=(0.0,), min=0.0, max=1.0,
                                                      help="0: the fluid slips along collisions freely; 1: the fluid touching them moves with them. An object's "
                                                           "own flip2_friction primitive attribute overrides this"))
@@ -285,6 +316,38 @@ def _interface(node):
                                                      help="0 for closed surfaces; for open ones, like a ground plane, the thickness of the shell around them. "
                                                           "An object's own flip2_thickness primitive attribute overrides this"))
     group.append(collisions)
+    rbd = hou.FolderParmTemplate("rbdfolder", "RBD", folder_type=hou.folderType.Tabs)
+    rbd.addParmTemplate(hou.StringParmTemplate("rbdsop", "RBD Geometry", 1, default_value=("",), string_type=hou.stringParmType.NodeReference,
+                                               tags={"opfilter": "!!SOP!!", "oprelative": "."},
+                                               help="A SOP of packed pieces, as RBD Bullet Solver's Geometry input takes them (from RBD Material Fracture, "
+                                                    "RBD Configure, or Pack with a name per piece): flip2 simulates them with the liquid, each moving the "
+                                                    "liquid as the liquid moves it. Their point attributes mean what they mean to RBD Bullet Solver: active "
+                                                    "(0: it doesn't move itself, but collides, still or animated as the geometry has it; without the "
+                                                    "attribute, simulated), density in kg/m3 (1000 without it) or mass in kg, friction (1), bounce (0.25), "
+                                                    "and v and w, its velocity and spin at the start frame, as they are there. The liquid slips along "
+                                                    "them and holds to them as the Collisions tab says, and there can be as many as fit in the GPU's "
+                                                    "memory. The node's sixth output has the pieces where flip2 moved them, as RBD Bullet Solver's "
+                                                    "Geometry output; its seventh the Simulation Points they were moved by"))
+    rbd.addParmTemplate(hou.IntParmTemplate("collisionsubsteps", "Collision Substeps", 1, default_value=(5,), min=1, max=100,
+                                            help="How many times a frame, at least, the pieces' contacts with each other, the walls and the collisions "
+                                                 "are solved, as RBD Bullet Solver's Substeps: 5 at 24 frames a second is 120 a second, enough for a "
+                                                 "stack to stand; a tall one needs more. More steps are taken when a piece moves fast, so none moves "
+                                                 "more than half a voxel in one"))
+    rbd.addParmTemplate(hou.FloatParmTemplate("rbdcollisionbounce", "Collision Bounce", 1, default_value=(CONTACT_DEFAULTS["bounce"],), min=0.0, max=1.0,
+                                              join_with_next=True,
+                                              help="What a piece meets in the Collisions input's objects, as RBD Bullet Solver's Collision tab: a piece "
+                                                   "bounces off one at its own bounce times this, and grips it at its own friction times Collision "
+                                                   "Friction, as Bullet multiplies them. An object's own flip2_bounce and flip2_contactfriction primitive "
+                                                   "attributes override these (once any object has one, every object has a value of it, 0 unless the "
+                                                   "attribute was made with another default). Pieces that aren't active collide with their own bounce "
+                                                   "and friction"))
+    rbd.addParmTemplate(hou.FloatParmTemplate("rbdcollisionfriction", "Friction", 1, default_value=(CONTACT_DEFAULTS["contactFriction"],), min=0.0, max=10.0))
+    rbd.addParmTemplate(hou.FloatParmTemplate("rbdwallbounce", "Wall Bounce", 1, default_value=(CONTACT_DEFAULTS["bounce"],), min=0.0, max=1.0,
+                                              join_with_next=True,
+                                              help="What a piece meets in the domain's walls, as RBD Bullet Solver's ground plane: a piece of Bullet's "
+                                                   "defaults (bounce 0.25) bounces off the floor at 0.25 times 0.5, as it does there"))
+    rbd.addParmTemplate(hou.FloatParmTemplate("rbdwallfriction", "Friction", 1, default_value=(CONTACT_DEFAULTS["contactFriction"],), min=0.0, max=10.0))
+    group.append(rbd)
     sources = hou.FolderParmTemplate("sources", "Sources", folder_type=hou.folderType.Tabs)
     sources.addParmTemplate(hou.ToggleParmTemplate("usev", "Use v Attribute", default_value=True,
                                                    help="Each source emits at its points' mean v, if it has a v attribute; otherwise at the emission velocity"))
@@ -326,11 +389,21 @@ def _interface(node):
                                                        "the liquid's volume at an influence scale of 3 (0.6 at 2). Less than the influence scale"))
     surface.addParmTemplate(hou.IntParmTemplate("smoothing", "Smoothing", 1, default_value=SURFACE_DEFAULTS["smoothing"], min=0, max=10,
                                                 help="Passes of a smoothing filter over the surface before it's meshed"))
+    surface.addParmTemplate(hou.MenuParmTemplate("surfacesolids", "Water at Collisions", ("overlap", "cut"),
+                                                 ("Overlap (Karma Setup Resolves It)", "Cut at Their Surfaces"), default_value=0,
+                                                 help="Where the water touches a collision object or an RBD piece. Overlap carries the water's surface a "
+                                                      "voxel or so into the object, which hides it; for glass, ice or anything else see-through, flip2 "
+                                                      "Karma Setup gives the water a lower dielectric priority than every other object, so Karma "
+                                                      "renders the object's own surface against the water. Cut stops the water exactly at the "
+                                                      "object's surface: for renderers without dielectric priorities, where the two surfaces in "
+                                                      "one place can show specks with see-through objects. Either way the domain's walls cut the "
+                                                      "water flat, as a cutaway shows it"))
     surface.addParmTemplate(hou.ToggleParmTemplate("outputfields", "Output Fluid Fields", default_value=False,
                                                    help="Write the liquid's surface level set and velocity field each frame too (surface and vel, as Houdini's FLIP "
-                                                        "outputs them): the node's second output, for Whitewater Source"))
+                                                        "outputs them): the node's second output, for Whitewater Source. Always written with Liquid and Air "
+                                                        "when Droplets and Bubbles Fly, with the air's bubbles: flip2 Karma Setup renders them from it"))
     surface.addParmTemplate(hou.FloatParmTemplate("fieldvoxelscale", "Field Voxel Scale", 1, default_value=(2.0,), min=0.5, max=8.0,
-                                                  disable_when="{ outputfields == 0 }",
+                                                  disable_when="{ outputfields == 0 phases == 0 } { outputfields == 0 airescaped == 0 }",
                                                   help="The fields' voxel size, in particle separations: 2 is the simulation's own, as Houdini's FLIP has them"))
     surface.addParmTemplate(hou.ButtonParmTemplate("meshbake", "Mesh Bake", help="Mesh the bake's frames again with these settings, replacing their "
                                                    "surfaces: after a bake made without them, or to try others", **_callback("mesh_bake")))
@@ -426,7 +499,10 @@ def _network(node):
     importer.build_whitewater(node, folder, frame)
     _split_volumes(node)
     _force_network(node)
-    box = importer.build_container(node, node.node("collision_unpack"), ROLES.index("collision"))
+    _rbd_network(node)
+    moved = importer.build_bodies(node, folder, frame, node.node("rbd_rest"), node.node("RBD_PIECES"))
+    box = importer.build_container(node, importer.collisions_with(node, node.node("collision_unpack"), ROLES.index("collision"), moved),
+                                   ROLES.index("collision"), 'strlen(chs("../rbdsop")) > 0')
     for axis in "xyz":
         box.parm("size" + axis).setExpression('ch("../domainsize%s")' % axis)
         box.parm("t" + axis).setExpression('ch("../domaincenter%s")' % axis)
@@ -475,6 +551,42 @@ def _force_network(node):
     node.layoutChildren()
 
 
+def _rbd_network(node):
+    """the RBD tab's pieces brought into this node's space (rbd_merge): as they are now (RBD_PIECES), at the start frame, where the bake starts them
+    (rbd_rest), and as triangles by name (RBD), as an input's are. Makes only what's missing, so an older node gains it"""
+    if node.node("RBD") is not None:
+        return
+    merge = node.createNode("object_merge", "rbd_merge")
+    merge.parm("objpath1").set('`chsop("../rbdsop")`')
+    merge.parm("xformtype").set("local")    #into this object, as the inputs are
+    node.createNode("null", "RBD_PIECES").setInput(0, merge)
+    rest = node.createNode("timeshift", "rbd_rest")
+    rest.setInput(0, merge)
+    rest.parm("frame").setExpression('ch("../startframe")')
+    tag = node.createNode("attribwrangle", "rbd_tag")     #each piece's geometry named as the piece is: what's inside can be named otherwise
+    tag.parm("class").set(2)
+    tag.parm("snippet").set(PIECE_TAG)
+    tag.setInput(0, merge)
+    unpack = node.createNode("unpack", "rbd_unpack")
+    unpack.setInput(0, tag)
+    unpack.parm("limit_iterations").set(False)
+    unpack.parm("transfer_attributes").set("flip2_piece")
+    named = node.createNode("attribwrangle", "rbd_named")
+    named.parm("class").set(1)
+    named.parm("snippet").set('s@name = point(0, "flip2_piece", primpoint(0, @primnum, 0));')
+    named.setInput(0, unpack)
+    polygons = node.createNode("convert", "rbd_polygons")
+    polygons.setInput(0, named)
+    triangles = node.createNode("divide", "rbd_triangles")
+    triangles.setInput(0, polygons)
+    corners = node.createNode("attribwrangle", "rbd_corners")
+    corners.parm("class").set(1)
+    corners.parm("snippet").set(CORNERS)
+    corners.setInput(0, triangles)
+    node.createNode("null", "RBD").setInput(0, corners)
+    node.layoutChildren()
+
+
 def create_solver(parent, name="flip2_solver"):
     """a flip2 Solver node in the SOP network parent"""
     node = parent.createNode("subnet", name)
@@ -512,6 +624,17 @@ def _frames(node):
     if end < start:
         raise hou.NodeError("the end frame is before the start frame")
     return start, end
+
+
+def _contact_settings(node, samples):
+    """what the RBD tab's pieces meet in a collision object, where it isn't the engine's default: a piece that isn't active, its own bounce and friction, as
+    RBD Bullet Solver collides them; any other object, its flip2_bounce and flip2_contactfriction, or the RBD tab's Collision Bounce and Friction"""
+    own = samples.get("rbd")
+    tab = {"bounce": node.evalParm("rbdcollisionbounce") if node.parm("rbdcollisionbounce") is not None else CONTACT_DEFAULTS["bounce"],
+           "contactFriction": node.evalParm("rbdcollisionfriction") if node.parm("rbdcollisionfriction") is not None else CONTACT_DEFAULTS["contactFriction"]}
+    found = {"bounce": own["bounce"], "contactFriction": own["friction"]} if own is not None else \
+            {key: samples.get("settings", {}).get(key, tab[key]) for key in tab}
+    return {key: value for key, value in found.items() if value != CONTACT_DEFAULTS[key]}
 
 
 def _settings(geometry, chosen, label):
@@ -556,6 +679,10 @@ def _objects(geometry):
     return objects, positions
 
 
+def _label(role):
+    return LABELS[ROLES.index(role)] if role in ROLES else "RBD Geometry"
+
+
 def _connected(node, index):
     inputs = node.inputs()
     return index < len(inputs) and inputs[index] is not None
@@ -579,12 +706,57 @@ def _sample(node, role, frames, progress=None):
                                                     for sample, (name, triangles, _) in zip(samples, objects))
         if not same:
             raise hou.NodeError("%s: its triangles change at frame %d; flip2 can only move or deform a mesh whose points and triangles stay the same"
-                                % (LABELS[ROLES.index(role)], frame))
+                                % (_label(role), frame))
         for sample in samples:
             sample["frames"].append(positions[sample["points"]].copy())
         if progress is not None:
             progress()
     return samples
+
+
+def _rbd_pieces(node, frames, progress=None):
+    """the RBD tab's pieces over frames, as _sample has an input's objects, each with its settings under "rbd": whether it's simulated (active, or
+    without active), its density or mass, friction, bounce, and v and w, from the point attributes RBD Bullet Solver reads on each packed piece (or
+    primitive ones), as they are at the start frame; RBD Bullet Solver's own defaults for those it hasn't. [] with no SOP named"""
+    path = node.evalParm("rbdsop").strip() if node.parm("rbdsop") is not None else ""
+    if not path:
+        return []
+    if node.parm("rbdsop").evalAsNode() is None:
+        raise hou.NodeError("RBD: RBD Geometry names %r, and there's no such node" % path)
+    geometry = node.node("RBD_PIECES").geometryAtFrame(frames[0])
+    settings = {}
+    for prim in geometry.prims():
+        if not isinstance(prim, hou.PackedPrim):
+            raise hou.NodeError("RBD Geometry: flip2 takes packed pieces, as RBD Bullet Solver does: pack them first (RBD Material Fracture and RBD "
+                                "Configure give packed pieces, or Pack with Name Attribute)")
+        point = prim.points()[0]
+
+        def value(name, default):
+            attrib = geometry.findPointAttrib(name)
+            if attrib is not None:
+                return point.attribValue(attrib)
+            attrib = geometry.findPrimAttrib(name)
+            return prim.attribValue(attrib) if attrib is not None else default
+        name = value("name", "")
+        if not name:
+            raise hou.NodeError("RBD Geometry: its pieces need a name point attribute, as RBD Bullet Solver's do: RBD Material Fracture and RBD Configure "
+                                "give them one, and Pack does with Transfer Attributes set to name")
+        if name in settings:
+            raise hou.NodeError("RBD Geometry: two pieces are both named %r; flip2 tells them apart by name, as RBD Bullet Solver does" % name)
+        piece = {"active": int(value("active", 1)) != 0, "density": float(value("density", RBD_DEFAULTS["density"])), "mass": float(value("mass", 0.0)),
+                 "friction": float(value("friction", RBD_DEFAULTS["friction"])), "bounce": float(value("bounce", RBD_DEFAULTS["bounce"])),
+                 "v": [float(c) for c in value("v", (0.0, 0.0, 0.0))], "w": [float(c) for c in value("w", (0.0, 0.0, 0.0))]}
+        if piece["active"] and (piece["density"] <= 0.0 or piece["mass"] < 0.0 or not 0.0 <= piece["bounce"] <= 1.0 or piece["friction"] < 0.0):
+            raise hou.NodeError("RBD Geometry: the piece %r has density %g, mass %g, bounce %g and friction %g; flip2 takes a density over 0, a mass of 0 "
+                                "or more (0: from the density), a bounce from 0 to 1, and a friction of 0 or more"
+                                % (name, piece["density"], piece["mass"], piece["bounce"], piece["friction"]))
+        settings[name] = piece
+    pieces = _sample(node, "rbd", frames, progress)
+    for samples in pieces:
+        if samples["name"] not in settings:
+            raise hou.NodeError("RBD Geometry: geometry named %r that isn't in any of its packed pieces" % samples["name"])
+        samples["rbd"] = settings[samples["name"]]
+    return pieces
 
 
 def _rigid(first, later, tolerance):
@@ -615,53 +787,40 @@ def _motion(samples, tolerance):
     return "rigid", transforms
 
 
-def _merge(objects):
-    """several sampled objects as one: at every frame their vertices one after another, and their triangles. Their own settings have to agree, as the
-    one object gets one set"""
-    import numpy
-    triangles, offset = [], 0
-    for samples in objects:
-        triangles.append(samples["triangles"] + offset)
-        offset += len(samples["frames"][0])
-    settings = objects[0]["settings"]
-    if any(samples["settings"] != settings for samples in objects):
-        raise hou.NodeError("Collisions: more than %d objects, so flip2 takes some of them as one, and they don't share their flip2_friction, flip2_hold "
-                            "and flip2_thickness attributes: give them the same, or fewer objects" % LIMIT)
-    return {"name": "", "triangles": numpy.concatenate(triangles), "points": numpy.concatenate([samples["points"] for samples in objects]),
-            "frames": [numpy.concatenate([samples["frames"][frame] for samples in objects]) for frame in range(len(objects[0]["frames"]))], "settings": settings}
+class _Packer:
+    """The scene's meshes, packed: every object's vertices where it starts in one file and its triangles in another, and every deforming object's
+    vertices at a frame in a file a frame, which the scene names rows of ({"file", "first", "count"}), rather than files an object: a scene of a
+    thousand pieces is a handful of files to write, copy to a farm and read back"""
+
+    def __init__(self):
+        self.arrays = {}    #per file, its arrays in the order they go in, and its rows so far
+        self.rows = {}
+
+    def add(self, name, values):
+        """values (n x 3), at the end of the file name, and the rows they take there"""
+        first = self.rows.get(name, 0)
+        self.arrays.setdefault(name, []).append(values)
+        self.rows[name] = first + len(values)
+        return {"file": "geo/" + name, "first": first, "count": len(values)}
+
+    def write(self, geo_dir):
+        import numpy
+        for name, arrays in self.arrays.items():
+            kind = numpy.int32 if name == MESH_TRIANGLES else numpy.float32
+            numpy.save(os.path.join(geo_dir, name), numpy.concatenate([numpy.asarray(values, dtype=kind).reshape(-1, 3) for values in arrays]))
 
 
-def _within(objects, limit, tolerance):
-    """objects with how each moves, no more than limit of them: as they are if they fit; otherwise the still ones as one object, and if that's still too
-    many, the moving ones as another (together they deform)"""
-    moving = [(samples, _motion(samples, tolerance)) for samples in objects]
-    if len(moving) <= limit:
-        return moving
-    still = [samples for samples, (kind, _) in moving if kind == "still"]
-    rest = [(samples, motion) for samples, motion in moving if motion[0] != "still"]
-    if len(rest) + min(len(still), 1) > limit:
-        merged = _merge([samples for samples, _ in rest])
-        rest = [(merged, _motion(merged, tolerance))]
-    return ([(_merge(still), ("still", None))] if still else []) + rest
-
-
-def _write_object(samples, motion, prefix, geo_dir, frames, fps):
-    """an object's files, and its scene entry: still, moving rigidly with a transform every frame, or deforming with its vertices every frame"""
-    import numpy
+def _write_object(samples, motion, packer, frames, fps):
+    """an object's scene entry, its geometry packed: still, moving rigidly with a transform every frame, or deforming with its vertices every frame"""
     kind, transforms = motion
-    numpy.save(os.path.join(geo_dir, prefix + "_triangles.npy"), samples["triangles"])
-    entry = {"vertices": "geo/%s_vertices.npy" % prefix, "triangles": "geo/%s_triangles.npy" % prefix}
+    triangles = packer.add(MESH_TRIANGLES, samples["triangles"])
     if kind != "deforming":
-        numpy.save(os.path.join(geo_dir, prefix + "_vertices.npy"), samples["frames"][0])
+        entry = {"vertices": packer.add(MESH_VERTICES, samples["frames"][0]), "triangles": triangles}
         if kind == "rigid":
             entry["keyframes"] = [{"time": (frame - frames[0]) / fps, "transform": transform} for frame, transform in zip(frames, transforms)]
         return entry
-    deforming = []
-    for frame, positions in zip(frames, samples["frames"]):
-        name = "%s_f%d.npy" % (prefix, frame)
-        numpy.save(os.path.join(geo_dir, name), positions)
-        deforming.append({"time": (frame - frames[0]) / fps, "vertices": "geo/" + name})
-    return {"vertices": deforming[0]["vertices"], "triangles": entry["triangles"], "deforming": deforming}
+    deforming = [{"time": (frame - frames[0]) / fps, "vertices": packer.add(DEFORMING_FILE % frame, positions)} for frame, positions in zip(frames, samples["frames"])]
+    return {"vertices": deforming[0]["vertices"], "triangles": triangles, "deforming": deforming}
 
 
 def _volume_state(volume):
@@ -840,7 +999,7 @@ def write_scene(node):
         "solver": {"flipRatio": node.evalParm("flipratio"), "cfl": node.evalParm("cfl"), "densityCorrectionTime": node.evalParm("densitytime"),
                    "transfer": ("flip", "apic")[node.evalParm("transfer")],
                    "viscousCfl": node.evalParm("viscouscfl") if node.parm("viscouscfl") is not None else 6.0,
-                   "freeSurface": ("footprint", "sharp")[node.evalParm("freesurface")] if node.parm("freesurface") is not None else "footprint"},
+                   "freeSurface": ("voxel", "levelSet")[node.evalParm("freesurface")] if node.parm("freesurface") is not None else "levelSet"},
         "gravity": list(node.evalParmTuple("gravity")),
         "liquid": {key: node.evalParm(name) if node.parm(name) is not None else default       #a node from before the Liquid tab has none of it
                    for key, name, default in (("density", "density", 1000.0), ("viscosity", "viscosity", 0.0), ("surfaceTension", "surfacetension", 0.0),
@@ -864,6 +1023,9 @@ def write_scene(node):
             wall["contactAngle"] = node.evalParm("wallangle%d" % index)
         if wall:
             walls[face] = wall
+    for key, parm in (("bounce", "rbdwallbounce"), ("contactFriction", "rbdwallfriction")):   #and what the RBD tab's pieces meet at all of them
+        if node.parm(parm) is not None and node.evalParm(parm) != CONTACT_DEFAULTS[key]:
+            walls[key] = node.evalParm(parm)
     if walls:
         scene["domain"]["walls"] = walls
     holds = node.parm("collisionhold") is None or bool(node.evalParm("collisionhold"))     #whether collisions hold the liquid on them, as walls do
@@ -873,7 +1035,8 @@ def write_scene(node):
                                "maxParticles": round(node.evalParm("wwmaxparticles")*1.0e6), "dropletScale": node.evalParm("wwdropletscale"),
                                "bubbleScale": node.evalParm("wwbubblescale")}
     roles = [role for role in ROLES if _connected(node, ROLES.index(role))]
-    total = sum(1 if role == "fluid" else len(frames) for role in roles) + (len(frames) if "collision" in roles else 0)
+    rbd_named = node.parm("rbdsop") is not None and bool(node.evalParm("rbdsop").strip())
+    total = sum(1 if role == "fluid" else len(frames) for role in roles) + (len(frames) if "collision" in roles else 0) + (len(frames) if rbd_named else 0)
     sampled = [0]
     with hou.InterruptableOperation("flip2: sampling the inputs", long_operation_name="Writing the flip2 scene", open_interrupt_dialog=True) as operation:
         def progress():     #a progress bar, which Esc interrupts
@@ -881,19 +1044,24 @@ def write_scene(node):
             operation.updateLongProgress(sampled[0] / max(total, 1), "sampled %d of %d frames of the inputs" % (sampled[0], total))
         sampled_roles = {role: _sample(node, role, frames[:1] if role == "fluid" else frames, progress) for role in roles}
         volumes = _sample_volumes(node, frames, progress) if "collision" in roles else []
-    if len(volumes) > LIMIT:
-        raise hou.NodeError("flip2 takes up to %d collision objects; this has %d volumes" % (LIMIT, len(volumes)))
+        rbd = _rbd_pieces(node, frames, progress)
+    simulated = [samples for samples in rbd if samples["rbd"]["active"]]    #dynamic bodies; the others collide as the Collisions input's objects do
+    if len(simulated) < len(rbd):
+        sampled_roles.setdefault("collision", []).extend(samples for samples in rbd if not samples["rbd"]["active"])
+        roles = [role for role in ROLES if role in sampled_roles]
+    if simulated and scene["solver"]["freeSurface"] == "voxel" and not (node.parm("phases") is not None and node.evalParm("phases") == 1):
+        raise hou.NodeError("RBD: a simulated piece floats at the right height only with the Level Set free surface, or with Liquid and Air: the Voxel "
+                            "surface is a voxel or two over the liquid, and pieces float that much high. Set Free Surface on the Simulation tab")
     tolerance = 0.01*2*separation      #a hundredth of a voxel: less than the fluid can feel
-    crowded = sum(len(sampled_roles.get(role, ())) for role in ("fluid", "source", "sink")) > LIMIT    #flip2's limit is on the three together
-    limits = {"collision": LIMIT - len(volumes), "fluid": 1 if crowded else LIMIT, "source": 2 if crowded else LIMIT, "sink": 2 if crowded else LIMIT}
     made = []
+    packer = _Packer()
     for role in roles:
-        objects = _within(sampled_roles[role], limits[role], tolerance)
+        objects = [(samples, _motion(samples, tolerance)) for samples in sampled_roles[role]]   #each object on its own, still, rigid or deforming
         kinds = [kind for _, (kind, _) in objects] + (["volume"]*len(volumes) if role == "collision" else [])
         made.append("%s: %s" % (LABELS[ROLES.index(role)].lower(), ", ".join("%d %s" % (kinds.count(kind), kind) for kind in ("still", "rigid", "deforming", "volume")
                                                                                if kind in kinds) or "nothing"))
         for index, (samples, motion) in enumerate(objects):
-            entry = _write_object(samples, motion, "%s%d" % (role, index), geo_dir, frames[:len(samples["frames"])], fps)
+            entry = _write_object(samples, motion, packer, frames[:len(samples["frames"])], fps)
             if role == "fluid":
                 entry = {key: entry[key] for key in ("vertices", "triangles")}
                 scene["fluids"].append(entry)
@@ -902,6 +1070,7 @@ def write_scene(node):
                 entry["thickness"] = samples["settings"].get("thickness", node.evalParm("thickness"))
                 if not samples["settings"].get("hold", holds):
                     entry["hold"] = False
+                entry.update(_contact_settings(node, samples))
                 scene["obstacles"].append(entry)
             elif role == "source":
                 entry["velocity"] = _emission_velocity(node, samples)
@@ -914,11 +1083,26 @@ def write_scene(node):
         entry = {"vdb": "geo/" + VOLUME_FILE, "grid": volume["name"], "friction": volume["settings"].get("friction", node.evalParm("friction"))}
         if not volume["settings"].get("hold", holds):
             entry["hold"] = False
+        entry.update(_contact_settings(node, volume))
         if volume["velocity"]:
             entry["velocityGrid"] = volume["velocity"]
         if volume["transforms"]:
             entry["keyframes"] = [{"time": (frame - frames[0]) / fps, "transform": transform} for frame, transform in zip(frames, volume["transforms"])]
         scene["obstacles"].append(entry)
+    for index, samples in enumerate(simulated):     #the RBD tab's simulated pieces, each a dynamic body starting where the start frame has it
+        settings = samples["rbd"]
+        entry = _write_object(samples, ("still", None), packer, frames[:1], fps)
+        dynamic = {"velocity": settings["v"], "angularVelocity": settings["w"], "bounce": settings["bounce"], "contactFriction": settings["friction"]}
+        dynamic.update({"mass": settings["mass"]} if settings["mass"] > 0.0 else {"density": settings["density"]})
+        entry.update({"name": samples["name"], "dynamic": dynamic, "friction": samples["settings"].get("friction", node.evalParm("friction"))})
+        if not samples["settings"].get("hold", holds):
+            entry["hold"] = False
+        scene["obstacles"].append(entry)
+    if rbd:
+        made.append("rbd: %d simulated, %d colliding" % (len(simulated), len(rbd) - len(simulated)))
+    packer.write(geo_dir)
+    if simulated and node.parm("collisionsubsteps") is not None:
+        scene["solver"]["collisionSubsteps"] = node.evalParm("collisionsubsteps")
     forces, said = _force_volumes(node, frames[0], geo_dir)
     fields, fields_said = _force_fields(node, frames[0])
     if len(forces) + len(fields) > FORCE_LIMIT:
@@ -939,7 +1123,7 @@ def write_scene(node):
             if node.evalParm(name) != default:
                 air[key] = node.evalParm(name)
         scene["air"] = air
-        scene["solver"]["freeSurface"] = "footprint"    #the sharp free surface doesn't go with air yet: the tab says so
+        scene["solver"]["freeSurface"] = "voxel"        #the level set surface doesn't go with air yet: the tab says so
         made.append("air: a band of %d voxels" % air["band"] if air["band"] else "air: everywhere")
     path = os.path.join(directory, "scene.json")
     with open(path, "w") as out:
@@ -963,7 +1147,7 @@ def fit_domain(node):
     """sets the domain to the box around every input's geometry over the frame range, a little larger"""
     start, end = _frames(node)
     low, high = [float("inf")]*3, [float("-inf")]*3
-    for source in [node.node(role.upper()) for role in ROLES] + [node.node("COLLISION_VOLUMES")]:
+    for source in [node.node(role.upper()) for role in ROLES] + [node.node("COLLISION_VOLUMES")] + ([node.node("RBD")] if node.node("RBD") is not None else []):
         role = source.name().lower()
         for frame in ([start] if role == "fluid" else range(start, end + 1)):
             geometry = source.geometryAtFrame(frame)
@@ -1166,8 +1350,10 @@ def _launch_remote(job, host, directory, program, arguments, upload, local, logs
 
 
 def _mesh_options(node):
-    """flip2 mesh's options, from the Surface tab, checked as flip2 mesh would check them"""
-    fields = node.evalParm("outputfields")
+    """flip2 mesh's options, from the Surface tab, checked as flip2 mesh would check them. A bake whose air's bubbles fly always has its fields:
+    they hold the light the bubbles scatter, which is how they render (flip2 Karma Setup)"""
+    bubbles = node.parm("phases") is not None and node.evalParm("phases") == 1 and node.evalParm("airescaped")
+    fields = node.evalParm("outputfields") or bubbles
     voxel, influence, radius = node.evalParm("voxelscale"), node.evalParm("influencescale"), node.evalParm("radiusscale")
     smoothing = node.evalParm("smoothing")
     if min(voxel, influence, radius) <= 0 or smoothing < 0:
@@ -1178,6 +1364,8 @@ def _mesh_options(node):
         raise hou.NodeError("the surface's influence scale can be at most 8 times its voxel scale")
     options = ["--format", node.parm("exportformat").evalAsString(), "--voxel-scale", repr(voxel), "--influence-scale", repr(influence),
                "--radius-scale", repr(radius), "--smoothing", str(smoothing)]
+    if node.parm("surfacesolids") is not None and node.parm("surfacesolids").evalAsString() == "cut":    #overlap is flip2 mesh's own
+        options += ["--solids", "cut"]
     if fields:
         if node.evalParm("fieldvoxelscale") <= 0:
             raise hou.NodeError("the fields' voxel scale has to be positive")
@@ -1354,7 +1542,7 @@ def _refresh(node, job):
     """reloads the frame on show, surface and particles, where its file has arrived or changed since it was loaded"""
     if not node.evalParm("load"):
         return
-    for name in (importer.SURFACE, importer.PARTICLES, importer.FIELDS):
+    for name in (importer.SURFACE, importer.PARTICLES, importer.FIELDS, importer.WHITEWATER, importer.BUBBLES, importer.BODIES):
         loader = node.node(name)
         if loader is None:
             continue

@@ -1,4 +1,4 @@
-#Copyright 2023 Aberrant Behavior LLC
+#Copyright 2026 Taimen LLC
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_FLAGS "-Wall -Wextra")
@@ -40,6 +40,8 @@ add_library(particles STATIC
     forces.cu
     sources.cu
     obstacles.cu
+    bodies.cu
+    contacts.cu
     pockets.cu
     boundaries.cu
     levelset.cu
@@ -50,7 +52,7 @@ add_library(particles STATIC
     cacheWriter.cu
 )
 
-target_link_libraries(particles ${cudaLibraries}  parallelPrefixSumKernels radixSortKernels reductionKernels particleToGridFunctions perVoxelParticleListFunctions voxelSolveFunctions conjugateGradientFunctions multigridFunctions Threads::Threads)
+target_link_libraries(particles ${cudaLibraries}  parallelPrefixSumKernels radixSortKernels reductionKernels particleToGridFunctions perVoxelParticleListFunctions voxelSolveFunctions conjugateGradientFunctions condensationFunctions multigridFunctions Threads::Threads)
 set_target_properties(particles PROPERTIES CUDA_ARCHITECTURES "${flip2Architectures}")
 
 # blosc compresses the cache's shards (cacheWriter.cu). Optional: without it they're written raw

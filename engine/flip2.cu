@@ -1,4 +1,4 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 
 //flip2's command line:
 //
@@ -7,7 +7,7 @@
 //  flip2 verify DIR
 //  flip2 export DIR [--frames A-B] [--out DIR] [--overwrite] [--follow] [--format bgeo.sc|bgeo]
 //  flip2 mesh DIR [--frames A-B] [--out DIR] [--overwrite] [--follow] [--format bgeo.sc|bgeo] [--separation S] [--voxel-scale S] [--influence-scale S]
-//             [--radius-scale S] [--smoothing N] [--fields] [--field-voxel-scale S] [--no-surface]
+//             [--radius-scale S] [--smoothing N] [--fields] [--field-voxel-scale S] [--no-surface] [--workers N]
 //  flip2 info
 //
 //bake runs the scene (see scene.hpp) and writes into the output directory its cache (cacheWriter.hu: cache.json, frames/NNNN/, which a DCC can read
@@ -32,9 +32,11 @@
 //  {"event":"done","frames":120,"seconds":5.2}                 every frame committed
 //  {"event":"verified","frames":121,"unfinished":0,"shards":121,"particles":150040000,"bytes":1712345678,"problems":0}
 //  {"event":"exported","frame":42,"particles":1240000,"file":"/shots/a/export/houdini/particles.0042.bgeo.sc"}
+//      with whitewater, and ...,"whitewater":310000,"whitewaterFile":"..."; with escaping air, and ...,"bubbles":21000,"bubblesFile":"..."; with dynamic
+//      bodies, and ...,"bodies":3,"bodiesFile":".../bodies.0042.bgeo.sc"}
 //  {"event":"exportDone","frames":121,"exported":121,"seconds":9.8}
 //  {"event":"meshed","frame":42,"particles":1240000,"points":310000,"faces":309000,"bandCells":52000,"rounds":2,"seconds":0.05,"file":"/shots/a/export/houdini/surface.0042.bgeo.sc"}
-//      with --fields, and ...,"surfaceVoxels":90000,"velocityVoxels":180000,"fieldSeconds":0.01,"writeSeconds":0.05,"fields":"/shots/a/export/houdini/fields.0042.vdb"}
+//      with --fields, and ...,"surfaceVoxels":90000,"velocityVoxels":180000,"bubbleVoxels":0,"fieldSeconds":0.01,"writeSeconds":0.05,"fields":"/shots/a/export/houdini/fields.0042.vdb"}
 //  {"event":"meshDone","frames":121,"meshed":121,"seconds":12.1}
 //  {"event":"info","build":"7dc95a4","architectures":"86","cudaRuntime":13040,"driver":13040,"gpus":[{"index":0,"name":"...","uuid":"GPU-7c2ab39e-...","pci":"0000:0A:00.0",
 //      "sm":86,"memoryMB":24135,"runs":true}],...}
@@ -55,6 +57,7 @@
 #include "ncclTransport.hu"
 #endif
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -69,6 +72,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 
 static bool printsEvents = true;    //only rank 0 does, across processes
 static std::mutex eventLock;        //the cache's thread says when frames are committed
@@ -112,7 +116,8 @@ static int usage(){
                "       flip2 verify DIR\n"
                "       flip2 export DIR [--frames A-B] [--out DIR] [--overwrite] [--follow] [--format bgeo.sc|bgeo]\n"
                "       flip2 mesh DIR [--frames A-B] [--out DIR] [--overwrite] [--follow] [--format bgeo.sc|bgeo] [--separation S] [--voxel-scale S]\n"
-               "                  [--influence-scale S] [--radius-scale S] [--smoothing N] [--fields] [--field-voxel-scale S] [--no-surface]\n"
+               "                  [--influence-scale S] [--radius-scale S] [--smoothing N] [--fields] [--field-voxel-scale S] [--no-surface] [--workers N]\n"
+               "                  [--solids overlap|cut]\n"
                "       flip2 info\n";
     return 2;
 }
@@ -258,10 +263,12 @@ static int verify(const std::string& directory){
                 problem((frame / "commit.json").string() + ": no shards");
                 continue;
             }
-            std::vector<const Json*> lists = {list};    //the particles' shards, and the whitewater's from a bake with any
-            const Json* whitewater = commit.find("whitewater");
-            if(whitewater != nullptr && whitewater->find("shards") != nullptr){
-                lists.push_back(whitewater->find("shards"));
+            std::vector<const Json*> lists = {list};    //the particles' shards, and the whitewater's, the bodies' and the bubbles' from a bake with any
+            for(const char* key : {"whitewater", "bodies", "bubbles"}){
+                const Json* more = commit.find(key);
+                if(more != nullptr && more->kind == Json::OBJECT && more->find("shards") != nullptr){
+                    lists.push_back(more->find("shards"));
+                }
             }
             for(const Json* each : lists) for(const Json& shard : each->items){
                 const Json* file = shard.find("file");
@@ -330,17 +337,50 @@ static std::string frameName(int frame){    //as the cache's folders and the exp
     return name;
 }
 
+//the memory this machine has free for a process to take, in bytes, as Linux counts it (MemAvailable); 0 where it can't be read
+static unsigned long long availableMemory(){
+    std::ifstream meminfo("/proc/meminfo");
+    std::string key;
+    unsigned long long kilobytes = 0;
+    while(meminfo >> key){
+        if(key == "MemAvailable:" && meminfo >> kilobytes){
+            return 1024ULL*kilobytes;
+        }
+        meminfo.ignore(1 << 10, '\n');
+    }
+    return 0;
+}
+
+//the particles frame's commit record says it has, 0 if it can't be read
+static unsigned long long committedParticles(const std::string& directory, int frame){
+    std::string text, record = directory + "/frames/" + frameName(frame) + "/commit.json";
+    try{
+        if(readFile(record, text)){
+            const Json* count = JsonReader(text, record).document().find("particles");
+            return count != nullptr ? (unsigned long long)count->number : 0;
+        }
+    }
+    catch(const std::exception&){
+    }
+    return 0;
+}
+
 //makes files of each of the cache's committed frames, for export and mesh: for every frame from first to last (or the bake's last, if last is -1) one of
 //whose files, targets(frame), is missing or older than the frame's commit record (a resume worked it out again), or every one with overwrite, reads its
-//shards, each checked against its commit record's XXH64, and has make(frame, shards, targets, why) write them (saying so as an event) or say why not. follow
+//shards, each checked against its commit record's XXH64, and has make(frame, shards, whitewater, record, targets, why) write them (saying so as an event)
+//or say why not, record being the frame's commit record. follow
 //waits for frames still to come, and for the cache itself if the bake hasn't started it, so a DCC can show a bake's frames as it commits them; it stops
-//when they've all been made. Ends with the event finished, counting the files written as written
+//when they've all been made. Ends with the event finished, counting the files written as written. With workers over 1 it works on up to that many frames
+//at once, each read and made on a thread of its own, which make must allow: fewer when the frames' memory, bytesPerParticle for each particle of the first
+//of them, would come to more than half of what the machine has free (asked each time it looks for frames)
 static int eachCommittedFrame(const std::string& directory, int first, int last, bool overwrite, bool follow, const char* finished, const char* written,
-                              const std::function<std::vector<std::string>(int)>& targets,
-                              const std::function<bool(int, const std::vector<ShardData>&, const std::vector<ShardData>&, const std::vector<std::string>&, std::string&)>& make){
+                              int workers, unsigned long long bytesPerParticle, const std::function<std::vector<std::string>(int)>& targets,
+                              const std::function<bool(int, const std::vector<ShardData>&, const std::vector<ShardData>&, const Json&, const std::vector<std::string>&,
+                                                       std::string&)>& make){
     auto start = std::chrono::steady_clock::now();
     size_t made = 0, problems = 0;
     std::vector<bool> done;     //per frame in range: made, or found already made
+    std::mutex tally;           //made, problems and done, with frames made at once
     for(;;){
         std::string text;
         if(!readFile(directory + "/cache.json", text)){
@@ -369,13 +409,12 @@ static int eachCommittedFrame(const std::string& directory, int first, int last,
         }
         done.resize(end - first + 1, false);
         size_t waiting = 0;
+        std::vector<int> todo;      //committed frames to make
         for(int frame = first; frame <= end; ++frame){
             if(done[frame - first]){
                 continue;
             }
-            std::string name = frameName(frame);
-            std::string record = directory + "/frames/" + name + "/commit.json";
-            std::vector<std::string> files = targets(frame);
+            std::string record = directory + "/frames/" + frameName(frame) + "/commit.json";
             std::error_code missing;
             auto committedAt = std::filesystem::last_write_time(record, missing);
             if(missing){
@@ -383,7 +422,7 @@ static int eachCommittedFrame(const std::string& directory, int first, int last,
                 continue;
             }
             bool current = !overwrite;
-            for(const std::string& file : files){
+            for(const std::string& file : targets(frame)){
                 std::error_code absent;
                 auto madeAt = std::filesystem::last_write_time(file, absent);
                 current = current && !absent && madeAt >= committedAt;
@@ -392,14 +431,28 @@ static int eachCommittedFrame(const std::string& directory, int first, int last,
                 done[frame - first] = true;
                 continue;
             }
+            todo.push_back(frame);
+        }
+        unsigned long long running = std::min<unsigned long long>(std::max(workers, 1), todo.size());
+        if(running > 1 && bytesPerParticle > 0){
+            unsigned long long free = availableMemory(), each = bytesPerParticle*committedParticles(directory, todo[0]);
+            if(free > 0 && each > 0){
+                running = std::max(1ULL, std::min(running, free/2/each));
+            }
+        }
+        auto makeFrame = [&](int frame){
+            std::string name = frameName(frame);
+            std::string record = directory + "/frames/" + name + "/commit.json";
+            std::vector<std::string> files = targets(frame);
             std::string why;
             std::vector<ShardData> shards, whitewater;   //the frame's particles, and its whitewater if the bake made any
+            Json commit;
             try{
                 std::string contents;
                 if(!readFile(record, contents)){
                     why = record + ": unreadable";
                 }
-                Json commit = why.empty() ? JsonReader(contents, record).document() : Json();
+                commit = why.empty() ? JsonReader(contents, record).document() : Json();
                 const Json* list = commit.find("shards");
                 if(why.empty() && (newerThanKnown(commit) || list == nullptr)){
                     why = record + (list == nullptr ? ": no shards" : ": a version newer than this flip2 reads");
@@ -430,15 +483,41 @@ static int eachCommittedFrame(const std::string& directory, int first, int last,
                 std::error_code ignored;
                 std::filesystem::create_directories(std::filesystem::path(file).parent_path(), ignored);
             }
-            if(why.empty() && make(frame, shards, whitewater, files, why)){
+            bool fine = false;
+            try{
+                fine = why.empty() && make(frame, shards, whitewater, commit, files, why);
+            }
+            catch(const std::exception& error){     //on a thread of its own, nothing above it would catch it
+                why = error.what();
+            }
+            std::lock_guard<std::mutex> lock(tally);
+            done[frame - first] = true;     //made, or not tried again
+            if(fine){
                 ++made;
-                done[frame - first] = true;
             }
             else{
                 ++problems;
-                done[frame - first] = true;     //not tried again
                 event("{\"event\":\"error\",\"message\":" + quoted("frame " + std::to_string(frame) + ": " + why) + "}");
                 std::cerr<<"frame "<<frame<<": "<<why<<"\n";
+            }
+        };
+        if(running <= 1){
+            for(int frame : todo){
+                makeFrame(frame);
+            }
+        }
+        else{
+            std::atomic<size_t> next{0};
+            std::vector<std::thread> pool;
+            for(unsigned long long worker = 0; worker < running; ++worker){
+                pool.emplace_back([&](){
+                    for(size_t index = next++; index < todo.size(); index = next++){
+                        makeFrame(todo[index]);
+                    }
+                });
+            }
+            for(std::thread& thread : pool){
+                thread.join();
             }
         }
         if(!follow || waiting == 0){
@@ -462,12 +541,95 @@ static bool makeDirectory(const std::string& path){
     return true;
 }
 
+//a frame's dynamic bodies, as Houdini's RBD Simulation Points have them: where each is and how it moves from the frame's bodies shard (its commit record's
+//"bodies"), its name and pivot from cache.json, and orient x y z w where the shard has w x y z. Says why not if anything's missing or malformed
+static bool bodiesOf(const std::string& directory, int frame, const Json& listing, std::vector<BgeoBody>& out, std::string& why){
+    const Json* shards = listing.kind == Json::OBJECT ? listing.find("shards") : nullptr;
+    const Json* file = shards != nullptr && shards->items.size() == 1 ? shards->items[0].find("file") : nullptr;
+    const Json* hash = shards != nullptr && shards->items.size() == 1 ? shards->items[0].find("xxh64") : nullptr;
+    if(file == nullptr || hash == nullptr){
+        why = "\"bodies\" has no shard with its file and xxh64";
+        return false;
+    }
+    char name[16];
+    std::snprintf(name, sizeof(name), "%04d", frame);
+    ShardData shard;
+    if(!readShard(directory + "/frames/" + name + "/" + file->text, hash->text, shard, why)){
+        return false;
+    }
+    std::string text;
+    Json cache;
+    try{
+        if(!readFile(directory + "/cache.json", text)){
+            why = directory + "/cache.json: can't read it";
+            return false;
+        }
+        cache = JsonReader(text, directory + "/cache.json").document();
+    }
+    catch(const std::exception& error){
+        why = error.what();
+        return false;
+    }
+    const Json* described = cache.find("bodies");
+    if(described == nullptr || described->kind != Json::ARRAY || described->items.size() != shard.particles){
+        why = directory + "/cache.json: its \"bodies\" don't name the frame's " + std::to_string(shard.particles);
+        return false;
+    }
+    const ShardData::Attribute* columns[4] = {shard.find("P"), shard.find("orient"), shard.find("v"), shard.find("w")};
+    const uint32_t components[4] = {3, 4, 3, 3};
+    for(int column = 0; column < 4; ++column){
+        if(columns[column] == nullptr || columns[column]->type != 2 || columns[column]->components != components[column]){
+            why = file->text + ": no float64 P, orient, v and w";
+            return false;
+        }
+    }
+    size_t count = (size_t)shard.particles;
+    auto value = [&](int column, uint32_t component, size_t body){
+        return (float)((const double*)columns[column]->planes.data())[component*count + body];
+    };
+    for(size_t body = 0; body < count; ++body){
+        BgeoBody point;
+        const Json& about = described->items[body];
+        const Json* named = about.find("name");
+        const Json* pivot = about.find("pivot");
+        point.name = named != nullptr && named->kind == Json::STRING ? named->text : "";
+        for(int axis = 0; axis < 3; ++axis){
+            point.position[axis] = value(0, axis, body);
+            point.velocity[axis] = value(2, axis, body);
+            point.angularVelocity[axis] = value(3, axis, body);
+            point.pivot[axis] = pivot != nullptr && pivot->kind == Json::ARRAY && pivot->items.size() == 3 ? (float)pivot->items[axis].number : 0.0f;
+            point.orientation[axis] = value(1, axis + 1, body);
+        }
+        point.orientation[3] = value(1, 0, body);
+        out.push_back(point);
+    }
+    return true;
+}
+
+//a frame's bubbles shards (into read), as its commit record lists them, each checked against its XXH64: none in a bake whose air doesn't escape
+static bool readBubbleShards(const std::string& directory, int frame, const Json& record, std::vector<ShardData>& read, std::string& why){
+    const Json* bubbles = record.kind == Json::OBJECT ? record.find("bubbles") : nullptr;
+    const Json* list = bubbles != nullptr ? bubbles->find("shards") : nullptr;
+    read.assign(list != nullptr ? list->items.size() : 0, ShardData());
+    for(size_t index = 0; index < read.size(); ++index){
+        const Json* shardFile = list->items[index].find("file");
+        const Json* hash = list->items[index].find("xxh64");
+        if(shardFile == nullptr || hash == nullptr || !readShard(directory + "/frames/" + frameName(frame) + "/" + shardFile->text, hash->text, read[index], why)){
+            why = why.empty() ? frameName(frame) + ": a bubbles shard without its file and xxh64" : why;
+            return false;
+        }
+    }
+    return true;
+}
+
 //flip2 export: the cache's committed frames, as files DCCs load natively. For now Houdini's: OUT/particles.NNNN.bgeo.sc (OUT is DIR/export/houdini
 //unless --out says; .bgeo, uncompressed, with format "bgeo"), each a frame's every shard in one point cloud, in rank order (the order one partition would
 //have held them), with P and v, and id and age if the cache's frames carry them (bgeo.cu). Frame NNNN is the cache's: frame 0 is the start, at time
 //0. A bake with whitewater has each frame's beside it, OUT/whitewater.NNNN.bgeo.sc, a point cloud too, with life, radius, kind, and the pscale its
-//particles are meant to be drawn at: half the spacing of what a voxel's volume of whitewater is drawn as. Frames are picked, redone and followed as
-//eachCommittedFrame says
+//particles are meant to be drawn at: half the spacing of what a voxel's volume of whitewater is drawn as. A bake whose air escapes has each frame's
+//bubbles, OUT/bubbles.NNNN.bgeo.sc, as the whitewater's bubbles are (writeBubblesBgeo): pscale half the spacing of its particles. A bake with dynamic bodies has
+//OUT/bodies.NNNN.bgeo.sc too, a point per body as RBD Bullet Solver's Simulation Points have them, which Transform Pieces moves the pieces by
+//(writeBodiesBgeo). Frames are picked, redone and followed as eachCommittedFrame says
 static int exportCache(const std::string& directory, int first, int last, std::string out, bool overwrite, bool follow, const std::string& format){
     if(out.empty()){
         out = directory + "/export/houdini";
@@ -475,9 +637,10 @@ static int exportCache(const std::string& directory, int first, int last, std::s
     if(!makeDirectory(out)){
         return 1;
     }
-    return eachCommittedFrame(directory, first, last, overwrite, follow, "exportDone", "exported", [&](int frame){
+    return eachCommittedFrame(directory, first, last, overwrite, follow, "exportDone", "exported", 1, 0, [&](int frame){
         return std::vector<std::string>{out + "/particles." + frameName(frame) + "." + format};
-    }, [&](int frame, const std::vector<ShardData>& shards, const std::vector<ShardData>& whitewater, const std::vector<std::string>& targets, std::string& why){
+    }, [&](int frame, const std::vector<ShardData>& shards, const std::vector<ShardData>& whitewater, const Json& record, const std::vector<std::string>& targets,
+           std::string& why){
         const std::string& target = targets[0];
         std::vector<const ShardData*> pieces;
         unsigned long long particles = 0;
@@ -489,14 +652,15 @@ static int exportCache(const std::string& directory, int first, int last, std::s
             return false;
         }
         std::string also;
-        if(!whitewater.empty()){    //drawn at half the spacing of what cache.json says a voxel's volume of it is drawn as
+        //the radius to draw whitewater or bubbles at (key: which): half the spacing of what cache.json says a voxel's volume of them is drawn as
+        auto drawnAt = [&](const char* key, float& pscale){
             double voxelSize = 0.0, perVoxel = 0.0;
             std::string text;
             if(readFile(directory + "/cache.json", text)){
                 try{
                     Json cache = JsonReader(text, directory + "/cache.json").document();
                     const Json* size = cache.find("voxelSize");
-                    const Json* described = cache.find("whitewater");
+                    const Json* described = cache.find(key);
                     const Json* count = described != nullptr ? described->find("perVoxel") : nullptr;
                     voxelSize = size != nullptr ? size->number : 0.0;
                     perVoxel = count != nullptr ? count->number : 0.0;
@@ -505,7 +669,15 @@ static int exportCache(const std::string& directory, int first, int last, std::s
                 }
             }
             if(!(voxelSize > 0.0) || !(perVoxel > 0.0)){
-                why = directory + "/cache.json: no voxelSize and whitewater.perVoxel to size the whitewater by";
+                why = directory + "/cache.json: no voxelSize and " + key + ".perVoxel to size the " + key + " by";
+                return false;
+            }
+            pscale = (float)(0.5*voxelSize / std::cbrt(perVoxel));
+            return true;
+        };
+        if(!whitewater.empty()){
+            float pscale;
+            if(!drawnAt("whitewater", pscale)){
                 return false;
             }
             std::vector<const ShardData*> more;
@@ -515,23 +687,158 @@ static int exportCache(const std::string& directory, int first, int last, std::s
                 points += shard.particles;
             }
             std::string file = out + "/whitewater." + frameName(frame) + "." + format;
-            if(!writeWhitewaterBgeo(file, more, (float)(0.5*voxelSize / std::cbrt(perVoxel)), std::string("flip2 ") + FLIP2_BUILD_ID, why)){
+            if(!writeWhitewaterBgeo(file, more, pscale, std::string("flip2 ") + FLIP2_BUILD_ID, why)){
                 return false;
             }
             also = ",\"whitewater\":" + std::to_string(points) + ",\"whitewaterFile\":" + ::quoted(file);
+        }
+        if(record.find("bubbles") != nullptr){   //a bake whose air escapes: its bubbles, which its shards hold as the commit record lists them
+            std::vector<ShardData> read;
+            if(!readBubbleShards(directory, frame, record, read, why)){
+                return false;
+            }
+            std::vector<const ShardData*> more;
+            unsigned long long points = 0;
+            for(const ShardData& shard : read){
+                more.push_back(&shard);
+                points += shard.particles;
+            }
+            float pscale;
+            if(!drawnAt("bubbles", pscale)){
+                return false;
+            }
+            std::string file = out + "/bubbles." + frameName(frame) + "." + format;
+            if(!writeBubblesBgeo(file, more, pscale, std::string("flip2 ") + FLIP2_BUILD_ID, why)){
+                return false;
+            }
+            also += ",\"bubbles\":" + std::to_string(points) + ",\"bubblesFile\":" + ::quoted(file);
+        }
+        if(const Json* bodies = record.find("bodies")){     //a bake with dynamic bodies: each one where it is, as Houdini's RBD Simulation Points
+            std::vector<BgeoBody> points;
+            if(!bodiesOf(directory, frame, *bodies, points, why)){
+                why = frameName(frame) + ": " + why;
+                return false;
+            }
+            std::string file = out + "/bodies." + frameName(frame) + "." + format;
+            if(!writeBodiesBgeo(file, points, std::string("flip2 ") + FLIP2_BUILD_ID, why)){
+                return false;
+            }
+            also += ",\"bodies\":" + std::to_string(points.size()) + ",\"bodiesFile\":" + ::quoted(file);
         }
         event("{\"event\":\"exported\",\"frame\":" + std::to_string(frame) + ",\"particles\":" + std::to_string(particles) + ",\"file\":" + ::quoted(target) + also + "}");
         return true;
     });
 }
 
+//a dynamic body's frame where a frame's record has it (bodiesOf), as writeBodyFrames makes it in a bake: the world to its own space, (R^T, pivot - R^T x),
+//its reach (the box round where its own bounds are, 3 voxels wider every way) and its velocity at a world point, v + w x (point - x)
+static BodyFrame bodyFrameOf(const BgeoBody& body, float3 objectLow, float3 objectHigh, double voxelSize){
+    double x = body.orientation[0], y = body.orientation[1], z = body.orientation[2], w = body.orientation[3];
+    double r[9] = {1 - 2*(y*y + z*z), 2*(x*y - w*z), 2*(x*z + w*y),
+                   2*(x*y + w*z), 1 - 2*(x*x + z*z), 2*(y*z - w*x),
+                   2*(x*z - w*y), 2*(y*z + w*x), 1 - 2*(x*x + y*y)};    //row-major
+    BodyFrame frame;
+    for(int row = 0; row < 3; ++row){
+        double moved = 0.0;
+        for(int column = 0; column < 3; ++column){
+            frame.worldToObject[4*row + column] = (float)r[3*column + row];
+            moved += r[3*column + row]*body.position[column];
+        }
+        frame.worldToObject[4*row + 3] = (float)(body.pivot[row] - moved);
+    }
+    double spin[9] = {0.0, -body.angularVelocity[2], body.angularVelocity[1],
+                      body.angularVelocity[2], 0.0, -body.angularVelocity[0],
+                      -body.angularVelocity[1], body.angularVelocity[0], 0.0};
+    for(int row = 0; row < 3; ++row){
+        double moved = 0.0;
+        for(int column = 0; column < 3; ++column){
+            frame.velocity[4*row + column] = (float)spin[3*row + column];
+            moved += spin[3*row + column]*body.position[column];
+        }
+        frame.velocity[4*row + 3] = (float)(body.velocity[row] - moved);
+    }
+    double low[3] = {INFINITY, INFINITY, INFINITY}, high[3] = {-INFINITY, -INFINITY, -INFINITY};
+    for(int corner = 0; corner < 8; ++corner){
+        double local[3] = {(corner & 1 ? objectHigh.x : objectLow.x) - body.pivot[0], (corner & 2 ? objectHigh.y : objectLow.y) - body.pivot[1],
+                           (corner & 4 ? objectHigh.z : objectLow.z) - body.pivot[2]};
+        for(int row = 0; row < 3; ++row){
+            double world = r[3*row]*local[0] + r[3*row + 1]*local[1] + r[3*row + 2]*local[2] + body.position[row];
+            low[row] = std::min(low[row], world);
+            high[row] = std::max(high[row], world);
+        }
+    }
+    double reach = 3.0*voxelSize;
+    frame.reachLow = make_float3((float)(low[0] - reach), (float)(low[1] - reach), (float)(low[2] - reach));
+    frame.reachHigh = make_float3((float)(high[0] + reach), (float)(high[1] + reach), (float)(high[2] + reach));
+    return frame;
+}
+
+//What a frame's bubbles scatter, into fields' bubble voxels (FluidFields::scattering), at its voxel size. Each bubble is air cubic metres in
+//bubbles of its spread's Sauter mean radius ("sauter"; its own "radius" in a cache made before it had that), which reflect and refract light at
+//their surfaces, as large as they are against its wavelength: 0.75 air / sauter square metres of cross-section (the cache's Bubbles: the diffracted
+//half goes on as if it hadn't been), spread over the 27 voxels round it by the quadratic B-spline the bake's grid weighs a particle by, so it all lands
+//somewhere. Per voxel, over its volume: per metre
+static void bubbleScattering(const std::vector<ShardData>& shards, double air, FluidFields& fields){
+    double h = fields.voxelSize;
+    std::unordered_map<uint64_t, double> sums;
+    auto key = [](int i, int j, int k){     //21 bits an axis, a million voxels either side of the origin
+        return (uint64_t)(uint32_t)(i + (1 << 20)) << 42 | (uint64_t)(uint32_t)(j + (1 << 20)) << 21 | (uint64_t)(uint32_t)(k + (1 << 20));
+    };
+    for(const ShardData& shard : shards){
+        const ShardData::Attribute* positions = shard.find("P");
+        const ShardData::Attribute* sizes = shard.find("sauter");
+        sizes = sizes != nullptr ? sizes : shard.find("radius");
+        if(positions == nullptr || sizes == nullptr || positions->type != 1 || sizes->type != 1 || shard.particles == 0){
+            continue;
+        }
+        const float* p = (const float*)positions->planes.data();
+        const float* r = (const float*)sizes->planes.data();
+        for(uint64_t bubble = 0; bubble < shard.particles; ++bubble){
+            double cross = 0.75*air / std::max((double)r[bubble], 1.0e-6);
+            int base[3];
+            double w[3][3];
+            for(int axis = 0; axis < 3; ++axis){
+                double at = p[axis*shard.particles + bubble] / h;
+                int centre = (int)std::floor(at + 0.5);
+                double d = at - centre;
+                base[axis] = centre - 1;
+                w[axis][0] = 0.5*(0.5 - d)*(0.5 - d);
+                w[axis][1] = 0.75 - d*d;
+                w[axis][2] = 0.5*(0.5 + d)*(0.5 + d);
+            }
+            for(int k = 0; k < 3; ++k){
+                for(int j = 0; j < 3; ++j){
+                    for(int i = 0; i < 3; ++i){
+                        sums[key(base[0] + i, base[1] + j, base[2] + k)] += cross*w[0][i]*w[1][j]*w[2][k];
+                    }
+                }
+            }
+        }
+    }
+    fields.bubbleVoxels.reserve(3*sums.size());
+    fields.scattering.reserve(sums.size());
+    for(const auto& [packed, sum] : sums){
+        fields.bubbleVoxels.push_back((int)(packed >> 42 & 0x1FFFFF) - (1 << 20));
+        fields.bubbleVoxels.push_back((int)(packed >> 21 & 0x1FFFFF) - (1 << 20));
+        fields.bubbleVoxels.push_back((int)(packed & 0x1FFFFF) - (1 << 20));
+        fields.scattering.push_back((float)(sum / (h*h*h)));
+    }
+}
+
 //flip2 mesh: the liquid's surface in each of the cache's committed frames, worked out on the GPU (surface.cu), as OUT/surface.NNNN.bgeo.sc (OUT and
-//format as for export): closed quads facing outwards, their points carrying the liquid's velocity v for motion blur. With fields, also OUT/fields.NNNN.vdb, the
-//liquid's fields as Houdini's FLIP outputs them for its whitewater: "surface", a level set, and "vel", its velocity (surface.hu, volumes.hpp); with
+//format as for export): closed quads facing outwards, their points carrying the liquid's velocity v for motion blur, flat against the domain's walls
+//where the liquid reaches them (MeshWalls), and carried on into the scene's obstacles where it touches them, or with overlap false stopped at their
+//surfaces (MeshSolids): the obstacles as the bake had them, built from the scene the cache names, at the frame's time, dynamic bodies where the frame's
+//records put them. With fields, also OUT/fields.NNNN.vdb, the
+//liquid's fields as Houdini's FLIP outputs them for its whitewater: "surface", a level set, and "vel", its velocity (surface.hu, volumes.hpp), and with
+//escaping air "bubbles", what its bubbles scatter, per metre, inside the surface (bubbleScattering); with
 //surface false, only them. The particle separation is the bake's (half its voxel size) unless settings give one. Frames are picked, redone and
-//followed as eachCommittedFrame says
+//followed as eachCommittedFrame says, up to workers at once: each frame's reading, gathering and writing on its thread, and its meshing on the GPU
+//in turns, on one mesher, since that's the least of a frame's time and one mesher's memory is what the GPU can spare beside a bake
+static const unsigned long long MESH_BYTES_PER_PARTICLE = 80;   //what a frame being meshed holds in memory: its shards (P, v, id and age, 36 bytes a
+                                                                //particle), its positions and velocities gathered (24) and its mesh and file (under 20)
 static int meshCache(const std::string& directory, int first, int last, std::string out, bool overwrite, bool follow, const std::string& format,
-                     SurfaceSettings settings, bool surface, bool fields, const FieldSettings& fieldSettings){
+                     SurfaceSettings settings, bool surface, bool fields, const FieldSettings& fieldSettings, int workers, bool overlap){
     SurfaceSettings checked = settings;
     if(checked.separation <= 0.0f){
         checked.separation = 1.0f;      //the bake's, which can only be checked once there's a cache
@@ -552,14 +859,22 @@ static int meshCache(const std::string& directory, int first, int last, std::str
     if(!makeDirectory(out)){
         return 1;
     }
-    if(const char* device = std::getenv("FLIP2_DEVICE")){
-        cudaSetDevice(std::atoi(device));
+    int device = -1;    //the GPU FLIP2_DEVICE names, which every thread that meshes has to choose for itself
+    if(const char* chosen = std::getenv("FLIP2_DEVICE")){
+        device = std::atoi(chosen);
+        cudaSetDevice(device);
     }
     std::unique_ptr<SurfaceMesher> mesher;      //made at the first frame, on the GPU: so not at all, if there's nothing to mesh
-    std::vector<float> positions, velocities;
-    SurfaceMesh mesh;
-    FluidFields fluidFields;
-    return eachCommittedFrame(directory, first, last, overwrite, follow, "meshDone", "meshed", [&](int frame){
+    std::mutex turn;                            //the mesher's, and the separation's and the walls' while they're still to be read from the cache
+    MeshWalls walls;                            //the domain's walls (cache.json's domain, less its open faces), which the surface meets flat
+    bool cacheRead = false;
+    std::unique_ptr<ObstacleSet> obstacles;     //the scene's obstacles, built at the first frame, and moved to each frame's time
+    cudaStream_t obstacleStream = nullptr;
+    BodyFrame* bodyFrames = nullptr;            //the dynamic bodies' frames, on the GPU, which the obstacles read
+    std::vector<int> bodyObstacles;             //each body's obstacle among those built (cache.json's "bodies" are the scene's dynamic obstacles in order)
+    double fps = 24.0, voxelSize = 0.0;
+    double bubbleAir = 0.0;                     //with escaping air, one bubble's: a voxel's volume over cache.json's bubbles.perVoxel
+    return eachCommittedFrame(directory, first, last, overwrite, follow, "meshDone", "meshed", workers, MESH_BYTES_PER_PARTICLE, [&](int frame){
         std::vector<std::string> files;
         if(surface){
             files.push_back(out + "/surface." + frameName(frame) + "." + format);
@@ -568,27 +883,7 @@ static int meshCache(const std::string& directory, int first, int last, std::str
             files.push_back(out + "/fields." + frameName(frame) + ".vdb");
         }
         return files;
-    }, [&](int frame, const std::vector<ShardData>& shards, const std::vector<ShardData>&, const std::vector<std::string>& targets, std::string& why){
-        if(settings.separation <= 0.0f){
-            std::string text;
-            const Json* voxelSize = nullptr;
-            Json cache;
-            try{
-                if(readFile(directory + "/cache.json", text)){
-                    cache = JsonReader(text, directory + "/cache.json").document();
-                    voxelSize = cache.find("voxelSize");
-                }
-            }
-            catch(const std::exception& error){
-                why = error.what();
-                return false;
-            }
-            if(voxelSize == nullptr || !(voxelSize->number > 0.0)){
-                why = directory + "/cache.json: no voxelSize, so no particle separation to mesh with";
-                return false;
-            }
-            settings.separation = (float)(voxelSize->number/2.0);
-        }
+    }, [&](int frame, const std::vector<ShardData>& shards, const std::vector<ShardData>&, const Json& commit, const std::vector<std::string>& targets, std::string& why){
         unsigned long long particles = 0;
         for(const ShardData& shard : shards){
             const ShardData::Attribute* p = shard.find("P");
@@ -601,8 +896,7 @@ static int meshCache(const std::string& directory, int first, int last, std::str
             }
             particles += shard.particles;
         }
-        positions.resize(3*particles);
-        velocities.resize(3*particles);
+        std::vector<float> positions(3*particles), velocities(3*particles);
         float low[3] = {INFINITY, INFINITY, INFINITY}, high[3] = {-INFINITY, -INFINITY, -INFINITY};
         unsigned long long offset = 0;
         for(const ShardData& shard : shards){   //every shard's planes into one x, y and z plane each
@@ -618,22 +912,157 @@ static int meshCache(const std::string& directory, int first, int last, std::str
             }
             offset += shard.particles;
         }
-        try{
-            if(!mesher){
-                mesher.reset(new SurfaceMesher);
+        SurfaceMesh mesh;
+        FluidFields fluidFields;
+        size_t bandCells = 0;
+        int rounds = 0;
+        double seconds = 0.0, fieldSeconds = 0.0;
+        {
+            std::lock_guard<std::mutex> lock(turn);
+            if(!cacheRead){
+                std::string text;
+                Json cache;
+                try{
+                    if(readFile(directory + "/cache.json", text)){
+                        cache = JsonReader(text, directory + "/cache.json").document();
+                    }
+                }
+                catch(const std::exception& error){
+                    why = error.what();
+                    return false;
+                }
+                const Json* voxel = cache.find("voxelSize");
+                if(voxel == nullptr || !(voxel->number > 0.0)){
+                    why = directory + "/cache.json: no voxelSize, so no particle separation to mesh with, and no obstacles";
+                    return false;
+                }
+                voxelSize = voxel->number;
+                if(settings.separation <= 0.0f){
+                    settings.separation = (float)(voxelSize/2.0);
+                }
+                if(const Json* rate = cache.find("fps")){
+                    fps = rate->number > 0.0 ? rate->number : fps;
+                }
+                const Json* bubbled = cache.find("bubbles");
+                const Json* perVoxel = bubbled != nullptr ? bubbled->find("perVoxel") : nullptr;
+                bubbleAir = perVoxel != nullptr && perVoxel->number > 0.0 ? voxelSize*voxelSize*voxelSize / perVoxel->number : 0.0;
+                const Json* nodes = cache.find("nodes");
+                const Json* nodeSize = cache.find("nodeSize");
+                const Json* domainMin = cache.find("domainMin");
+                if(nodes != nullptr && nodeSize != nullptr && domainMin != nullptr && nodes->items.size() == 3 && domainMin->items.size() == 3){
+                    walls.closed = 63u;     //a cache from before "open" was written: walls all round
+                    for(int axis = 0; axis < 3; ++axis){
+                        walls.low[axis] = (float)domainMin->items[axis].number;
+                        walls.high[axis] = (float)(domainMin->items[axis].number + nodes->items[axis].number*nodeSize->number);
+                    }
+                    if(const Json* open = cache.find("open")){
+                        const char* faces[6] = {"-x", "+x", "-y", "+y", "-z", "+z"};
+                        for(const Json& face : open->items){
+                            for(int which = 0; which < 6; ++which){
+                                if(face.kind == Json::STRING && face.text == faces[which]){
+                                    walls.closed &= ~(1u << which);
+                                }
+                            }
+                        }
+                    }
+                    //the scene's obstacles, as the bake built them; a scene that can't be read now meshes with none, and says so
+                    const Json* scene = cache.find("scene");
+                    const Json* path = scene != nullptr ? scene->find("path") : nullptr;
+                    Scene described;
+                    bool loaded = false;
+                    try{
+                        if(path != nullptr && path->kind == Json::STRING){
+                            described = loadScene(path->text);
+                            loaded = true;
+                        }
+                    }
+                    catch(const std::exception& error){
+                        std::cerr<<"mesh: the scene's obstacles aren't met: "<<error.what()<<"\n";
+                    }
+                    if(loaded && !described.obstacles.empty()){
+                        if(device >= 0){
+                            cudaSetDevice(device);
+                        }
+                        try{
+                            gpuErrchk(cudaStreamCreate(&obstacleStream));
+                            obstacles.reset(new ObstacleSet);
+                            Grid grid((float)walls.low[0], (float)walls.low[1], (float)walls.low[2], (uint)nodes->items[0].number, (uint)nodes->items[1].number,
+                                      (uint)nodes->items[2].number, (float)nodeSize->number);
+                            obstacles->build(described.obstacles, voxelSize, grid, obstacleStream);
+                            for(size_t index = 0; index < described.obstacles.size(); ++index){
+                                if(described.obstacles[index].dynamic){
+                                    bodyObstacles.push_back(obstacles->builtFrom(index));
+                                }
+                            }
+                            if(!bodyObstacles.empty()){
+                                gpuErrchk(cudaMalloc((void**)&bodyFrames, sizeof(BodyFrame)*bodyObstacles.size()));
+                                for(size_t body = 0; body < bodyObstacles.size(); ++body){
+                                    if(bodyObstacles[body] >= 0){
+                                        obstacles->setFrame(bodyObstacles[body], bodyFrames + body, (int)body);
+                                    }
+                                }
+                            }
+                        }
+                        catch(const std::exception& error){
+                            why = std::string("building the scene's obstacles: ") + error.what();
+                            return false;
+                        }
+                    }
+                }
+                cacheRead = true;
             }
-            mesher->mesh(positions.data(), velocities.data(), particles, low, high, settings, mesh);
-            if(fields){
-                mesher->fields(fieldSettings, fluidFields);
+            if(obstacles){      //where they are at the frame's time: dynamic bodies where its records have them
+                if(device >= 0){
+                    cudaSetDevice(device);
+                }
+                if(!bodyObstacles.empty()){
+                    std::vector<BgeoBody> bodies;
+                    const Json* listing = commit.kind == Json::OBJECT ? commit.find("bodies") : nullptr;
+                    if(listing == nullptr || !bodiesOf(directory, frame, *listing, bodies, why) || bodies.size() != bodyObstacles.size()){
+                        why = "the frame's bodies: " + (why.empty() ? std::string("not as many as cache.json names") : why);
+                        return false;
+                    }
+                    std::vector<BodyFrame> frames(bodies.size());
+                    for(size_t body = 0; body < bodies.size(); ++body){
+                        float3 low = make_float3(0.0f, 0.0f, 0.0f), high = low;
+                        if(bodyObstacles[body] >= 0){
+                            obstacles->objectBounds(bodyObstacles[body], low, high);
+                        }
+                        frames[body] = bodyFrameOf(bodies[body], low, high, voxelSize);
+                    }
+                    gpuErrchk(cudaMemcpyAsync(bodyFrames, frames.data(), sizeof(BodyFrame)*frames.size(), cudaMemcpyHostToDevice, obstacleStream));
+                }
+                obstacles->update(frame / fps);
+                obstacles->index();
+                gpuErrchk(cudaStreamSynchronize(obstacleStream));
             }
-        }
-        catch(const std::exception& error){
-            why = error.what();
-            return false;
+            try{
+                if(device >= 0){
+                    cudaSetDevice(device);
+                }
+                if(!mesher){
+                    mesher.reset(new SurfaceMesher);
+                }
+                MeshSolids solids;
+                solids.obstacles = obstacles ? &obstacles->state() : nullptr;
+                solids.overlap = overlap;
+                mesher->mesh(positions.data(), velocities.data(), particles, low, high, settings, mesh, walls, solids);
+                if(fields){
+                    mesher->fields(fieldSettings, fluidFields);     //of the particles it has just meshed
+                }
+            }
+            catch(const std::exception& error){
+                why = error.what();
+                return false;
+            }
+            bandCells = mesher->bandCells;
+            rounds = mesher->rounds;
+            seconds = mesher->seconds;
+            fieldSeconds = mesher->fieldSeconds;
         }
         char numbers[200];
         std::snprintf(numbers, sizeof(numbers), ",\"particles\":%llu,\"points\":%zu,\"faces\":%zu,\"bandCells\":%zu,\"rounds\":%d,\"seconds\":%.4f",
-                      particles, mesh.points.size()/3, mesh.quads.size()/4, mesher->bandCells, mesher->rounds, mesher->seconds);
+                      particles, mesh.points.size()/3, mesh.quads.size()/4, bandCells, rounds, seconds);
         std::string said = "{\"event\":\"meshed\",\"frame\":" + std::to_string(frame) + numbers;
         if(surface){
             if(!writeSurfaceBgeo(targets[0], mesh, std::string("flip2 ") + FLIP2_BUILD_ID, why)){
@@ -643,11 +1072,19 @@ static int meshCache(const std::string& directory, int first, int last, std::str
         }
         if(fields){
             auto writing = std::chrono::steady_clock::now();
+            if(bubbleAir > 0.0){
+                std::vector<ShardData> bubbles;
+                if(!readBubbleShards(directory, frame, commit, bubbles, why)){
+                    return false;
+                }
+                fluidFields.bubbles = true;
+                bubbleScattering(bubbles, bubbleAir, fluidFields);
+            }
             if(!writeFluidFields(targets.back(), fluidFields, why)){
                 return false;
             }
-            std::snprintf(numbers, sizeof(numbers), ",\"surfaceVoxels\":%zu,\"velocityVoxels\":%zu,\"fieldSeconds\":%.4f,\"writeSeconds\":%.4f,\"fields\":",
-                          fluidFields.distances.size(), fluidFields.velocities.size()/3, mesher->fieldSeconds,
+            std::snprintf(numbers, sizeof(numbers), ",\"surfaceVoxels\":%zu,\"velocityVoxels\":%zu,\"bubbleVoxels\":%zu,\"fieldSeconds\":%.4f,\"writeSeconds\":%.4f,\"fields\":",
+                          fluidFields.distances.size(), fluidFields.velocities.size()/3, fluidFields.scattering.size(), fieldSeconds,
                           std::chrono::duration<double>(std::chrono::steady_clock::now() - writing).count());
             said += numbers + ::quoted(targets.back());
         }
@@ -726,6 +1163,8 @@ struct Checkpoint{
     std::vector<State> states;  //in rank order
     std::vector<State> whitewater;  //its ranks' whitewater, from a bake with any
     unsigned long long whitewaterNextId = 0;    //and the id the next of its particles gets
+    std::vector<State> bodies;      //the dynamic bodies' states (Bodies::restore), from a bake with any: one shard, none from one made before checkpoints kept them
+    std::vector<State> contacts;    //and the contacts their next substep starts from
 };
 
 //the newest checkpoint in directory whose record is down; frame -1 if there's none
@@ -804,6 +1243,18 @@ static bool newestCheckpoint(const std::string& directory, Checkpoint& out, std:
             }
             out.whitewater.push_back({std::string(name) + "/" + file->text, (int)rank->number, hash->text});
         }
+        for(const char* key : {"bodies", "contacts"}){  //a bake with dynamic bodies: their states and contacts, a shard each
+            const Json* part = record.find(key);
+            const Json* listed = part != nullptr && part->kind == Json::OBJECT ? part->find("shards") : nullptr;
+            for(size_t index = 0; listed != nullptr && index < listed->items.size(); ++index){
+                const Json* file = listed->items[index].find("file");
+                const Json* hash = listed->items[index].find("xxh64");
+                if(file == nullptr || hash == nullptr){
+                    throw std::runtime_error(path + ": a " + key + " shard without its file and xxh64");
+                }
+                (std::string(key) == "bodies" ? out.bodies : out.contacts).push_back({std::string(name) + "/" + file->text, 0, hash->text});
+            }
+        }
     }
     catch(const std::exception& error){
         why = error.what();
@@ -813,12 +1264,14 @@ static bool newestCheckpoint(const std::string& directory, Checkpoint& out, std:
 }
 
 //the checkpoint's particles in the ranks whose planes overlap node planes [low, high), in rank order: the order one partition would hold them in. Each
-//state shard is checked against its record's XXH64 as it's read. ids and births come back empty from a checkpoint made before particles had them
+//state shard is checked against its record's XXH64 as it's read. ids and births come back empty from a checkpoint made before particles had them, and
+//breakup (how far the churning has broken each air particle's air: escaping air) and sauter (each escaped one's spread's Sauter mean) from one without them
 static bool loadCheckpoint(const std::string& directory, const Checkpoint& checkpoint, uint low, uint high, std::vector<double>& x, std::vector<double>& y,
                            std::vector<double>& z, std::vector<float>& u, std::vector<float>& v, std::vector<float>& w,
-                           std::vector<std::vector<float>>& gradients, std::vector<uint>& ids, std::vector<float>& births, std::string& why){
+                           std::vector<std::vector<float>>& gradients, std::vector<uint>& ids, std::vector<float>& births, std::vector<float>& breakup,
+                           std::vector<float>& sauter, std::string& why){
     gradients.assign(9, {});
-    bool identified = true;
+    bool identified = true, sized = true, spread = true;
     for(const Checkpoint::State& state : checkpoint.states){
         if(checkpoint.planes[state.rank] >= high || checkpoint.planes[state.rank + 1] <= low){
             continue;
@@ -849,6 +1302,22 @@ static bool loadCheckpoint(const std::string& directory, const Checkpoint& check
                 gradients[k].insert(gradients[k].end(), c + k*count, c + (k + 1)*count);
             }
         }
+        const ShardData::Attribute* broken = shard.find("breakup");
+        if(broken != nullptr && broken->type == 1 && broken->components == 1){
+            const float* b = (const float*)broken->planes.data();
+            breakup.insert(breakup.end(), b, b + count);
+        }
+        else{
+            sized = false;
+        }
+        const ShardData::Attribute* means = shard.find("sauter");
+        if(means != nullptr && means->type == 1 && means->components == 1){
+            const float* m = (const float*)means->planes.data();
+            sauter.insert(sauter.end(), m, m + count);
+        }
+        else{
+            spread = false;
+        }
         const ShardData::Attribute* id = shard.find("id");
         const ShardData::Attribute* birth = shard.find("birth");
         if(id != nullptr && birth != nullptr && id->type == 3 && birth->type == 1 && id->components == 1 && birth->components == 1){
@@ -866,6 +1335,12 @@ static bool loadCheckpoint(const std::string& directory, const Checkpoint& check
     if(!identified){
         ids.clear();
         births.clear();
+    }
+    if(!sized){
+        breakup.clear();
+    }
+    if(!spread){
+        sauter.clear();
     }
     return true;
 }
@@ -969,10 +1444,21 @@ int main(int argc, char** argv){
         SurfaceSettings surface;
         FieldSettings fieldSettings;
         bool meshSurface = true, fields = false;
+        bool overlap = true;    //the surface carried on into the obstacles (--solids overlap), or stopped at their surfaces (cut)
         std::string format = "bgeo.sc";
+        int workers = std::max(1, std::min(8, (int)std::thread::hardware_concurrency()/2));    //frames meshed at once: the GPU's part is small, the rest isn't
         for(int arg = 3; arg < argc; ++arg){
             std::string option = argv[arg];
-            if(option == "--format" && arg + 1 < argc){
+            if(meshing && option == "--workers" && arg + 1 < argc){
+                char* end = nullptr;
+                std::string given = argv[++arg];
+                long count = std::strtol(given.c_str(), &end, 10);
+                if(end == given.c_str() || *end != '\0' || count < 1 || count > 256){
+                    return usage();
+                }
+                workers = (int)count;
+            }
+            else if(option == "--format" && arg + 1 < argc){
                 format = argv[++arg];
                 if(format != "bgeo" && format != "bgeo.sc"){
                     return usage();
@@ -983,6 +1469,13 @@ int main(int argc, char** argv){
             }
             else if(meshing && option == "--no-surface"){
                 meshSurface = false;
+            }
+            else if(meshing && option == "--solids" && arg + 1 < argc){
+                std::string how = argv[++arg];
+                if(how != "overlap" && how != "cut"){
+                    return usage();
+                }
+                overlap = how == "overlap";
             }
             else if(meshing && arg + 1 < argc && (option == "--separation" || option == "--voxel-scale" || option == "--influence-scale" || option == "--radius-scale" ||
                                                   option == "--smoothing" || option == "--field-voxel-scale")){
@@ -1036,7 +1529,7 @@ int main(int argc, char** argv){
                 return usage();
             }
         }
-        return meshing ? meshCache(argv[2], first, last, out, overwrite, follow, format, surface, meshSurface, fields, fieldSettings)
+        return meshing ? meshCache(argv[2], first, last, out, overwrite, follow, format, surface, meshSurface, fields, fieldSettings, workers, overlap)
                        : exportCache(argv[2], first, last, out, overwrite, follow, format);
     }
     if(argc < 3 || (std::string(argv[1]) != "bake" && std::string(argv[1]) != "resume")){
@@ -1120,6 +1613,11 @@ int main(int argc, char** argv){
     }
     if(resuming){
         scene.writeCache = true;    //into the cache it resumes
+        bool dynamic = std::any_of(scene.obstacles.begin(), scene.obstacles.end(), [](const SceneObstacle& obstacle){ return obstacle.dynamic; });
+        if(dynamic && (checkpoint.bodies.size() != 1 || checkpoint.contacts.size() != 1)){
+            return failure(outputDirectory + ": its newest checkpoint, at frame " + std::to_string(checkpoint.frame) + ", is from a flip2 that didn't keep the dynamic "
+                           "bodies in its checkpoints as shards, so the bake can't carry on from it: bake it again");
+        }
     }
     if(const char* partitions = std::getenv("FLIP2_PARTITIONS")){
         scene.partitions = std::max(1, std::atoi(partitions));
@@ -1185,6 +1683,8 @@ int main(int argc, char** argv){
     std::vector<std::vector<float>> gradients;
     std::vector<uint> ids;
     std::vector<float> births;
+    std::vector<float> breakup; //how far the churning has broken each air particle's air, with escaping air
+    std::vector<float> sauter;  //and each escaped one's spread's Sauter mean
     uint low = 0, high = scene.nodes[2];    //the node planes this process holds: all of them, or across processes, its rank's
     if(resuming){   //every rank's particles here, or across processes, those of the checkpoint's ranks whose planes overlap this rank's
         if(!alone){
@@ -1196,7 +1696,7 @@ int main(int argc, char** argv){
             high = planes[myRank + 1];
         }
         std::string why;
-        if(!loadCheckpoint(scene.outputDirectory, checkpoint, low, high, x, y, z, u, v, w, gradients, ids, births, why)){
+        if(!loadCheckpoint(scene.outputDirectory, checkpoint, low, high, x, y, z, u, v, w, gradients, ids, births, breakup, sauter, why)){
             return failure(why);
         }
         if((ids.empty() && !x.empty()) || !checkpoint.hasNextId){   //made before particles had ids: they're numbered as they come, from here on
@@ -1266,9 +1766,10 @@ int main(int argc, char** argv){
     for(int face = 0; face < 6; ++face){
         simulation->setWallContactAngle(face, scene.wallContactAngle[face]);
         simulation->setWallFriction(face, scene.wallFriction[face]);
+        simulation->setWallContact(face, scene.wallBounce[face], scene.wallContactFriction[face]);
     }
     simulation->setViscousCfl(scene.viscousCfl);
-    simulation->setFreeSurface(scene.freeSurface == "sharp" ? FreeSurface::sharp : FreeSurface::footprint);
+    simulation->setFreeSurface(scene.freeSurface == "levelSet" ? FreeSurface::sharp : FreeSurface::footprint);
     if(scene.air){      //a second fluid (TwoPhase, particles.hu): the particles seeded after the liquid's, and any made later, are air
         TwoPhase twoPhase;
         twoPhase.on = true;
@@ -1286,6 +1787,28 @@ int main(int argc, char** argv){
             simulation->markAirParticles(liquidSeeds);
         }
         simulation->setTwoPhase(twoPhase);
+        if(resuming && twoPhase.escaping()){    //the air's breakup as the checkpoint has it: one made before has its flying bubbles at the size every
+            if(breakup.size() != x.size()){     //bubble flew at then, and the rest unbroken
+                float then = twoPhase.bubbleRadius > 0.0f ? twoPhase.bubbleRadius
+                                                          : (float)(scene.voxelSize()*std::cbrt(3.0 / (4.0*3.14159265358979323846*scene.particlesPerVoxel)));
+                breakup.assign(x.size(), 0.0f);
+                for(size_t particle = 0; particle < ids.size() && particle < breakup.size(); ++particle){
+                    if((ids[particle] & (AIR_PARTICLE | ESCAPED_PARTICLE)) == (AIR_PARTICLE | ESCAPED_PARTICLE)){
+                        breakup[particle] = then;
+                    }
+                }
+            }
+            simulation->setAirBreakup(breakup);
+            if(sauter.size() != x.size()){      //from before bubbles kept it: a flying bubble's spread as its own size alone
+                sauter.assign(x.size(), 0.0f);
+                for(size_t particle = 0; particle < ids.size() && particle < sauter.size(); ++particle){
+                    if((ids[particle] & (AIR_PARTICLE | ESCAPED_PARTICLE)) == (AIR_PARTICLE | ESCAPED_PARTICLE)){
+                        sauter[particle] = breakup[particle];
+                    }
+                }
+            }
+            simulation->setAirSauter(sauter);
+        }
         if(printsEvents){
             std::cerr<<"Two phases: density ratio "<<twoPhase.densityRatio<<"\n";
         }
@@ -1331,16 +1854,16 @@ int main(int argc, char** argv){
         }
     }
     simulation->setForceFields(fields, volumes);
-    Sources sources;
+    SourceSettings sources;
     sources.latticePerSide = scene.particlesPerVoxel == 27 ? 3 : scene.particlesPerVoxel == 8 ? 2 : 1;
     sources.seed = scene.seed;
     sources.openFaces = scene.openFaces;
     std::vector<SceneObstacle> sourceMeshes;
     for(const SceneShape& emitter : scene.emitters){
-        sources.emitters[sources.numEmitters++] = toFluidShape(emitter, sourceMeshes);
+        sources.emitters.push_back(toFluidShape(emitter, sourceMeshes));
     }
     for(const SceneShape& sink : scene.sinks){
-        sources.sinks[sources.numSinks++] = toFluidShape(sink, sourceMeshes);
+        sources.sinks.push_back(toFluidShape(sink, sourceMeshes));
     }
     simulation->setSources(sources);
     std::vector<FluidShape> fluids;
@@ -1350,7 +1873,20 @@ int main(int argc, char** argv){
     if(!sourceMeshes.empty()){
         simulation->setSourceMeshes(sourceMeshes, fluids);      //after setDomain and setSources
     }
-    simulation->setObstacles(scene.obstacles);      //after setDomain: they're voxelized at its voxel size
+    simulation->setObstacles(scene.obstacles, scene.density);      //after setDomain: they're voxelized at its voxel size, and the dynamic ones weighed against the liquid
+    simulation->setCollisionSubsteps(scene.collisionSubsteps);
+    if(resuming && checkpoint.bodies.size() == 1 && checkpoint.contacts.size() == 1){   //the dynamic bodies as the checkpoint left them, in place of where the scene starts them
+        ShardData bodies, contacts;
+        std::string why;
+        if(!readShard(outputDirectory + "/checkpoints/" + checkpoint.bodies[0].file, checkpoint.bodies[0].xxh64, bodies, why) ||
+           !readShard(outputDirectory + "/checkpoints/" + checkpoint.contacts[0].file, checkpoint.contacts[0].xxh64, contacts, why)){
+            return failure(why);
+        }
+        why = simulation->restoreBodies(bodies, contacts);
+        if(!why.empty()){
+            return failure(outputDirectory + ": " + why);
+        }
+    }
     unsigned int wallsLetGo = 0;    //the walls that let go of the liquid, a bit each
     for(int face = 0; face < 6; ++face){
         wallsLetGo |= scene.wallHold[face] ? 0u : 1u << face;
@@ -1369,6 +1905,7 @@ int main(int argc, char** argv){
         description.ages = scene.writeAges;
         description.keepCheckpoints = scene.keepCheckpoints;
         description.whitewaterPerVoxel = scene.whitewater ? scene.whitewaterPerVoxel : 0;
+        description.openFaces = scene.openFaces;
         simulation->startCache(scene.outputDirectory, description, resuming ? checkpoint.frame : -1, [](const char* what, int frame){
             event("{\"event\":\"" + std::string(what) + "\",\"frame\":" + std::to_string(frame) + "}");
         });

@@ -1,4 +1,4 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 
 #ifndef CONJUGATEGRADIENTFUNCTIONS_HU
 #define CONJUGATEGRADIENTFUNCTIONS_HU
@@ -6,6 +6,32 @@
     #include "../typedefs.h"
     #include "../cudaVec.hu"
     #include "multigridFunctions.hu"
+
+    struct Condensation;     //condensationFunctions.hu
+
+    static constexpr int TERM_ROW_ENTRIES = 36;             //the most entries a row of a term's factor has (SolveTerm::factorRows)
+    static constexpr uint NO_TERM_COLUMN = 0xFFFFFFFFu;     //past a row's last
+
+    //More of the matrix than the stencil holds: a symmetric, positive semidefinite term the solve adds to A, as the bodies coupled to the fluid make it
+    //(bodies.cu): each one's motion ties together every unknown its surface cuts. The V-cycle sees the stencil's part alone; at the unknowns the term
+    //outweighs it at, the multigrid's preconditioner takes the term in exactly (condensationFunctions.cu), the others' only the stencil's part
+    class SolveTerm{
+    public:
+        virtual ~SolveTerm() = default;
+        //y += sign*T*x over this partition's own unknowns, every partition at once; with onlyIf, only if the device's *onlyIf is set
+        virtual void addTimes(const float* x, float* y, float sign, const uint* onlyIf, cudaStream_t stream) = 0;
+        //x*T*x for the last addTimes' x, added into *total on the device: for the per-block dot products, whose sums are taken as the stencil's product is
+        virtual void addLastEnergy(double* total, cudaStream_t stream) = 0;
+        //no less than T's largest eigenvalue, on the host: what a step that mustn't overshoot is cut by (the bounded solve's plain step)
+        virtual float normBound() const = 0;
+        //T's own coefficient at each of this partition's own unknowns it reaches, added into diagonal (a value per stored voxel)
+        virtual void addDiagonal(float* diagonal, cudaStream_t stream) = 0;
+        //T as W*W^T: at count of this partition's own unknowns (their indices among the stored voxels, and where each is in the domain, in voxels), each
+        //one's row of W, TERM_ROW_ENTRIES (column, value) pairs a row in increasing column order, its unused ones' columns NO_TERM_COLUMN
+        virtual void factorRows(uint count, const uint* voxels, const int3* places, uint* columns, double* values, cudaStream_t stream) = 0;
+        //what the multigrid's preconditioner keeps between solves for the unknowns the term outweighs the stencil at
+        virtual Condensation& condensation() = 0;
+    };
 
     //how CG adds up its dot products (see conjugateGradientFunctions.cu)
     enum class DotProductSums{
@@ -17,21 +43,22 @@
     //plus where the unknowns sit in the nodes (the exact dot products sum node by node), how to add up the dot products, and, split between partitions, how
     //many voxels are this partition's own (they come first) and the other partitions (see partitionContext.hu). Same stopping rule (the largest residual relative to the largest divergence), same return value, so pressureSolve can use either
     //With bounded (a flag per voxel, the ghosts' their owners'), instead: from the pressures p has, the solve that keeps the unknowns it names from going
-    //under the air's pressure, 0, each ending held or let go (boundedConjugateGradient); stopping on what's left of the residual where it counts
+    //under the air's pressure, 0, each ending held or let go (boundedConjugateGradient); stopping on what's left of the residual where it counts.
+    //With term, the equations are (A + term)*p = -divU
     float cudaConjugateGradient(const CudaVec<char>& solveCodes, const CudaVec<uint>& neighborNx, const CudaVec<uint>& neighborPx, const CudaVec<uint>& neighborNy, const CudaVec<uint>& neighborPy, const CudaVec<uint>& neighborNz, const CudaVec<uint>& neighborPz,
         const CudaVec<float>& Anx, const CudaVec<float>& Apx, const CudaVec<float>& Any, const CudaVec<float>& Apy, const CudaVec<float>& Anz, const CudaVec<float>& Apz, const CudaVec<float>& Adiag,
         CudaVec<float>& divU, CudaVec<float>& p, CudaVec<float>& residuals, float tolerance, uint maxIterations, const VoxelLayout& layout, DotProductSums sums, uint numOwnVoxels,
-        PartitionContext& context, cudaStream_t stream, const char* bounded = nullptr);
+        PartitionContext& context, cudaStream_t stream, const char* bounded = nullptr, SolveTerm* term = nullptr);
 
     //the same, preconditioned by Jacobi: z = r / each unknown's own coefficient
     float cudaJacobiConjugateGradient(const CudaVec<char>& solveCodes, const CudaVec<uint>& neighborNx, const CudaVec<uint>& neighborPx, const CudaVec<uint>& neighborNy, const CudaVec<uint>& neighborPy, const CudaVec<uint>& neighborNz, const CudaVec<uint>& neighborPz,
         const CudaVec<float>& Anx, const CudaVec<float>& Apx, const CudaVec<float>& Any, const CudaVec<float>& Apy, const CudaVec<float>& Anz, const CudaVec<float>& Apz, const CudaVec<float>& Adiag,
         CudaVec<float>& divU, CudaVec<float>& p, CudaVec<float>& residuals, float tolerance, uint maxIterations, const VoxelLayout& layout, DotProductSums sums, uint numOwnVoxels,
-        PartitionContext& context, cudaStream_t stream, const char* bounded = nullptr);
+        PartitionContext& context, cudaStream_t stream, const char* bounded = nullptr, SolveTerm* term = nullptr);
 
     //the same, preconditioned by a multigrid V-cycle (multigridFunctions.cu), which is laid out by where the unknowns sit in the domain
     float cudaMultigridConjugateGradient(const CudaVec<char>& solveCodes, const CudaVec<uint>& neighborNx, const CudaVec<uint>& neighborPx, const CudaVec<uint>& neighborNy, const CudaVec<uint>& neighborPy, const CudaVec<uint>& neighborNz, const CudaVec<uint>& neighborPz,
         const CudaVec<float>& Anx, const CudaVec<float>& Apx, const CudaVec<float>& Any, const CudaVec<float>& Apy, const CudaVec<float>& Anz, const CudaVec<float>& Apz, const CudaVec<float>& Adiag,
         CudaVec<float>& divU, CudaVec<float>& p, CudaVec<float>& residuals, float tolerance, uint maxIterations, const VoxelLayout& layout, DotProductSums sums, uint numOwnVoxels,
-        PartitionContext& context, cudaStream_t stream, const char* bounded = nullptr);
+        PartitionContext& context, cudaStream_t stream, const char* bounded = nullptr, SolveTerm* term = nullptr);
 #endif

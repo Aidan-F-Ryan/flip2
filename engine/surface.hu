@@ -1,4 +1,4 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 #ifndef SURFACE_HU
 #define SURFACE_HU
 #include <string>
@@ -18,6 +18,31 @@ struct SurfaceSettings{
     std::string problem() const;    //what's wrong with these, if anything
 };
 
+//The domain's walls, which the liquid's surface meets flat where the liquid reaches them, as a cutaway shows it. The particles stop short of a wall
+//and have none past it, so from them alone the surface there is each last particle's own bulge, up to a third of a voxel through the wall's plane
+//(a tank's walls at 1 cm voxels: 20 to 80 thousand points of a frame's mesh past them, a few thousand in their plane). Within a particle's reach of
+//a wall each particle has its mirror image across it, so the field there is the one the liquid would make if it went on past the wall as its mirror
+//image, the same on both sides; and past the wall nothing is liquid: none of the mesh is past it, and what meets it lies in its plane. closed: bits
+//-x, +x, -y, +y, -z, +z, the faces that are walls (none: the surface is the particles' alone)
+struct MeshWalls{
+    float low[3] = {0.0f, 0.0f, 0.0f};
+    float high[3] = {0.0f, 0.0f, 0.0f};
+    unsigned int closed = 0;
+};
+
+struct Obstacles;   //the scene's obstacles where they are, for the kernels (obstacles.hu)
+
+//How the liquid's surface meets the scene's obstacles where the liquid touches them. A particle within reach of one has its mirror image across its
+//surface (the tangent plane where it's nearest), inside the obstacle, so the field goes on into it as the liquid's mirror image, as at a wall. Then
+//with overlap the surface is carried on into the obstacle as far as a particle reaches, and the obstacle hides it, or, one a renderer sees through,
+//the renderer takes the obstacle for what's there where the two overlap: nested dielectrics, the obstacle's priority over the liquid's (flip2's Karma
+//setup gives the liquid the lower). Without, the surface stops at the obstacle's own, the two meeting in one surface, which renderers seeing through
+//both can tell apart only by chance
+struct MeshSolids{
+    const Obstacles* obstacles = nullptr;   //none: the surface is the particles' alone round them
+    bool overlap = true;
+};
+
 struct SurfaceMesh{
     std::vector<float> points;      //x, y, z per point
     std::vector<float> velocities;  //x, y, z per point, metres per second
@@ -33,7 +58,8 @@ struct FieldSettings{
 
 //the fields' voxels, (i, j, k) centred at (i, j, k) voxel sizes from the origin, as a VDB's are. The surface: the distance to the zero level of the
 //particles' field as the mesh has it (but at these voxels), negative inside, at voxels within the half width of it; deeper in, everything is inside. The
-//velocity: the particles' velocities averaged wherever they reach, as the mesh's points have them, and carried on as far again as the half width
+//velocity: the particles' velocities averaged wherever they reach, as the mesh's points have them, and carried on as far again as the half width.
+//With escaping air, the light its bubbles scatter (bubbles): per metre, at the voxels they reach (flip2.cu's bubbleScattering)
 struct FluidFields{
     float voxelSize = 0.0f;
     float halfWidth = 0.0f;
@@ -41,6 +67,9 @@ struct FluidFields{
     std::vector<float> distances;       //per voxel, metres
     std::vector<int> velocityVoxels;    //i, j, k per voxel
     std::vector<float> velocities;      //x, y, z per voxel, metres per second
+    bool bubbles = false;               //whether the bake's air escapes as bubbles: a "bubbles" grid, even with none in the frame
+    std::vector<int> bubbleVoxels;      //i, j, k per voxel
+    std::vector<float> scattering;      //per voxel, per metre
 };
 
 //keeps its GPU buffers between frames, growing them as needed; one per thread, on the device that's current when it's made
@@ -50,10 +79,11 @@ public:
     ~SurfaceMesher();
     SurfaceMesher(const SurfaceMesher&) = delete;
     SurfaceMesher& operator=(const SurfaceMesher&) = delete;
-    //meshes count particles: positions and velocities as x, y and z planes (each count floats, one after another), within bounds low and high
+    //meshes count particles: positions and velocities as x, y and z planes (each count floats, one after another), within bounds low and high, against
+    //the walls and the obstacles (which have to stay where they are until fields() has been called too)
     void mesh(const float* positions, const float* velocities, unsigned long long count, const float low[3], const float high[3], const SurfaceSettings& settings,
-              SurfaceMesh& out);
-    //the fields of the particles the last mesh() meshed
+              SurfaceMesh& out, const MeshWalls& walls = MeshWalls(), const MeshSolids& solids = MeshSolids());
+    //the fields of the particles the last mesh() meshed, against the same walls and obstacles, but always stopped at the obstacles' surfaces
     void fields(const FieldSettings& settings, FluidFields& out);
     double seconds = 0.0;           //the last mesh's time on the GPU, copies included
     double fieldSeconds = 0.0;      //and the last fields'
@@ -63,9 +93,11 @@ public:
 private:
     struct Buffers;
     Buffers* buffers;
-    unsigned long long count = 0;   //the last mesh's particles, which are still on the GPU, and their bounds and separation
+    unsigned long long count = 0;   //the last mesh's particles, which are still on the GPU (their mirror images across the walls with them), and their bounds
     float low[3] = {0.0f, 0.0f, 0.0f}, high[3] = {0.0f, 0.0f, 0.0f};
-    SurfaceSettings surface;        //the last mesh's settings, which the fields share
+    SurfaceSettings surface;        //the last mesh's settings, walls and obstacles, which the fields share
+    MeshWalls walls;
+    MeshSolids solids;
 };
 
 #endif

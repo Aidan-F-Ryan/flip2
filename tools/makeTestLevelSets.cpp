@@ -1,4 +1,4 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 
 //Writes the VDB level sets the test scenes use, into the directory given (the repo's scenes/geo):
 //  sphere.vdb      a sphere of radius 0.05 m centred at (0.125, 0.06, 0.125), the tanks' (tank-meshsphere.json), as grid "surface", 2.5 mm voxels

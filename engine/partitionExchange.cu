@@ -1,4 +1,4 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 
 #include "partitionExchange.hu"
 #include "particles.hu"
@@ -33,6 +33,14 @@ __global__ void leastOfRanks(const float* gathered, int ranks, float* least){
         found = fminf(found, gathered[rank]);
     }
     *least = found;
+}
+
+int PartitionExchange::rank() const{
+    return me.rank;
+}
+
+int PartitionExchange::numRanks() const{
+    return me.numRanks;
 }
 
 PartitionExchange::~PartitionExchange(){

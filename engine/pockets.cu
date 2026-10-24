@@ -1,4 +1,4 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 
 //Sealed pockets: fluid no air reaches, shut in by obstacles and the domain's walls. Nothing in a pocket's pressure equations is held at 0, so they fix its
 //pressure only up to a constant, and they have a solution only if the fluid's net flow out of the pocket is 0: fluid that can't be compressed can't leave
@@ -11,8 +11,11 @@
 //unknowns finds each partition's pieces of fluid, and each piece takes the smallest label among its unknowns: 0 for an unknown with a face to air,
 //otherwise 1 + its index among the domain's voxels. Partitions then swap labels with their ghosts until every piece agrees, so fluid air reaches ends up at
 //0 and a pocket at its smallest voxel's label, the same on every partition however the domain is split. Each pocket gets a place in a table every
-//partition holds alike, from the partition that owns its smallest voxel (registerPockets). balanceSealedPockets then takes each pocket's mean divergence
-//out, added up exactly as the CG's dot products are, so that doesn't depend on the split either.
+//partition holds alike, from the partition that owns its smallest voxel (registerPockets), and each piece finds it there by its label, the table sorted.
+//balanceSealedPockets then takes each pocket's mean divergence out, added up exactly as the CG's dot products are, so that doesn't depend on the split
+//either. The table has room for as many pockets as there are: the first round's labels leave unchanged just the unknowns that are their pieces'
+//smallest, and those it counts are no fewer than the pockets each partition registers (a pocket crossing partitions has one in each piece of it to begin
+//with, and its smallest voxel is one of them), which the host reads along with the rest.
 //
 //Without pockets, only the labelling costs anything, and the host learns there are none along with the free surface pressureSolve already waits for.
 //Partitions agreeing on a piece of fluid that crosses between them takes a round of ghost labels per partition boundary it crosses, and the host waits on
@@ -22,32 +25,35 @@
 #include "algorithms/voxelSolveFunctions.hu"   //NO_VOXEL, WALL_VOXEL
 #include <cmath>
 #include <iostream>
+#include <cub/cub.cuh>
 
-static constexpr uint MOST_POCKETS = 256;   //the most pockets there can be in all: past it none are balanced, whichever partitions hold them
 static constexpr int POCKET_DIGITS = 9;
 static constexpr uint POCKET_WORDS = POCKET_DIGITS + 2;     //per pocket: its divergence summed exactly, how many values weren't finite, and its unknowns
 static constexpr uint NO_POCKET = 0xFFFFFFFFu;
 static constexpr uint POCKET_THREADS = 128;
 static constexpr uint FULL_WARP = 0xFFFFFFFFu;
 
-//the pockets' bookkeeping, in 64-bit words (Particles::pocketWords): two counts added up over the partitions; the table of pockets, numRanks*MOST_POCKETS
-//labels with each partition's from rank*MOST_POCKETS on, then how many pockets the partitions registered in all; each table entry's sum; and its mean
+//the pockets' bookkeeping, in 64-bit words (Particles::pocketWords): the counts added up over the partitions; the table of pockets, room for entries
+//labels with each partition's part after the last's, then how many each registered; each table entry's sum; and its mean. Grows as it needs to, and
+//what's in it doesn't last a resize: the counts are on the host by then
 struct PocketBook{
-    long long* summed;      //[0] the unknowns no air reaches, [1] the labels the last round changed
+    long long* summed;      //[0] the unknowns no air reaches, [1] the labels the last round changed, then per partition the first round's smallest unknowns
     long long* table;
     long long* sums;
     double* means;
     uint entries;
 };
 
-static PocketBook pocketBook(CudaVec<double>& words, int numRanks, cudaStream_t stream){
-    uint entries = numRanks*MOST_POCKETS;
-    size_t size = 2 + (entries + 1) + (size_t)entries*POCKET_WORDS + entries;
-    if(words.size() != size){
+static PocketBook pocketBook(CudaVec<double>& words, int numRanks, uint entries, cudaStream_t stream){
+    size_t counts = 2 + (size_t)numRanks;
+    size_t size = counts + (entries + (size_t)numRanks) + (size_t)entries*POCKET_WORDS + entries;
+    if(words.size() < size){
         words.resizeAsync((uint)size, stream);
     }
     long long* base = (long long*)words.devPtr();
-    return {base, base + 2, base + 3 + entries, (double*)(base + 3 + entries + (size_t)entries*POCKET_WORDS), entries};
+    long long* table = base + counts;
+    long long* sums = table + entries + numRanks;
+    return {base, table, sums, (double*)(sums + (size_t)entries*POCKET_WORDS), entries};
 }
 
 // ---- labels ----
@@ -165,8 +171,10 @@ __global__ void pocketMinimum(uint numVoxels, const char* solveCodes, const uint
     }
 }
 
-//each own unknown takes its piece's smallest label. Counts the own unknowns no air reaches, so far as this round knows, and the labels that changed
-__global__ void pocketRelabel(uint numOwnVoxels, const char* solveCodes, const uint* parents, const uint* minima, uint* labels, long long* summed){
+//each own unknown takes its piece's smallest label. Counts the own unknowns no air reaches, so far as this round knows, and the labels that changed;
+//and at roots (summed's word for this partition, in the first round, when each unknown still has its own label), the sealed ones it didn't change:
+//their pieces' smallest, one a pocket within the partition, and one a piece of a pocket that crosses partitions
+__global__ void pocketRelabel(uint numOwnVoxels, const char* solveCodes, const uint* parents, const uint* minima, uint* labels, long long* summed, long long* roots){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
     bool sealed = false;
     bool changed = false;
@@ -178,6 +186,7 @@ __global__ void pocketRelabel(uint numOwnVoxels, const char* solveCodes, const u
     }
     uint sealedLanes = __ballot_sync(FULL_WARP, sealed);
     uint changedLanes = __ballot_sync(FULL_WARP, changed);
+    uint smallestLanes = __ballot_sync(FULL_WARP, sealed && !changed);
     if(threadIdx.x % 32 == 0){
         if(sealedLanes != 0){
             atomicAdd((unsigned long long*)&summed[0], (unsigned long long)__popc(sealedLanes));
@@ -185,14 +194,17 @@ __global__ void pocketRelabel(uint numOwnVoxels, const char* solveCodes, const u
         if(changedLanes != 0){
             atomicAdd((unsigned long long*)&summed[1], (unsigned long long)__popc(changedLanes));
         }
+        if(roots != nullptr && smallestLanes != 0){
+            atomicAdd((unsigned long long*)roots, (unsigned long long)__popc(smallestLanes));
+        }
     }
 }
 
 // ---- the table of pockets ----
 
-//a pocket's smallest voxel registers it in its partition's part of the table. A block per own node. The count goes on past the table's room, so once
-//it's added up over the partitions, every partition can tell there were too many
-__global__ void registerPockets(VoxelPlaces places, uint3 domainVoxels, uint rank, const char* solveCodes, const uint* labels, long long* table, long long* registered){
+//a pocket's smallest voxel registers it in its partition's part of the table, which has room for it (the first round counted it among its smallest).
+//A block per own node
+__global__ void registerPockets(VoxelPlaces places, uint3 domainVoxels, const char* solveCodes, const uint* labels, long long* table, uint room, long long* registered){
     uint node = blockIdx.x;
     uint first = node == 0 ? 0 : places.nodeVoxelEnds[node - 1];
     uint last = places.nodeVoxelEnds[node];
@@ -206,26 +218,41 @@ __global__ void registerPockets(VoxelPlaces places, uint3 domainVoxels, uint ran
             continue;
         }
         unsigned long long place = atomicAdd((unsigned long long*)registered, 1ull);
-        if(place < MOST_POCKETS){
-            table[rank*MOST_POCKETS + place] = labels[index];
+        if(place < room){
+            table[place] = labels[index];
         }
     }
 }
 
-//each own piece of a pocket finds its pocket in the table, by its label, and its root keeps where (in slots, which held the pieces' smallest labels
-//until now). Only roots look, a handful, so a scan of the table does
-__global__ void findPocketSlots(uint numOwnVoxels, uint entries, const char* solveCodes, const uint* parents, const uint* labels, const long long* table, uint* slots){
+//the table's labels, to be sorted with where each is
+__global__ void keyPockets(uint entries, const long long* table, unsigned long long* keys, uint* places){
+    uint entry = threadIdx.x + blockIdx.x*blockDim.x;
+    if(entry < entries){
+        keys[entry] = (unsigned long long)table[entry];
+        places[entry] = entry;
+    }
+}
+
+//each own piece of a pocket finds its pocket in the table, by its label in the sorted labels (each pocket is there once, and the room nothing took is
+//0, first), and its root keeps where (in slots, which held the pieces' smallest labels until now)
+__global__ void findPocketSlots(uint numOwnVoxels, uint entries, const char* solveCodes, const uint* parents, const uint* labels, const unsigned long long* sorted,
+                                const uint* places, uint* slots){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
     if(index >= numOwnVoxels || !solveCodes[index] || parents[index] != index || labels[index] == 0){
         return;
     }
-    uint slot = NO_POCKET;
-    if(table[entries] <= MOST_POCKETS){
-        for(uint entry = 0; entry < entries && slot == NO_POCKET; ++entry){
-            slot = table[entry] == (long long)labels[index] ? entry : NO_POCKET;
+    unsigned long long label = labels[index];
+    uint low = 0, high = entries;
+    while(low < high){
+        uint middle = low + (high - low)/2;
+        if(sorted[middle] < label){
+            low = middle + 1;
+        }
+        else{
+            high = middle;
         }
     }
-    slots[index] = slot;
+    slots[index] = low < entries && sorted[low] == label ? places[low] : NO_POCKET;
 }
 
 // ---- balancing the divergence ----
@@ -345,8 +372,8 @@ static uint3 pocketDomain(const Grid& grid, uint interiorWidth){
     return x*y*z < 0xFFFFFFFFull ? make_uint3((uint)x, (uint)y, (uint)z) : make_uint3(0, 0, 0);
 }
 
-//a round of labels: each piece's smallest, which each own unknown takes, counting into summed
-void Particles::pocketRound(long long* summed){
+//a round of labels: each piece's smallest, which each own unknown takes, counting into summed, and with roots (the first round) the pieces' smallest
+void Particles::pocketRound(long long* summed, long long* roots){
     uint numVoxels = pocketLabels.size();
     gpuErrchk(cudaMemsetAsync(pocketMinima.devPtr(), 0xFF, sizeof(uint)*numVoxels, stream));
     if(numVoxels > 0){
@@ -354,7 +381,7 @@ void Particles::pocketRound(long long* summed){
     }
     if(numOwnVoxels > 0){
         pocketRelabel<<<numOwnVoxels / POCKET_THREADS + 1, POCKET_THREADS, 0, stream>>>(numOwnVoxels, solveCodes.devPtr(), pocketParents.devPtr(), pocketMinima.devPtr(),
-            pocketLabels.devPtr(), summed);
+            pocketLabels.devPtr(), summed, roots);
     }
 }
 
@@ -363,13 +390,16 @@ void Particles::pocketRound(long long* summed){
 void Particles::findSealedPockets(){
     uint interiorWidth = numVoxels1D - 2*(uint)std::floor(radius);
     uint3 domainVoxels = pocketDomain(grid, interiorWidth);
+    size_t counts = 2 + (size_t)numRanks;
     if(pocketSeen == nullptr){
-        gpuErrchk(cudaMallocHost((void**)&pocketSeen, 2*sizeof(long long)));
+        gpuErrchk(cudaMallocHost((void**)&pocketSeen, counts*sizeof(long long)));
         if(domainVoxels.x == 0 && verbose()){
             std::cerr<<"The domain has too many voxels to look for sealed pockets of fluid in: their divergence won't be balanced\n";
         }
     }
-    pocketSeen[0] = pocketSeen[1] = 0;
+    for(size_t count = 0; count < counts; ++count){
+        pocketSeen[count] = 0;
+    }
     if(domainVoxels.x == 0){
         return;
     }
@@ -377,8 +407,8 @@ void Particles::findSealedPockets(){
     for(CudaVec<uint>* perVoxel : {&pocketParents, &pocketLabels, &pocketMinima}){
         perVoxel->resizeAsync(numVoxels, stream);
     }
-    PocketBook book = pocketBook(pocketWords, numRanks, stream);
-    gpuErrchk(cudaMemsetAsync(book.summed, 0, 2*sizeof(long long), stream));
+    PocketBook book = pocketBook(pocketWords, numRanks, 0, stream);
+    gpuErrchk(cudaMemsetAsync(book.summed, 0, counts*sizeof(long long), stream));
     if(numStoredNodes > 0 && numVoxels > 0){
         startPockets<<<numStoredNodes, POCKET_THREADS, 0, stream>>>(voxelPlaces(), domainVoxels, solveCodes.devPtr(), neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(),
             neighborPy.devPtr(), neighborNz.devPtr(), neighborPz.devPtr(), pocketParents.devPtr(), pocketLabels.devPtr());
@@ -387,9 +417,9 @@ void Particles::findSealedPockets(){
         flattenPockets<<<numVoxels / POCKET_THREADS + 1, POCKET_THREADS, 0, stream>>>(numVoxels, solveCodes.devPtr(), pocketParents.devPtr());
     }
     context->fillGhosts((float*)pocketLabels.devPtr(), stream);    //labels go across bit for bit
-    pocketRound(book.summed);
-    context->sumOverPartitions(book.summed, 2, stream);
-    gpuErrchk(cudaMemcpyAsync(pocketSeen, book.summed, 2*sizeof(long long), cudaMemcpyDeviceToHost, stream));
+    pocketRound(book.summed, book.summed + 2 + rank);
+    context->sumOverPartitions(book.summed, (uint)counts, stream);
+    gpuErrchk(cudaMemcpyAsync(pocketSeen, book.summed, counts*sizeof(long long), cudaMemcpyDeviceToHost, stream));
     gpuErrchk(cudaPeekAtLastError());
 }
 
@@ -398,11 +428,19 @@ void Particles::findSealedPockets(){
 void Particles::settleSealedPockets(){
     long long unknowns = pocketSeen[0];
     long long changed = pocketSeen[1];
-    PocketBook book = pocketBook(pocketWords, numRanks, stream);
+    uint room = 0, before = 0;  //this partition's part of the table, and the parts ahead of it
+    pocketEntries = 0;
+    for(int other = 0; other < numRanks; ++other){
+        uint smallest = (uint)pocketSeen[2 + other];
+        before += other < rank ? smallest : 0;
+        room = other == rank ? smallest : room;
+        pocketEntries += smallest;
+    }
+    PocketBook book = pocketBook(pocketWords, numRanks, pocketEntries, stream);
     while(numRanks > 1 && unknowns > 0 && changed > 0){    //a lone partition's first round is its last
         gpuErrchk(cudaMemsetAsync(book.summed, 0, 2*sizeof(long long), stream));
         context->fillGhosts((float*)pocketLabels.devPtr(), stream);
-        pocketRound(book.summed);
+        pocketRound(book.summed, nullptr);
         context->sumOverPartitions(book.summed, 2, stream);
         gpuErrchk(cudaMemcpyAsync(pocketSeen, book.summed, 2*sizeof(long long), cudaMemcpyDeviceToHost, stream));
         gpuErrchk(cudaStreamSynchronize(stream));
@@ -414,19 +452,38 @@ void Particles::settleSealedPockets(){
         return;
     }
     uint interiorWidth = numVoxels1D - 2*(uint)std::floor(radius);
-    gpuErrchk(cudaMemsetAsync(book.table, 0, sizeof(long long)*(book.entries + 1), stream));
+    uint entries = book.entries;
+    gpuErrchk(cudaMemsetAsync(book.table, 0, sizeof(long long)*(entries + numRanks), stream));
     if(numOwnNodes > 0){
-        registerPockets<<<numOwnNodes, POCKET_THREADS, 0, stream>>>(voxelPlaces(), pocketDomain(grid, interiorWidth), rank, solveCodes.devPtr(), pocketLabels.devPtr(), book.table,
-            book.table + book.entries);
+        registerPockets<<<numOwnNodes, POCKET_THREADS, 0, stream>>>(voxelPlaces(), pocketDomain(grid, interiorWidth), solveCodes.devPtr(), pocketLabels.devPtr(), book.table + before,
+            room, book.table + entries + rank);
     }
-    context->sumOverPartitions(book.table, book.entries + 1, stream);
+    context->sumOverPartitions(book.table, entries + numRanks, stream);
+    //the labels in order, for each piece to find its pocket's by
+    unsigned long long* keys;
+    unsigned long long* sorted;
+    uint* places;
+    uint* placesSorted;
+    gpuErrchk(cudaMallocAsync((void**)&keys, sizeof(unsigned long long)*entries, stream));
+    gpuErrchk(cudaMallocAsync((void**)&sorted, sizeof(unsigned long long)*entries, stream));
+    gpuErrchk(cudaMallocAsync((void**)&places, sizeof(uint)*entries, stream));
+    gpuErrchk(cudaMallocAsync((void**)&placesSorted, sizeof(uint)*entries, stream));
+    keyPockets<<<entries / POCKET_THREADS + 1, POCKET_THREADS, 0, stream>>>(entries, book.table, keys, places);
+    size_t bytes = 0;
+    gpuErrchk(cub::DeviceRadixSort::SortPairs(nullptr, bytes, keys, sorted, places, placesSorted, (int)entries, 0, 32, stream));    //labels are 32 bits
+    void* scratch;
+    gpuErrchk(cudaMallocAsync(&scratch, bytes, stream));
+    gpuErrchk(cub::DeviceRadixSort::SortPairs(scratch, bytes, keys, sorted, places, placesSorted, (int)entries, 0, 32, stream));
     if(numOwnVoxels > 0){
-        findPocketSlots<<<numOwnVoxels / POCKET_THREADS + 1, POCKET_THREADS, 0, stream>>>(numOwnVoxels, book.entries, solveCodes.devPtr(), pocketParents.devPtr(), pocketLabels.devPtr(),
-            book.table, pocketMinima.devPtr());
+        findPocketSlots<<<numOwnVoxels / POCKET_THREADS + 1, POCKET_THREADS, 0, stream>>>(numOwnVoxels, entries, solveCodes.devPtr(), pocketParents.devPtr(), pocketLabels.devPtr(),
+            sorted, placesSorted, pocketMinima.devPtr());
+    }
+    for(void* used : {(void*)keys, (void*)sorted, (void*)places, (void*)placesSorted, scratch}){
+        gpuErrchk(cudaFreeAsync(used, stream));
     }
     gpuErrchk(cudaPeekAtLastError());
     if(verbose()){
-        std::cout<<"Sealed pockets: "<<unknowns<<" unknowns no air reaches; each pocket's divergence is balanced (at most "<<MOST_POCKETS<<" pockets)\n";
+        std::cout<<"Sealed pockets: "<<unknowns<<" unknowns no air reaches, in no more than "<<entries<<" pockets; each pocket's divergence is balanced\n";
     }
 }
 
@@ -435,7 +492,7 @@ void Particles::balanceSealedPockets(){
     if(pocketUnknowns == 0){
         return;
     }
-    PocketBook book = pocketBook(pocketWords, numRanks, stream);
+    PocketBook book = pocketBook(pocketWords, numRanks, pocketEntries, stream);
     gpuErrchk(cudaMemsetAsync(book.sums, 0, sizeof(long long)*book.entries*POCKET_WORDS, stream));
     if(numOwnVoxels > 0){
         sumPockets<<<numOwnVoxels / POCKET_THREADS + 1, POCKET_THREADS, 0, stream>>>(numOwnVoxels, solveCodes.devPtr(), pocketParents.devPtr(), pocketLabels.devPtr(), pocketMinima.devPtr(),

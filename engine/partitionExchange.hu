@@ -1,4 +1,4 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 
 #ifndef PARTITIONEXCHANGE_HU
 #define PARTITIONEXCHANGE_HU
@@ -19,6 +19,8 @@ public:
     {}
     ~PartitionExchange();   //frees its buffers: make its GPU the current one first
 
+    int rank() const override;
+    int numRanks() const override;
     void fillGhosts(float* values, cudaStream_t stream) override;
     void fillGhosts(char* values, cudaStream_t stream) override;
     void reduceGhosts(int* values, cudaStream_t stream) override;

@@ -1,4 +1,4 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 
 #include "particles.hu"
 
@@ -167,6 +167,10 @@ std::vector<CudaVec<float>*> Particles::particleFloats(){
             arrays.push_back(&gradient);
         }
     }
+    if(twoPhase.escaping()){
+        arrays.push_back(&airBreakup);
+        arrays.push_back(&airSauter);
+    }
     return arrays;
 }
 
@@ -334,6 +338,26 @@ __global__ void markReachedVoxels(uint numParticleNodes, uint numParticles, uint
     __syncthreads();
     for(int word = threadIdx.x; word < maskWords; word += blockDim.x){
         reachedMasks[blockIdx.x*maskStride + word] = reached[word];
+    }
+}
+
+//which voxels hold a particle, a block per node holding particles: each particle's own voxel, in its node's interior (markObstacleSolids). One that
+//rounding puts just past the interior, on its boundary, counts in the voxel at the edge
+__global__ void findOccupiedVoxels(uint numParticleNodes, uint numParticles, uint numVoxels1D, const uint* gridNodeIndicesToFirstParticleIndex, const uint* gridPosition, const double* px, const double* py,
+                                   const double* pz, const uint* interiorVoxels, char* occupied, double radius, Grid grid, uint refinementLevel){
+    int apronCells = floor(radius);
+    int interiorWidth = numVoxels1D - 2*apronCells;
+    uint firstParticle = gridNodeIndicesToFirstParticleIndex[blockIdx.x];
+    uint lastParticle = blockIdx.x == numParticleNodes - 1 ? numParticles : gridNodeIndicesToFirstParticleIndex[blockIdx.x + 1];
+    for(uint index = firstParticle + threadIdx.x; index < lastParticle; index += blockDim.x){
+        float3 pos = positionInNodeBlock(index, gridPosition, px, py, pz, grid, refinementLevel, apronCells);
+        int x = min(max((int)floorf(pos.x) - apronCells, 0), interiorWidth - 1);
+        int y = min(max((int)floorf(pos.y) - apronCells, 0), interiorWidth - 1);
+        int z = min(max((int)floorf(pos.z) - apronCells, 0), interiorWidth - 1);
+        uint voxel = interiorVoxels[(size_t)blockIdx.x*interiorWidth*interiorWidth*interiorWidth + x + (y + z*interiorWidth)*interiorWidth];
+        if(voxel != NO_VOXEL){
+            occupied[voxel] = 1;
+        }
     }
 }
 
@@ -807,6 +831,18 @@ void Particles::orderNodes(uint maskWords){
     gpuErrchk(cudaPeekAtLastError());
 }
 
+//which stored voxels hold a particle (::findOccupiedVoxels), the ghosts' from their owners, which have their particles
+void Particles::findOccupiedVoxels(){
+    occupiedVoxels.resizeAsync(voxelIDsUsed.size(), stream);
+    occupiedVoxels.zeroDeviceAsync(stream);
+    if(numParticleNodes > 0 && occupiedVoxels.size() > 0){
+        ::findOccupiedVoxels<<<numParticleNodes, NODE_THREADS, 0, stream>>>(numParticleNodes, size, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(),
+            pz.devPtr(), nodeInteriorVoxels.devPtr(), occupiedVoxels.devPtr(), radius, grid, refinementLevel);
+        gpuErrchk(cudaPeekAtLastError());
+    }
+    context->fillGhosts(occupiedVoxels.devPtr(), stream);
+}
+
 //each ghost node's voxels here and in its owner, for filling and reducing; and the check that both partitions built it alike
 //A partition's ghost runs have to be its neighbours' edge runs, node for node and voxel for voxel. Both sides build them from the same particles, so they
 //always should be; if they ever differ, filling ghosts would mix up voxels, so stop
@@ -926,7 +962,7 @@ void Particles::generateVoxels(){
     uint interiorWidth = numVoxels1D - 2*(uint)std::floor(radius);
     nodeInteriorVoxels.resizeAsync(numUsedGridNodes*interiorWidth*interiorWidth*interiorWidth, stream);
     cudaMemsetAsync(nodeInteriorVoxels.devPtr(), 0xFF, sizeof(uint)*nodeInteriorVoxels.size(), stream);   //NO_VOXEL until buildVoxelTopology finds one
-    for(CudaVec<float>* voxelData : {&voxelsUx, &voxelsUy, &voxelsUz, &voxelsUxOld, &voxelsUyOld, &voxelsUzOld, &voxelWeightsX, &voxelWeightsY, &voxelWeightsZ, &particleCounts, &divU, &p, &residuals, &Anx, &Apx, &Any, &Apy, &Anz, &Apz, &Adiag}){
+    for(CudaVec<float>* voxelData : {&voxelsUx, &voxelsUy, &voxelsUz, &voxelsUxOld, &voxelsUyOld, &voxelsUzOld, &voxelWeightsX, &voxelWeightsY, &voxelWeightsZ, &particleCounts, &particleDensity, &divU, &p, &residuals, &Anx, &Apx, &Any, &Apy, &Anz, &Apz, &Adiag}){
         voxelData->resizeAsync(numUsedVoxels, stream);
     }
     if(twoPhase.on){    //each face's density, and with air particles the liquid's weights that go into it (twophase.cu)
@@ -942,13 +978,18 @@ void Particles::generateVoxels(){
     if(twoPhase.escaping() || whitewater.on){   //what escaping particles and the whitewater are judged by
         liquidShare.resizeAsync(numUsedVoxels, stream);
     }
+    if(twoPhase.escaping()){    //and the air by which of it the grid resolves
+        airResolved.resizeAsync(numUsedVoxels, stream);
+    }
     if(lettingGo()){    //which voxels boundaries have let go of, a solve at a time (boundaries.cu)
         letGo.resizeAsync(numUsedVoxels, stream);
     }
     p.zeroDeviceAsync(stream);
 
-    for(CudaVec<uint>* lower : {&neighborNx, &neighborNy, &neighborNz}){   //air voxels' lower neighbours: NO_VOXEL unless an unknown below claims them
-        cudaMemsetAsync(lower->devPtr(), 0xFF, sizeof(uint)*numUsedVoxels, stream);
+    //every voxel's neighbours NO_VOXEL, but an unknown's (buildVoxelTopology) and an air voxel's lower ones an unknown below claims. Reallocated each
+    //initialize, an air voxel's upper ones held whatever was there before, and letGoOfAir read them: bakes whose walls let go split differently
+    for(CudaVec<uint>* neighbor : {&neighborNx, &neighborPx, &neighborNy, &neighborPy, &neighborNz, &neighborPz}){
+        cudaMemsetAsync(neighbor->devPtr(), 0xFF, sizeof(uint)*numUsedVoxels, stream);
     }
     if(numStoredNodes > 0){     //the nodes 2 planes out have no voxels to build
         writeUsedVoxelIDs<<<numStoredNodes, 32, 0, stream>>>(numVoxels1D, usedVoxelMasks.devPtr(), nodeIndexUsedVoxels.devPtr(), nodeCells.devPtr(), voxelIDsUsed.devPtr(), solids.devPtr(), solveCodes.devPtr(), radius, grid, refinementLevel);
@@ -957,8 +998,8 @@ void Particles::generateVoxels(){
             grid, refinementLevel);
     }
     gpuErrchk(cudaPeekAtLastError());
+    checkGhostRuns();       //before anything fills the ghosts
     markObstacleSolids();   //the voxels inside obstacles stop being unknowns, and their neighbours see walls
-    checkGhostRuns();
 
     if(numRanks == 1){
         std::cout<<"Nodes: "<<numParticleNodes<<" with particles, "<<numUsedGridNodes<<" in all, holding "<<numUsedVoxels<<" voxels\n";
@@ -988,9 +1029,15 @@ static AffineVelocities affineVelocities(CudaVec<float> (&affine)[9]){
 }
 
 //P2G: a block per node and a thread per particle. Each particle adds its weight and its momentum on the 27 faces of each component around it into
-//the node's voxel block in shared memory, and 1 to the count of the voxel holding it; then each voxel the node stores adds the block's sums into its
-//owner. It sums in fixed point, as sm_86 has native shared integer atomics but not float ones, and integers add up the same in any order, so the
-//result doesn't depend on which node gets there first.
+//the node's voxel block in shared memory, 1 to the count of the voxel holding it, and its weight on the 27 voxel centres around it to their density;
+//then each voxel the node stores adds the block's sums into its owner. It sums in fixed point, as sm_86 has native shared integer atomics but not
+//float ones, and integers add up the same in any order, so the result doesn't depend on which node gets there first.
+//The density is what the density correction measures (cudaCalcDivU): the quadratic B-spline's weights on the centres, which add up to 1 wherever the
+//particle is, so a lattice of particles at rest reads restParticlesPerVoxel at every centre to the rounding, however it lies on the voxels and as it
+//slides across them, where the count of a voxel's particles rises and falls by one as they cross into it and out. A particle's weight on a centre past
+//a domain wall goes to that centre's mirror image inside, which is the weight the particle's own mirror image across the wall has there, as G2P reads
+//the faces past a wall from their images: so the liquid beside a wall reads as liquid all round, its images filling the room past the wall, where the
+//wall's side of the B-spline would read as empty
 //A particle's share of a face's weight is a whole number of units (weightScale to a weight of 1), and its share of the face's momentum is that many
 //times its velocity there, in whole units too (velocityScale to 1 m/s: 2^MOMENTUM_DIGIT to the fastest there is). So a face's momentum over its
 //weight is the mean of its particles' velocities, each by its share, exactly, however little of any of them reaches it; and a share too small to
@@ -999,23 +1046,24 @@ static AffineVelocities affineVelocities(CudaVec<float> (&affine)[9]){
 //velocity, faces were off by a third of it, the pressure solve took that for divergence, and the ball lost a thousandth of its speed a substep.)
 //The products take 64 bits, and the shared atomics that are native are 32: so each sum is two words, the product's low half added to the low
 //one, and its high half to the high one with the carry, which the add that wrapped the low word knows it made, by what it found there. Per slot,
-//3 such sums, and 4 ints, the weights and the count: 20 KB for an 8^3 block. The owners' sums are 32-bit, in the float arrays' storage: the
+//3 such sums, and 5 ints, the weights, the count and the density: 22 KB for an 8^3 block. The owners' sums are 32-bit, in the float arrays' storage: the
 //momentum's as two digits, the low MOMENTUM_DIGIT bits of each block's sum (low) and the rest of it (ux, uy, uz). No more than 8 blocks reach a
 //voxel, so neither digit can run over. normalizeVoxelVelocities turns them into floats.
 //With APIC, each face takes the particle's velocity carried out to it along its gradient, v + c.(x_face - x). With two PHASES (TwoPhase,
 //particles.hu), a particle weighs as much as its fluid, air's being airMass of the liquid's: the momentum and the weights are then each face's
 //momentum and mass, so the velocity they give is the two fluids' together, and three more sums a slot keep the liquid's weights alone: what's left
-//of a face's mass is its air's, so how much of the face is liquid is exact, and so is whether either fluid reaches it at all (26 KB)
+//of a face's mass is its air's, so how much of the face is liquid is exact, and so is whether either fluid reaches it at all (28 KB)
 template<bool APIC, bool PHASES>
 __global__ void scatterParticleVelsToVoxels(uint numParticleNodes, uint numParticles, uint numVoxels1D, const uint* gridNodeIndicesToFirstParticleIndex, const uint* gridPosition,
                                             const double* px, const double* py, const double* pz, const float* vx, const float* vy, const float* vz,
                                             AffineVelocities affine, float voxelSize,
                                             const uint* numVoxelsEachNode, const uint* voxelIDs, const uint* voxelOwners,
                                             int* ux, int* uy, int* uz, unsigned int* lowX, unsigned int* lowY, unsigned int* lowZ, int* weightsX, int* weightsY, int* weightsZ, int* particleCounts,
-                                            float velocityScale, float weightScale, double radius, Grid grid, uint refinementLevel,
+                                            int* particleDensity, float velocityScale, float weightScale, double radius, Grid grid, uint refinementLevel,
                                             const uint* ids, float airMass, int* liquidX, int* liquidY, int* liquidZ){
-    extern __shared__ long long blockSums[];    //per slot: x, y, z momentum; then, as ints, x, y, z weight and the particle count, and with PHASES the liquid's x, y, z weight
-    const int SUMS = PHASES ? 7 : 4;
+    extern __shared__ long long blockSums[];    //per slot: x, y, z momentum; then, as ints, x, y, z weight, the particle count and the density, and with PHASES
+                                                //the liquid's x, y, z weight
+    const int SUMS = PHASES ? 8 : 5;
     int voxels1D = numVoxels1D;
     int voxels3D = voxels1D*voxels1D*voxels1D;
     unsigned int* momentum = (unsigned int*)blockSums;      //each sum's low word, then its high one
@@ -1023,6 +1071,11 @@ __global__ void scatterParticleVelsToVoxels(uint numParticleNodes, uint numParti
     int apronCells = floor(radius);
     uint firstParticle = gridNodeIndicesToFirstParticleIndex[blockIdx.x];
     uint lastParticle = blockIdx.x == numParticleNodes - 1 ? numParticles : gridNodeIndicesToFirstParticleIndex[blockIdx.x + 1];
+    uint cell = gridPosition[firstParticle];
+    int interiorWidth = voxels1D - 2*apronCells;
+    const int first[3] = {(int)(cell % grid.sizeX)*interiorWidth - apronCells, (int)(cell / grid.sizeX % grid.sizeY)*interiorWidth - apronCells,
+                          (int)(cell / (grid.sizeX*grid.sizeY))*interiorWidth - apronCells};   //the block's first voxel, in the domain's voxels
+    const int size[3] = {(int)grid.sizeX*interiorWidth, (int)grid.sizeY*interiorWidth, (int)grid.sizeZ*interiorWidth};
     for(int i = threadIdx.x; i < (6 + SUMS)*voxels3D; i += blockDim.x){
         ((int*)blockSums)[i] = 0;
     }
@@ -1083,7 +1136,7 @@ __global__ void scatterParticleVelsToVoxels(uint numParticleNodes, uint numParti
                             }
                             if constexpr(PHASES){
                                 if(liquid){     //its mass is 1, so its share of the liquid's weight is its share of the mass
-                                    atomicAdd(fixedSums + (4 + dim)*voxels3D + rowStart + i, share);
+                                    atomicAdd(fixedSums + (5 + dim)*voxels3D + rowStart + i, share);
                                 }
                             }
                         }
@@ -1092,9 +1145,39 @@ __global__ void scatterParticleVelsToVoxels(uint numParticleNodes, uint numParti
             }
         }
         atomicAdd(fixedSums + 3*voxels3D + (int)pos.x + (int)pos.y*voxels1D + (int)pos.z*voxels1D*voxels1D, 1);
+        //its weight on the 27 centres, the density's, a centre past a wall's on its mirror image inside. The faces' stencils reach every one of those
+        //voxels, which the node stores, but the corner below a particle past the middle of its voxel along all three axes. Its weight there is 1/512
+        //at most (1/8 along each axis, for a particle at the middle), and it's lost only where that corner is in the block's apron, owned by another
+        //node, and no other particle of this node's reaches it: a particle on its own at the edge of its node
+        const Spline3* centres = stencil.onCentres;
+        int at[3][3];   //each axis's 3 slots along it, folded
+        #pragma unroll
+        for(int a = 0; a < 3; ++a){
+            #pragma unroll
+            for(int i = 0; i < 3; ++i){
+                int voxel = first[a] + centres[a].base + i;
+                voxel = voxel < 0 ? -1 - voxel : voxel >= size[a] ? 2*size[a] - 1 - voxel : voxel;
+                at[a][i] = voxel - first[a];
+            }
+        }
+        #pragma unroll
+        for(int k = 0; k < 3; ++k){
+            #pragma unroll
+            for(int j = 0; j < 3; ++j){
+                float yz = centres[1].w[j]*centres[2].w[k];
+                int rowStart = 4*voxels3D + (at[1][j] + at[2][k]*voxels1D)*voxels1D;
+                #pragma unroll
+                for(int i = 0; i < 3; ++i){
+                    int share = __float2int_rn(centres[0].w[i]*yz*weightScale);
+                    if(share != 0){
+                        atomicAdd(fixedSums + rowStart + at[0][i], share);
+                    }
+                }
+            }
+        }
     }
     __syncthreads();
-    int* accumulators[7] = {weightsX, weightsY, weightsZ, particleCounts, liquidX, liquidY, liquidZ};
+    int* accumulators[8] = {weightsX, weightsY, weightsZ, particleCounts, particleDensity, liquidX, liquidY, liquidZ};
     int* high[3] = {ux, uy, uz};
     unsigned int* low[3] = {lowX, lowY, lowZ};
     for(uint i = (blockIdx.x == 0 ? 0 : numVoxelsEachNode[blockIdx.x - 1]) + threadIdx.x; i < numVoxelsEachNode[blockIdx.x]; i += blockDim.x){    //coalesced over the node's voxels
@@ -1180,9 +1263,9 @@ __global__ void largestApicVelocities(uint numParticles, const float* vx, const 
 //(advectThroughGrid)
 double Particles::getCourantDt(){
     double voxelSize = (grid.cellSize / (numVoxels1D - 2*std::floor(radius)));
-    double fastest = std::max(maxVelocity, (double)obstacles.fastest());
+    double fastest = std::max({maxVelocity, (double)obstacles.fastest(), (double)bodies.fastest()});
     double strongest = std::max({std::abs(forces.gravity.x), std::abs(forces.gravity.y), std::abs(forces.gravity.z)}) + fieldAcceleration + fieldDrag*maxVelocity;
-    strongest = std::max(strongest, maxAcceleration);
+    strongest = std::max({strongest, maxAcceleration, (double)bodies.acceleration()});  //and a body's surface, which a splash can kick as hard as the liquid
     if(verbose()){
         std::cout<<"maxVel: "<<maxVelocity<<" fastest obstacle: "<<obstacles.fastest()<<" strongest force: "<<strongest<<" (the last substep's acceleration "<<maxAcceleration<<") voxelSize: "<<voxelSize<<"\n";
     }
@@ -1192,7 +1275,7 @@ double Particles::getCourantDt(){
 void Particles::particleVelToVoxels(){
     //the voxels' sums: the momentum's in two arrays a component, its high digits where the velocities will be and its low ones where FLIP's old
     //velocities go once there are any (scatterParticleVelsToVoxels)
-    for(CudaVec<float>* accumulator : {&voxelsUx, &voxelsUy, &voxelsUz, &voxelsUxOld, &voxelsUyOld, &voxelsUzOld, &voxelWeightsX, &voxelWeightsY, &voxelWeightsZ, &particleCounts}){
+    for(CudaVec<float>* accumulator : {&voxelsUx, &voxelsUy, &voxelsUz, &voxelsUxOld, &voxelsUyOld, &voxelsUzOld, &voxelWeightsX, &voxelWeightsY, &voxelWeightsZ, &particleCounts, &particleDensity}){
         accumulator->zeroDeviceAsync(stream);
     }
     float voxelSize = grid.cellSize / (2<<refinementLevel);
@@ -1215,16 +1298,18 @@ void Particles::particleVelToVoxels(){
         maxVelocity = context->maxOverPartitions(maxVelocity);     //every partition's fixed point and timestep have to agree
         transferred = maxVelocity;
     }
-    if(twoPhase.on && size > 0){    //the timestep follows the liquid: the air driven out of its way goes faster, and may (advectThroughGrid caps how far)
-        unsigned int* largest;
-        unsigned int bits;
-        gpuErrchk(cudaMallocAsync((void**)&largest, sizeof(unsigned int), stream));
-        gpuErrchk(cudaMemsetAsync(largest, 0, sizeof(unsigned int), stream));
-        largestLiquidSpeedBits<<<std::min(size / BLOCKSIZE + 1, 1024u), BLOCKSIZE, 0, stream>>>(size, vx.devPtr(), vy.devPtr(), vz.devPtr(), particleIds.devPtr(), largest);
-        gpuErrchk(cudaMemcpyAsync(&bits, largest, sizeof(unsigned int), cudaMemcpyDeviceToHost, stream));
-        gpuErrchk(cudaFreeAsync(largest, stream));
-        float liquidFastest;
-        memcpy(&liquidFastest, &bits, sizeof(liquidFastest));
+    if(twoPhase.on){    //the timestep follows the liquid: the air driven out of its way goes faster, and may (advectThroughGrid caps how far)
+        float liquidFastest = 0.0f;     //none in a partition without particles, which still takes its turn in the reduction
+        if(size > 0){
+            unsigned int* largest;
+            unsigned int bits;
+            gpuErrchk(cudaMallocAsync((void**)&largest, sizeof(unsigned int), stream));
+            gpuErrchk(cudaMemsetAsync(largest, 0, sizeof(unsigned int), stream));
+            largestLiquidSpeedBits<<<std::min(size / BLOCKSIZE + 1, 1024u), BLOCKSIZE, 0, stream>>>(size, vx.devPtr(), vy.devPtr(), vz.devPtr(), particleIds.devPtr(), largest);
+            gpuErrchk(cudaMemcpyAsync(&bits, largest, sizeof(unsigned int), cudaMemcpyDeviceToHost, stream));
+            gpuErrchk(cudaFreeAsync(largest, stream));
+            memcpy(&liquidFastest, &bits, sizeof(liquidFastest));
+        }
         maxVelocity = context->maxOverPartitions(liquidFastest);
     }
     unsigned int accelerationFound;     //and the most the last substep changed a particle's velocity by, per second (voxelVelsToParticles), for the timestep too
@@ -1246,14 +1331,15 @@ void Particles::particleVelToVoxels(){
     if(numParticleNodes > 0){
         auto scatter = phases ? (apic ? scatterParticleVelsToVoxels<true, true> : scatterParticleVelsToVoxels<false, true>)
                               : (apic ? scatterParticleVelsToVoxels<true, false> : scatterParticleVelsToVoxels<false, false>);
-        scatter<<<numParticleNodes, NODE_THREADS, (3*sizeof(long long) + (phases ? 7 : 4)*sizeof(int))*numVoxelsPerNode, stream>>>(numParticleNodes, size, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(),
+        scatter<<<numParticleNodes, NODE_THREADS, (3*sizeof(long long) + (phases ? 8 : 5)*sizeof(int))*numVoxelsPerNode, stream>>>(numParticleNodes, size, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(),
             affineVelocities(affine), voxelSize, nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(), voxelOwners.devPtr(), (int*)voxelsUx.devPtr(), (int*)voxelsUy.devPtr(), (int*)voxelsUz.devPtr(),
             (unsigned int*)voxelsUxOld.devPtr(), (unsigned int*)voxelsUyOld.devPtr(), (unsigned int*)voxelsUzOld.devPtr(),
-            (int*)voxelWeightsX.devPtr(), (int*)voxelWeightsY.devPtr(), (int*)voxelWeightsZ.devPtr(), (int*)particleCounts.devPtr(), velocityScale, weightScale, radius, grid, refinementLevel,
+            (int*)voxelWeightsX.devPtr(), (int*)voxelWeightsY.devPtr(), (int*)voxelWeightsZ.devPtr(), (int*)particleCounts.devPtr(), (int*)particleDensity.devPtr(), velocityScale, weightScale, radius,
+            grid, refinementLevel,
             particleIds.devPtr(), 1.0f / twoPhase.densityRatio, (int*)liquidWeights[0].devPtr(), (int*)liquidWeights[1].devPtr(), (int*)liquidWeights[2].devPtr());
     }
     //particles near this partition's edge reach into ghost voxels: their owners add those sums in, which in fixed point come out the same in any order
-    for(CudaVec<float>* accumulator : {&voxelsUx, &voxelsUy, &voxelsUz, &voxelsUxOld, &voxelsUyOld, &voxelsUzOld, &voxelWeightsX, &voxelWeightsY, &voxelWeightsZ, &particleCounts}){
+    for(CudaVec<float>* accumulator : {&voxelsUx, &voxelsUy, &voxelsUz, &voxelsUxOld, &voxelsUyOld, &voxelsUzOld, &voxelWeightsX, &voxelWeightsY, &voxelWeightsZ, &particleCounts, &particleDensity}){
         context->reduceGhosts((int*)accumulator->devPtr(), stream);
     }
     if(phases){
@@ -1262,11 +1348,12 @@ void Particles::particleVelToVoxels(){
             context->fillGhosts(liquid.devPtr(), stream);   //as bits: they stay fixed point
         }
     }
-    cudaNormalizeVoxelVelocities(solids, voxelWeightsX, voxelWeightsY, voxelWeightsZ, voxelsUx, voxelsUy, voxelsUz, voxelsUxOld, voxelsUyOld, voxelsUzOld, particleCounts, velocityScale, weightScale, stream);
-    for(CudaVec<float>* field : {&voxelsUx, &voxelsUy, &voxelsUz, &voxelWeightsX, &voxelWeightsY, &voxelWeightsZ, &particleCounts}){   //and the ghosts take the totals
+    cudaNormalizeVoxelVelocities(solids, voxelWeightsX, voxelWeightsY, voxelWeightsZ, voxelsUx, voxelsUy, voxelsUz, voxelsUxOld, voxelsUyOld, voxelsUzOld, particleCounts, particleDensity, velocityScale,
+        weightScale, stream);
+    for(CudaVec<float>* field : {&voxelsUx, &voxelsUy, &voxelsUz, &voxelWeightsX, &voxelWeightsY, &voxelWeightsZ, &particleCounts, &particleDensity}){   //and the ghosts take the totals
         context->fillGhosts(field->devPtr(), stream);
     }
-    creditObstacleVolume();     //voxels obstacles partly cover hold fewer particles at rest: the density correction mustn't read them as thin
+    creditObstacleVolume();     //voxels by obstacles hold fewer particles at rest: neither the counts nor the density may read them as thin
     cudaExtrapolateUnreachedFaces(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, voxelWeightsX, voxelWeightsY, voxelWeightsZ, voxelsUx, voxelsUy, voxelsUz, *context, stream);
     cudaFindFootprintDepth(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, footprintDepth, freeSurface, *context, stream);
     if(needsLevelSet()){    //the liquid's surface, where viscosity and surface tension act, and the sharp free surface's liquid (freesurface.cu)
@@ -1274,14 +1361,15 @@ void Particles::particleVelToVoxels(){
     }
     retireDryUnknowns();    //sharp, the solve's liquid is the unknowns whose centres are in it
     findFaceDensities();    //two phases: how light each face is, for the pressure equations and the velocity update
-    obstacleGhostVelocities(voxelsUx, voxelsUy, voxelsUz);      //the faces in and beside obstacles, so FLIP's change over the solve is measured from the same kind of value there
+    obstacleGhostVelocities(voxelsUx, voxelsUy, voxelsUz, 0.0f);    //the faces in and beside obstacles, so FLIP's change over the solve is measured from the same kind of value there
     for(auto [velocity, before] : {std::pair{&voxelsUx, &voxelsUxOld}, {&voxelsUy, &voxelsUyOld}, {&voxelsUz, &voxelsUzOld}}){    //for FLIP's velocity change over the solve
         cudaMemcpyAsync(before->devPtr(), velocity->devPtr(), sizeof(float)*velocity->size(), cudaMemcpyDeviceToDevice, stream);
     }
     //and FLIP's old faces that obstacles cut as what crosses them all told, as the new ones will be, with the faces inside them from those. The solve's own
-    //take the open part alone, as it needs
-    mixObstacleFaces(voxelsUxOld, voxelsUyOld, voxelsUzOld);
-    obstacleGhostVelocities(voxelsUxOld, voxelsUyOld, voxelsUzOld);
+    //take the open part alone, as it needs. What a dynamic body's friction does to them, the particles take back from it (G2P's FLIP), less flipRatio
+    bodies.beginFriction();
+    mixObstacleFaces(voxelsUxOld, voxelsUyOld, voxelsUzOld, (float)-flipRatio);
+    obstacleGhostVelocities(voxelsUxOld, voxelsUyOld, voxelsUzOld, (float)-flipRatio);
 }
 
 void Particles::pressureSolve(){
@@ -1317,11 +1405,14 @@ void Particles::pressureSolve(){
     }
     findWhitewater();   //what the surface makes this substep, now its length is known: read from the grid as P2G left it, and nothing of the fluid's changes by it
     applyForces(forces, dt, elapsedTime, forceVoxels(), stream);
+    bodies.warmStart(dt, obstacles.state(), forces.gravity, obstacles.fastest(), make_float3(grid.negX, grid.negY, grid.negZ),     //the dynamic bodies held up by
+        make_float3(grid.negX + grid.sizeX*grid.cellSize, grid.negY + grid.sizeY*grid.cellSize, grid.negZ + grid.sizeZ*grid.cellSize));   //what they rested on, as last substep,
+    bodies.predict(dt, forces.gravity);     //and falling as the fluid does: the solve starts them from there
     floatInAir(dt);     //an air band: less the still air's weight
     if(surfaceTension > 0.0){
         applySurfaceTension();
     }
-    cudaCalcDivU(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, voxelsUx, voxelsUy, voxelsUz, particleCounts, footprintDepth, restParticlesPerVoxel, correctionRate, divU, stream);
+    cudaCalcDivU(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, voxelsUx, voxelsUy, voxelsUz, particleDensity, footprintDepth, restParticlesPerVoxel, correctionRate, divU, stream);
     addObstacleFlux();      //what obstacles' surfaces make of the flow through the faces they cut or close
     addSurfaceDivergence(correctionRate);   //sharp: the surface tension's pressure, and spreading what's packed near the surface
     balanceSealedPockets(); //and fluid no air reaches can't change its volume
@@ -1334,17 +1425,24 @@ void Particles::pressureSolve(){
     uint interiorWidth = numVoxels1D - 2*(uint)std::floor(radius);
     uint3 domainVoxels = make_uint3(grid.sizeX*interiorWidth, grid.sizeY*interiorWidth, grid.sizeZ*interiorWidth);
     VoxelLayout layout = {nodeCells.devPtr(), nodeInteriorVoxels.devPtr(), coarseCells.devPtr(), numOwnNodes, interiorWidth, domainVoxels};   //the nodes this partition solves for
+    //the dynamic bodies' coupling, which the solve adds to A (bodies.cu): each one's motion ties together the unknowns its surface cuts
+    SolveTerm* coupling = nullptr;
+    if(bodies.count() > 0){
+        bodies.prepare(dt/(density*voxelSize*voxelSize), obstacleNodes.devPtr(), numOwnNodes, nodeCells.devPtr(), nodeInteriorVoxels.devPtr(), solveCodes.devPtr(), obstacleNear.devPtr(),
+                       obstacleOpen.devPtr(), obstacleCentroids.devPtr(), grid, (int)interiorWidth, lettingGo());
+        coupling = &bodies;
+    }
     auto solve = [&](const char* bounded){   //bounded: the voxels to keep from going under the air's pressure, from the pressures the last solve left (boundaries.cu)
         switch(pressureSolver){
             case PressureSolver::cg:
                 return cudaConjugateGradient(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, divU, p, residuals, tolerance, maxIterations,
-                                             layout, dotProductSums, numOwnVoxels, *context, stream, bounded);
+                                             layout, dotProductSums, numOwnVoxels, *context, stream, bounded, coupling);
             case PressureSolver::jacobi:
                 return cudaJacobiConjugateGradient(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, divU, p, residuals, tolerance, maxIterations,
-                                                   layout, dotProductSums, numOwnVoxels, *context, stream, bounded);
+                                                   layout, dotProductSums, numOwnVoxels, *context, stream, bounded, coupling);
             case PressureSolver::multigrid:
                 return cudaMultigridConjugateGradient(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, divU, p, residuals, tolerance, maxIterations,
-                                                      layout, dotProductSums, numOwnVoxels, *context, stream, bounded);
+                                                      layout, dotProductSums, numOwnVoxels, *context, stream, bounded, coupling);
             default:
                 return cudaGSiteration(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, Anx, Apx, Any, Apy, Anz, Apz, Adiag, divU, p, residuals, tolerance, maxIterations,
                                        numOwnVoxels, *context, stream, bounded);
@@ -1368,18 +1466,20 @@ void Particles::pressureSolve(){
     //With boundaries that let go of the liquid (boundaries.cu): the voxels on them that the solve leaves pulled on, and that air can reach, are solved
     //for again with the rest, each ending either held or let go, at the air's pressure. Without such boundaries, or where none pulls on anything
     //that air reaches, it's the one solve
+    //And the dynamic bodies take the impulse the pressure it settles on gives them
     auto settled = [&](){
         holdEverything();
         if(!solved(nullptr)){
             return false;
         }
-        if(!lettingGo() || !letGoOfSuction()){
-            return true;
+        if(lettingGo() && letGoOfSuction()){
+            if(!solved(letGo.devPtr())){
+                return false;
+            }
+            keepLetGo();
         }
-        if(!solved(letGo.devPtr())){
-            return false;
-        }
-        keepLetGo();
+        letGoOfAir();       //and the air on them, which nothing holds
+        bodies.takePressure(p.devPtr());
         return true;
     };
     //Viscosity goes between two solves: the first gives the flow the forces drive once the pressure has answered them, the viscous step acts on that,
@@ -1394,7 +1494,7 @@ void Particles::pressureSolve(){
         lightenFaceUpdates(dt/(density*voxelSize*voxelSize));   //two phases, as updateVoxelVelocities has it: the viscous step acts on the flow the first solve leaves
         p.zeroDeviceAsync(stream);
         applyViscosity();
-        cudaCalcDivU(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, voxelsUx, voxelsUy, voxelsUz, particleCounts, footprintDepth, restParticlesPerVoxel, correctionRate, divU, stream);
+        cudaCalcDivU(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, voxelsUx, voxelsUy, voxelsUz, particleDensity, footprintDepth, restParticlesPerVoxel, correctionRate, divU, stream);
         addObstacleFlux();
         addSurfaceDivergence(correctionRate);
         balanceSealedPockets();
@@ -1425,8 +1525,9 @@ void Particles::updateVoxelVelocities(){
     lightenFaceUpdates(dt/(0.014*voxelSize*voxelSize));     //two phases, each face pushed as its own density lets the pressure push it
     extendLiquidVelocities();   //and the faces around the liquid that particles read carry its velocity on
     pinEmitterVelocities();     //an emitter's fluid leaves at its velocity, whatever the solve made of it
-    mixObstacleFaces(voxelsUx, voxelsUy, voxelsUz);         //the faces obstacles cut carry what crosses them all told, not the open part's alone
-    obstacleGhostVelocities(voxelsUx, voxelsUy, voxelsUz);  //the faces between fluid and obstacles take the obstacles' velocity across them; the faces inside continue the fluid's
+    mixObstacleFaces(voxelsUx, voxelsUy, voxelsUz, 1.0f);         //the faces obstacles cut carry what crosses them all told, not the open part's alone
+    obstacleGhostVelocities(voxelsUx, voxelsUy, voxelsUz, 1.0f);  //the faces between fluid and obstacles take the obstacles' velocity across them; the faces inside continue the fluid's
+    bodies.takeFriction();      //and what the dynamic bodies' friction gave the particles, the bodies give up
     if(anyLetGo && obstacles.lettingGo()){  //but the liquid's, where an obstacle let go of it; and in FLIP's old velocities, set before the solve said where
         carryLetGoFaces(voxelsUx, voxelsUy, voxelsUz);
         carryLetGoFaces(voxelsUxOld, voxelsUyOld, voxelsUzOld);
@@ -1472,6 +1573,69 @@ __global__ void largestLiquidSpeedBits(uint numParticles, const float* vx, const
     largestInBlock(bits, warpLargest, largest);
 }
 
+//How violently the grid's flow churns at a voxel of G2P's block (slot; voxels1D a side, the faces' new velocities on its first three planes, each
+//voxels3D, a voxel's own face the one on its negative side): the turbulent dissipation Smagorinsky's model gives for what the grid doesn't resolve,
+//(Cs h)^2 |S|^3, m^2/s^3, with |S| = sqrt(2 S:S) and S the strain rate, the symmetric part of the velocity's gradient at the voxel's centre: each
+//component's own derivative across its two faces, and the others' across the centres beside it (a centre the mean of its two faces). The voxels
+//beside it are the block's: the voxel is in its node's interior, inside the apron
+__device__ inline float churnAt(const float* block, int voxels1D, int voxels3D, int slot, float voxelSize){
+    int at[3] = {slot % voxels1D, slot / voxels1D % voxels1D, slot / (voxels1D*voxels1D)};
+    auto face = [&](int component, int dx, int dy, int dz){
+        return block[component*voxels3D + at[0] + dx + voxels1D*(at[1] + dy + voxels1D*(at[2] + dz))];
+    };
+    float strain = 0.0f;    //2 S:S
+    #pragma unroll
+    for(int c = 0; c < 3; ++c){
+        int across[3] = {c == 0, c == 1, c == 2};
+        float own = (face(c, across[0], across[1], across[2]) - face(c, 0, 0, 0)) / voxelSize;
+        strain += 2.0f*own*own;
+        #pragma unroll
+        for(int a = c + 1; a < 3; ++a){     //each pair once: S_ca = S_ac, half of c's change along a and a's along c, twice in S:S
+            int e[3] = {a == 0, a == 1, a == 2};
+            float ca = face(c, e[0], e[1], e[2]) + face(c, e[0] + across[0], e[1] + across[1], e[2] + across[2]) - face(c, -e[0], -e[1], -e[2])
+                     - face(c, across[0] - e[0], across[1] - e[1], across[2] - e[2]);
+            float ac = face(a, across[0], across[1], across[2]) + face(a, across[0] + e[0], across[1] + e[1], across[2] + e[2]) - face(a, -across[0], -across[1], -across[2])
+                     - face(a, e[0] - across[0], e[1] - across[1], e[2] - across[2]);
+            float shear = 0.5f*(ca + ac) / (4.0f*voxelSize);
+            strain += 4.0f*shear*shear;
+        }
+    }
+    float rate = sqrtf(strain);
+    return (SMAGORINSKY*voxelSize)*(SMAGORINSKY*voxelSize)*rate*rate*rate;
+}
+
+//The size of the bubbles an air particle that has just escaped at pos stands for (BubbleSizes): the scene's, or drawn, by the most violent churning
+//it went through since the liquid pulled it in (churn, m^2/s^3: churnAt) and the voxels' liquid shares around it, at shares, a tile width voxels on
+//a side that pos is in (signed: shareAround); x, y, z, where it is. The largest it can be, the air around it the grid doesn't resolve as one ball:
+//1 less the liquid's share there, of a voxel. The draw, by the inverse of the spread's distribution, from a hash of where it is; and sauter, the
+//spread's Sauter mean radius
+__device__ inline float bubbleRadius(const float* shares, int width, float3 pos, int3 origin, int3 domainVoxels, float voxelSize, float churn,
+                                     double x, double y, double z, const BubbleSizes& sizes, float& sauter){
+    if(sizes.fixed > 0.0f){
+        sauter = sizes.fixed;
+        return sizes.fixed;
+    }
+    float liquid = shareAround<true>(shares, width, pos, origin, domainVoxels, false);
+    float air = isnan(liquid) ? 0.0f : fminf(fmaxf(1.0f - liquid, 0.0f), 1.0f);
+    float largest = fmaxf(sizes.ball, voxelSize*cbrtf(3.0f*air / (4.0f*3.14159265f)));
+    float hinze = churn > 0.0f ? 0.5f*HINZE*powf(sizes.tension, 0.6f)*powf(churn, -0.4f) : largest;
+    float smallest = fminf(BUBBLE_SMALLEST, largest);
+    hinze = fminf(fmaxf(hinze, smallest), largest);
+    //the spread by volume, r^(3/2) up to the Hinze scale and hinze^(11/6) r^(-1/3) past it: what of it lies under each, and the draw's share of all of it
+    float below = 0.4f*(powf(hinze, 2.5f) - powf(smallest, 2.5f));
+    float above = 1.5f*powf(hinze, 11.0f/6.0f)*(powf(largest, 2.0f/3.0f) - powf(hinze, 2.0f/3.0f));
+    //the Sauter mean: all of it over the sum of each size's share over that size, the same two pieces' r^(1/2) and hinze^(11/6) r^(-4/3)
+    float under = (2.0f/3.0f)*(powf(hinze, 1.5f) - powf(smallest, 1.5f));
+    float over = 3.0f*powf(hinze, 11.0f/6.0f)*(powf(hinze, -1.0f/3.0f) - powf(largest, -1.0f/3.0f));
+    sauter = under + over > 0.0f ? (below + above) / (under + over) : largest;
+    unsigned long long hash = mixBits64(mixBits64(mixBits64((unsigned long long)__double_as_longlong(x) ^ 0xb5ad4eceda1ce2a9ull) ^ (unsigned long long)__double_as_longlong(y)) ^
+                                        (unsigned long long)__double_as_longlong(z));
+    float drawn = (float)(hash >> 40)*(1.0f / 16777216.0f)*(below + above);    //24 bits: [0, 1) of all of it
+    float radius = drawn < below ? powf(powf(smallest, 2.5f) + 2.5f*drawn, 0.4f)
+                                 : powf(powf(hinze, 2.0f/3.0f) + (drawn - below) / (1.5f*powf(hinze, 11.0f/6.0f)), 1.5f);
+    return fminf(fmaxf(radius, smallest), largest);
+}
+
 //G2P: a block per node and a thread per particle. The block copies the new and old face velocities of every voxel the node stores into shared memory,
 //from their owners, and turns the faces inside walls into their mirror images (the wall's normal component reversed, so it's 0 on the wall, and the
 //tangential ones as they are, so walls don't drag). Each particle then reads its 27 faces per component from there; the weights sum to 1, so no
@@ -1479,8 +1643,9 @@ __global__ void largestLiquidSpeedBits(uint numParticles, const float* vx, const
 //grid's. 6 floats per slot: 12 KB for an 8^3 block. With APIC, the particle also takes the new velocity's gradient around it: c = B D^-1, where
 //B = sum of w u (x_face - x) and D = dx^2/4 on every axis for quadratic B-splines (Jiang et al. 2015)
 //With two PHASES (TwoPhase, particles.hu) the air's particles blend at their own ratio, and with escaping particles (share not nullptr) each is judged
-//here first, by the liquid's share where it is (shareAround, from the voxels' shares, which the block holds with the faces): a particle on the wrong
-//side of the interface escapes, or one back on the right side is the grid's again. An escaped one, as it's judged, keeps the velocity it has: the
+//here first, by its own fluid's share where it is (shareAround, from the voxels' shares, which the block holds with the faces, their sign set where the
+//voxel's air is air the grid resolves: resolved): a particle on the wrong side of the interface, or air the grid doesn't resolve, escapes, or one back
+//on the right side, in air the grid resolves, is the grid's again. An escaped one, as it's judged, keeps the velocity it has: the
 //grid's change isn't its own, and its flight through the substep is flyEscaped's. And the walls' hold is each fluid's own (stick the liquid's,
 //airStick the air's: a viscous liquid holds to them and air, with no viscosity here, only as far as their friction holds it): the faces inside the
 //walls mirror what's in the domain as it is, and each particle weighs the ones past a wall, along an axis they're tangential to, by what its own
@@ -1496,14 +1661,16 @@ __global__ void gatherVoxelVelsToParticles(uint numParticleNodes, uint numPartic
                                             const uint* numVoxelsEachNode, const uint* voxelIDs, const uint* voxelOwners, const char* solids,
                                             const float* ux, const float* uy, const float* uz, const float* oldUx, const float* oldUy, const float* oldUz,
                                             float flipRatio, WallStick stick, WallStick airStick, double radius, Grid grid, uint refinementLevel,
-                                            uint* ids, float airFlipRatio, const float* share,      //two phases; else ids is null
+                                            uint* ids, float airFlipRatio, const float* share, const char* resolved,    //two phases; else ids is null
+                                            float* airBreakup,     //with escaping air: how far the churning has broken each air particle's air
                                             const float* births, float bornSince, float perSecond, unsigned int* largestChange,     //the most the velocity of any particle
                                             //from before this substep changes by, per second, as a float's bits: one born in it (an emitter's, the band's air)
                                             //starts at its own velocity and takes the grid's, which isn't an acceleration
                                             const char* letGo){
-    extern __shared__ float blockVelocities[];  //per slot: new x, y, z, then old x, y, z; with PHASES, then the liquid's share of the voxel; then, a byte a slot, whether a wall let go of it
+    extern __shared__ float blockVelocities[];  //per slot: new x, y, z, then old x, y, z; with PHASES, then the liquid's share of the voxel and how violently the
+                                                //grid churns there (churnAt; the node's interior, with escaping particles); then, a byte a slot, whether a wall let go of it
     __shared__ unsigned int warpLargest[NODE_THREADS / 32];
-    const int PLANES = PHASES ? 7 : 6;
+    const int PLANES = PHASES ? 8 : 6;
     int voxels1D = numVoxels1D;
     int voxels3D = voxels1D*voxels1D*voxels1D;
     char* gone = (char*)(blockVelocities + PLANES*voxels3D);
@@ -1531,7 +1698,8 @@ __global__ void gatherVoxelVelsToParticles(uint numParticleNodes, uint numPartic
         }
         if constexpr(PHASES){
             if(share != nullptr){
-                blockVelocities[6*voxels3D + slot] = share[owner];
+                float liquid = share[owner];
+                blockVelocities[6*voxels3D + slot] = resolved[owner] & AIR_RESOLVED ? -liquid : liquid;
             }
         }
         if(letGo != nullptr){
@@ -1606,6 +1774,16 @@ __global__ void gatherVoxelVelsToParticles(uint numParticleNodes, uint numPartic
         }
     }
     __syncthreads();
+    if constexpr(PHASES){
+        if(share != nullptr){   //how violently the grid churns at each voxel of the node, with the walls' images in, for the air there (airBreakup)
+            int interior3D = interiorWidth*interiorWidth*interiorWidth;
+            for(int t = threadIdx.x; t < interior3D; t += blockDim.x){
+                int slot = apronCells + t % interiorWidth + voxels1D*(apronCells + t / interiorWidth % interiorWidth + voxels1D*(apronCells + t / (interiorWidth*interiorWidth)));
+                blockVelocities[7*voxels3D + slot] = churnAt(blockVelocities, voxels1D, voxels3D, slot, voxelSize);
+            }
+            __syncthreads();
+        }
+    }
     float* particleVelocities[3] = {vx, vy, vz};
     float change = 0.0f;    //the most this thread's particles' velocities change by along an axis
     for(uint index = firstParticle + threadIdx.x; index < lastParticle; index += blockDim.x){    //consecutive threads, consecutive particles
@@ -1616,15 +1794,27 @@ __global__ void gatherVoxelVelsToParticles(uint numParticleNodes, uint numPartic
         if constexpr(PHASES){
             if(share != nullptr){
                 uint id = ids[index];
-                float liquid = shareAround(blockVelocities + 6*voxels3D, voxels1D, pos, origin, domainVoxels);
-                float own = id & AIR_PARTICLE ? 1.0f - liquid : liquid;     //its own fluid's share where it is (nan where nothing's known: no change)
+                //its own fluid's share where it is, for air of the air the grid resolves (nan where nothing's known: no change)
+                float own = shareAround<true>(blockVelocities + 6*voxels3D, voxels1D, pos, origin, domainVoxels, id & AIR_PARTICLE);
                 if(id & ESCAPED_PARTICLE){
                     if(own > REJOIN_SHARE){
                         id &= ~ESCAPED_PARTICLE;    //back in its own fluid: the grid's again, with the velocity it arrives with
+                        if(id & AIR_PARTICLE){
+                            airBreakup[index] = 0.0f;   //back in air the grid resolves: as it starts again from here
+                        }
                     }
                 }
-                else if(own < ESCAPE_SHARE){
-                    id |= ESCAPED_PARTICLE;         //a droplet, or a bubble, from here on
+                else{
+                    if(id & AIR_PARTICLE){  //the most violent churning it has been through since the liquid took hold of it, since it was last in a voxel
+                        //holding none (nan: none stored): escaping, it's marked with it, and its flight sizes it by it (flyEscaped, bubbleRadius), as drawing
+                        //the size here took G2P from 64 registers to 95
+                        int slot = (int)pos.x + voxels1D*((int)pos.y + voxels1D*(int)pos.z);
+                        float churned = fabsf(blockVelocities[6*voxels3D + slot]) > 0.0f ? fmaxf(airBreakup[index], blockVelocities[7*voxels3D + slot]) : 0.0f;
+                        airBreakup[index] = own < ESCAPE_SHARE ? -churned - 1.0e-30f : churned;
+                    }
+                    if(own < ESCAPE_SHARE){
+                        id |= ESCAPED_PARTICLE;     //a droplet, or a bubble, from here on
+                    }
                 }
                 ids[index] = id;
                 escaped = id & ESCAPED_PARTICLE;
@@ -1705,6 +1895,18 @@ __global__ void advectParticlePositions(uint numParticles, double dt, double* po
     }
 }
 
+//the stored voxel at slot t of an advection tile (NO_VOXEL for none, or past the domain's walls), and where that is in the domain's voxels
+__device__ inline uint tileVoxel(int t, int interiorWidth, int3 tileOrigin, int3 domainVoxels, const uint* neighborNodes, uint numUsedGridNodes, const uint* interiorVoxels,
+                                 int3& global){
+    int tileWidth = 3*interiorWidth;
+    int x = t % tileWidth, y = t / tileWidth % tileWidth, z = t / (tileWidth*tileWidth);
+    global = make_int3(tileOrigin.x + x, tileOrigin.y + y, tileOrigin.z + z);
+    bool inside = global.x >= 0 && global.y >= 0 && global.z >= 0 && global.x < domainVoxels.x && global.y < domainVoxels.y && global.z < domainVoxels.z;
+    uint node = neighborNodes[x / interiorWidth + 3*(y / interiorWidth) + 9*(z / interiorWidth)];
+    return inside && node < numUsedGridNodes ?
+        interiorVoxels[node*interiorWidth*interiorWidth*interiorWidth + x % interiorWidth + (y % interiorWidth)*interiorWidth + (z % interiorWidth)*interiorWidth*interiorWidth] : NO_VOXEL;
+}
+
 //An advection tile, into a block's shared memory: the interior of a node and its 26 neighbours', 3 nodes wide. Per component, each voxel's negative
 //face: past the walls, their faces at rest; inside, where nothing is stored or no particle reached, no velocity. Then, with share, each voxel's
 //share of liquid, and none (not 0: what isn't liquid is air) where no voxel is stored. And where a wall has let go of a voxel this substep (letGo,
@@ -1719,12 +1921,7 @@ __device__ inline void loadTile(float* tile, int interiorWidth, int3 tileOrigin,
     const float* velocities[3] = {ux, uy, uz};
     const float* weights[3] = {weightsX, weightsY, weightsZ};
     auto stored = [&](int t, int3& global){
-        int x = t % tileWidth, y = t / tileWidth % tileWidth, z = t / (tileWidth*tileWidth);
-        global = make_int3(tileOrigin.x + x, tileOrigin.y + y, tileOrigin.z + z);
-        bool inside = global.x >= 0 && global.y >= 0 && global.z >= 0 && global.x < domainVoxels.x && global.y < domainVoxels.y && global.z < domainVoxels.z;
-        uint node = neighborNodes[x / interiorWidth + 3*(y / interiorWidth) + 9*(z / interiorWidth)];
-        return inside && node < numUsedGridNodes ?
-            interiorVoxels[node*interiorWidth*interiorWidth*interiorWidth + x % interiorWidth + (y % interiorWidth)*interiorWidth + (z % interiorWidth)*interiorWidth*interiorWidth] : NO_VOXEL;
+        return tileVoxel(t, interiorWidth, tileOrigin, domainVoxels, neighborNodes, numUsedGridNodes, interiorVoxels, global);
     };
     for(int t = threadIdx.x; t < tileVoxels; t += blockDim.x){
         int3 global;
@@ -1820,7 +2017,7 @@ __global__ void advectThroughGrid(uint numParticleNodes, uint numParticles, cons
 }
 
 //Whether a straight piece of an escaped particle's flight enters its own fluid: way, in voxels from point (both in the tile's voxels), reaching
-//where its fluid's share, as G2P judges it (shareAround), is over REJOIN_SHARE: the liquid's for a droplet, what's left for a bubble (air). The
+//where its fluid's share, as G2P judges it (shareAround), is over REJOIN_SHARE: the liquid's for a droplet, the air the grid resolves for a bubble. The
 //share is asked where the piece crosses each voxel face along it (Amanatides and Woo's traversal) and where it ends; if it's over at one of those,
 //found is how far along the piece that is and before the last point along it where it wasn't (0 for the piece's start, which G2P judged the
 //particle by or the piece before came to). Where nothing is stored, or past the tile's edge, nothing is known, so it flies on
@@ -1843,8 +2040,7 @@ __device__ inline bool entersOwnFluid(const float* share, int tileWidth, int3 ti
         int axis = next[0] <= next[1] ? (next[0] <= next[2] ? 0 : 2) : (next[1] <= next[2] ? 1 : 2);
         bool ends = !(next[axis] < 1.0f);   //the piece ends in this voxel: its end is the last point asked
         float at = ends ? 1.0f : next[axis];
-        float liquid = shareAround(share, tileWidth, make_float3(from[0] + at*along[0], from[1] + at*along[1], from[2] + at*along[2]), tileOrigin, domainVoxels);
-        if((air ? 1.0f - liquid : liquid) > REJOIN_SHARE){
+        if(shareAround<true>(share, tileWidth, make_float3(from[0] + at*along[0], from[1] + at*along[1], from[2] + at*along[2]), tileOrigin, domainVoxels, air) > REJOIN_SHARE){
             found = at;
             return true;
         }
@@ -1885,7 +2081,15 @@ __device__ inline float flyEscapedParticle(uint index, double* px, double* py, d
     float3 rest = make_float3(0.0f, 0.0f, 0.0f);
     float3 now = sampleVelocity(tile, tileWidth, from, tileOrigin, domainVoxels, rest, stick);
     float3 before = sampleVelocity(tile + 4*tileVoxels, tileWidth, from, tileOrigin, domainVoxels, rest, stick);
-    EscapedPath path(make_float3(vx[index], vy[index], vz[index]), now, make_float3((now.x - before.x)/dt, (now.y - before.y)/dt, (now.z - before.z)/dt), flight, dt);
+    //what the mixture of the two fluids where it starts weighs, against the fluid it flies in, from the liquid's share there
+    float liquid = shareAround<true>(tile + 3*tileVoxels, tileWidth, from, tileOrigin, domainVoxels, false);
+    float mixture = 1.0f;   //where nothing's known, the fluid it flies in alone
+    if(!isnan(liquid)){
+        liquid = fminf(fmaxf(liquid, 0.0f), 1.0f);
+        mixture = liquid*flight.liquid + (1.0f - liquid)*flight.air;
+    }
+    EscapedPath path(make_float3(vx[index], vy[index], vz[index]), now, make_float3((now.x - before.x)/dt, (now.y - before.y)/dt, (now.z - before.z)/dt), flight, dt,
+                     mixture);
     float began[3] = {from.x, from.y, from.z}, last[3] = {from.x, from.y, from.z};
     float furthest = 0.0f;  //the most it can move along an axis, in voxels
     #pragma unroll
@@ -1911,9 +2115,9 @@ __device__ inline float flyEscapedParticle(uint index, double* px, double* py, d
             for(int halving = 0; halving < 24; ++halving){
                 double middle = 0.5*(low + high);
                 path.at(middle, moved, arrives);
-                float liquid = shareAround(tile + 3*tileVoxels, tileWidth, make_float3(began[0] + (float)(moved[0] / voxelSize), began[1] + (float)(moved[1] / voxelSize),
-                                           began[2] + (float)(moved[2] / voxelSize)), tileOrigin, domainVoxels);
-                if((air ? 1.0f - liquid : liquid) > REJOIN_SHARE){
+                float own = shareAround<true>(tile + 3*tileVoxels, tileWidth, make_float3(began[0] + (float)(moved[0] / voxelSize), began[1] + (float)(moved[1] / voxelSize),
+                                              began[2] + (float)(moved[2] / voxelSize)), tileOrigin, domainVoxels, air);
+                if(own > REJOIN_SHARE){
                     high = middle;
                 }
                 else{
@@ -1938,16 +2142,21 @@ __device__ inline float flyEscapedParticle(uint index, double* px, double* py, d
 }
 
 //The escaped particles' part of advection, after advectThroughGrid, which leaves them where they are: a block per node with particles, as it has,
-//with its tile, each voxel's share of liquid after the velocities, and the old velocities after that. Each droplet and each bubble flies
+//with its tile, each voxel's share of liquid after the velocities (its sign set where the voxel's air is air the grid resolves, resolved, as G2P's
+//block has it), and the old velocities after that. Each droplet and each bubble flies
 //(flyEscapedParticle). Where its flight ends in its own fluid it's the grid's again, with the velocity it arrives with, and the grid moves it for
 //what's left of the substep. A block is done as soon as it knows its node has none. A kernel of its own: with the flight in advectThroughGrid's
-//body, that took 1.8 times as long for every particle (0.80 ms against 0.45 for 1.3M particles, none of them escaped)
-__global__ void flyEscaped(uint numParticleNodes, uint numParticles, const uint* gridNodeIndicesToFirstParticleIndex, const uint* gridPosition,
-                           double* px, double* py, double* pz, float* vx, float* vy, float* vz, uint* ids, const float* share,
+//body, that took 1.8 times as long for every particle (0.80 ms against 0.45 for 1.3M particles, none of them escaped). Two blocks to a
+//multiprocessor, as its tile (48,384 B) allows: held to 128 registers a thread, which sizing a new bubble (bubbleRadius) took it past
+__global__ void __launch_bounds__(NODE_THREADS, 2) flyEscaped(uint numParticleNodes, uint numParticles, const uint* gridNodeIndicesToFirstParticleIndex, const uint* gridPosition,
+                           double* px, double* py, double* pz, float* vx, float* vy, float* vz, uint* ids, const float* share, const char* resolved,
                            uint numUsedGridNodes, const uint* nodeCells, const uint* cellToNode, const uint* interiorVoxels,
                            const float* ux, const float* uy, const float* uz, const float* oldUx, const float* oldUy, const float* oldUz,
                            const float* weightsX, const float* weightsY, const float* weightsZ,
                            float dt, bool rungeKutta3, WallStick stick, WallStick airStick, Grid grid, uint refinementLevel, EscapedFlight droplet, EscapedFlight bubble,
+                           float* airBreakup, float* airSauter, BubbleSizes bubbleSizes, float eotvosPerArea,  //each bubble's size and its spread's Sauter
+                                                                                                                //mean, a new one's drawn here (bubbleRadius);
+                                                                                                //its Eotvos number over its radius squared
                            unsigned int* largestChange){    //the most any particle's velocity changes by, per second (G2P's measure, carried on)
     extern __shared__ float tile[];
     __shared__ uint neighborNodes[27];
@@ -1979,6 +2188,14 @@ __global__ void flyEscaped(uint numParticleNodes, uint numParticles, const uint*
     loadTile(tile, interiorWidth, tileOrigin, domainVoxels, neighborNodes, numUsedGridNodes, interiorVoxels, ux, uy, uz, weightsX, weightsY, weightsZ, share, nullptr);
     loadTile(tile + 4*tileVoxels, interiorWidth, tileOrigin, domainVoxels, neighborNodes, numUsedGridNodes, interiorVoxels, oldUx, oldUy, oldUz, weightsX, weightsY, weightsZ, nullptr, nullptr);
     __syncthreads();
+    for(int t = threadIdx.x; t < tileVoxels; t += blockDim.x){     //the shares' signs, where the voxels' air is air the grid resolves
+        int3 global;
+        uint voxel = tileVoxel(t, interiorWidth, tileOrigin, domainVoxels, neighborNodes, numUsedGridNodes, interiorVoxels, global);
+        if(voxel != NO_VOXEL && (resolved[voxel] & AIR_RESOLVED)){
+            tile[3*tileVoxels + t] = -tile[3*tileVoxels + t];
+        }
+    }
+    __syncthreads();
     float voxelSize = grid.cellSize / interiorWidth;
     float change = 0.0f;
     for(uint index = firstParticle + threadIdx.x; index < lastParticle; index += blockDim.x){
@@ -1987,8 +2204,23 @@ __global__ void flyEscaped(uint numParticleNodes, uint numParticles, const uint*
         }
         bool air = ids[index] & AIR_PARTICLE;
         float3 before = make_float3(vx[index], vy[index], vz[index]);
+        EscapedFlight flight = air ? bubble : droplet;
+        if(air){    //a bubble flies at its own size, flattened by it as far as its Eotvos number says (voxelVelsToParticles)
+            flight.radius = airBreakup[index];
+            if(flight.radius < 0.0f){   //escaped in this substep's G2P, where it still is, marked with the churning it went through: its size by that
+                float3 at = make_float3((px[index] - grid.negX)/voxelSize - tileOrigin.x, (py[index] - grid.negY)/voxelSize - tileOrigin.y,
+                                        (pz[index] - grid.negZ)/voxelSize - tileOrigin.z);
+                float sauter;
+                flight.radius = bubbleRadius(tile + 3*tileVoxels, tileWidth, at, tileOrigin, domainVoxels, voxelSize, fmaxf(-flight.radius - 1.0e-30f, 0.0f),
+                                             px[index], py[index], pz[index], bubbleSizes, sauter);
+                airBreakup[index] = flight.radius;
+                airSauter[index] = sauter;
+            }
+            float eotvos = eotvosPerArea*flight.radius*flight.radius;
+            flight.bluff = 8.0f/3.0f*eotvos / (eotvos + 4.0f);
+        }
         //the walls' hold on the fluid around it as it flies, the liquid for a bubble and the air for a droplet, and then on its own once it has landed
-        float flown = flyEscapedParticle(index, px, py, pz, vx, vy, vz, air, tile, tileWidth, tileOrigin, domainVoxels, grid, voxelSize, dt, air ? stick : airStick, air ? bubble : droplet);
+        float flown = flyEscapedParticle(index, px, py, pz, vx, vy, vz, air, tile, tileWidth, tileOrigin, domainVoxels, grid, voxelSize, dt, air ? stick : airStick, flight);
         if(!air){   //a droplet's change counts for the timestep; a bubble is air, and the air's doesn't
             change = fmaxf(change, fmaxf(fabsf(vx[index] - before.x), fmaxf(fabsf(vy[index] - before.y), fabsf(vz[index] - before.z))));
         }
@@ -1996,6 +2228,9 @@ __global__ void flyEscaped(uint numParticleNodes, uint numParticles, const uint*
             continue;   //escaped still
         }
         ids[index] &= ~ESCAPED_PARTICLE;
+        if(air){
+            airBreakup[index] = 0.0f;   //back in air the grid resolves: nothing has broken it since
+        }
         float left = dt - flown;
         float3 point = make_float3((px[index] - grid.negX)/voxelSize - tileOrigin.x, (py[index] - grid.negY)/voxelSize - tileOrigin.y, (pz[index] - grid.negZ)/voxelSize - tileOrigin.z);
         float3 velocity = velocityThrough(tile, tileWidth, point, tileOrigin, domainVoxels, make_float3(vx[index], vy[index], vz[index]), left / voxelSize, rungeKutta3, air ? airStick : stick);
@@ -2017,6 +2252,8 @@ WallStick Particles::wallSticks(bool liquid) const{
 }
 
 void Particles::voxelVelsToParticles(){
+    accelerationBits.zeroDeviceAsync(stream);   //the most any particle's velocity changes by this substep, per second: G2P's update and the escaped ones' flights, for the next substep's timestep
+                                                //(getCourantDt). Nothing, in a partition with no particles: what it had found before it emptied isn't this substep's
     if(numParticleNodes == 0){  //no particles in this partition
         return;
     }
@@ -2027,13 +2264,14 @@ void Particles::voxelVelsToParticles(){
     WallStick stick = wallSticks(true);     //how far each wall holds the liquid's particles: a viscous liquid's as its faces are held in the viscous solve
     WallStick airStick = wallSticks(false); //and the air's
     bool phases = twoPhase.on;
-    accelerationBits.zeroDeviceAsync(stream);   //the most any particle's velocity changes by this substep, per second: G2P's update and the escaped ones' flights, for the next substep's timestep (getCourantDt)
     auto gather = phases ? (apic ? gatherVoxelVelsToParticles<true, true> : gatherVoxelVelsToParticles<false, true>)
                          : (apic ? gatherVoxelVelsToParticles<true, false> : gatherVoxelVelsToParticles<false, false>);
     const char* gone = lettingGo() ? letGo.devPtr() : nullptr;  //the voxels boundaries let go of in this substep's solve: their walls' faces carry the liquid's velocity on
-    gather<<<numParticleNodes, NODE_THREADS, ((phases ? 7 : 6)*sizeof(float) + 1)*numVoxelsPerNode, stream>>>(numParticleNodes, size, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(),
+    gather<<<numParticleNodes, NODE_THREADS, ((phases ? 8 : 6)*sizeof(float) + 1)*numVoxelsPerNode, stream>>>(numParticleNodes, size, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(),
         affineVelocities(affine), (float)(grid.cellSize / (2<<refinementLevel)), nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(), voxelOwners.devPtr(), solids.devPtr(), voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr(), voxelsUxOld.devPtr(), voxelsUyOld.devPtr(), voxelsUzOld.devPtr(), flipRatio, stick, airStick, radius, grid, refinementLevel,
-        phases ? particleIds.devPtr() : nullptr, twoPhase.airFlipRatio, twoPhase.escaping() ? liquidShare.devPtr() : nullptr, particleBirths.devPtr(), (float)substepStart, (float)(1.0 / dt), accelerationBits.devPtr(),
+        phases ? particleIds.devPtr() : nullptr, twoPhase.airFlipRatio, twoPhase.escaping() ? liquidShare.devPtr() : nullptr, twoPhase.escaping() ? airResolved.devPtr() : nullptr,
+        twoPhase.escaping() ? airBreakup.devPtr() : nullptr,
+        particleBirths.devPtr(), (float)substepStart, (float)(1.0 / dt), accelerationBits.devPtr(),
         gone);
     gpuErrchk(cudaPeekAtLastError());
     uint tileWidth = 3*(numVoxels1D - 2*(uint)std::floor(radius));
@@ -2044,23 +2282,22 @@ void Particles::voxelVelsToParticles(){
         (float)(cfl*grid.cellSize / (2<<refinementLevel)));     //the air goes at most as far as the liquid may, the tile's reach
     gpuErrchk(cudaPeekAtLastError());
     if(twoPhase.escaping()){    //then the escaped ones, which that left where they were
-        double voxelSize = grid.cellSize / (2<<refinementLevel);
-        //a droplet's or a bubble's radius, unless the scene gives one: a ball of the fluid one particle stands for
-        double ball = voxelSize*std::cbrt(3.0 / (4.0*3.14159265358979323846*restParticlesPerVoxel));
-        double dropletRadius = twoPhase.dropletRadius > 0.0f ? twoPhase.dropletRadius : ball;
-        double bubbleRadius = twoPhase.bubbleRadius > 0.0f ? twoPhase.bubbleRadius : ball;
+        double dropletRadius = twoPhase.dropletRadius > 0.0f ? twoPhase.dropletRadius : particleBall();  //a droplet's, unless the scene gives one: a ball of its liquid
         //A bubble flattens as it rises, the more the larger it is against the surface tension that rounds it: by its Eotvos number, its buoyancy over
         //that. The drag coefficient of one that has levels at 8/3 Eo / (Eo + 4) (Tomiyama et al. 1998, for water that isn't pure, as Schiller and
-        //Naumann's ball is), which is what holds bubbles from 2 mm to 2 cm across all to 0.2 to 0.3 m/s in water
+        //Naumann's ball is), which is what holds bubbles from 2 mm to 2 cm across all to 0.2 to 0.3 m/s in water. Each bubble's own size makes its
+        //own (flyEscaped)
         double pulled = std::sqrt((double)forces.gravity.x*forces.gravity.x + (double)forces.gravity.y*forces.gravity.y + (double)forces.gravity.z*forces.gravity.z);
-        double eotvos = pulled*(1.0 - 1.0 / twoPhase.densityRatio)*4.0*bubbleRadius*bubbleRadius / twoPhase.surfaceTension;
-        EscapedFlight droplet = {forces.gravity, (float)dropletRadius, twoPhase.airViscosity, twoPhase.densityRatio, 0.44f};
-        EscapedFlight bubble = {forces.gravity, (float)bubbleRadius, twoPhase.liquidViscosity, 1.0f / twoPhase.densityRatio, (float)(8.0/3.0*eotvos / (eotvos + 4.0))};
+        double eotvosPerArea = pulled*(1.0 - 1.0 / twoPhase.densityRatio)*4.0 / twoPhase.surfaceTension;
+        EscapedFlight droplet = {forces.gravity, (float)dropletRadius, twoPhase.airViscosity, twoPhase.densityRatio, 0.44f, twoPhase.densityRatio, 1.0f};
+        EscapedFlight bubble = {forces.gravity, 0.0f, twoPhase.liquidViscosity, 1.0f / twoPhase.densityRatio, 0.0f, 1.0f, 1.0f / twoPhase.densityRatio};   //size, drag: its own
         flyEscaped<<<numParticleNodes, NODE_THREADS, 7*sizeof(float)*tileWidth*tileWidth*tileWidth, stream>>>(numParticleNodes, size, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(),
-            px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(), particleIds.devPtr(), liquidShare.devPtr(),
+            px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(), particleIds.devPtr(), liquidShare.devPtr(), airResolved.devPtr(),
             numUsedGridNodes, nodeCells.devPtr(), cellToNode.devPtr(), nodeInteriorVoxels.devPtr(),
             voxelsUx.devPtr(), voxelsUy.devPtr(), voxelsUz.devPtr(), voxelsUxOld.devPtr(), voxelsUyOld.devPtr(), voxelsUzOld.devPtr(),
-            voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), dt, rungeKutta3, stick, airStick, grid, refinementLevel, droplet, bubble, accelerationBits.devPtr());
+            voxelWeightsX.devPtr(), voxelWeightsY.devPtr(), voxelWeightsZ.devPtr(), dt, rungeKutta3, stick, airStick, grid, refinementLevel, droplet, bubble,
+            airBreakup.devPtr(), airSauter.devPtr(), BubbleSizes{twoPhase.bubbleRadius, (float)particleBall(), twoPhase.surfaceTension}, (float)eotvosPerArea,
+            accelerationBits.devPtr());
         gpuErrchk(cudaPeekAtLastError());
     }
 }
@@ -2115,6 +2352,9 @@ void Particles::solveFrame(double fps){
         updateVoxelVelocities();
         voxelVelsToParticles();   //also moves the particles; initialize re-bins them wherever they landed, reflecting any that crossed a wall
         stepWhitewater();         //the whitewater flies through the same grid, and what the surface made joins it: nothing of the fluid's changes by it
+        //the dynamic bodies' own steps through the substep: their contacts, and their moves, before initialize places the obstacles
+        bodies.step(dt, frameDt, obstacles.state(), make_float3(grid.negX, grid.negY, grid.negZ),
+                    make_float3(grid.negX + grid.sizeX*grid.cellSize, grid.negY + grid.sizeY*grid.cellSize, grid.negZ + grid.sizeZ*grid.cellSize), forces.gravity);
         ++substepIndex;
         initialize();
     }
@@ -2220,13 +2460,45 @@ __global__ void flagLiquid(uint numParticles, const uint* ids, uint* liquid){
     }
 }
 
+//A bubble's number, for the frames to tell it by: a hash of where it is when a frame first finds it a bubble, the same however the domain is split.
+//It goes in an air particle's number bits, which mean nothing to the simulation (the air takes no numbers from the count). Never 0, which is what the
+//air's band makes its particles with
+__device__ inline uint bubbleNumber(double x, double y, double z){
+    unsigned long long hash = mixBits64(mixBits64(mixBits64((unsigned long long)__double_as_longlong(x)) ^ (unsigned long long)__double_as_longlong(y)) ^
+                                        (unsigned long long)__double_as_longlong(z));
+    uint number = (uint)(hash >> 34);   //PARTICLE_NUMBER's 30 bits
+    return number != 0 ? number : 1;
+}
+
+//which particles are bubbles, the air's escaped ones, into bubbles (1 or 0). One without a number takes one (bubbleNumber), for good: the air the scene
+//seeded has the number its seeding gave it, and what the air's band has made since has none
+__global__ void flagBubbles(uint numParticles, const double* px, const double* py, const double* pz, uint* ids, uint* bubbles){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(index < numParticles){
+        uint id = ids[index];
+        bool bubble = (id & (AIR_PARTICLE | ESCAPED_PARTICLE)) == (AIR_PARTICLE | ESCAPED_PARTICLE);
+        if(bubble && !(id & PARTICLE_NUMBER)){
+            ids[index] = id | bubbleNumber(px[index], py[index], pz[index]);
+        }
+        bubbles[index] = bubble;
+    }
+}
+
 uint Particles::countFrameParticles(){
     frameParticles = size;
+    frameBubbles = 0;
     if(twoPhase.on && size > 0){
         frameEnds.resizeAsync(size, stream);
         flagLiquid<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, particleIds.devPtr(), frameEnds.devPtr());
         gpuErrchk(cudaPeekAtLastError());
         cudaParallelPrefixSum(size, frameEnds.devPtr(), stream);
+        if(twoPhase.escaping()){    //and the bubbles, for frameBubbleCount: both counted before either is copied, so the copies wait once
+            bubbleEnds.resizeAsync(size, stream);
+            flagBubbles<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, px.devPtr(), py.devPtr(), pz.devPtr(), particleIds.devPtr(), bubbleEnds.devPtr());
+            gpuErrchk(cudaPeekAtLastError());
+            cudaParallelPrefixSum(size, bubbleEnds.devPtr(), stream);
+            gpuErrchk(cudaMemcpyAsync(&frameBubbles, bubbleEnds.devPtr() + size - 1, sizeof(uint), cudaMemcpyDeviceToHost, stream));
+        }
         gpuErrchk(cudaMemcpyAsync(&frameParticles, frameEnds.devPtr() + size - 1, sizeof(uint), cudaMemcpyDeviceToHost, stream));
         gpuErrchk(cudaStreamSynchronize(stream));
     }
@@ -2256,6 +2528,47 @@ void Particles::copyFrameColumnsToHost(float* planes, bool ids, bool ages, cudaE
     gpuErrchk(cudaEventRecord(copied, frameStream));
 }
 
+double Particles::particleBall() const{
+    double voxelSize = grid.cellSize / (2<<refinementLevel);
+    return voxelSize*std::cbrt(3.0 / (4.0*3.14159265358979323846*restParticlesPerVoxel));
+}
+
+//the bubbles countFrameParticles counted, closed up in the order they're in (ends: how many there are up to each particle; count: in all), as
+//CacheWriter::bubbleBytes has them: P and v as float32s, the id (the number alone, as a frame's particles have theirs), the radius each flies as and
+//its spread's Sauter mean
+__global__ void packBubbles(uint numParticles, const double* px, const double* py, const double* pz, const float* vx, const float* vy, const float* vz,
+                            const uint* ids, const uint* ends, uint count, const float* radii, const float* sauters, char* planes){
+    uint index = threadIdx.x + blockIdx.x*blockDim.x;
+    if(index < numParticles && ends[index] != (index == 0 ? 0 : ends[index - 1])){
+        size_t n = count;
+        size_t at = ends[index] - 1;
+        float* floats = (float*)planes;
+        floats[at] = (float)px[index];
+        floats[n + at] = (float)py[index];
+        floats[2*n + at] = (float)pz[index];
+        floats[3*n + at] = vx[index];
+        floats[4*n + at] = vy[index];
+        floats[5*n + at] = vz[index];
+        ((unsigned long long*)planes)[3*n + at] = ids[index] & PARTICLE_NUMBER;     //6n floats in, so on an 8-byte boundary
+        floats[8*n + at] = radii[index];
+        floats[9*n + at] = sauters[index];
+    }
+}
+
+void Particles::copyFrameBubblesToHost(char* host, cudaEvent_t copied){
+    if(frameBubbles > 0){
+        size_t bytes = (size_t)frameBubbles*40;     //CacheWriter::bubbleBytes
+        char* planes;
+        gpuErrchk(cudaMallocAsync((void**)&planes, bytes, stream));
+        packBubbles<<<size / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(size, px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(),
+            particleIds.devPtr(), bubbleEnds.devPtr(), frameBubbles, airBreakup.devPtr(), airSauter.devPtr(), planes);
+        gpuErrchk(cudaPeekAtLastError());
+        gpuErrchk(cudaMemcpyAsync(host, planes, bytes, cudaMemcpyDeviceToHost, stream));
+        gpuErrchk(cudaFreeAsync(planes, stream));
+    }
+    gpuErrchk(cudaEventRecord(copied, stream));
+}
+
 //each particle's id as the cache has it, in 64 bits
 __global__ void widenIds(uint numParticles, const uint* ids, unsigned long long* wide){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
@@ -2264,7 +2577,8 @@ __global__ void widenIds(uint numParticles, const uint* ids, unsigned long long*
     }
 }
 
-//positions (double) then velocities, and with APIC their gradients (particleFloats' order), then the ids (64 bits) and the birth times, each a plane of
+//positions (double) then velocities, with APIC their gradients and with escaping air the bubbles' sizes (particleFloats' order), then the ids (64
+//bits) and the birth times, each a plane of
 //every particle's value: the layout of a checkpoint's state shard. Copied on this partition's own stream, so they're the state at this point, whatever
 //the next substep does to them
 void Particles::copyCheckpointToHost(char* host, cudaEvent_t copied){
@@ -2350,6 +2664,9 @@ Particles::~Particles(){     //with its GPU the current one
     }
     if(viscousSeen != nullptr){
         cudaFreeHost(viscousSeen);
+    }
+    if(sourceTable != nullptr){
+        cudaFree(sourceTable);
     }
     for(int field = 0; field < forces.numFields; ++field){
         freeForceVolume(forces.fields[field].volume);
