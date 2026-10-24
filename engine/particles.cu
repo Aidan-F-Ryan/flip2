@@ -986,8 +986,10 @@ void Particles::generateVoxels(){
     }
     p.zeroDeviceAsync(stream);
 
-    for(CudaVec<uint>* lower : {&neighborNx, &neighborNy, &neighborNz}){   //air voxels' lower neighbours: NO_VOXEL unless an unknown below claims them
-        cudaMemsetAsync(lower->devPtr(), 0xFF, sizeof(uint)*numUsedVoxels, stream);
+    //every voxel's neighbours NO_VOXEL, but an unknown's (buildVoxelTopology) and an air voxel's lower ones an unknown below claims. Reallocated each
+    //initialize, an air voxel's upper ones held whatever was there before, and letGoOfAir read them: bakes whose walls let go split differently
+    for(CudaVec<uint>* neighbor : {&neighborNx, &neighborPx, &neighborNy, &neighborPy, &neighborNz, &neighborPz}){
+        cudaMemsetAsync(neighbor->devPtr(), 0xFF, sizeof(uint)*numUsedVoxels, stream);
     }
     if(numStoredNodes > 0){     //the nodes 2 planes out have no voxels to build
         writeUsedVoxelIDs<<<numStoredNodes, 32, 0, stream>>>(numVoxels1D, usedVoxelMasks.devPtr(), nodeIndexUsedVoxels.devPtr(), nodeCells.devPtr(), voxelIDsUsed.devPtr(), solids.devPtr(), solveCodes.devPtr(), radius, grid, refinementLevel);

@@ -62,8 +62,9 @@ __device__ inline bool mayLetGo(const Boundaries& b, uint index, int3 voxel, int
     bool solid = false, held = false;
     #pragma unroll
     for(int face = 0; face < 6; ++face){
-        if(at[face/2] == (face % 2 ? size[face/2] - 1 : 0) && b.neighbors[face][index] == WALL_VOXEL
-           && !(b.near != nullptr && (b.near[index] & CLOSED_FACE << face))){     //the wall's own face, not one an obstacle against the wall has closed
+        //by where it is: an air voxel (letGoOfAir) stores no neighbours, and an unknown's across this face is the wall just where it's at the domain's edge
+        if(at[face/2] == (face % 2 ? size[face/2] - 1 : 0) && !(b.near != nullptr && (b.near[index] & CLOSED_FACE << face))){  //the wall's own face, not
+                                                                                                                              //one an obstacle closed
             solid = true;
             held = held || !(b.walls >> face & 1);
         }
