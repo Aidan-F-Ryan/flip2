@@ -1,4 +1,4 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 
 //The multigrid's preconditioner where a solve's term outweighs the stencil: the unknowns it does are eliminated from the V-cycle and solved for
 //exactly, with everything the equations tie them to (block elimination, or static condensation).

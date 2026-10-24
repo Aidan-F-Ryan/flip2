@@ -1,4 +1,4 @@
-#Copyright 2023 Aberrant Behavior LLC
+#Copyright 2026 Taimen LLC
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_FLAGS "-Wall -Wextra")

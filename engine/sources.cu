@@ -1,4 +1,4 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 
 //Emitters, sinks and open faces (see sources.hu), run as initialize re-bins the particles each substep:
 //  markRemovedParticles before rootCell reflects anything back off the walls; killRemovedParticles after it, giving them the cell past the last, so the

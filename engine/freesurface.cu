@@ -1,4 +1,4 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 
 //The sharp free surface (FreeSurface::sharp, particles.hu; levelSet in scene files, Level Set in Houdini, and the default without air): the pressure
 //solve's liquid is what the level set finds (levelset.cu), and its pressure is 0 at the surface itself, or sigma kappa with surface tension, rather than

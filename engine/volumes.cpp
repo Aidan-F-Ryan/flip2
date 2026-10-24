@@ -1,4 +1,4 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 
 //VDB level sets, resampled into the engine's sparse bricks, and the liquid's fields written as VDBs (see volumes.hpp). Only this file sees OpenVDB, so
 //the CUDA sources never include it

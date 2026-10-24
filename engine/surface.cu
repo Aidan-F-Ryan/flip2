@@ -1,4 +1,4 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 
 //A liquid's surface from its particles, on the GPU (surface.hu), in five passes over compact lists:
 //

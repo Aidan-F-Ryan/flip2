@@ -1,4 +1,4 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 
 //Sealed pockets: fluid no air reaches, shut in by obstacles and the domain's walls. Nothing in a pocket's pressure equations is held at 0, so they fix its
 //pressure only up to a constant, and they have a solution only if the fluid's net flow out of the pocket is 0: fluid that can't be compressed can't leave

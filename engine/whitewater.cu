@@ -1,4 +1,4 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 
 //Whitewater (whitewater.hu). Each substep, as soon as its length is known and before the pressure solve, the surface is read for where it's breaking
 //up and how many particles that makes (Particles::findWhitewater, findWhitewaterSources). Then, once the grid has its new velocities and the fluid's

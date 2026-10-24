@@ -1,4 +1,4 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 
 //Houdini's .bgeo is its JSON geometry schema in its binary JSON encoding (Houdini 12 on). The reference for both is in every Houdini install:
 //$HFS/houdini/public/binary_json/binary_json.py (the encoding) and $HFS/houdini/public/hgeo/hgeo.py (the schema). The file starts with a magic number,

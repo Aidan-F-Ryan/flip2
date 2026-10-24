@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright 2023 Aberrant Behavior LLC
+# Copyright 2026 Taimen LLC
 """Regression runs for flip2. Runs a few scenes with FLIP2_DIAGNOSTICS set, which makes main write a line of JSON per frame (engine/diagnostics.hu):
 the particles' energy, momentum and extent, how they fill the voxels, and a hash of every particle's exact state. Then compares runs frame by frame.
 

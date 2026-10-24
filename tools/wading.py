@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright 2023 Aberrant Behavior LLC
+# Copyright 2026 Taimen LLC
 """Writes the character wading scene (scenes/wading.json): a figure walking through water up to its thighs, the P1 exit test for deforming obstacles at a
 character's scale. Only Python's standard library, so it runs on coeus.
 

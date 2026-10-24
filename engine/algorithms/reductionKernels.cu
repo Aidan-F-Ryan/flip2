@@ -1,4 +1,4 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 
 #include "parallelPrefixSumKernels.hu"
 #include "reductionKernels.hu"

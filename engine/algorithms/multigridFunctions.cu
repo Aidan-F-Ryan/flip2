@@ -1,4 +1,4 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 
 //The V-cycle that preconditions CG, z = M^-1*r: an approximate solve of A*z = r.
 //

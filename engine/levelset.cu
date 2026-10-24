@@ -1,4 +1,4 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 
 //The liquid's level set on the simulation's own voxels, and surface tension from it.
 //

@@ -1,4 +1,4 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 
 //Contacts between the dynamic bodies and what they touch (bodies.hu): the domain's walls, the obstacles, and each other.
 //

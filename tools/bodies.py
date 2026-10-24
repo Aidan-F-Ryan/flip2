@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright 2023 Aberrant Behavior LLC
+# Copyright 2026 Taimen LLC
 """Test scenes for two-way coupled bodies (engine/bodies.cu), and what their bakes' diagnostics say about them. Only Python's standard library.
 
   bodies.py scene KIND [key=value ...] > scene.json     write a scene: a tank of water, half full, with a body in it

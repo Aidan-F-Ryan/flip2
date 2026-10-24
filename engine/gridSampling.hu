@@ -1,4 +1,4 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 
 //What the particle kernels share for reading the grid where a particle is, and for flying one that the grid doesn't move: the quadratic B-spline's
 //weights, the liquid's share at a point, a MAC velocity out of a tile, the path through a tile's field, and an escaped particle's flight. Here, not in

@@ -1,4 +1,4 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 
 //Obstacles: their distance fields, built on the GPU, and what the simulation does with them each substep. Nothing here changes the pressure solve; it
 //only changes what the solve is given:

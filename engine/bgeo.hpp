@@ -1,4 +1,4 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 #ifndef BGEO_HPP
 #define BGEO_HPP
 #include "cacheWriter.hu"   //ShardData

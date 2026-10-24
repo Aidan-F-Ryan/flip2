@@ -1,4 +1,4 @@
-#Copyright 2023 Aberrant Behavior LLC
+#Copyright 2026 Taimen LLC
 
 """Reads a flip2 bake's cache (engine/cacheWriter.hu): cache.json, each frame's commit record and its shards.
 

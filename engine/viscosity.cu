@@ -1,4 +1,4 @@
-//Copyright 2023 Aberrant Behavior LLC
+//Copyright 2026 Taimen LLC
 
 //Viscosity, implicit, with the free surface it needs (Batty and Bridson, Accurate viscous free surfaces for buckling, coiling and rotating liquids,
 //2008), between two pressure solves, which it leaves alone: it has its own equations and its own conjugate gradient, here.

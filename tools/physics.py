@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright 2023 Aberrant Behavior LLC
+# Copyright 2026 Taimen LLC
 """Physics checks for flip2. golden.py says a build still gives what it gave when its goldens were recorded; it can't say that was right. Each check here
 bakes a small scene whose answer is known beforehand, from a conservation law, an exact solution or a published result, and holds the bake to it.
 
