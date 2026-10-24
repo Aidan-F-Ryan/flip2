@@ -522,6 +522,8 @@ private:
     CudaVec<float> voxelWeightsY;
     CudaVec<float> voxelWeightsZ;
     CudaVec<float> particleCounts; //P2G: the particles in each voxel
+    CudaVec<float> particleDensity;    //P2G: the particles' quadratic B-spline weights on each voxel's centre, and obstacles' credit (creditObstacleVolume),
+                                       //restParticlesPerVoxel at rest: what the density correction measures
     CudaVec<char> footprintDepth;   //per voxel: how many voxels inside the fluid's footprint it is, up to CORRECTION_DEPTH
     CudaVec<uint> freeSurface;      //whether any pressure unknown touches air
 

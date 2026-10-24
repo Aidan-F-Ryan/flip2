@@ -178,10 +178,13 @@ __global__ void weighSurfaceFacesKernel(uint numVoxels, const char* solveCodes, 
 //- The density correction, where cudaCalcDivU leaves it out (within CORRECTION_DEPTH of the footprint's edge), for voxels packed denser than rest only:
 //  particles falling through the air above the liquid, which nothing holds apart there, land in its top voxels, and with nothing to spread them those
 //  pack ever tighter (the footprint holds them as they come). Spreading only, measured as cudaCalcDivU measures it, so the partly filled voxels at the
-//  surface aren't taken for sparse and filled. Not in the voxels obstacles cut, whose correction obstacleFaceFlux scales
+//  surface aren't taken for sparse and filled. Its B-spline weights reach into the air there, so the last voxel under a flat surface reads 5/6 of its
+//  packing, and could pack a fifth denser than rest unseen. None does: a dam break's pool 16 s on is at rest to 0.2% under its surface with no layer
+//  denser, as with the particle counts this measured before (each voxel's own particles alone), which shook it with every particle that crossed a face.
+//  Not in the voxels obstacles cut, whose correction obstacleFaceFlux scales
 __global__ void surfaceDivergenceKernel(uint numVoxels, const char* solveCodes, const uint* neighborNx, const uint* neighborPx, const uint* neighborNy, const uint* neighborPy,
                                         const uint* neighborNz, const uint* neighborPz, const float* surface, const float* level, const float* curvature, const char* near,
-                                        const uint* opens, float tension, const float* particleCounts, const char* footprintDepth, float restParticlesPerVoxel,
+                                        const uint* opens, float tension, const float* particleDensity, const char* footprintDepth, float restParticlesPerVoxel,
                                         float correctionRate, float* divU){
     uint index = threadIdx.x + blockIdx.x*blockDim.x;
     if(index >= numVoxels || !solveCodes[index]){
@@ -208,13 +211,13 @@ __global__ void surfaceDivergenceKernel(uint numVoxels, const char* solveCodes, 
         change -= tension*sum;
     }
     if(correctionRate > 0.0f && footprintDepth[index] < CORRECTION_DEPTH && !cut){
-        float count = 6.0f*particleCounts[index];
+        float count = 6.0f*particleDensity[index];
         float weight = 6.0f;
         #pragma unroll
         for(int face = 0; face < 6; ++face){
             uint neighbor = neighbors[face][index];
             if(neighbor < WALL_VOXEL){
-                count += particleCounts[neighbor];
+                count += particleDensity[neighbor];
                 weight += 1.0f;
             }
         }
@@ -448,7 +451,7 @@ void Particles::addSurfaceDivergence(float correctionRate){
     bool cut = obstacles.count() > 0;
     surfaceDivergenceKernel<<<numVoxels / BLOCKSIZE + 1, BLOCKSIZE, 0, stream>>>(numVoxels, solveCodes.devPtr(), neighborNx.devPtr(), neighborPx.devPtr(), neighborNy.devPtr(),
         neighborPy.devPtr(), neighborNz.devPtr(), neighborPz.devPtr(), surfaceLevel.devPtr(), liquidLevel.devPtr(), tension ? liquidCurvature.devPtr() : nullptr,
-        cut ? obstacleNear.devPtr() : nullptr, cut ? obstacleOpen.devPtr() : nullptr, (float)(dt*surfaceTension / (voxelSize*voxelSize)), particleCounts.devPtr(),
+        cut ? obstacleNear.devPtr() : nullptr, cut ? obstacleOpen.devPtr() : nullptr, (float)(dt*surfaceTension / (voxelSize*voxelSize)), particleDensity.devPtr(),
         footprintDepth.devPtr(), (float)restParticlesPerVoxel, correctionRate, divU.devPtr());
     gpuErrchk(cudaPeekAtLastError());
 }

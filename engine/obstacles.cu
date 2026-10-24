@@ -1735,15 +1735,20 @@ __device__ inline float openVolume(const CutFaces& cut){
     return sum / 6.0f;
 }
 
-//the fraction of a voxel inside obstacles, from the distances at the centres of its eighths: each inside by as much as a plane that far from its centre
-//would cut it (a ramp half a voxel wide), so it moves smoothly with the surface. What P2G's count of the particles in a voxel falls short by at rest. Off
-//the exact volume by 1.4% at most around a sphere 13 voxels across and 4% at a box's edges, where a count of 64 points inside is off by up to 9%, and
-//trilinear blends of the corners by 24%, as they round the edge off
+//how much of an eighth of a voxel is inside obstacles, from the distance at its centre: as much as a plane that far from its centre would cut it (a
+//ramp half a voxel wide, the eighth's width)
+__device__ inline float eighthCovered(float distance, float h){
+    return fminf(fmaxf(0.5f - 2.0f*distance/h, 0.0f), 1.0f);
+}
+
+//the fraction of a voxel inside obstacles, from the distances at the centres of its eighths (eighthCovered), so it moves smoothly with the surface.
+//What P2G's count of the particles in a voxel falls short by at rest. Off the exact volume by 1.4% at most around a sphere 13 voxels across and 4% at a
+//box's edges, where a count of 64 points inside is off by up to 9%, and trilinear blends of the corners by 24%, as they round the edge off
 __device__ inline float coveredFraction(const float eighths[8], float h){
     float sum = 0.0f;
     #pragma unroll
     for(int eighth = 0; eighth < 8; ++eighth){
-        sum += fminf(fmaxf(0.5f - 2.0f*eighths[eighth]/h, 0.0f), 1.0f);
+        sum += eighthCovered(eighths[eighth], h);
     }
     return sum / 8.0f;
 }
@@ -2587,9 +2592,9 @@ void Particles::carryLetGoFaces(CudaVec<float>& ux, CudaVec<float>& uy, CudaVec<
     }
 }
 
-//the density correction counts each voxel's particles against the rest count, but a voxel an obstacle partly covers can only hold its uncovered part's
-//worth, so it would read as thin and the correction would keep pulling fluid towards the obstacle. Each cut voxel gets credit for its covered part: the
-//rest count times the fraction of its volume inside obstacles (coveredFraction), which moves smoothly with the surface
+//the sharp surface weighs each voxel's count of particles against the rest count (dryUnknown), but a voxel an obstacle partly covers can only hold its
+//uncovered part's worth, so it would read as thin. Each cut voxel gets credit for its covered part: the rest count times the fraction of its volume
+//inside obstacles (coveredFraction), which moves smoothly with the surface
 __global__ void creditCoveredVolume(Obstacles obstacles, VoxelPlaces places, const uint* nodes, const char* walls, const char* solid, const char* near, const uint* opens,
                                     float restParticlesPerVoxel,
                                     float* particleCounts){
@@ -2606,11 +2611,96 @@ __global__ void creditCoveredVolume(Obstacles obstacles, VoxelPlaces places, con
     }
 }
 
+//How much of each eighth of a tile's voxels is inside obstacles (eighthCovered), the eighths 8 to a slot, x fastest: a thread a slot for the distance
+//at its centre, and for a slot within 0.9 voxels of a surface a thread an eighth, as cutFaces measures them (near says which). Past the domain's walls an
+//eighth is its mirror image's inside, as the particles' weight past them lands on their images. From the obstacles' fields alone, which every partition
+//holds, so a ghost's comes out as its owner's to the bit. Every thread of the block calls it, and it ends synced
+__device__ inline void coverEighths(const Obstacles& obstacles, const VoxelPlaces& places, const Tile& tile, float* eighths, char* near){
+    float h = places.voxelSize();
+    int slots = tile.slots();
+    for(int slot = threadIdx.x; slot < slots; slot += blockDim.x){
+        float distance;
+        float3 normal;
+        int nearest = nearestObstacle(obstacles, places.point(tile.global(tile.mirrored(tile.at(slot))), 0.5f, 0.5f, 0.5f), distance, normal);
+        near[slot] = nearest >= 0 && fabsf(distance) <= 0.9f*h;
+        if(!near[slot]){    //all of it in an obstacle or none of it
+            float whole = nearest < 0 || distance > 0.0f ? 0.0f : 1.0f;
+            #pragma unroll
+            for(int eighth = 0; eighth < 8; ++eighth){
+                eighths[8*slot + eighth] = whole;
+            }
+        }
+    }
+    __syncthreads();
+    for(int item = threadIdx.x; item < 8*slots; item += blockDim.x){
+        if(near[item / 8]){
+            int3 t = tile.at(item / 8), image = tile.mirrored(t);
+            int flips = (image.x != t.x) | (image.y != t.y) << 1 | (image.z != t.z) << 2;
+            int eighth = item % 8 ^ flips;  //its mirror image, in the voxel inside
+            float distance;
+            float3 normal;
+            nearestObstacle(obstacles, places.point(tile.global(image), 0.25f + 0.5f*(eighth & 1), 0.25f + 0.5f*(eighth >> 1 & 1), 0.25f + 0.5f*(eighth >> 2)), distance, normal);
+            eighths[item] = eighthCovered(distance, h);
+        }
+    }
+    __syncthreads();
+}
+
+//what the centre of the voxel at t, inside a tile with a voxel round it, reads of its reach's eighths: their shares times the B-spline's weights on the
+//centre from theirs, each axis's six eighths from the voxel below's lower one to the voxel above's upper one: 1/32, 9/32, 22/32, 22/32, 9/32 and 1/32,
+//for eighths five quarters, three quarters and a quarter of a voxel away, which add up to 2 along each axis
+__device__ inline float eighthsOnCentre(const float* eighths, const Tile& tile, int3 t){
+    const float weights[6] = {1.0f/32.0f, 9.0f/32.0f, 22.0f/32.0f, 22.0f/32.0f, 9.0f/32.0f, 1.0f/32.0f};
+    float sum = 0.0f;
+    for(int z = 0; z < 6; ++z){
+        for(int y = 0; y < 6; ++y){
+            const float* row = eighths + 8*tile.slot(make_int3(t.x - 1, t.y - 1 + y/2, t.z - 1 + z/2)) + 2*(y & 1) + 4*(z & 1);
+            float yz = weights[y]*weights[z];
+            #pragma unroll
+            for(int x = 0; x < 6; ++x){
+                sum += row[8*(x/2) + (x & 1)]*weights[x]*yz;
+            }
+        }
+    }
+    return sum;
+}
+
+//The density correction measures each particle's quadratic B-spline weight on the voxel centres (scatterParticleVelsToVoxels), and beside an obstacle
+//part of a centre's reach is inside it, where no particle can be, so it would read as thin and the correction would keep pulling fluid towards the
+//obstacle. Each voxel is credited with what rest particles filling the obstacles would add. Those sit one to each eighth of a voxel at 8 a voxel, a
+//lattice that reads rest at every centre, so a voxel takes rest/8 times its reach's eighths' covered shares on its centre (coverEighths,
+//eighthsOnCentre). Obstacles filling a centre's reach then read rest, and with them filling some of it and particles at rest the rest, rest too,
+//whatever their shape. A block per node near obstacles (findSolidVoxels), over a tile of its voxels and one more round them. A voxel in a node not near
+//an obstacle is 1.5 voxels or more from every one, and misses at most 0.2% of rest from them
+__global__ void creditCoveredDensity(Obstacles obstacles, VoxelPlaces places, const uint* nodes, float restParticlesPerVoxel, float* density){
+    extern __shared__ float eighths[];  //per slot of the tile, its eighths' covered shares; then per slot whether it's within 0.9 voxels of a surface
+    int voxels1D = places.interiorWidth + 2*places.apronCells;
+    for(uint listed = blockIdx.x; listed < nodes[0]; listed += gridDim.x){    //the nodes near obstacles (findSolidVoxels), a block each in turn
+        uint node = nodes[1 + listed];
+        uint first = node == 0 ? 0 : places.nodeVoxelEnds[node - 1];
+        uint last = places.nodeVoxelEnds[node];
+        Tile tile(places.nodeCells[node], places.grid, places.interiorWidth, 1);
+        coverEighths(obstacles, places, tile, eighths, (char*)(eighths + 8*tile.slots()));
+        for(uint index = first + threadIdx.x; index < last; index += blockDim.x){
+            int slot = places.voxelSlots[index];
+            int3 t = make_int3(slot % voxels1D - places.apronCells + 1, slot / voxels1D % voxels1D - places.apronCells + 1, slot / (voxels1D*voxels1D) - places.apronCells + 1);
+            if(tile.interior(t)){   //the node's own voxels
+                density[index] += 0.125f*restParticlesPerVoxel*eighthsOnCentre(eighths, tile, t);
+            }
+        }
+        __syncthreads();    //the next node's tile
+    }
+}
+
 void Particles::creditObstacleVolume(){
     if(obstacles.count() == 0 || numStoredNodes == 0){
         return;
     }
     creditCoveredVolume<<<obstacleBlocks(), OBSTACLE_THREADS, 0, stream>>>(obstacles.state(), voxelPlaces(), obstacleNodes.devPtr(), solids.devPtr(), obstacleSolids.devPtr(), obstacleNear.devPtr(),
         obstacleOpen.devPtr(), (float)restParticlesPerVoxel, particleCounts.devPtr());
+    int width = (2<<refinementLevel) + 2;   //a node's tile, with a voxel round it
+    size_t shared = (8*sizeof(float) + sizeof(char))*width*width*width;
+    creditCoveredDensity<<<obstacleBlocks(), OBSTACLE_THREADS, shared, stream>>>(obstacles.state(), voxelPlaces(), obstacleNodes.devPtr(), (float)restParticlesPerVoxel,
+        particleDensity.devPtr());
     gpuErrchk(cudaPeekAtLastError());
 }

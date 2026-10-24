@@ -962,7 +962,7 @@ void Particles::generateVoxels(){
     uint interiorWidth = numVoxels1D - 2*(uint)std::floor(radius);
     nodeInteriorVoxels.resizeAsync(numUsedGridNodes*interiorWidth*interiorWidth*interiorWidth, stream);
     cudaMemsetAsync(nodeInteriorVoxels.devPtr(), 0xFF, sizeof(uint)*nodeInteriorVoxels.size(), stream);   //NO_VOXEL until buildVoxelTopology finds one
-    for(CudaVec<float>* voxelData : {&voxelsUx, &voxelsUy, &voxelsUz, &voxelsUxOld, &voxelsUyOld, &voxelsUzOld, &voxelWeightsX, &voxelWeightsY, &voxelWeightsZ, &particleCounts, &divU, &p, &residuals, &Anx, &Apx, &Any, &Apy, &Anz, &Apz, &Adiag}){
+    for(CudaVec<float>* voxelData : {&voxelsUx, &voxelsUy, &voxelsUz, &voxelsUxOld, &voxelsUyOld, &voxelsUzOld, &voxelWeightsX, &voxelWeightsY, &voxelWeightsZ, &particleCounts, &particleDensity, &divU, &p, &residuals, &Anx, &Apx, &Any, &Apy, &Anz, &Apz, &Adiag}){
         voxelData->resizeAsync(numUsedVoxels, stream);
     }
     if(twoPhase.on){    //each face's density, and with air particles the liquid's weights that go into it (twophase.cu)
@@ -1029,9 +1029,15 @@ static AffineVelocities affineVelocities(CudaVec<float> (&affine)[9]){
 }
 
 //P2G: a block per node and a thread per particle. Each particle adds its weight and its momentum on the 27 faces of each component around it into
-//the node's voxel block in shared memory, and 1 to the count of the voxel holding it; then each voxel the node stores adds the block's sums into its
-//owner. It sums in fixed point, as sm_86 has native shared integer atomics but not float ones, and integers add up the same in any order, so the
-//result doesn't depend on which node gets there first.
+//the node's voxel block in shared memory, 1 to the count of the voxel holding it, and its weight on the 27 voxel centres around it to their density;
+//then each voxel the node stores adds the block's sums into its owner. It sums in fixed point, as sm_86 has native shared integer atomics but not
+//float ones, and integers add up the same in any order, so the result doesn't depend on which node gets there first.
+//The density is what the density correction measures (cudaCalcDivU): the quadratic B-spline's weights on the centres, which add up to 1 wherever the
+//particle is, so a lattice of particles at rest reads restParticlesPerVoxel at every centre to the rounding, however it lies on the voxels and as it
+//slides across them, where the count of a voxel's particles rises and falls by one as they cross into it and out. A particle's weight on a centre past
+//a domain wall goes to that centre's mirror image inside, which is the weight the particle's own mirror image across the wall has there, as G2P reads
+//the faces past a wall from their images: so the liquid beside a wall reads as liquid all round, its images filling the room past the wall, where the
+//wall's side of the B-spline would read as empty
 //A particle's share of a face's weight is a whole number of units (weightScale to a weight of 1), and its share of the face's momentum is that many
 //times its velocity there, in whole units too (velocityScale to 1 m/s: 2^MOMENTUM_DIGIT to the fastest there is). So a face's momentum over its
 //weight is the mean of its particles' velocities, each by its share, exactly, however little of any of them reaches it; and a share too small to
@@ -1040,23 +1046,24 @@ static AffineVelocities affineVelocities(CudaVec<float> (&affine)[9]){
 //velocity, faces were off by a third of it, the pressure solve took that for divergence, and the ball lost a thousandth of its speed a substep.)
 //The products take 64 bits, and the shared atomics that are native are 32: so each sum is two words, the product's low half added to the low
 //one, and its high half to the high one with the carry, which the add that wrapped the low word knows it made, by what it found there. Per slot,
-//3 such sums, and 4 ints, the weights and the count: 20 KB for an 8^3 block. The owners' sums are 32-bit, in the float arrays' storage: the
+//3 such sums, and 5 ints, the weights, the count and the density: 22 KB for an 8^3 block. The owners' sums are 32-bit, in the float arrays' storage: the
 //momentum's as two digits, the low MOMENTUM_DIGIT bits of each block's sum (low) and the rest of it (ux, uy, uz). No more than 8 blocks reach a
 //voxel, so neither digit can run over. normalizeVoxelVelocities turns them into floats.
 //With APIC, each face takes the particle's velocity carried out to it along its gradient, v + c.(x_face - x). With two PHASES (TwoPhase,
 //particles.hu), a particle weighs as much as its fluid, air's being airMass of the liquid's: the momentum and the weights are then each face's
 //momentum and mass, so the velocity they give is the two fluids' together, and three more sums a slot keep the liquid's weights alone: what's left
-//of a face's mass is its air's, so how much of the face is liquid is exact, and so is whether either fluid reaches it at all (26 KB)
+//of a face's mass is its air's, so how much of the face is liquid is exact, and so is whether either fluid reaches it at all (28 KB)
 template<bool APIC, bool PHASES>
 __global__ void scatterParticleVelsToVoxels(uint numParticleNodes, uint numParticles, uint numVoxels1D, const uint* gridNodeIndicesToFirstParticleIndex, const uint* gridPosition,
                                             const double* px, const double* py, const double* pz, const float* vx, const float* vy, const float* vz,
                                             AffineVelocities affine, float voxelSize,
                                             const uint* numVoxelsEachNode, const uint* voxelIDs, const uint* voxelOwners,
                                             int* ux, int* uy, int* uz, unsigned int* lowX, unsigned int* lowY, unsigned int* lowZ, int* weightsX, int* weightsY, int* weightsZ, int* particleCounts,
-                                            float velocityScale, float weightScale, double radius, Grid grid, uint refinementLevel,
+                                            int* particleDensity, float velocityScale, float weightScale, double radius, Grid grid, uint refinementLevel,
                                             const uint* ids, float airMass, int* liquidX, int* liquidY, int* liquidZ){
-    extern __shared__ long long blockSums[];    //per slot: x, y, z momentum; then, as ints, x, y, z weight and the particle count, and with PHASES the liquid's x, y, z weight
-    const int SUMS = PHASES ? 7 : 4;
+    extern __shared__ long long blockSums[];    //per slot: x, y, z momentum; then, as ints, x, y, z weight, the particle count and the density, and with PHASES
+                                                //the liquid's x, y, z weight
+    const int SUMS = PHASES ? 8 : 5;
     int voxels1D = numVoxels1D;
     int voxels3D = voxels1D*voxels1D*voxels1D;
     unsigned int* momentum = (unsigned int*)blockSums;      //each sum's low word, then its high one
@@ -1064,6 +1071,11 @@ __global__ void scatterParticleVelsToVoxels(uint numParticleNodes, uint numParti
     int apronCells = floor(radius);
     uint firstParticle = gridNodeIndicesToFirstParticleIndex[blockIdx.x];
     uint lastParticle = blockIdx.x == numParticleNodes - 1 ? numParticles : gridNodeIndicesToFirstParticleIndex[blockIdx.x + 1];
+    uint cell = gridPosition[firstParticle];
+    int interiorWidth = voxels1D - 2*apronCells;
+    const int first[3] = {(int)(cell % grid.sizeX)*interiorWidth - apronCells, (int)(cell / grid.sizeX % grid.sizeY)*interiorWidth - apronCells,
+                          (int)(cell / (grid.sizeX*grid.sizeY))*interiorWidth - apronCells};   //the block's first voxel, in the domain's voxels
+    const int size[3] = {(int)grid.sizeX*interiorWidth, (int)grid.sizeY*interiorWidth, (int)grid.sizeZ*interiorWidth};
     for(int i = threadIdx.x; i < (6 + SUMS)*voxels3D; i += blockDim.x){
         ((int*)blockSums)[i] = 0;
     }
@@ -1124,7 +1136,7 @@ __global__ void scatterParticleVelsToVoxels(uint numParticleNodes, uint numParti
                             }
                             if constexpr(PHASES){
                                 if(liquid){     //its mass is 1, so its share of the liquid's weight is its share of the mass
-                                    atomicAdd(fixedSums + (4 + dim)*voxels3D + rowStart + i, share);
+                                    atomicAdd(fixedSums + (5 + dim)*voxels3D + rowStart + i, share);
                                 }
                             }
                         }
@@ -1133,9 +1145,39 @@ __global__ void scatterParticleVelsToVoxels(uint numParticleNodes, uint numParti
             }
         }
         atomicAdd(fixedSums + 3*voxels3D + (int)pos.x + (int)pos.y*voxels1D + (int)pos.z*voxels1D*voxels1D, 1);
+        //its weight on the 27 centres, the density's, a centre past a wall's on its mirror image inside. The faces' stencils reach every one of those
+        //voxels, which the node stores, but the corner below a particle past the middle of its voxel along all three axes. Its weight there is 1/512
+        //at most (1/8 along each axis, for a particle at the middle), and it's lost only where that corner is in the block's apron, owned by another
+        //node, and no other particle of this node's reaches it: a particle on its own at the edge of its node
+        const Spline3* centres = stencil.onCentres;
+        int at[3][3];   //each axis's 3 slots along it, folded
+        #pragma unroll
+        for(int a = 0; a < 3; ++a){
+            #pragma unroll
+            for(int i = 0; i < 3; ++i){
+                int voxel = first[a] + centres[a].base + i;
+                voxel = voxel < 0 ? -1 - voxel : voxel >= size[a] ? 2*size[a] - 1 - voxel : voxel;
+                at[a][i] = voxel - first[a];
+            }
+        }
+        #pragma unroll
+        for(int k = 0; k < 3; ++k){
+            #pragma unroll
+            for(int j = 0; j < 3; ++j){
+                float yz = centres[1].w[j]*centres[2].w[k];
+                int rowStart = 4*voxels3D + (at[1][j] + at[2][k]*voxels1D)*voxels1D;
+                #pragma unroll
+                for(int i = 0; i < 3; ++i){
+                    int share = __float2int_rn(centres[0].w[i]*yz*weightScale);
+                    if(share != 0){
+                        atomicAdd(fixedSums + rowStart + at[0][i], share);
+                    }
+                }
+            }
+        }
     }
     __syncthreads();
-    int* accumulators[7] = {weightsX, weightsY, weightsZ, particleCounts, liquidX, liquidY, liquidZ};
+    int* accumulators[8] = {weightsX, weightsY, weightsZ, particleCounts, particleDensity, liquidX, liquidY, liquidZ};
     int* high[3] = {ux, uy, uz};
     unsigned int* low[3] = {lowX, lowY, lowZ};
     for(uint i = (blockIdx.x == 0 ? 0 : numVoxelsEachNode[blockIdx.x - 1]) + threadIdx.x; i < numVoxelsEachNode[blockIdx.x]; i += blockDim.x){    //coalesced over the node's voxels
@@ -1233,7 +1275,7 @@ double Particles::getCourantDt(){
 void Particles::particleVelToVoxels(){
     //the voxels' sums: the momentum's in two arrays a component, its high digits where the velocities will be and its low ones where FLIP's old
     //velocities go once there are any (scatterParticleVelsToVoxels)
-    for(CudaVec<float>* accumulator : {&voxelsUx, &voxelsUy, &voxelsUz, &voxelsUxOld, &voxelsUyOld, &voxelsUzOld, &voxelWeightsX, &voxelWeightsY, &voxelWeightsZ, &particleCounts}){
+    for(CudaVec<float>* accumulator : {&voxelsUx, &voxelsUy, &voxelsUz, &voxelsUxOld, &voxelsUyOld, &voxelsUzOld, &voxelWeightsX, &voxelWeightsY, &voxelWeightsZ, &particleCounts, &particleDensity}){
         accumulator->zeroDeviceAsync(stream);
     }
     float voxelSize = grid.cellSize / (2<<refinementLevel);
@@ -1289,14 +1331,15 @@ void Particles::particleVelToVoxels(){
     if(numParticleNodes > 0){
         auto scatter = phases ? (apic ? scatterParticleVelsToVoxels<true, true> : scatterParticleVelsToVoxels<false, true>)
                               : (apic ? scatterParticleVelsToVoxels<true, false> : scatterParticleVelsToVoxels<false, false>);
-        scatter<<<numParticleNodes, NODE_THREADS, (3*sizeof(long long) + (phases ? 7 : 4)*sizeof(int))*numVoxelsPerNode, stream>>>(numParticleNodes, size, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(),
+        scatter<<<numParticleNodes, NODE_THREADS, (3*sizeof(long long) + (phases ? 8 : 5)*sizeof(int))*numVoxelsPerNode, stream>>>(numParticleNodes, size, numVoxels1D, gridNodeIndicesToFirstParticleIndex.devPtr(), gridCell.devPtr(), px.devPtr(), py.devPtr(), pz.devPtr(), vx.devPtr(), vy.devPtr(), vz.devPtr(),
             affineVelocities(affine), voxelSize, nodeIndexUsedVoxels.devPtr(), voxelIDsUsed.devPtr(), voxelOwners.devPtr(), (int*)voxelsUx.devPtr(), (int*)voxelsUy.devPtr(), (int*)voxelsUz.devPtr(),
             (unsigned int*)voxelsUxOld.devPtr(), (unsigned int*)voxelsUyOld.devPtr(), (unsigned int*)voxelsUzOld.devPtr(),
-            (int*)voxelWeightsX.devPtr(), (int*)voxelWeightsY.devPtr(), (int*)voxelWeightsZ.devPtr(), (int*)particleCounts.devPtr(), velocityScale, weightScale, radius, grid, refinementLevel,
+            (int*)voxelWeightsX.devPtr(), (int*)voxelWeightsY.devPtr(), (int*)voxelWeightsZ.devPtr(), (int*)particleCounts.devPtr(), (int*)particleDensity.devPtr(), velocityScale, weightScale, radius,
+            grid, refinementLevel,
             particleIds.devPtr(), 1.0f / twoPhase.densityRatio, (int*)liquidWeights[0].devPtr(), (int*)liquidWeights[1].devPtr(), (int*)liquidWeights[2].devPtr());
     }
     //particles near this partition's edge reach into ghost voxels: their owners add those sums in, which in fixed point come out the same in any order
-    for(CudaVec<float>* accumulator : {&voxelsUx, &voxelsUy, &voxelsUz, &voxelsUxOld, &voxelsUyOld, &voxelsUzOld, &voxelWeightsX, &voxelWeightsY, &voxelWeightsZ, &particleCounts}){
+    for(CudaVec<float>* accumulator : {&voxelsUx, &voxelsUy, &voxelsUz, &voxelsUxOld, &voxelsUyOld, &voxelsUzOld, &voxelWeightsX, &voxelWeightsY, &voxelWeightsZ, &particleCounts, &particleDensity}){
         context->reduceGhosts((int*)accumulator->devPtr(), stream);
     }
     if(phases){
@@ -1305,11 +1348,12 @@ void Particles::particleVelToVoxels(){
             context->fillGhosts(liquid.devPtr(), stream);   //as bits: they stay fixed point
         }
     }
-    cudaNormalizeVoxelVelocities(solids, voxelWeightsX, voxelWeightsY, voxelWeightsZ, voxelsUx, voxelsUy, voxelsUz, voxelsUxOld, voxelsUyOld, voxelsUzOld, particleCounts, velocityScale, weightScale, stream);
-    for(CudaVec<float>* field : {&voxelsUx, &voxelsUy, &voxelsUz, &voxelWeightsX, &voxelWeightsY, &voxelWeightsZ, &particleCounts}){   //and the ghosts take the totals
+    cudaNormalizeVoxelVelocities(solids, voxelWeightsX, voxelWeightsY, voxelWeightsZ, voxelsUx, voxelsUy, voxelsUz, voxelsUxOld, voxelsUyOld, voxelsUzOld, particleCounts, particleDensity, velocityScale,
+        weightScale, stream);
+    for(CudaVec<float>* field : {&voxelsUx, &voxelsUy, &voxelsUz, &voxelWeightsX, &voxelWeightsY, &voxelWeightsZ, &particleCounts, &particleDensity}){   //and the ghosts take the totals
         context->fillGhosts(field->devPtr(), stream);
     }
-    creditObstacleVolume();     //voxels obstacles partly cover hold fewer particles at rest: the density correction mustn't read them as thin
+    creditObstacleVolume();     //voxels by obstacles hold fewer particles at rest: neither the counts nor the density may read them as thin
     cudaExtrapolateUnreachedFaces(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, voxelWeightsX, voxelWeightsY, voxelWeightsZ, voxelsUx, voxelsUy, voxelsUz, *context, stream);
     cudaFindFootprintDepth(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, footprintDepth, freeSurface, *context, stream);
     if(needsLevelSet()){    //the liquid's surface, where viscosity and surface tension act, and the sharp free surface's liquid (freesurface.cu)
@@ -1368,7 +1412,7 @@ void Particles::pressureSolve(){
     if(surfaceTension > 0.0){
         applySurfaceTension();
     }
-    cudaCalcDivU(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, voxelsUx, voxelsUy, voxelsUz, particleCounts, footprintDepth, restParticlesPerVoxel, correctionRate, divU, stream);
+    cudaCalcDivU(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, voxelsUx, voxelsUy, voxelsUz, particleDensity, footprintDepth, restParticlesPerVoxel, correctionRate, divU, stream);
     addObstacleFlux();      //what obstacles' surfaces make of the flow through the faces they cut or close
     addSurfaceDivergence(correctionRate);   //sharp: the surface tension's pressure, and spreading what's packed near the surface
     balanceSealedPockets(); //and fluid no air reaches can't change its volume
@@ -1450,7 +1494,7 @@ void Particles::pressureSolve(){
         lightenFaceUpdates(dt/(density*voxelSize*voxelSize));   //two phases, as updateVoxelVelocities has it: the viscous step acts on the flow the first solve leaves
         p.zeroDeviceAsync(stream);
         applyViscosity();
-        cudaCalcDivU(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, voxelsUx, voxelsUy, voxelsUz, particleCounts, footprintDepth, restParticlesPerVoxel, correctionRate, divU, stream);
+        cudaCalcDivU(solveCodes, neighborNx, neighborPx, neighborNy, neighborPy, neighborNz, neighborPz, voxelsUx, voxelsUy, voxelsUz, particleDensity, footprintDepth, restParticlesPerVoxel, correctionRate, divU, stream);
         addObstacleFlux();
         addSurfaceDivergence(correctionRate);
         balanceSealedPockets();

@@ -140,8 +140,12 @@ def free_fall(bake):
              "extrapolation after it left a handful of unreached faces at rest each substep; the pressure solve took both for divergence, and the "
              "ball lost a thousandth of its speed a substep. The sums are exact now and the extrapolation reaches every face: with the density "
              "correction off the ball keeps its velocity to 2e-8 of its speed over 12 substeps, whatever its size. What's left here is the "
-             "correction itself: the ball's particles cross the voxels in step, the counts it reads rise and fall by a particle as they do, and "
-             "it answers each: 0.4% of the ball's speed in spread after a quarter of a second. Not looked into further.")
+             "correction itself. Until 24 October it measured each voxel's count of particles, which rose and fell by a particle as the ball's "
+             "particles crossed the voxels in step: 0.4% of the ball's speed in spread after a quarter of a second. It measures their B-spline "
+             "density now, which slides smoothly with them: 0.17%. Most of that is the correction evening out the seeding's jitter, which a count "
+             "can't see: the same ball at rest spreads 0.0010 m/s by then, settling as the rest check's tank does, against 0.00105 moving. The "
+             "rest comes and goes with where the ball sits on the grid, every 6 frames here, when it has moved a whole number of voxels along "
+             "each axis.")
 def momentum(bake):
     start = [0.5, 0.3, 0.2]
     speed = math.sqrt(sum(v * v for v in start))
