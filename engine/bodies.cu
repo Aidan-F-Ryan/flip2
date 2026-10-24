@@ -1191,10 +1191,7 @@ std::string Bodies::restore(const ShardData& bodyShard, const ShardData& contact
     }
     std::memcpy(seen, restored.data(), sizeof(BodyState)*numBodies);   //what the first substep's timestep and contact steps go by, as the checkpoint's last left it
     gpuErrchk(cudaMemcpyAsync(states, seen, sizeof(BodyState)*numBodies, cudaMemcpyHostToDevice, stream));
-    reserve(slotCapacity, carried.size(), {{(void**)&picks, sizeof(unsigned long long)}, {(void**)&contacts, sizeof(BodyContact)}, {(void**)&lastContacts, sizeof(BodyContact)},
-                                           {(void**)&remapped, sizeof(BodyContact)}, {(void**)&islandKeys, sizeof(unsigned long long)},
-                                           {(void**)&sortedKeys, sizeof(unsigned long long)}, {(void**)&slotsIn, sizeof(int)}, {(void**)&slotsSorted, sizeof(int)},
-                                           {(void**)&contactOrder, sizeof(int)}});
+    growSlots(carried.size());      //the sort's scratch with the slots: the first substep may need no more room than these, and then makes none
     if(!carried.empty()){
         gpuErrchk(cudaMemcpyAsync(lastContacts, carried.data(), sizeof(BodyContact)*carried.size(), cudaMemcpyHostToDevice, stream));
     }

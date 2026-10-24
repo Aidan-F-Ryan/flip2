@@ -1051,34 +1051,42 @@ void Bodies::reserve(size_t& capacity, size_t needed, std::initializer_list<std:
     capacity = room;
 }
 
+//More room in the slots' arrays, the last contacts kept in it, and in the islands' sort's scratch: everything sized by the slots grows here alone, for a
+//substep's pairs (makePairs) and a resume's contacts (restore) alike. Without its scratch the sort only says how much it needs and sorts nothing, so
+//the islands would be dealt from whatever the keys' memory held
+void Bodies::growSlots(size_t needed){
+    if(needed <= slotCapacity){
+        return;
+    }
+    BodyContact* kept = lastContacts;
+    lastContacts = nullptr;
+    reserve(slotCapacity, needed, {{(void**)&picks, sizeof(unsigned long long)}, {(void**)&contacts, sizeof(BodyContact)}, {(void**)&lastContacts, sizeof(BodyContact)},
+                                   {(void**)&remapped, sizeof(BodyContact)}, {(void**)&islandKeys, sizeof(unsigned long long)},
+                                   {(void**)&sortedKeys, sizeof(unsigned long long)}, {(void**)&slotsIn, sizeof(int)}, {(void**)&slotsSorted, sizeof(int)},
+                                   {(void**)&contactOrder, sizeof(int)}});
+    if(kept != nullptr){
+        if(numLast > 0){
+            gpuErrchk(cudaMemcpyAsync(lastContacts, kept, sizeof(BodyContact)*numLast, cudaMemcpyDeviceToDevice, stream));
+        }
+        gpuErrchk(cudaFreeAsync(kept, stream));
+    }
+    size_t bytes = 0;
+    gpuErrchk(cub::DeviceRadixSort::SortPairs(nullptr, bytes, islandKeys, sortedKeys, slotsIn, slotsSorted, (int)slotCapacity, 0, 64, stream));
+    if(bytes > sortScratchBytes){
+        if(sortScratch != nullptr){
+            gpuErrchk(cudaFreeAsync(sortScratch, stream));
+        }
+        gpuErrchk(cudaMallocAsync(&sortScratch, bytes, stream));
+        sortScratchBytes = bytes;
+    }
+}
+
 void Bodies::makePairs(const Obstacles& obstacleState, float3 low, float3 high){
     gpuErrchk(cudaEventSynchronize(pairsCounted));      //done by now, as the pressure solve has waited on the stream since: it waits only if not
     numPairs = (int)*pairTotal;
     reserve(pairCapacity, (size_t)numPairs, {{(void**)&pairBodies, sizeof(int)}, {(void**)&pairPartners, sizeof(int)}});
     size_t numSlots = (size_t)numPairs*CONTACT_SLOTS;
-    if(numSlots > slotCapacity){    //more room, the last contacts kept in it
-        BodyContact* kept = lastContacts;
-        lastContacts = nullptr;
-        reserve(slotCapacity, numSlots, {{(void**)&picks, sizeof(unsigned long long)}, {(void**)&contacts, sizeof(BodyContact)}, {(void**)&lastContacts, sizeof(BodyContact)},
-                                         {(void**)&remapped, sizeof(BodyContact)}, {(void**)&islandKeys, sizeof(unsigned long long)},
-                                         {(void**)&sortedKeys, sizeof(unsigned long long)}, {(void**)&slotsIn, sizeof(int)}, {(void**)&slotsSorted, sizeof(int)},
-                                         {(void**)&contactOrder, sizeof(int)}});
-        if(kept != nullptr){
-            if(numLast > 0){
-                gpuErrchk(cudaMemcpyAsync(lastContacts, kept, sizeof(BodyContact)*numLast, cudaMemcpyDeviceToDevice, stream));
-            }
-            gpuErrchk(cudaFreeAsync(kept, stream));
-        }
-        size_t bytes = 0;
-        gpuErrchk(cub::DeviceRadixSort::SortPairs(nullptr, bytes, islandKeys, sortedKeys, slotsIn, slotsSorted, (int)slotCapacity, 0, 64, stream));
-        if(bytes > sortScratchBytes){
-            if(sortScratch != nullptr){
-                gpuErrchk(cudaFreeAsync(sortScratch, stream));
-            }
-            gpuErrchk(cudaMallocAsync(&sortScratch, bytes, stream));
-            sortScratchBytes = bytes;
-        }
-    }
+    growSlots(numSlots);
     ContactWorld world = contactWorld(obstacleState, deviceObstacles, low, high, wallBounce, wallContactFriction, voxel, 0.0, 0.0f);
     if(numPairs > 0){
         fillPairs<<<bodyBlocks(), 32, 0, stream>>>(numBodies, world, queryBoxes, pairEnds, pairBodies, pairPartners);

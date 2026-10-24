@@ -301,6 +301,7 @@ private:
     void sumShares(const float* x, const uint* onlyIf);    //B^T x into the sums, every partition's, then s M~^-1 of it into responses
     void makePairs(const Obstacles& obstacles, float3 low, float3 high);   //the substep's pairs, from the count warmStart made, and the last contacts in them
     void reserve(size_t& capacity, size_t needed, std::initializer_list<std::pair<void**, size_t>> arrays);  //room for needed of each, kept if there is
+    void growSlots(size_t needed);      //room for needed slots in every slot's array and the islands' sort, the last contacts kept (contacts.cu)
 
     int numBodies = 0;
     int partners = 6;                   //what a body can touch: the walls, and every obstacle (setUpContacts)
